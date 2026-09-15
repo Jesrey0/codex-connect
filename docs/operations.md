@@ -104,7 +104,16 @@ This is the canonical configuration shape for the pre-release backend. Historica
 
 ## Deployment boundary
 
-`deploy` builds from the current Codex Connect source tree without requiring Git or a clean working tree. It uses a temporary isolated build tree, installs a content-addressed artifact, atomically activates it, verifies backend health, removes older installed backend builds, and deletes the temporary deployment build tree. Activation replaces only the backend binary/service and leaves the independent native tunnel runtime intact.
+Deployment is deliberately two-phase so an operator invoking the CLI through the running backend never has to interpret a self-inflicted transport disconnect as command failure.
+
+```bash
+codex-connect deploy prepare
+codex-connect deploy status <operation-id>
+codex-connect deploy activate <operation-id>
+codex-connect deploy status <operation-id>
+```
+
+`deploy prepare` is a short enqueue operation: it creates a versioned durable record under the user state directory, records the source tree, assigns an operation id, and hands the potentially long release build to a detached systemd unit. The build itself requires neither Git nor a clean working tree, uses an operation-specific temporary Cargo target directory, installs a content-addressed artifact, and records `prepared` or `failed` without touching the running backend. `deploy activate` is also short: an operation-scoped OS lock serializes competing callers, the prepared artifact is validated, `activationQueued` is persisted, and the detached activation is handed to systemd before the foreground command returns. If handoff fails, the record is rolled back to `prepared`; if a detached worker later disappears without recording completion, `deploy status` reconciles that condition to `succeeded` only when the exact runtime and operator artifact prove activation completed, otherwise to `failed`. Successful normal activation is not considered verified until the live backend reports the exact prepared SHA-256. Installed content-addressed artifacts are retained rather than automatically deleted, so activating one durable operation cannot invalidate another prepared operation.
 
 That boundary is intentional. Backend deployment must not become tunnel lifecycle orchestration.
 

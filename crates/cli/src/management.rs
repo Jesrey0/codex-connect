@@ -31,72 +31,361 @@ pub async fn run_backend() -> Result<()> {
     .await
 }
 
-fn prune_installed_builds(keep_build_id: &str) -> Result<()> {
-    let builds = crate::config::home_dir()?.join(".local/lib/codex-connect/builds");
-    if !builds.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(&builds)? {
-        let entry = entry?;
-        if entry.file_name() == keep_build_id {
-            continue;
+async fn reconcile_deployment(operation_id: &str) -> Result<deployment::DeploymentRecord> {
+    let record = deployment::load(operation_id)?;
+    match record.state {
+        deployment::DeploymentState::Building => {
+            let unit = deployment::prepare_service_unit(operation_id)?;
+            if transient_unit_pending(&unit)? {
+                return Ok(record);
+            }
+            deployment::mark_failed_if_state(
+                operation_id,
+                &[deployment::DeploymentState::Building],
+                format!("detached build job {unit} ended before recording completion"),
+            )
         }
-        let path = entry.path();
-        if path.is_dir() {
-            fs::remove_dir_all(&path)
-                .with_context(|| format!("unable to remove stale build {}", path.display()))?;
-        } else {
-            fs::remove_file(&path).with_context(|| {
-                format!("unable to remove stale build artifact {}", path.display())
+        deployment::DeploymentState::ActivationQueued | deployment::DeploymentState::Activating => {
+            let service = deployment::activation_service_unit(operation_id)?;
+            let timer = deployment::activation_timer_unit(operation_id)?;
+            if transient_unit_pending(&service)? || transient_unit_pending(&timer)? {
+                return Ok(record);
+            }
+            let expected_sha256 = record
+                .sha256
+                .as_deref()
+                .context("pending activation has no SHA-256")?;
+            if deployment_effect_visible(&record).await? {
+                if record.state == deployment::DeploymentState::Activating {
+                    return deployment::mark_succeeded_if_activating(operation_id, expected_sha256);
+                }
+            }
+            deployment::mark_failed_if_state(
+                operation_id,
+                &[record.state],
+                format!(
+                    "detached activation job ended before recording completion and build {} is not fully active",
+                    record.build_id.as_deref().unwrap_or("unknown")
+                ),
+            )
+        }
+        _ => Ok(record),
+    }
+}
+
+fn transient_unit_pending(unit: &str) -> Result<bool> {
+    let state = SystemdManager.unit_state(unit)?;
+    Ok(transient_active_state(&state.active_state))
+}
+
+fn transient_active_state(active_state: &str) -> bool {
+    matches!(
+        active_state,
+        "active" | "activating" | "deactivating" | "reloading"
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn deactivating_transient_units_remain_pending() {
+    for state in ["active", "activating", "deactivating", "reloading"] {
+        assert!(transient_active_state(state), "{state}");
+    }
+    for state in ["inactive", "failed", "dead"] {
+        assert!(!transient_active_state(state), "{state}");
+    }
+}
+
+async fn deployment_effect_visible(record: &deployment::DeploymentRecord) -> Result<bool> {
+    let expected_sha256 = record
+        .sha256
+        .as_deref()
+        .context("deployment has no SHA-256")?;
+    let operator = crate::config::home_dir()?.join(".local/bin/codex-connect");
+    let operator_matches = operator.is_file()
+        && artifact::for_path(&operator)
+            .map(|identity| identity.sha256 == expected_sha256)
+            .unwrap_or(false);
+    if !operator_matches {
+        return Ok(false);
+    }
+    if record.no_start {
+        return Ok(true);
+    }
+    let (_, config) = load_config()?;
+    let runtime = match backend_status_once(&config.backend).await {
+        Ok(runtime) => runtime,
+        Err(_) => return Ok(false),
+    };
+    Ok(runtime.healthy && runtime.binary_sha256 == expected_sha256)
+}
+
+pub async fn deploy_prepare() -> Result<()> {
+    let source = source_tree()?;
+    let record = deployment::queue_prepare(&source)?;
+    println!(
+        "✓ Deployment build queued as operation {}. The running backend is unchanged.",
+        record.operation_id
+    );
+    println!(
+        "DEPLOYMENT_PREPARE operation_id={} state={}",
+        record.operation_id,
+        record.state.as_str()
+    );
+    Ok(())
+}
+
+pub async fn prepare_deployment(operation_id: &str, source: &Path) -> Result<()> {
+    let result = prepare_deployment_inner(operation_id, source).await;
+    if let Err(error) = result {
+        let message = error.to_string();
+        let _ = deployment::mark_failed_if_state(
+            operation_id,
+            &[deployment::DeploymentState::Building],
+            message,
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn prepare_deployment_inner(operation_id: &str, source: &Path) -> Result<()> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("unable to canonicalize source tree {}", source.display()))?;
+    let record = deployment::load(operation_id)?;
+    if record.source != source.display().to_string() {
+        bail!(
+            "deployment source mismatch for operation {operation_id}: expected {}, found {}",
+            record.source,
+            source.display()
+        );
+    }
+    match record.state {
+        deployment::DeploymentState::Building => {}
+        deployment::DeploymentState::Prepared
+        | deployment::DeploymentState::ActivationQueued
+        | deployment::DeploymentState::Activating
+        | deployment::DeploymentState::Succeeded => return Ok(()),
+        deployment::DeploymentState::Failed => {
+            bail!("deployment operation {operation_id} is already failed")
+        }
+    }
+
+    let build_root = deployment::build_target(operation_id, &source)?;
+    let build = (|| -> Result<_> {
+        if build_root.exists() {
+            fs::remove_dir_all(&build_root).with_context(|| {
+                format!(
+                    "unable to clear temporary build tree {}",
+                    build_root.display()
+                )
             })?;
         }
+        let cargo = find_executable("cargo").or_else(|_| {
+            let candidate = crate::config::home_dir()?.join(".cargo/bin/cargo");
+            ensure_executable(&candidate)?;
+            Ok::<PathBuf, anyhow::Error>(candidate)
+        })?;
+        let status = Command::new(cargo)
+            .current_dir(&source)
+            .env("CARGO_TARGET_DIR", &build_root)
+            .args(["build", "--release", "-p", "codex-connect", "--locked"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()?;
+        if !status.success() {
+            bail!("release build failed with {status}");
+        }
+        let built = build_root.join("release/codex-connect");
+        let identity = artifact::for_path(&built)?;
+        let installed = install_artifact(&built, &identity.sha256)?;
+        Ok((identity, installed))
+    })();
+
+    match build {
+        Ok((identity, installed)) => {
+            if build_root.exists() {
+                if let Err(error) = fs::remove_dir_all(&build_root) {
+                    eprintln!(
+                        "warning: unable to remove temporary build tree {}: {error}",
+                        build_root.display()
+                    );
+                }
+            }
+            let record = deployment::mark_prepared(operation_id, &identity, &installed)?;
+            println!(
+                "✓ Deployment operation {} prepared build {}.",
+                record.operation_id, identity.build_id
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&build_root);
+            Err(error)
+        }
+    }
+}
+
+pub async fn deploy_activate(operation_id: &str, no_start: bool) -> Result<()> {
+    let (record, newly_queued) = deployment::queue_activation(operation_id, no_start)?;
+    let build_id = record.build_id.as_deref().unwrap_or("pending");
+    let sha256 = record.sha256.as_deref().unwrap_or("pending");
+    if !newly_queued {
+        println!(
+            "Deployment operation {} is already {}.",
+            record.operation_id,
+            record.state.as_str()
+        );
+    } else if record.no_start {
+        println!(
+            "✓ Activation queued for operation {} with a minimum handoff delay of {}; the backend will not be restarted (--no-start).",
+            record.operation_id,
+            deployment::activation_delay()
+        );
+    } else {
+        println!(
+            "✓ Activation queued for operation {} with a minimum handoff delay of {}; this command returns before the backend restart.",
+            record.operation_id,
+            deployment::activation_delay()
+        );
+    }
+    println!(
+        "DEPLOYMENT_ACTIVATION operation_id={} build_id={} sha256={} state={}",
+        record.operation_id,
+        build_id,
+        sha256,
+        record.state.as_str()
+    );
+    Ok(())
+}
+
+pub async fn deploy_status(operation_id: &str) -> Result<()> {
+    let record = reconcile_deployment(operation_id).await?;
+    println!("Codex Connect deployment operation {}", record.operation_id);
+    println!("State: {}", record.state.as_str());
+    println!("Source: {}", record.source);
+    if let Some(build_id) = &record.build_id {
+        println!("Build: {build_id}");
+    }
+    if let Some(sha256) = &record.sha256 {
+        println!("SHA-256: {sha256}");
+    }
+    if let Some(executable) = &record.executable {
+        println!("Artifact: {executable}");
+    }
+    if let Some(error) = &record.error {
+        println!("Error: {error}");
+    }
+
+    match record.state {
+        deployment::DeploymentState::Building => {
+            println!(
+                "DEPLOYMENT_STATUS operation_id={} state=building verified=false",
+                record.operation_id
+            );
+            Ok(())
+        }
+        deployment::DeploymentState::Prepared => {
+            println!("Live verification: not activated");
+            println!(
+                "DEPLOYMENT_STATUS operation_id={} state=prepared build_id={} sha256={} verified=false",
+                record.operation_id,
+                record.build_id.as_deref().unwrap_or("unknown"),
+                record.sha256.as_deref().unwrap_or("unknown")
+            );
+            Ok(())
+        }
+        deployment::DeploymentState::ActivationQueued | deployment::DeploymentState::Activating => {
+            println!("Live verification: activation pending");
+            println!(
+                "DEPLOYMENT_STATUS operation_id={} state={} build_id={} verified=false",
+                record.operation_id,
+                record.state.as_str(),
+                record.build_id.as_deref().unwrap_or("unknown")
+            );
+            Ok(())
+        }
+        deployment::DeploymentState::Failed => {
+            println!(
+                "DEPLOYMENT_STATUS operation_id={} state=failed verified=false",
+                record.operation_id
+            );
+            bail!(
+                "deployment {} failed: {}",
+                record.operation_id,
+                record
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown activation failure")
+            )
+        }
+        deployment::DeploymentState::Succeeded => {
+            if record.no_start {
+                println!("Live verification: intentionally skipped (--no-start)");
+                println!(
+                    "DEPLOYMENT_STATUS operation_id={} state=succeeded build_id={} verified=false no_start=true",
+                    record.operation_id,
+                    record.build_id.as_deref().unwrap_or("unknown")
+                );
+                return Ok(());
+            }
+            let expected_sha256 = record
+                .sha256
+                .as_deref()
+                .context("successful deployment has no SHA-256")?;
+            let (_, config) = load_config()?;
+            let runtime = backend_status_once(&config.backend)
+                .await
+                .context("deployment succeeded but the backend health endpoint is unavailable")?;
+            if !runtime.healthy || runtime.binary_sha256 != expected_sha256 {
+                bail!(
+                    "deployment {} recorded success but live backend is build {} ({})",
+                    record.operation_id,
+                    runtime.build_id,
+                    runtime.binary_sha256
+                );
+            }
+            println!("Live verification: healthy build {} ✓", runtime.build_id);
+            println!(
+                "DEPLOYMENT_STATUS operation_id={} state=succeeded build_id={} sha256={} verified=true",
+                record.operation_id, runtime.build_id, runtime.binary_sha256
+            );
+            Ok(())
+        }
+    }
+}
+
+pub async fn activate_deployment(
+    operation_id: &str,
+    expected_sha256: &str,
+    no_start: bool,
+) -> Result<()> {
+    let result = activate_deployment_inner(operation_id, expected_sha256, no_start).await;
+    if let Err(error) = result {
+        let message = error.to_string();
+        let _ = deployment::mark_failed_if_state(
+            operation_id,
+            &[
+                deployment::DeploymentState::ActivationQueued,
+                deployment::DeploymentState::Activating,
+            ],
+            message,
+        );
+        return Err(error);
     }
     Ok(())
 }
 
-pub async fn deploy(no_start: bool) -> Result<()> {
-    let source = source_tree()?;
-    println!("Building release from {}", display_path(&source));
-    let build_root = source.join("target/codex-connect-deploy");
-    let cargo = find_executable("cargo").or_else(|_| {
-        let candidate = crate::config::home_dir()?.join(".cargo/bin/cargo");
-        ensure_executable(&candidate)?;
-        Ok::<PathBuf, anyhow::Error>(candidate)
-    })?;
-    let status = Command::new(cargo)
-        .current_dir(&source)
-        .env("CARGO_TARGET_DIR", &build_root)
-        .args(["build", "--release", "-p", "codex-connect", "--locked"])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
-    if !status.success() {
-        bail!("release build failed with {status}");
-    }
-    let built = build_root.join("release/codex-connect");
-    let artifact = artifact::for_path(&built)?;
-    let installed = install_artifact(&built, &artifact.sha256)?;
-    println!(
-        "✓ Installed build {} at {}",
-        artifact.build_id,
-        display_path(&installed)
-    );
-    let activation_unit = deployment::unit_name(&artifact.build_id);
-    deployment::handoff(&installed, &artifact.sha256, &activation_unit, no_start)?;
-    fs::remove_dir_all(&build_root).with_context(|| {
-        format!(
-            "unable to remove temporary build tree {}",
-            build_root.display()
-        )
-    })?;
-    println!(
-        "✓ Activation handed off to {activation_unit}; it restarts only the backend, never the native tunnel-client runtime"
-    );
-    Ok(())
-}
-
-pub async fn activate_deployment(expected_sha256: &str, no_start: bool) -> Result<()> {
+async fn activate_deployment_inner(
+    operation_id: &str,
+    expected_sha256: &str,
+    no_start: bool,
+) -> Result<()> {
+    // All deployment operations mutate the same backend unit/config/operator symlink.
+    // Serialize that shared activation boundary across operation ids.
+    let _activation_lock = deployment::ActivationLock::acquire()?;
     let running = artifact::current()?;
     if running.sha256 != expected_sha256 {
         bail!(
@@ -104,9 +393,10 @@ pub async fn activate_deployment(expected_sha256: &str, no_start: bool) -> Resul
             running.sha256
         );
     }
+    deployment::mark_activating(operation_id, expected_sha256, no_start)?;
     setup(no_start).await?;
     activate_operator_symlink(&running.executable)?;
-    prune_installed_builds(&running.build_id)?;
+    deployment::mark_succeeded(operation_id, expected_sha256)?;
     Ok(())
 }
 

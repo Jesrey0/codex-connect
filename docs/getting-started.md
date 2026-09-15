@@ -105,18 +105,18 @@ codex-connect doctor
 For later source updates, run:
 
 ```bash
-codex-connect deploy
+codex-connect deploy prepare
+# use the operation id printed above
+codex-connect deploy status <operation-id>
+# once status reports prepared
+codex-connect deploy activate <operation-id>
+# after the backend reconnects, verify the same operation
+codex-connect deploy status <operation-id>
 ```
 
-`deploy` builds the current source tree in an isolated temporary target directory, installs the resulting content-addressed artifact, atomically activates it, verifies backend health, removes older installed backend builds, and removes the temporary deployment build tree. It does not restart or recreate the independent tunnel runtime.
+`deploy prepare` immediately writes a durable operation record and queues the release build as a detached user-systemd job, then returns without waiting for compilation. The build uses an operation-scoped temporary target directory, installs the resulting content-addressed artifact, cleans its temporary build tree, and moves the operation from `building` to `prepared` (or `failed`) without changing the running backend. `deploy activate` validates that prepared artifact, serializes competing activation requests for that operation, queues detached activation, and returns before the backend restart begins. The detached activation restarts only the Codex Connect backend, verifies backend health, and records success or failure. `deploy status` is authoritative for the whole transaction: it also converts an abandoned detached job into a terminal result instead of leaving a deployment permanently pending, and after success it verifies that the live backend is running the exact prepared SHA-256. Installed content-addressed builds are retained so one prepared operation cannot be invalidated by activating another. Deployment never restarts or recreates the independent tunnel runtime.
 
-Verify:
-
-```bash
-codex-connect status
-```
-
-Expected state: the backend service is running and the endpoint is `http://127.0.0.1:8767/mcp`.
+Expected final state: `deploy status` reports `state=succeeded verified=true`, and `codex-connect status` reports the backend service running at `http://127.0.0.1:8767/mcp`.
 
 ## 5. Create or select an OpenAI tunnel
 

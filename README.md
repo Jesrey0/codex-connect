@@ -65,7 +65,7 @@ codex-connect doctor
 codex-connect status
 ```
 
-`setup` installs the binary into the content-addressed build store under `~/.local/lib/codex-connect/builds/`, points `~/.local/bin/codex-connect` at that build, installs the user service, and verifies backend health. After source changes, use `codex-connect deploy`; it builds and atomically activates the new artifact, removes older installed backend builds, and leaves the tunnel runtime untouched.
+`setup` installs the binary into the content-addressed build store under `~/.local/lib/codex-connect/builds/`, points `~/.local/bin/codex-connect` at that build, installs the user service, and verifies backend health. After source changes, use the explicit deployment workflow: `codex-connect deploy prepare`, poll `codex-connect deploy status <operation-id>` until it reports `prepared`, then run `codex-connect deploy activate <operation-id>` and verify the same operation after reconnect. Both the potentially long release build and the disruptive backend activation run as detached systemd jobs, so foreground operator commands remain short and deterministic. The tunnel runtime remains untouched.
 
 Configure the official tunnel client separately to connect its long-lived runtime to `http://127.0.0.1:8767/mcp`. The ChatGPT custom app/connector uses **no authentication**. The tunnel runtime owns its OpenAI control-plane credential and organization context. Codex Connect accepts MCP only on loopback, has no application-level authentication, and manages only its own backend service.
 

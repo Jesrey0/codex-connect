@@ -39,11 +39,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandName {
-    /// Build, install, activate, and verify the current source tree.
+    /// Prepare, activate, or inspect a source deployment.
     Deploy {
-        /// Install configuration and units without starting services.
-        #[arg(long)]
-        no_start: bool,
+        #[command(subcommand)]
+        command: DeployCommand,
     },
     /// One-time backend configuration and managed-service installation.
     Setup {
@@ -77,9 +76,21 @@ enum CommandName {
     /// Internal systemd entrypoint for the backend.
     #[command(hide = true)]
     RunBackend,
+    /// Internal detached deployment build entrypoint.
+    #[command(hide = true)]
+    PrepareDeployment {
+        #[arg(long)]
+        operation_id: String,
+
+        #[arg(long)]
+        source: PathBuf,
+    },
     /// Internal detached deployment activation entrypoint.
     #[command(hide = true)]
     ActivateDeployment {
+        #[arg(long)]
+        operation_id: String,
+
         #[arg(long)]
         expected_sha256: String,
 
@@ -102,10 +113,34 @@ enum CommandName {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum DeployCommand {
+    /// Build and install the current source tree without restarting the backend.
+    Prepare,
+    /// Queue detached activation of a prepared build and return before restart begins.
+    Activate {
+        operation_id: String,
+        /// Install configuration and units without starting services.
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Show durable deployment state and verify the live backend after success.
+    Status { operation_id: String },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        CommandName::Deploy { no_start } => management::deploy(no_start).await,
+        CommandName::Deploy { command } => match command {
+            DeployCommand::Prepare => management::deploy_prepare().await,
+            DeployCommand::Activate {
+                operation_id,
+                no_start,
+            } => management::deploy_activate(&operation_id, no_start).await,
+            DeployCommand::Status { operation_id } => {
+                management::deploy_status(&operation_id).await
+            }
+        },
         CommandName::Setup { no_start } => management::setup(no_start).await,
         CommandName::Status => management::status().await,
         CommandName::Restart => management::restart().await,
@@ -113,10 +148,15 @@ async fn main() -> Result<()> {
         CommandName::Doctor => management::doctor().await,
         CommandName::Probe { codex_bin, cwd } => probe_app_server(&codex_bin, &cwd).await,
         CommandName::RunBackend => management::run_backend().await,
+        CommandName::PrepareDeployment {
+            operation_id,
+            source,
+        } => management::prepare_deployment(&operation_id, &source).await,
         CommandName::ActivateDeployment {
+            operation_id,
             expected_sha256,
             no_start,
-        } => management::activate_deployment(&expected_sha256, no_start).await,
+        } => management::activate_deployment(&operation_id, &expected_sha256, no_start).await,
         CommandName::Serve {
             codex_bin,
             scope_root,
@@ -256,6 +296,7 @@ fn command_with_binary_path(binary: &Path) -> StdCommand {
 mod tests {
     use super::Cli;
     use super::CommandName;
+    use super::DeployCommand;
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -280,11 +321,45 @@ mod tests {
 
     #[test]
     fn operator_commands_parse_cleanly() {
-        let deploy = Cli::try_parse_from(["codex-connect", "deploy", "--no-start"])
-            .expect("deploy arguments should parse");
+        let deploy = Cli::try_parse_from([
+            "codex-connect",
+            "deploy",
+            "activate",
+            "0123456789abcdef01234567",
+            "--no-start",
+        ])
+        .expect("deploy arguments should parse");
         assert!(matches!(
             deploy.command,
-            CommandName::Deploy { no_start: true }
+            CommandName::Deploy {
+                command: DeployCommand::Activate {
+                    ref operation_id,
+                    no_start: true
+                }
+            } if operation_id == "0123456789abcdef01234567"
+        ));
+
+        let prepare = Cli::try_parse_from(["codex-connect", "deploy", "prepare"])
+            .expect("deploy prepare should parse");
+        assert!(matches!(
+            prepare.command,
+            CommandName::Deploy {
+                command: DeployCommand::Prepare
+            }
+        ));
+
+        let status = Cli::try_parse_from([
+            "codex-connect",
+            "deploy",
+            "status",
+            "0123456789abcdef01234567",
+        ])
+        .expect("deploy status should parse");
+        assert!(matches!(
+            status.command,
+            CommandName::Deploy {
+                command: DeployCommand::Status { ref operation_id }
+            } if operation_id == "0123456789abcdef01234567"
         ));
 
         let probe = Cli::try_parse_from([

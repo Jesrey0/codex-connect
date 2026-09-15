@@ -275,6 +275,7 @@ dependencies = [
  "codex-connect-mcp",
  "codex-connect-relay",
  "codex-connect-scope",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

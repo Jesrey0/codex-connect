@@ -19,6 +19,7 @@ codex-connect-app-server = { path = "../app-server" }
 codex-connect-mcp = { path = "../mcp" }
 codex-connect-relay = { path = "../relay" }
 codex-connect-scope = { path = "../scope" }
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
