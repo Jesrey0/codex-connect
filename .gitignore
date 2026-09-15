@@ -1,0 +1,6 @@
+/target/
+__pycache__/
+.env
+.env.*
+!.env.example
+/config/tunnel-client/codex-connect.yaml

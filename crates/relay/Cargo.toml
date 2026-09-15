@@ -1,0 +1,17 @@
+[package]
+name = "codex-connect-relay"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[dependencies]
+codex-connect-app-server = { path = "../app-server" }
+codex-connect-scope = { path = "../scope" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

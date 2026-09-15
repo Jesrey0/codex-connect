@@ -1,0 +1,113 @@
+# Operations
+
+For first-time installation, prerequisites, Secure MCP Tunnel, and ChatGPT custom app setup, start with [Getting Started](getting-started.md). This document covers steady-state operation after installation.
+
+## Install
+
+```bash
+cargo build --release -p codex-connect --locked
+target/release/codex-connect setup
+export PATH="$HOME/.local/bin:$PATH"
+codex-connect doctor
+codex-connect status
+```
+
+`setup` converges the bootstrap binary into the canonical runtime layout: one content-addressed artifact under `~/.local/lib/codex-connect/builds/`, `~/.local/bin/codex-connect` as the operator symlink, and `codex-connect.service` pointing at that artifact.
+
+Configure the official tunnel client separately to connect its long-lived runtime to `http://127.0.0.1:8767/mcp`. The ChatGPT custom app uses **no authentication**. The tunnel runtime authenticates to OpenAI with its own runtime API key; Codex Connect's MCP endpoint is deliberately loopback-only and has no application-level authentication. Use the tunnel client's native lifecycle commands:
+
+```bash
+tunnel-client runtimes connect ...
+tunnel-client runtimes status <alias>
+```
+
+The canonical tunnel-client profile is `~/.config/tunnel-client/codex-connect.yaml`. It is tunnel-client-owned; Codex Connect does not read or manage the tunnel ID.
+
+The exact connection parameters and credentials remain tunnel-client-owned. `codex-connect restart` restarts only the backend and intentionally leaves the native tunnel runtime alone.
+
+For an organization-scoped tunnel, keep the runtime key and organization context available before connecting or repairing the native runtime:
+
+```bash
+export CONTROL_PLANE_API_KEY='...'
+export CONTROL_PLANE_ORGANIZATION_ID='org_...'
+```
+
+The organization variable is sent by `tunnel-client` as the `OpenAI-Organization` header. It is separate from the `--organization-id` lookup scope used by `tunnel-client runtimes connect`.
+
+## Backend commands
+
+`setup` is installation/configuration. Normal operation uses `status`, `restart`, `doctor`, and `logs`:
+
+```bash
+codex-connect status
+codex-connect restart
+codex-connect doctor
+codex-connect logs --follow
+codex-connect probe --codex-bin ~/.local/bin/codex --cwd ~/projects/example-project
+```
+
+`codex-connect restart` also enables the backend service if it was installed but disabled, so a successful recovery restores the next-boot invariant.
+
+## After a computer restart
+
+The backend and tunnel are separate failure domains. Do not rerun installation just because the machine restarted.
+
+```bash
+codex-connect status
+codex-connect doctor
+```
+
+`codex-connect.service` should already be enabled. If the backend is stopped or unhealthy, run `codex-connect restart` and recheck it.
+
+For the tunnel, export the runtime API key required by the saved profile and inspect the existing alias:
+
+```bash
+export CONTROL_PLANE_API_KEY='...'
+export CONTROL_PLANE_ORGANIZATION_ID='org_...'
+tunnel-client runtimes status codex-connect --json
+```
+
+If the native runtime is stopped, execute the `repair_command` returned by `runtimes status`, then run the status command again. The repair command is tunnel-client-owned and is derived from the saved alias/profile state, so it is preferable to reconstructing account-specific flags by hand.
+
+The canonical profile remains `~/.config/tunnel-client/codex-connect.yaml`. Do not recreate the profile, invent a second alias, or add a systemd tunnel unit for routine reboot recovery.
+
+## Recovery
+
+Check the backend and tunnel independently before changing anything:
+
+```bash
+codex-connect status
+codex-connect doctor
+tunnel-client runtimes status <alias> --json
+```
+
+For a failed backend, inspect `codex-connect logs`, then use `codex-connect restart` and rerun `doctor`.
+
+For a native tunnel runtime that is stopped or not ready, use its `tunnel-client runtimes` lifecycle command and recheck its status.
+
+Do not add a per-client backend or systemd tunnel unit. The only persistent Codex Connect unit is `codex-connect.service`; the official tunnel client owns its own runtime lifecycle.
+
+## Configuration
+
+The configuration at `~/.config/codex-connect/config.toml` is deliberately small:
+
+```toml
+[scope]
+root = "~/projects"
+
+[backend]
+listen = "127.0.0.1:8767"
+codex_bin = "codex"
+```
+
+This is the canonical configuration shape for the pre-release backend. Historical configuration forms are not retained.
+
+## Deployment boundary
+
+`deploy` builds from the current Codex Connect source tree without requiring Git or a clean working tree. It uses a temporary isolated build tree, installs a content-addressed artifact, atomically activates it, verifies backend health, removes older installed backend builds, and deletes the temporary deployment build tree. Activation replaces only the backend binary/service and leaves the independent native tunnel runtime intact.
+
+That boundary is intentional. Backend deployment must not become tunnel lifecycle orchestration.
+
+## Security boundary
+
+Codex Connect is a high-trust host execution bridge. Scope fencing protects direct filesystem operations and establishes allowed starting paths; it does not sandbox the whole machine. Review [Security](../SECURITY.md) before changing ingress, scope, command execution, or service privileges.

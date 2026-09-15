@@ -1,0 +1,16 @@
+[package]
+name = "codex-connect-scope"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+image.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true

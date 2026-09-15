@@ -1,0 +1,23 @@
+[package]
+name = "codex-connect-mcp"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+codex-connect-relay = { path = "../relay" }
+codex-connect-scope = { path = "../scope" }
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+tempfile.workspace = true
