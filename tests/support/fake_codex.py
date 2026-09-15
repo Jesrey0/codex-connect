@@ -153,16 +153,14 @@ for line in sys.stdin:
         if method == "thread/resume":
             thread["cwd"] = params.get("cwd", thread["cwd"])
             result["cwd"] = thread["cwd"]
-    elif method in ("turn/start", "review/start"):
+    elif method == "turn/start":
         thread_id = params["threadId"]
         thread = threads[thread_id]
         turn = result["turn"]
         turn_id = f"{thread_id}-turn-{len(thread['turns']) + 1}"
         turn.update(id=turn_id, status="inProgress", items=[], error=None)
         thread["turns"].append(turn)
-        scenario = params["input"][0]["text"] if method == "turn/start" else "complete"
-        if method == "review/start":
-            result["reviewThreadId"] = thread_id
+        scenario = params["input"][0]["text"]
         respond(message, result)
         if scenario == "no_event":
             complete(thread_id, turn_id, notify=False)
@@ -183,6 +181,30 @@ for line in sys.stdin:
             action(thread_id, turn_id, scenario)
         else:
             complete(thread_id, turn_id)
+        continue
+    elif method == "review/start":
+        assert params["delivery"] == "inline"
+        thread_id = params["threadId"]
+        thread = threads[thread_id]
+        turn = result["turn"]
+        turn_id = f"{thread_id}-turn-{len(thread['turns']) + 1}"
+        turn.update(id=turn_id, status="inProgress", items=[], error=None)
+        thread["turns"].append(turn)
+
+        # Mirror live 0.154.0: reviewThreadId can identify the internal reviewer while the
+        # response turn itself belongs to the source thread.
+        review_thread_id = f"review-thread-{thread_id}-{len(thread['turns'])}"
+        review_thread = copy.deepcopy(thread)
+        review_thread["id"] = review_thread_id
+        review_turn = copy.deepcopy(turn)
+        review_turn.update(id=f"{review_thread_id}-turn-1", status="inProgress", items=[])
+        review_thread["turns"] = [review_turn]
+        threads[review_thread_id] = review_thread
+
+        result["reviewThreadId"] = review_thread_id
+        respond(message, result)
+        complete(thread_id, turn_id)
+        complete(review_thread_id, review_turn["id"], status="interrupted")
         continue
     elif method == "turn/steer":
         result["turnId"] = params["expectedTurnId"]

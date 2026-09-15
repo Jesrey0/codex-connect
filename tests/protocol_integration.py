@@ -246,8 +246,17 @@ class OperatorProtocolTests(unittest.TestCase):
                 self.assertEqual(self.wait(work)["state"],"completed")
 
     def test_review_and_discovery(self):
-        review = self.client.call("codexConnect.review",{"target":{"type":"uncommittedChanges"}})
-        self.assertEqual(self.wait(review)["state"],"completed")
+        source = self.start("complete")
+        self.assertEqual(self.wait(source)["state"],"completed")
+        review = self.client.call("codexConnect.review",{
+            "threadId": source["threadId"], "target":{"type":"uncommittedChanges"},
+        })
+        self.assertFalse(review["createdThread"])
+        self.assertEqual(review["threadId"], source["threadId"])
+        result = self.wait(review)
+        self.assertEqual(result["state"],"completed")
+        self.assertEqual(result["threadId"], source["threadId"])
+        self.assertEqual(result["turnId"], review["turnId"])
         self.client.call("model.list")
         self.client.call("skills.list")
         self.client.call("codexConnect.usage")

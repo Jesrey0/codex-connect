@@ -426,13 +426,15 @@ impl Relay {
         let response = self
             .app_server
             .request(ReviewStart {
-                thread_id,
+                thread_id: thread_id.clone(),
                 target,
                 delivery: "inline",
             })
             .await?;
+        // Live App Server 0.154.0 returns the inline review turn on the source thread even
+        // when reviewThreadId names the internal reviewer thread. work.wait needs that pair.
         Ok(
-            json!({"threadId":response.review_thread_id,"turnId":response.turn.id,"createdThread":created,"cursor":cursor}),
+            json!({"threadId":thread_id,"turnId":response.turn.id,"createdThread":created,"cursor":cursor}),
         )
     }
 
