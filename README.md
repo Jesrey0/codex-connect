@@ -47,7 +47,7 @@ The canonical MCP surface contains 19 tools:
 | Operator/action loop | `codexConnect.pendingActions.list`, `codexConnect.approval.respond`, `codexConnect.permissions.respond`, `codexConnect.elicitation.respond`, `codexConnect.userInput.respond` |
 | Review/discovery | `codexConnect.review`, `model.list`, `skills.list` |
 
-The App Server is initialized with `experimentalApi: true` solely to support the official `item/tool/requestUserInput` collaboration path. No other experimental App Server method is surfaced merely because the capability is enabled.
+The App Server is initialized with `experimentalApi: true` and advertises `extensions["openai/form"]` for the official structured collaboration paths Codex Connect exposes. Its dedicated App Server process also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` feature flags so those catalog responders can be exercised without relying on a user's global Codex configuration.
 
 The configured host scope is a general filesystem workspace, not implicitly a Git repository. Version control is optional. Codex Connect and its agents must not initialize repositories, create branches, commits, or tags, or use Git as a workflow/checkpoint mechanism unless the user explicitly requests version-control work.
 

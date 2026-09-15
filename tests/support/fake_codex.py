@@ -136,7 +136,11 @@ for line in sys.stdin:
     result = sample(CONTRACT["methods"][method]["outputSchema"])
     if method == "initialize":
         assert not handshake
-        assert params["capabilities"] == {"experimentalApi": True, "requestAttestation": False}
+        assert params["capabilities"] == {
+            "experimentalApi": True,
+            "requestAttestation": False,
+            "extensions": {"openai/form": {}},
+        }
         handshake = True
         respond(message, result)
         continue

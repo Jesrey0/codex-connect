@@ -32,6 +32,41 @@ pub struct AppServerConfig {
     pub request_timeout: Duration,
 }
 
+#[cfg(test)]
+mod launch_tests {
+    use super::APP_SERVER_ARGS;
+
+    #[test]
+    fn app_server_launch_enables_required_operator_features() {
+        assert_eq!(
+            APP_SERVER_ARGS,
+            [
+                "app-server",
+                "-c",
+                "features.default_mode_request_user_input=true",
+                "-c",
+                "features.request_permissions_tool=true",
+                "-c",
+                "features.exec_permission_approvals=true",
+                "--listen",
+                "stdio://",
+            ]
+        );
+    }
+}
+
+const APP_SERVER_ARGS: &[&str] = &[
+    "app-server",
+    "-c",
+    "features.default_mode_request_user_input=true",
+    "-c",
+    "features.request_permissions_tool=true",
+    "-c",
+    "features.exec_permission_approvals=true",
+    "--listen",
+    "stdio://",
+];
+
 #[derive(Debug, Error)]
 pub enum AppServerError {
     #[error("unable to start Codex app-server: {0}")]
@@ -93,7 +128,7 @@ impl AppServerClient {
     pub async fn start(config: AppServerConfig) -> Result<Self, AppServerError> {
         verify_codex_pin(&config.codex_bin).await?;
         let mut child = codex_command(&config.codex_bin)
-            .args(["app-server", "--listen", "stdio://"])
+            .args(APP_SERVER_ARGS)
             .current_dir(config.working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

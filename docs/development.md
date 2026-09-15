@@ -58,7 +58,7 @@ When adding event handling:
 
 Server-request response shapes must come from the pinned generated schemas. Public responders should normalize only the operator decision and translate it to the official shape. Never reintroduce a generic `result: any` public responder.
 
-`experimentalApi` is enabled only because Codex Connect intentionally supports `item/tool/requestUserInput`. Treat that request as a named exception, not as permission to expose other experimental methods.
+`experimentalApi` is enabled because Codex Connect intentionally supports `item/tool/requestUserInput`. The dedicated App Server launch also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` flags, while initialize advertises the `openai/form` extension. These are explicit integration requirements, not blanket permission to expose unrelated experimental methods.
 
 ## Tool-selection calibration
 

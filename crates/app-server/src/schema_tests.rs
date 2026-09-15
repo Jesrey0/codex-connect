@@ -180,7 +180,7 @@ fn capability_flags_and_signed_request_ids_match_the_pin() {
     let initialize = serde_json::to_value(Initialize::new("codex-connect".into())).unwrap();
     assert_eq!(
         initialize["capabilities"],
-        json!({"experimentalApi":true,"requestAttestation":false})
+        json!({"experimentalApi":true,"requestAttestation":false,"extensions":{"openai/form":{}}})
     );
     for value in [
         json!(""),

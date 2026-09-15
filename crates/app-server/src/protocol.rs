@@ -14,6 +14,25 @@ pub enum RpcId {
     Integer(i64),
 }
 
+#[cfg(test)]
+mod initialize_tests {
+    use super::Initialize;
+    use serde_json::json;
+
+    #[test]
+    fn initialize_advertises_supported_operator_capabilities() {
+        let value = serde_json::to_value(Initialize::new("test-client".into())).unwrap();
+        assert_eq!(
+            value["capabilities"],
+            json!({
+                "experimentalApi": true,
+                "requestAttestation": false,
+                "extensions": {"openai/form": {}}
+            })
+        );
+    }
+}
+
 pub trait Request: Serialize {
     type Response: DeserializeOwned;
     const METHOD: &'static str;
@@ -44,6 +63,10 @@ impl Initialize {
             capabilities: InitializeCapabilities {
                 experimental_api: true,
                 request_attestation: false,
+                extensions: BTreeMap::from([(
+                    "openai/form".to_string(),
+                    Value::Object(Default::default()),
+                )]),
             },
         }
     }
@@ -62,6 +85,7 @@ pub struct ClientInfo {
 pub struct InitializeCapabilities {
     pub experimental_api: bool,
     pub request_attestation: bool,
+    pub extensions: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
