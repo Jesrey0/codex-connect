@@ -83,8 +83,11 @@ The pending registry preserves the exact official request ID, method, params, an
 - `metadata`
 - `searchContent`
 - `searchNames`
+- `fuzzyFileSearch`
 
-All paths are fenced to the configured durable root. Text reads require UTF-8, content/name search does not follow symlinks, and build/cache directories are skipped where appropriate.
+All paths are fenced to the configured durable root before an App Server filesystem request is sent. `readText`, `readDirectory`, and `metadata` use the pinned `fs/readFile`, `fs/readDirectory`, and `fs/getMetadata` RPCs. `readText` rejects files that cannot fit safely inside the shared App Server JSONL frame before issuing `fs/readFile`, then decodes the base64 payload and applies its existing line-range presentation. `readDirectory` similarly estimates the pinned response size from entry names and rejects listings that could exceed the shared transport frame before issuing the RPC; App Server remains authoritative for the returned entry data. `fuzzyFileSearch` uses the pinned App Server RPC of the same name and preserves its ranked result contract (`root`, relative `path`, `match_type`, `file_name`, `score`, and optional `indices`) without adding synthetic limits or truncation semantics; returned roots and paths are canonicalized and any match that escapes the selected scoped root, including through descendant symlinks, is dropped. Directory and metadata results use the App Server field names; in particular, metadata has `createdAtMs`, `modifiedAtMs`, `isFile`, `isDirectory`, and `isSymlink`, and no synthetic `sizeBytes` field because the official metadata RPC does not report one.
+
+`searchContent` and `searchNames` remain native scoped operations. `searchNames` remains distinct from `fuzzyFileSearch`: it provides deterministic substring matching with caller-controlled result limits and an explicit truncation signal, while App Server fuzzy search returns ranked matches and may classify matches as files or directories. Content/name search does not follow symlinks, and build/cache directories are skipped where appropriate.
 
 `apply_patch` and `view_image` remain native host primitives because their content semantics are more useful to ChatGPT than byte-oriented filesystem RPCs.
 

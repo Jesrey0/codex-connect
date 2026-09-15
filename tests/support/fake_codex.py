@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pinned-schema-valid App Server peer for operator integration tests."""
 
+import base64
 import copy
 import json
 import os
@@ -86,6 +87,7 @@ def action(thread_id, turn_id, scenario):
     with lock:
         method = {
             "question": "item/tool/requestUserInput",
+            "oversized_question": "item/tool/requestUserInput",
             "nonblocking": "item/tool/requestUserInput",
             "approval": "item/commandExecution/requestApproval",
             "file": "item/fileChange/requestApproval",
@@ -95,11 +97,14 @@ def action(thread_id, turn_id, scenario):
         }[scenario]
         params = sample(CONTRACT["serverRequests"][method]["paramsSchema"])
         params.update(threadId=thread_id, turnId=turn_id)
-        if scenario in ("question", "nonblocking"):
+        if scenario in ("question", "oversized_question", "nonblocking"):
             params.update(isBlocking=scenario == "question", questions=[{
-                "id": "format", "header": "Format", "question": "Which output format?",
+                "id": "format", "header": "Format",
+                "question": "Q" * (9 * 1024 * 1024) if scenario == "oversized_question" else "Which output format?",
                 "options": [{"label": "JSON", "description": "Structured output"}],
             }])
+            if scenario == "oversized_question":
+                params["isBlocking"] = True
         elif scenario == "permissions":
             params.update(cwd=os.getcwd(), permissions={"network": {"enabled": True}})
         elif scenario == "form":
@@ -165,13 +170,16 @@ for line in sys.stdin:
             send({"method":"item/agentMessage/delta","params":{"threadId":thread_id,"turnId":turn_id,"delta":"Working"}})
         elif scenario == "oversized":
             send({"method":"item/completed","params":{"threadId":thread_id,"turnId":turn_id,"data":"x"*140000}})
+        elif scenario == "wire_oversized":
+            send({"method":"item/completed","params":{"threadId":thread_id,"turnId":turn_id,"data":"x"*(9*1024*1024)}})
+            complete(thread_id, turn_id)
         elif scenario == "idle":
             pass
         elif scenario == "delayed_question":
             timer = threading.Timer(0.25, action, (thread_id, turn_id, "question"))
             timer.daemon = True
             timer.start()
-        elif scenario in ("question", "nonblocking", "approval", "file", "permissions", "form", "url"):
+        elif scenario in ("question", "oversized_question", "nonblocking", "approval", "file", "permissions", "form", "url"):
             action(thread_id, turn_id, scenario)
         else:
             complete(thread_id, turn_id)
@@ -191,4 +199,33 @@ for line in sys.stdin:
         if params["command"] == ["disconnect"]:
             raise SystemExit
         result.update(exitCode=0, stdout="fixture command\n", stderr="")
+    elif method == "fs/readFile":
+        result["dataBase64"] = base64.b64encode(pathlib.Path(params["path"]).read_bytes()).decode()
+    elif method == "fs/readDirectory":
+        result["entries"] = [{
+            "fileName": child.name,
+            "isDirectory": child.is_dir(),
+            "isFile": child.is_file(),
+        } for child in pathlib.Path(params["path"]).iterdir()]
+    elif method == "fs/getMetadata":
+        stat = pathlib.Path(params["path"]).lstat()
+        result.update(
+            createdAtMs=int(stat.st_ctime * 1000),
+            isDirectory=pathlib.Path(params["path"]).is_dir(),
+            isFile=pathlib.Path(params["path"]).is_file(),
+            isSymlink=pathlib.Path(params["path"]).is_symlink(),
+            modifiedAtMs=int(stat.st_mtime * 1000),
+        )
+    elif method == "fuzzyFileSearch":
+        root = pathlib.Path(params["roots"][0])
+        relative = "escape/external_secret.txt" if params["query"] == "external" else "sample.txt"
+        candidate = root / relative
+        result["files"] = [{
+            "root": str(root),
+            "path": relative,
+            "match_type": "file",
+            "file_name": candidate.name,
+            "score": 100,
+            "indices": [0, 2],
+        }] if candidate.is_file() else []
     respond(message, result)

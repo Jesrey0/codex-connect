@@ -35,7 +35,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codexConnect.inspect",
                 "Inspect Workspace",
-                "Use for read-only workspace understanding: text ranges, directories, metadata, content search, or filename search. The workspace need not use version control. Prefer this over command.exec for inspection.",
+                "Use for read-only workspace understanding: text ranges, directories, metadata, content search, exact-ish name search, or ranked fuzzy file search. The workspace need not use version control. Prefer this over command.exec for inspection.",
                 true,
                 false,
                 false,
@@ -434,7 +434,8 @@ fn inspect_schema() -> Value {
             object_schema(json!({"type":{"const":"readDirectory"},"path":{"type":"string"}}), &["type","path"]),
             object_schema(json!({"type":{"const":"metadata"},"path":{"type":"string"}}), &["type","path"]),
             object_schema(json!({"type":{"const":"searchContent"},"query":{"type":"string","minLength":1},"path":{"type":"string"},"maxResults":{"type":"integer","minimum":1,"maximum":1000}}), &["type","query"]),
-            object_schema(json!({"type":{"const":"searchNames"},"query":{"type":"string","minLength":1},"path":{"type":"string"},"maxResults":{"type":"integer","minimum":1,"maximum":1000}}), &["type","query"])
+            object_schema(json!({"type":{"const":"searchNames"},"query":{"type":"string","minLength":1},"path":{"type":"string"},"maxResults":{"type":"integer","minimum":1,"maximum":1000}}), &["type","query"]),
+            object_schema(json!({"type":{"const":"fuzzyFileSearch"},"query":{"type":"string","minLength":1},"path":{"type":"string"}}), &["type","query"])
         ]}}}),
         &["operations"],
     )

@@ -32,6 +32,10 @@ class OperatorProtocolTests(unittest.TestCase):
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory(prefix="codex-connect-integration-")
         cls.scope = pathlib.Path(cls.directory.name)
+        cls.outside = tempfile.TemporaryDirectory(prefix="codex-connect-outside-")
+        cls.outside_path = pathlib.Path(cls.outside.name)
+        (cls.outside_path / "external_secret.txt").write_text("secret\n")
+        (cls.scope / "escape").symlink_to(cls.outside_path, target_is_directory=True)
         (cls.scope / "sample.txt").write_text("one\ntwo\nthree\n")
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
@@ -67,6 +71,7 @@ class OperatorProtocolTests(unittest.TestCase):
             print(output)
         cls.log.close()
         cls.directory.cleanup()
+        cls.outside.cleanup()
 
     def start(self, scenario, **arguments):
         return self.client.call("codexConnect.work.start", {"task": scenario, **arguments})
@@ -103,9 +108,44 @@ class OperatorProtocolTests(unittest.TestCase):
             {"type": "searchNames", "query": "sample", "maxResults": 1},
             {"type": "metadata", "path": "sample.txt"},
             {"type": "readDirectory", "path": "."},
+            {"type": "fuzzyFileSearch", "query": "smp", "path": "."},
         ]})
         self.assertEqual(result["results"][0]["result"]["text"], "two")
+        self.assertEqual(set(result["results"][3]["result"]), {
+            "createdAtMs", "isDirectory", "isFile", "isSymlink", "modifiedAtMs",
+        })
+        self.assertTrue(result["results"][3]["result"]["isFile"])
+        self.assertIn(
+            "sample.txt",
+            {entry["fileName"] for entry in result["results"][4]["result"]["entries"]},
+        )
+        fuzzy = result["results"][5]["result"]["files"][0]
+        self.assertEqual(fuzzy["path"], "sample.txt")
+        self.assertEqual(fuzzy["match_type"], "file")
+        self.assertEqual(fuzzy["score"], 100)
+        escaped = self.client.call("codexConnect.inspect", {"operations": [
+            {"type": "fuzzyFileSearch", "query": "external", "path": "."},
+        ]})
+        self.assertEqual(escaped["results"][0]["result"]["files"], [])
+        large = self.scope / "large.txt"
+        large.write_bytes(b"x" * (7 * 1024 * 1024))
+        self.client.call("codexConnect.inspect", {"operations": [
+            {"type": "readText", "path": "large.txt", "startLine": 1, "endLine": 1},
+        ]}, error=True)
+        large_directory = self.scope / "large-directory"
+        large_directory.mkdir()
+        suffix = "x" * 240
+        for index in range(28_000):
+            (large_directory / f"{index:05d}-{suffix}").touch()
+        self.client.call("codexConnect.inspect", {"operations": [
+            {"type": "readDirectory", "path": "large-directory"},
+        ]}, error=True)
+        healthy = self.client.call("codexConnect.inspect", {"operations": [
+            {"type": "readText", "path": "sample.txt", "startLine": 1, "endLine": 1},
+        ]})
+        self.assertEqual(healthy["results"][0]["result"]["text"], "one")
         self.client.call("codexConnect.inspect", {"operations": [{"type":"readText","path":"/etc/passwd"}]}, error=True)
+        self.client.call("codexConnect.inspect", {"operations": [{"type":"fuzzyFileSearch","query":"etc","path":"/etc"}]}, error=True)
         self.client.call("apply_patch", {"patch":"*** Begin Patch\n*** Add File: patch.txt\n+created\n*** End Patch"})
         self.assertEqual((self.scope / "patch.txt").read_text(), "created\n")
 
@@ -143,6 +183,26 @@ class OperatorProtocolTests(unittest.TestCase):
             self.client.call("codexConnect.work.steer",{"threadId":work["threadId"],"expectedTurnId":work["turnId"],"instruction":"continue"})
             self.client.call("codexConnect.work.interrupt",{"threadId":work["threadId"],"turnId":work["turnId"]})
             self.assertEqual(self.wait(work)["turn"]["status"],"interrupted")
+
+    def test_oversized_wire_messages_are_contained(self):
+        notification = self.start("wire_oversized")
+        notification_result = self.wait(notification, timeout=5000)
+        self.assertEqual(notification_result["state"], "completed")
+        self.assertTrue(notification_result["historyLost"])
+
+        request = self.start("oversized_question")
+        request_result = self.wait(request, timeout=5000)
+        if request_result["state"] != "completed":
+            request_result = self.wait(
+                request,
+                timeout=5000,
+                afterCursor=request_result["cursor"],
+            )
+        self.assertEqual(request_result["state"], "completed")
+        self.assertEqual(request_result["pendingActions"], [])
+
+        status = self.client.call("codexConnect.status")
+        self.assertTrue(status["healthy"])
 
     def test_questions_wake_wait_and_preserve_the_same_turn(self):
         work = self.start("delayed_question")

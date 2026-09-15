@@ -20,6 +20,10 @@ fn exact_internal_contracts_include_initialization_and_selected_actions() {
         TurnInterrupt::METHOD,
         ReviewStart::METHOD,
         CommandExec::METHOD,
+        FuzzyFileSearch::METHOD,
+        FsReadFile::METHOD,
+        FsReadDirectory::METHOD,
+        FsGetMetadata::METHOD,
         ModelList::METHOD,
         SkillsList::METHOD,
         RateLimitsRead::METHOD,
@@ -56,6 +60,62 @@ fn exact_internal_contracts_include_initialization_and_selected_actions() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from(["serverRequest/resolved", "turn/completed", "thread/started"])
     );
+}
+
+#[test]
+fn filesystem_requests_match_the_pinned_wire_shapes() {
+    assert_eq!(
+        serde_json::to_value(FsReadFile {
+            path: "/scope/file.txt".into(),
+        })
+        .unwrap(),
+        json!({"path":"/scope/file.txt"})
+    );
+    assert_eq!(
+        serde_json::to_value(FsReadDirectory {
+            path: "/scope".into(),
+        })
+        .unwrap(),
+        json!({"path":"/scope"})
+    );
+    assert_eq!(
+        serde_json::to_value(FsGetMetadata {
+            path: "/scope/file.txt".into(),
+        })
+        .unwrap(),
+        json!({"path":"/scope/file.txt"})
+    );
+    let directory: FsReadDirectoryResponse = serde_json::from_value(json!({"entries":[{
+        "fileName":"file.txt", "isDirectory":false, "isFile":true
+    }]}))
+    .unwrap();
+    assert_eq!(directory.entries[0].file_name, "file.txt");
+    let metadata: FsGetMetadataResponse = serde_json::from_value(json!({
+        "createdAtMs":1, "isDirectory":false, "isFile":true,
+        "isSymlink":false, "modifiedAtMs":2
+    }))
+    .unwrap();
+    assert_eq!(metadata.modified_at_ms, 2);
+
+    assert_eq!(
+        serde_json::to_value(FuzzyFileSearch {
+            query: "proto".into(),
+            roots: vec!["/scope".into()],
+        })
+        .unwrap(),
+        json!({"query":"proto","roots":["/scope"]})
+    );
+    let fuzzy: FuzzyFileSearchResponse = serde_json::from_value(json!({"files":[{
+        "root":"/scope",
+        "path":"src/protocol.rs",
+        "match_type":"file",
+        "file_name":"protocol.rs",
+        "score":134,
+        "indices":[4,5,6]
+    }]}))
+    .unwrap();
+    assert_eq!(fuzzy.files[0].path, "src/protocol.rs");
+    assert_eq!(fuzzy.files[0].match_type, FuzzyFileSearchMatchType::File);
 }
 
 fn refs(value: &Value, output: &mut Vec<String>) {

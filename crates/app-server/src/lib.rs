@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, broadcast, watch};
 use transport::Connection;
 
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_WIRE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REMOTE_ERROR_BYTES: usize = 8 * 1024;
 const PINNED_CODEX_RELEASE: &str = protocol::CODEX_PIN;
 

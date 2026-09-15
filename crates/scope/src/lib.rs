@@ -38,6 +38,8 @@ const SKIPPED_DIRECTORIES: &[&str] = &[
 pub enum ScopeError {
     #[error("path is outside the configured scope root")]
     OutsideRoot,
+    #[error("scope path is not valid UTF-8 for App Server")]
+    NonUtf8Path,
     #[error("scope operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("search query must not be empty")]
@@ -58,10 +60,6 @@ pub enum ScopeError {
     SymlinkMutation(String),
     #[error("the configured scope root cannot be mutated")]
     RootMutation,
-    #[error("file is not valid UTF-8 text: {0}")]
-    NonUtf8(String),
-    #[error("invalid line range")]
-    InvalidLineRange,
 }
 
 fn search_names_tree(
@@ -102,35 +100,6 @@ fn search_names_tree(
         }
     }
     Ok(())
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TextRead {
-    pub path: String,
-    pub start_line: usize,
-    pub end_line: usize,
-    pub total_lines: usize,
-    pub text: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DirectoryEntry {
-    pub name: String,
-    pub is_file: bool,
-    pub is_directory: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PathMetadata {
-    pub path: String,
-    pub is_file: bool,
-    pub is_directory: bool,
-    pub is_symlink: bool,
-    pub size_bytes: u64,
-    pub modified_at_ms: Option<u128>,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,72 +150,6 @@ impl Scope {
         Ok(Self { root })
     }
 
-    pub fn read_text(
-        &self,
-        requested: &str,
-        start_line: Option<usize>,
-        end_line: Option<usize>,
-    ) -> Result<TextRead, ScopeError> {
-        let path = self.resolve_existing(requested)?;
-        let bytes = fs::read(&path)?;
-        let text =
-            std::str::from_utf8(&bytes).map_err(|_| ScopeError::NonUtf8(self.relative(&path)))?;
-        let lines = text.lines().collect::<Vec<_>>();
-        let total_lines = lines.len();
-        let start = start_line.unwrap_or(1);
-        let end = end_line.unwrap_or(total_lines.max(1));
-        if start == 0 || end < start {
-            return Err(ScopeError::InvalidLineRange);
-        }
-        let text = if total_lines == 0 || start > total_lines {
-            String::new()
-        } else {
-            lines[(start - 1)..end.min(total_lines)].join("\n")
-        };
-        Ok(TextRead {
-            path: self.relative(&path),
-            start_line: start,
-            end_line: end.min(total_lines),
-            total_lines,
-            text,
-        })
-    }
-
-    pub fn read_directory(&self, requested: &str) -> Result<Vec<DirectoryEntry>, ScopeError> {
-        let path = self.resolve_existing(requested)?;
-        let mut entries = fs::read_dir(path)?
-            .map(|entry| {
-                let entry = entry?;
-                let metadata = entry.file_type()?;
-                Ok(DirectoryEntry {
-                    name: entry.file_name().to_string_lossy().to_string(),
-                    is_file: metadata.is_file(),
-                    is_directory: metadata.is_dir(),
-                })
-            })
-            .collect::<Result<Vec<_>, std::io::Error>>()?;
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(entries)
-    }
-
-    pub fn metadata(&self, requested: &str) -> Result<PathMetadata, ScopeError> {
-        let path = self.resolve_existing(requested)?;
-        let metadata = fs::symlink_metadata(&path)?;
-        let modified_at_ms = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_millis());
-        Ok(PathMetadata {
-            path: self.relative(&path),
-            is_file: metadata.is_file(),
-            is_directory: metadata.is_dir(),
-            is_symlink: metadata.file_type().is_symlink(),
-            size_bytes: metadata.len(),
-            modified_at_ms,
-        })
-    }
-
     pub fn search_names(
         &self,
         query: &str,
@@ -272,18 +175,21 @@ impl Scope {
         &self.root
     }
 
-    fn resolve_app_server_existing(&self, requested: &str) -> Result<String, ScopeError> {
+    pub fn resolve_app_server_existing(&self, requested: &str) -> Result<String, ScopeError> {
         let candidate = self.resolve_rooted_path(requested, true)?;
         let canonical = candidate.canonicalize()?;
         if !canonical.starts_with(&self.root) {
             return Err(ScopeError::OutsideRoot);
         }
-        Ok(candidate.to_string_lossy().into_owned())
+        canonical
+            .to_str()
+            .map(str::to_owned)
+            .ok_or(ScopeError::NonUtf8Path)
     }
 
     pub fn resolve_app_server_directory(&self, requested: &str) -> Result<String, ScopeError> {
         let candidate = self.resolve_app_server_existing(requested)?;
-        if !Path::new(&candidate).canonicalize()?.is_dir() {
+        if !Path::new(&candidate).is_dir() {
             return Err(ScopeError::PatchFailed(format!(
                 "scope path is not a directory: {requested}"
             )));
@@ -1137,6 +1043,43 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn app_server_paths_forward_the_validated_canonical_target() {
+        use std::os::unix::fs::symlink;
+
+        let scope_dir = tempfile::tempdir().unwrap();
+        fs::write(scope_dir.path().join("target.txt"), "inside").unwrap();
+        symlink("target.txt", scope_dir.path().join("link.txt")).unwrap();
+        let scope = Scope::open(scope_dir.path()).unwrap();
+
+        let resolved = scope.resolve_app_server_existing("link.txt").unwrap();
+        assert_eq!(
+            std::path::Path::new(&resolved),
+            scope_dir.path().join("target.txt").canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_paths_reject_non_utf8_canonical_targets() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let scope_dir = tempfile::tempdir().unwrap();
+        let invalid_name = OsString::from_vec(b"invalid-\xff.txt".to_vec());
+        let target = scope_dir.path().join(invalid_name);
+        fs::write(&target, "inside").unwrap();
+        symlink(&target, scope_dir.path().join("alias.txt")).unwrap();
+        let scope = Scope::open(scope_dir.path()).unwrap();
+
+        assert!(matches!(
+            scope.resolve_app_server_existing("alias.txt"),
+            Err(ScopeError::NonUtf8Path)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn app_server_mutations_reject_symlink_escape_paths() {
         use std::os::unix::fs::symlink;
 
@@ -1328,33 +1271,16 @@ mod tests {
     }
 
     #[test]
-    fn read_text_is_utf8_and_line_oriented() {
-        let temporary = tempfile::tempdir().unwrap();
-        fs::write(
-            temporary.path().join("notes.txt"),
-            "one\ntwo\nthree\nfour\n",
-        )
-        .unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let read = scope.read_text("notes.txt", Some(2), Some(3)).unwrap();
-        assert_eq!(read.text, "two\nthree");
-        assert_eq!(read.start_line, 2);
-        assert_eq!(read.end_line, 3);
-        assert_eq!(read.total_lines, 4);
-
-        fs::write(temporary.path().join("binary.bin"), [0xff, 0xfe, 0xfd]).unwrap();
-        assert!(matches!(
-            scope.read_text("binary.bin", None, None),
-            Err(ScopeError::NonUtf8(_))
-        ));
-    }
-
-    #[test]
-    fn inspect_helpers_remain_scope_fenced_and_skip_build_directories() {
+    fn name_search_remains_scope_fenced_and_skips_build_directories() {
         let temporary = tempfile::tempdir().unwrap();
         fs::create_dir_all(temporary.path().join("src")).unwrap();
         fs::create_dir_all(temporary.path().join("target/generated")).unwrap();
         fs::write(temporary.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            temporary.path().join("src/main_test.rs"),
+            "fn main_test() {}\n",
+        )
+        .unwrap();
         fs::write(
             temporary.path().join("target/generated/main.rs"),
             "ignored\n",
@@ -1362,9 +1288,15 @@ mod tests {
         .unwrap();
         let scope = Scope::open(temporary.path()).unwrap();
 
-        let names = scope.search_names("main", None, None).unwrap();
+        let names = scope.search_names("main.rs", None, None).unwrap();
         assert_eq!(names.paths, vec!["src/main.rs"]);
-        assert!(scope.metadata("../outside").is_err());
-        assert!(scope.read_directory("../outside").is_err());
+        assert_eq!(
+            scope.search_names("src", None, None).unwrap().paths,
+            vec!["src"]
+        );
+        let limited = scope.search_names("main", None, Some(1)).unwrap();
+        assert_eq!(limited.paths.len(), 1);
+        assert!(limited.truncated);
+        assert!(scope.resolve_app_server_existing("../outside").is_err());
     }
 }

@@ -282,6 +282,83 @@ pub struct CommandExec {
 }
 request!(CommandExec, "command/exec", CommandExecResponse);
 
+#[derive(Clone, Debug, Serialize)]
+pub struct FsReadFile {
+    pub path: String,
+}
+request!(FsReadFile, "fs/readFile", FsReadFileResponse);
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsReadFileResponse {
+    pub data_base64: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FsReadDirectory {
+    pub path: String,
+}
+request!(FsReadDirectory, "fs/readDirectory", FsReadDirectoryResponse);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsReadDirectoryResponse {
+    pub entries: Vec<FsReadDirectoryEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsReadDirectoryEntry {
+    pub file_name: String,
+    pub is_directory: bool,
+    pub is_file: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FsGetMetadata {
+    pub path: String,
+}
+request!(FsGetMetadata, "fs/getMetadata", FsGetMetadataResponse);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsGetMetadataResponse {
+    pub created_at_ms: i64,
+    pub is_directory: bool,
+    pub is_file: bool,
+    pub is_symlink: bool,
+    pub modified_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FuzzyFileSearch {
+    pub query: String,
+    pub roots: Vec<String>,
+}
+request!(FuzzyFileSearch, "fuzzyFileSearch", FuzzyFileSearchResponse);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FuzzyFileSearchResponse {
+    pub files: Vec<FuzzyFileSearchResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FuzzyFileSearchResult {
+    pub root: String,
+    pub path: String,
+    pub match_type: FuzzyFileSearchMatchType,
+    pub file_name: String,
+    pub score: u32,
+    pub indices: Option<Vec<u32>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FuzzyFileSearchMatchType {
+    File,
+    Directory,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandExecResponse {

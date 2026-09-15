@@ -4,20 +4,23 @@ mod actions;
 mod event_journal;
 
 pub use actions::{ApprovalDecision, ElicitationAction, PermissionGrant, PermissionScope};
+use base64::Engine;
 pub use codex_connect_app_server::protocol::{
     ApprovalPolicy, CommandExec, ModelList, ReviewTarget, RpcId, SandboxPolicy,
 };
 use codex_connect_app_server::protocol::{
-    CommandExecResponse, RateLimitsRead, ReviewStart, SkillsList, TextInput, Thread, ThreadRead,
-    ThreadResume, ThreadStart, TurnInterrupt, TurnStart, TurnSteer,
+    CommandExecResponse, FsGetMetadata, FsGetMetadataResponse, FsReadDirectory,
+    FsReadDirectoryResponse, FsReadFile, FuzzyFileSearch, FuzzyFileSearchResponse, RateLimitsRead,
+    ReviewStart, SkillsList, TextInput, Thread, ThreadRead, ThreadResume, ThreadStart,
+    TurnInterrupt, TurnStart, TurnSteer,
 };
 use codex_connect_app_server::{
-    AppServerClient, AppServerConfig, AppServerError, DEFAULT_REQUEST_TIMEOUT,
+    AppServerClient, AppServerConfig, AppServerError, DEFAULT_REQUEST_TIMEOUT, MAX_WIRE_BYTES,
 };
 pub use codex_connect_app_server::{PendingActionKind, PendingServerRequest};
 use codex_connect_scope::{Scope, ScopeError};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::time::{Duration, Instant};
@@ -26,6 +29,9 @@ pub const MAX_WAIT_MS: u64 = 120_000;
 pub const MAX_COMMAND_MS: u64 = 300_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const WORKSPACE_POLICY: &str = "Workspace policy: treat the working directory as a general filesystem workspace. Version control is optional. Do not initialize repositories, create branches, commits, or tags, or use Git as a checkpoint/workflow mechanism unless the task explicitly requests version-control operations. Existing VCS metadata may be read only when it is materially required by the task.";
+const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
+const MAX_APP_SERVER_RESPONSE_BYTES: usize = MAX_WIRE_BYTES - APP_SERVER_RESPONSE_HEADROOM_BYTES;
+const MAX_FS_READ_FILE_BYTES: u64 = ((MAX_APP_SERVER_RESPONSE_BYTES / 4) * 3) as u64;
 
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
@@ -39,6 +45,8 @@ pub enum RelayError {
     AppServer(#[from] AppServerError),
     #[error("scope policy failed: {0}")]
     Scope(#[from] ScopeError),
+    #[error("host I/O failed: {0}")]
+    Io(#[from] std::io::Error),
     #[error("unable to encode Codex response: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid Codex request: {0}")]
@@ -50,6 +58,16 @@ pub struct Relay {
     app_server: Arc<AppServerClient>,
     scope: Scope,
     journal: event_journal::EventJournal,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextRead {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub total_lines: usize,
+    pub text: String,
 }
 
 impl Relay {
@@ -81,6 +99,109 @@ impl Relay {
     }
     pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.app_server.changes()
+    }
+
+    /// Filesystem inspection is performed by the pinned App Server after the
+    /// scope resolves and fences the requested absolute path.
+    pub async fn inspect_read_text(
+        &self,
+        requested: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    ) -> Result<TextRead, RelayError> {
+        let path = self.scope.resolve_app_server_existing(requested)?;
+        let file_size = std::fs::metadata(&path)?.len();
+        if file_size > MAX_FS_READ_FILE_BYTES {
+            return Err(RelayError::Invalid(format!(
+                "file exceeds the safe fs/readFile transport limit of {MAX_FS_READ_FILE_BYTES} bytes"
+            )));
+        }
+        let response = self.app_server.request(FsReadFile { path }).await?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(response.data_base64)
+            .map_err(|error| {
+                RelayError::Invalid(format!("fs/readFile returned invalid base64: {error}"))
+            })?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| RelayError::Invalid("fs/readFile returned non-UTF-8 text".into()))?;
+        let lines = text.lines().collect::<Vec<_>>();
+        let total_lines = lines.len();
+        let start = start_line.unwrap_or(1);
+        let end = end_line.unwrap_or(total_lines.max(1));
+        if start == 0 || end < start {
+            return Err(RelayError::Invalid("invalid line range".into()));
+        }
+        Ok(TextRead {
+            path: requested.to_string(),
+            start_line: start,
+            end_line: end.min(total_lines),
+            total_lines,
+            text: if total_lines == 0 || start > total_lines {
+                String::new()
+            } else {
+                lines[(start - 1)..end.min(total_lines)].join("\n")
+            },
+        })
+    }
+
+    pub async fn inspect_read_directory(
+        &self,
+        requested: &str,
+    ) -> Result<FsReadDirectoryResponse, RelayError> {
+        let path = self.scope.resolve_app_server_directory(requested)?;
+        ensure_directory_response_fits(&path)?;
+        Ok(self.app_server.request(FsReadDirectory { path }).await?)
+    }
+
+    pub async fn inspect_metadata(
+        &self,
+        requested: &str,
+    ) -> Result<FsGetMetadataResponse, RelayError> {
+        let path = self.scope.resolve_app_server_existing(requested)?;
+        Ok(self.app_server.request(FsGetMetadata { path }).await?)
+    }
+
+    pub async fn inspect_fuzzy_file_search(
+        &self,
+        query: &str,
+        requested: Option<&str>,
+    ) -> Result<FuzzyFileSearchResponse, RelayError> {
+        if query.is_empty() {
+            return Err(RelayError::Invalid(
+                "fuzzy file search query must not be empty".into(),
+            ));
+        }
+        let root = self
+            .scope
+            .resolve_app_server_directory(requested.unwrap_or("."))?;
+        let canonical_root = Path::new(&root).canonicalize().map_err(|error| {
+            RelayError::Invalid(format!("unable to canonicalize fuzzy search root: {error}"))
+        })?;
+        let mut response = self
+            .app_server
+            .request(FuzzyFileSearch {
+                query: query.into(),
+                roots: vec![root.clone()],
+            })
+            .await?;
+        response.files.retain(|result| {
+            let result_root = Path::new(&result.root);
+            let relative = Path::new(&result.path);
+            if relative.is_absolute() {
+                return false;
+            }
+            let Ok(result_root) = result_root.canonicalize() else {
+                return false;
+            };
+            if result_root != canonical_root {
+                return false;
+            }
+            canonical_root
+                .join(relative)
+                .canonicalize()
+                .is_ok_and(|candidate| candidate.starts_with(&canonical_root))
+        });
+        Ok(response)
     }
 
     pub async fn command_exec(
@@ -368,6 +489,10 @@ impl Relay {
                 match events.recv().await {
                     Ok(event) => {
                         if let Some(method) = event.get("method").and_then(Value::as_str) {
+                            if method == "codexConnect/appServerHistoryGap" {
+                                journal.mark_gap().await;
+                                continue;
+                            }
                             journal
                                 .push(method, event.get("params").unwrap_or(&Value::Null))
                                 .await;
@@ -404,6 +529,24 @@ impl Relay {
             other => Ok(other),
         }
     }
+}
+
+fn ensure_directory_response_fits(path: &str) -> Result<(), RelayError> {
+    let mut estimated_bytes = 64usize;
+    for entry in std::fs::read_dir(path)? {
+        let file_name = entry?.file_name();
+        let encoded_name_bytes = serde_json::to_vec(file_name.to_string_lossy().as_ref())?.len();
+        // Conservatively covers the remaining fixed fields, punctuation, and commas for one entry.
+        estimated_bytes = estimated_bytes
+            .saturating_add(encoded_name_bytes)
+            .saturating_add(64);
+        if estimated_bytes > MAX_APP_SERVER_RESPONSE_BYTES {
+            return Err(RelayError::Invalid(
+                "directory listing exceeds the safe fs/readDirectory transport limit".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn turn_snapshot(turn: &codex_connect_app_server::protocol::Turn) -> Value {

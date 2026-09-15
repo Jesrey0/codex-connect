@@ -207,6 +207,10 @@ enum InspectOperation {
         path: Option<String>,
         max_results: Option<usize>,
     },
+    FuzzyFileSearch {
+        query: String,
+        path: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -336,7 +340,7 @@ async fn dispatch(
             ensure_empty(arguments)?;
             Ok(serde_json::to_value(OperatorStatus::read(relay, runtime))?)
         }
-        "codexConnect.inspect" => inspect(scope, parse(arguments)?, context),
+        "codexConnect.inspect" => inspect(relay, scope, parse(arguments)?, context).await,
         "apply_patch" => {
             let args: PatchArgs = parse(arguments)?;
             Ok(json!({"applied": scope.apply_patch(&args.patch)?}))
@@ -445,7 +449,8 @@ async fn dispatch(
     }
 }
 
-fn inspect(
+async fn inspect(
+    relay: &Relay,
     scope: &Scope,
     args: InspectArgs,
     context: &RequestContext<RoleServer>,
@@ -464,11 +469,17 @@ fn inspect(
                 path,
                 start_line,
                 end_line,
-            } => serde_json::to_value(scope.read_text(path, *start_line, *end_line)?),
+            } => serde_json::to_value(
+                relay
+                    .inspect_read_text(path, *start_line, *end_line)
+                    .await?,
+            ),
             InspectOperation::ReadDirectory { path } => {
-                serde_json::to_value(scope.read_directory(path)?)
+                serde_json::to_value(relay.inspect_read_directory(path).await?)
             }
-            InspectOperation::Metadata { path } => serde_json::to_value(scope.metadata(path)?),
+            InspectOperation::Metadata { path } => {
+                serde_json::to_value(relay.inspect_metadata(path).await?)
+            }
             InspectOperation::SearchContent {
                 query,
                 path,
@@ -484,6 +495,11 @@ fn inspect(
                 path,
                 max_results,
             } => serde_json::to_value(scope.search_names(query, path.as_deref(), *max_results)?),
+            InspectOperation::FuzzyFileSearch { query, path } => serde_json::to_value(
+                relay
+                    .inspect_fuzzy_file_search(query, path.as_deref())
+                    .await?,
+            ),
         }?;
         let kind = match operation {
             InspectOperation::ReadText { .. } => "readText",
@@ -491,6 +507,7 @@ fn inspect(
             InspectOperation::Metadata { .. } => "metadata",
             InspectOperation::SearchContent { .. } => "searchContent",
             InspectOperation::SearchNames { .. } => "searchNames",
+            InspectOperation::FuzzyFileSearch { .. } => "fuzzyFileSearch",
         };
         let row = json!({"type":kind,"result":result});
         let size = serde_json::to_vec(&row)?.len();

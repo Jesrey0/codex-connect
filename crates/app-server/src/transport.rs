@@ -1,6 +1,7 @@
 //! Bounded JSONL transport with cancellation-safe writes and one server-request registry.
 
-use crate::{AppServerError, PendingServerRequest, protocol::RpcId, remote_error};
+use crate::{AppServerError, MAX_WIRE_BYTES, PendingServerRequest, protocol::RpcId, remote_error};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -10,7 +11,6 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Instant, timeout};
 
-const MAX_WIRE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PENDING: usize = 128;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -90,6 +90,32 @@ impl Connection {
         let _ = self
             .events
             .send(json!({"method":"codexConnect/appServerStopped","params":{}}));
+        self.wake();
+    }
+
+    fn fail_call_for_oversized_frame(&self, id: &RpcId) {
+        if let Some(call) = self.calls.lock().unwrap().remove(id) {
+            let _ = call.sender.send(Err(AppServerError::MessageTooLarge));
+        }
+        self.wake();
+    }
+
+    async fn reject_oversized_server_request(&self, id: RpcId) -> Result<(), AppServerError> {
+        self.send(
+            json!({"id":id,"error":{
+                "code":-32000,
+                "message":"App Server request exceeds the operator transport size limit"
+            }}),
+            None,
+        )
+        .await
+    }
+
+    fn signal_history_gap(&self) {
+        let _ = self.events.send(json!({
+            "method":"codexConnect/appServerHistoryGap",
+            "params":{}
+        }));
         self.wake();
     }
 
@@ -274,9 +300,100 @@ impl Drop for CallGuard {
     }
 }
 
+enum OversizedEnvelope {
+    Response(RpcId),
+    ServerRequest(RpcId),
+    Notification,
+    Unknown,
+}
+
+fn parse_prefix_value<T: DeserializeOwned>(bytes: &[u8], position: &mut usize) -> Option<T> {
+    let mut stream = serde_json::Deserializer::from_slice(&bytes[*position..]).into_iter::<T>();
+    let value = stream.next()?.ok()?;
+    *position += stream.byte_offset();
+    Some(value)
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], position: &mut usize) {
+    while bytes
+        .get(*position)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        *position += 1;
+    }
+}
+
+fn classify_oversized_prefix(bytes: &[u8]) -> OversizedEnvelope {
+    let mut position = 0;
+    skip_ascii_whitespace(bytes, &mut position);
+    if bytes.get(position) != Some(&b'{') {
+        return OversizedEnvelope::Unknown;
+    }
+    position += 1;
+    let mut id = None;
+    let mut method_seen = false;
+    loop {
+        skip_ascii_whitespace(bytes, &mut position);
+        let Some(key) = parse_prefix_value::<String>(bytes, &mut position) else {
+            return OversizedEnvelope::Unknown;
+        };
+        skip_ascii_whitespace(bytes, &mut position);
+        if bytes.get(position) != Some(&b':') {
+            return OversizedEnvelope::Unknown;
+        }
+        position += 1;
+        skip_ascii_whitespace(bytes, &mut position);
+        match key.as_str() {
+            "id" => {
+                let Some(value) = parse_prefix_value::<RpcId>(bytes, &mut position) else {
+                    return OversizedEnvelope::Unknown;
+                };
+                id = Some(value);
+            }
+            "method" => {
+                if parse_prefix_value::<String>(bytes, &mut position).is_none() {
+                    return OversizedEnvelope::Unknown;
+                }
+                method_seen = true;
+            }
+            "params" if method_seen => {
+                return id.map_or(
+                    OversizedEnvelope::Notification,
+                    OversizedEnvelope::ServerRequest,
+                );
+            }
+            "result" | "error" => {
+                return id.map_or(OversizedEnvelope::Unknown, OversizedEnvelope::Response);
+            }
+            "jsonrpc" => {
+                if parse_prefix_value::<String>(bytes, &mut position).is_none() {
+                    return OversizedEnvelope::Unknown;
+                }
+            }
+            _ => return OversizedEnvelope::Unknown,
+        }
+        skip_ascii_whitespace(bytes, &mut position);
+        match bytes.get(position) {
+            Some(b',') => position += 1,
+            Some(b'}') => {
+                return if method_seen {
+                    id.map_or(
+                        OversizedEnvelope::Notification,
+                        OversizedEnvelope::ServerRequest,
+                    )
+                } else {
+                    OversizedEnvelope::Unknown
+                };
+            }
+            _ => return OversizedEnvelope::Unknown,
+        }
+    }
+}
+
 async fn read_loop<R: AsyncRead + Unpin>(connection: Arc<Connection>, reader: R) {
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
+    let mut discarding_oversized = false;
     let mut changes = connection.changes();
     loop {
         if !connection.available() {
@@ -293,9 +410,38 @@ async fn read_loop<R: AsyncRead + Unpin>(connection: Arc<Connection>, reader: R)
             .iter()
             .position(|b| *b == b'\n')
             .map_or(bytes.len(), |n| n + 1);
+        let ends_line = bytes.get(count.saturating_sub(1)) == Some(&b'\n');
+        if discarding_oversized {
+            reader.consume(count);
+            if ends_line {
+                discarding_oversized = false;
+            }
+            continue;
+        }
         if line.len() + count > MAX_WIRE_BYTES {
-            // An oversized response cannot be safely skipped: its caller could otherwise hang.
-            break;
+            let mut prefix = line.clone();
+            let remaining = MAX_WIRE_BYTES.saturating_sub(prefix.len());
+            prefix.extend_from_slice(&bytes[..remaining.min(count)]);
+            match classify_oversized_prefix(&prefix) {
+                OversizedEnvelope::Response(id) => {
+                    connection.fail_call_for_oversized_frame(&id);
+                }
+                OversizedEnvelope::ServerRequest(id) => {
+                    if connection
+                        .reject_oversized_server_request(id)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                OversizedEnvelope::Notification => connection.signal_history_gap(),
+                OversizedEnvelope::Unknown => break,
+            }
+            line.clear();
+            reader.consume(count);
+            discarding_oversized = !ends_line;
+            continue;
         }
         line.extend_from_slice(&bytes[..count]);
         reader.consume(count);
@@ -487,6 +633,117 @@ mod tests {
                 .count(),
             1
         );
+        connection.disconnect();
+    }
+
+    #[tokio::test]
+    async fn oversized_incoming_frame_fails_calls_without_disconnecting() {
+        let writer = TestWriter::default();
+        let (connection, mut peer) = setup(writer.clone());
+        let first = {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                connection
+                    .call("fs/readFile", json!({}), Duration::from_secs(5))
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if writer.bytes.lock().unwrap().contains(&b'\n') {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut oversized = b"{\"id\":1,\"result\":{\"data\":\"".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', MAX_WIRE_BYTES));
+        oversized.extend_from_slice(b"\"}}\n");
+        peer.write_all(&oversized).await.unwrap();
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(AppServerError::MessageTooLarge)
+        ));
+        assert!(connection.available());
+
+        let second = {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                connection
+                    .call("thread/read", json!({}), Duration::from_secs(5))
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if writer
+                    .bytes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|byte| **byte == b'\n')
+                    .count()
+                    >= 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        peer.write_all(b"{\"id\":2,\"result\":{\"ok\":true}}\n")
+            .await
+            .unwrap();
+        assert_eq!(second.await.unwrap().unwrap(), json!({"ok":true}));
+        assert!(connection.available());
+        connection.disconnect();
+    }
+
+    #[tokio::test]
+    async fn oversized_server_request_is_rejected_without_disconnecting() {
+        let writer = TestWriter::default();
+        let (connection, mut peer) = setup(writer.clone());
+        let mut oversized =
+            b"{\"id\":\"request-1\",\"method\":\"item/tool/requestUserInput\",\"params\":{\"data\":\""
+                .to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', MAX_WIRE_BYTES));
+        oversized.extend_from_slice(b"\"}}\n");
+        peer.write_all(&oversized).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if writer.bytes.lock().unwrap().contains(&b'\n') {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let response: Value = serde_json::from_slice(&writer.bytes.lock().unwrap()).unwrap();
+        assert_eq!(response["id"], "request-1");
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(connection.available());
+        connection.disconnect();
+    }
+
+    #[tokio::test]
+    async fn oversized_notification_emits_history_gap_without_disconnecting() {
+        let (connection, mut peer) = setup(TestWriter::default());
+        let mut events = connection.subscribe();
+        let mut oversized = b"{\"method\":\"item/completed\",\"params\":{\"data\":\"".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', MAX_WIRE_BYTES));
+        oversized.extend_from_slice(b"\"}}\n");
+        peer.write_all(&oversized).await.unwrap();
+        let event = timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["method"], "codexConnect/appServerHistoryGap");
+        assert!(connection.available());
         connection.disconnect();
     }
 
