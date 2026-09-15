@@ -5,11 +5,17 @@
 Run the complete validation gate before submitting changes:
 
 ```bash
-./scripts/generate-app-server-tool-schemas.py
+./scripts/generate-app-server-tool-schemas.py --check
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
+cargo check --locked
+cargo build --locked -p codex-connect
+python tests/protocol_integration.py
 ```
+
+The schema check requires the project-pinned Codex CLI to be installed and available as
+`codex`. The protocol integration suite requires Python with the `jsonschema` package.
 
 ## Pinned App Server contract
 
