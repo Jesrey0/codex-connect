@@ -55,10 +55,10 @@ async fn reconcile_deployment(operation_id: &str) -> Result<deployment::Deployme
                 .sha256
                 .as_deref()
                 .context("pending activation has no SHA-256")?;
-            if deployment_effect_visible(&record).await? {
-                if record.state == deployment::DeploymentState::Activating {
-                    return deployment::mark_succeeded_if_activating(operation_id, expected_sha256);
-                }
+            if deployment_effect_visible(&record).await?
+                && record.state == deployment::DeploymentState::Activating
+            {
+                return deployment::mark_succeeded_if_activating(operation_id, expected_sha256);
             }
             deployment::mark_failed_if_state(
                 operation_id,

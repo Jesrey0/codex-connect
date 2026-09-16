@@ -36,6 +36,7 @@ impl ActivationLock {
         let path = directory.join("activation.lock");
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -81,6 +82,7 @@ impl OperationLock {
         let path = directory.join(format!("{operation_id}.lock"));
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)

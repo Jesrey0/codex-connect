@@ -31,15 +31,6 @@ const DEFAULT_WAIT_MS: u64 = 60_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
 
-pub async fn serve(
-    listener: TcpListener,
-    relay: Relay,
-    scope: Scope,
-    runtime: RuntimeIdentity,
-) -> anyhow::Result<()> {
-    serve_router(listener, router(relay, scope, runtime)).await
-}
-
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeIdentity {
