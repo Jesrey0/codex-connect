@@ -352,6 +352,9 @@ impl Relay {
                 "terminal size is only valid when tty is true".into(),
             ));
         }
+        if let Some(size) = size {
+            validate_terminal_size(size)?;
+        }
         let cwd = self
             .scope
             .resolve_app_server_directory(cwd.as_deref().unwrap_or("."))?;
@@ -492,6 +495,7 @@ impl Relay {
         process_id: String,
         size: CommandExecTerminalSize,
     ) -> Result<Value, RelayError> {
+        validate_terminal_size(size)?;
         let (tty, _) = self
             .command_sessions
             .ensure_running(&process_id)
@@ -1082,6 +1086,15 @@ fn ensure_directory_response_fits(path: &str) -> Result<(), RelayError> {
                 "directory listing exceeds the safe fs/readDirectory transport limit".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_terminal_size(size: CommandExecTerminalSize) -> Result<(), RelayError> {
+    if size.rows == 0 || size.cols == 0 {
+        return Err(RelayError::Invalid(
+            "terminal size rows and cols must be greater than 0".into(),
+        ));
     }
     Ok(())
 }

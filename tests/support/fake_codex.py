@@ -333,6 +333,11 @@ for line in sys.stdin:
                     command_output(process_id, "stdout", "x" * 40000)
             elif scenario == "fixture-sandbox":
                 command_output(process_id, "stdout", json.dumps(params["sandboxPolicy"]) + "\n")
+            elif scenario == "fixture-context":
+                command_output(process_id, "stdout", json.dumps({
+                    "cwd": params.get("cwd"),
+                    "env": params.get("env"),
+                }) + "\n")
             elif scenario == "fixture-quiet":
                 pass
             else:

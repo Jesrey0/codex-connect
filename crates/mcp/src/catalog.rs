@@ -84,7 +84,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.read",
                 "Read Persistent Command",
-                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. Use afterCursor from the previous start/read result to consume incrementally.",
+                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. Use afterCursor from the previous start/read result to consume incrementally. Retained output is bounded internally; historyLost=true means afterCursor predates retained history.",
                 true,
                 false,
                 false,
@@ -559,8 +559,8 @@ fn command_schema() -> Value {
 fn terminal_size_schema() -> Value {
     object_schema(
         json!({
-            "rows":{"type":"integer","minimum":0,"maximum":65535},
-            "cols":{"type":"integer","minimum":0,"maximum":65535}
+            "rows":{"type":"integer","minimum":1,"maximum":65535},
+            "cols":{"type":"integer","minimum":1,"maximum":65535}
         }),
         &["rows", "cols"],
     )
@@ -643,8 +643,8 @@ fn command_resize_schema() -> Value {
     object_schema(
         json!({
             "processId":{"type":"string","minLength":1},
-            "rows":{"type":"integer","minimum":0,"maximum":65535},
-            "cols":{"type":"integer","minimum":0,"maximum":65535}
+            "rows":{"type":"integer","minimum":1,"maximum":65535},
+            "cols":{"type":"integer","minimum":1,"maximum":65535}
         }),
         &["processId", "rows", "cols"],
     )

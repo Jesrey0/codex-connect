@@ -251,6 +251,6 @@ impl CommandSessions {
 }
 
 fn stale_handle() -> String {
-    "unknown or stale processId; command session handles are App Server connection-scoped and do not survive connector restart"
+    "unknown, evicted, or stale processId; completed command-session projections may be evicted by bounded retention, and all handles are App Server connection-scoped and do not survive connector restart"
         .into()
 }
