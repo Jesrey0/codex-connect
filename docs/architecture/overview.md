@@ -56,10 +56,10 @@ sequenceDiagram
     A-->>X: official notifications
     X-->>C: threadId + turnId + cursor
     C->>X: work.wait(afterCursor)
-    X-->>C: progress / completion / pending action
+    X-->>C: terminal / operator action / lease timeout
 ```
 
-`work.wait` is bounded. It does not create a second scheduler or poll experimental App Server pagination APIs.
+`work.wait` is a bounded quiet join, not a progress subscription. Routine item lifecycle notifications, tool activity, file changes, and agent commentary continue to enter the bounded event journal but do not resolve the wait. The wait returns early only when the selected turn becomes terminal or operator action/input is required; otherwise it returns when its lease expires. A zero-duration wait can be used to pull the accumulated journal without blocking. The relay still performs periodic authoritative reconciliation so lost or oversized notifications cannot strand a completed turn.
 
 ## Typed action loop
 

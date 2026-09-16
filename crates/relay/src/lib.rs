@@ -26,6 +26,7 @@ use thiserror::Error;
 use tokio::time::{Duration, Instant};
 
 pub const MAX_WAIT_MS: u64 = 120_000;
+const WAIT_RECONCILE_MS: u64 = 1_000;
 pub const DEFAULT_COMMAND_MS: u64 = 30_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMAND_MS: u64 = 60 * 60 * 1_000;
@@ -335,7 +336,8 @@ impl Relay {
         timeout_ms: u64,
     ) -> Result<Value, RelayError> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(MAX_WAIT_MS));
-        // Subscribe before inspecting either state source, retaining changes during RPC reads.
+        // Subscribe before the authoritative read so actionable requests and terminal
+        // notifications cannot race the wait setup.
         let mut transport_changes = self.app_server.changes();
         let mut journal_changes = self.journal.changes();
         loop {
@@ -365,21 +367,60 @@ impl Relay {
                 .read_after(after_cursor, &thread_id, selected_id)
                 .await
                 .map_err(RelayError::Invalid)?;
-            let state = wait_state(turn.map(|t| t.status), &pending, !batch.events.is_empty());
-            if state != "timeout" || Instant::now() >= deadline {
+            if let Some((state, wake_reason)) = wait_wake(turn.map(|t| t.status), &pending) {
                 return Ok(json!({
-                    "threadId":thread_id,"turnId":selected_id,"state":state,
+                    "threadId":thread_id,"turnId":selected_id,"state":state,"wakeReason":wake_reason,
                     "turn":turn.map(turn_snapshot), "cursor":batch.cursor,
                     "historyLost":batch.history_lost,"events":batch.events,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 }));
             }
-            // The journal is an optimization. Reconcile official state periodically even when
-            // notifications are lost, oversized, or never emitted.
-            tokio::select! {
-                _ = transport_changes.changed() => {},
-                _ = journal_changes.changed() => {},
-                _ = tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(250))) => {},
+            if Instant::now() >= deadline {
+                return Ok(json!({
+                    "threadId":thread_id,"turnId":selected_id,"state":"active","wakeReason":"timeout",
+                    "turn":turn.map(turn_snapshot), "cursor":batch.cursor,
+                    "historyLost":batch.history_lost,"events":batch.events,
+                    "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
+                }));
+            }
+
+            // Ordinary worker notifications remain journaled but do not end the operator wait
+            // or force an App Server thread/read. Pending server requests are checked locally;
+            // terminal notifications and history gaps trigger an authoritative reconciliation.
+            let selected_id = selected_id.map(str::to_owned);
+            let reconcile_at =
+                deadline.min(Instant::now() + Duration::from_millis(WAIT_RECONCILE_MS));
+            loop {
+                tokio::select! {
+                    changed = transport_changes.changed() => {
+                        if changed.is_err() || !self.worker_available() {
+                            return Err(AppServerError::Disconnected.into());
+                        }
+                        let pending = self
+                            .app_server
+                            .pending_requests(Some(&thread_id))
+                            .into_iter()
+                            .filter(|r| r.turn_id.as_deref().is_none_or(|id| selected_id.as_deref() == Some(id)))
+                            .collect::<Vec<_>>();
+                        if wait_wake(None, &pending).is_some() {
+                            break;
+                        }
+                    }
+                    changed = journal_changes.changed() => {
+                        if changed.is_err() {
+                            return Err(AppServerError::Disconnected.into());
+                        }
+                        let batch = self
+                            .journal
+                            .read_after(after_cursor, &thread_id, selected_id.as_deref())
+                            .await
+                            .map_err(RelayError::Invalid)?;
+                        if batch.history_lost || batch.events.iter().any(|event| event.method == "turn/completed") {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep_until(reconcile_at) => break,
+                }
             }
         }
     }
@@ -574,27 +615,24 @@ fn turn_snapshot(turn: &codex_connect_app_server::protocol::Turn) -> Value {
     json!({"id":turn.id,"status":turn.status,"error":turn.error,"output":output})
 }
 
-fn wait_state(
+fn wait_wake(
     status: Option<codex_connect_app_server::protocol::TurnStatus>,
     pending: &[Arc<PendingServerRequest>],
-    has_events: bool,
-) -> &'static str {
+) -> Option<(&'static str, &'static str)> {
     if status.is_some_and(|s| s.is_terminal()) {
-        "completed"
+        Some(("terminal", "terminal"))
     } else if pending
         .iter()
         .any(|a| a.kind == PendingActionKind::UserInput && a.is_blocking)
     {
-        "waitingForInput"
+        Some(("active", "inputRequired"))
     } else if pending
         .iter()
         .any(|a| a.kind != PendingActionKind::UserInput)
     {
-        "waitingForAction"
-    } else if has_events || !pending.is_empty() {
-        "progress"
+        Some(("active", "actionRequired"))
     } else {
-        "timeout"
+        None
     }
 }
 

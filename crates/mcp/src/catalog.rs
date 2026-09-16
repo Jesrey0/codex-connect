@@ -118,7 +118,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codexConnect.work.read",
                 "Read Codex Work",
-                "Use for a compact authoritative snapshot of an official Codex thread. Use work.wait when waiting for new progress.",
+                "Use for a compact authoritative snapshot of an official Codex thread. Use work.wait to quietly join delegated work until completion, required operator action, or the wait lease expires.",
                 true,
                 false,
                 false,
@@ -130,8 +130,8 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         tool(
             meta(
                 "codexConnect.work.wait",
-                "Wait for Codex Progress",
-                "Use after work.start/review or an action response to wait up to 120 seconds for progress, completion, a pending action, or a Codex question without polling raw thread items.",
+                "Wait for Codex Work",
+                "Quietly join delegated Codex work for up to 120 seconds. Routine tool calls, file changes, and worker commentary remain journaled but do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required; otherwise returns when the wait lease expires.",
                 true,
                 false,
                 false,
@@ -182,7 +182,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codexConnect.pendingActions.list",
                 "List Pending Codex Actions",
-                "Use when work.wait reports waitingForAction or waitingForInput, or to inspect outstanding approvals, permissions, elicitations, and semantic questions. Check isBlocking before treating a question as a blocked turn.",
+                "Use when work.wait returns wakeReason=actionRequired or inputRequired, or to inspect outstanding approvals, permissions, elicitations, and semantic questions. Check isBlocking before treating a question as a blocked turn.",
                 true,
                 false,
                 false,
@@ -432,8 +432,15 @@ fn work_read_schema() -> Value {
 }
 fn work_wait_output_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnId":{"type":["string","null"]},"state":{"type":"string","enum":["completed","waitingForAction","waitingForInput","progress","timeout"]},"cursor":{"type":"integer"},"turn":nullable(turn_schema()),"historyLost":{"type":"boolean"},"events":{"type":"array","items":event_schema()},"pendingActions":{"type":"array","items":pending_schema()}}),
-        &["threadId", "state", "cursor", "events", "pendingActions"],
+        json!({"threadId":{"type":"string"},"turnId":{"type":["string","null"]},"state":{"type":"string","enum":["active","terminal"]},"wakeReason":{"type":"string","enum":["terminal","actionRequired","inputRequired","timeout"]},"cursor":{"type":"integer"},"turn":nullable(turn_schema()),"historyLost":{"type":"boolean"},"events":{"type":"array","items":event_schema()},"pendingActions":{"type":"array","items":pending_schema()}}),
+        &[
+            "threadId",
+            "state",
+            "wakeReason",
+            "cursor",
+            "events",
+            "pendingActions",
+        ],
     )
 }
 fn inspect_schema() -> Value {
@@ -472,7 +479,7 @@ fn work_start_schema() -> Value {
 }
 fn work_wait_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"afterCursor":{"type":"integer","minimum":0,"default":0},"timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS}}),
+        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by work.start/work.wait. Matching events after this cursor are returned when the quiet join ends but do not wake it by themselves."},"timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet-join lease in milliseconds. Set to 0 for a non-blocking state/journal pull."}}),
         &["threadId"],
     )
 }
@@ -624,6 +631,29 @@ mod tests {
         for schema in [command_schema(), work_start_schema()] {
             assert_eq!(schema["properties"]["sandboxPolicy"], sandbox);
         }
+    }
+
+    #[test]
+    fn work_wait_schema_models_a_quiet_join() {
+        let output = work_wait_output_schema();
+        assert_eq!(
+            output["properties"]["state"]["enum"],
+            json!(["active", "terminal"])
+        );
+        assert_eq!(
+            output["properties"]["wakeReason"]["enum"],
+            json!(["terminal", "actionRequired", "inputRequired", "timeout"])
+        );
+        assert!(!output.to_string().contains("progress"));
+
+        let input = work_wait_schema();
+        assert_eq!(input["properties"]["timeoutMs"]["minimum"], 0);
+        assert!(
+            input["properties"]["timeoutMs"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("non-blocking")
+        );
     }
 
     #[test]

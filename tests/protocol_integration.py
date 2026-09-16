@@ -224,40 +224,50 @@ class OperatorProtocolTests(unittest.TestCase):
     def test_authoritative_completion_without_events_and_unknown_turn(self):
         work = self.start("no_event")
         result = self.wait(work)
-        self.assertEqual(result["state"],"completed")
+        self.assertEqual(result["state"],"terminal")
+        self.assertEqual(result["wakeReason"],"terminal")
         self.assertEqual(result["turn"]["output"][0]["text"],"fixture complete")
         self.client.call("codexConnect.work.wait",{"threadId":work["threadId"],"turnId":"missing","timeoutMs":0},error=True)
         next_work = self.start("idle",threadId=work["threadId"])
         self.assertFalse(next_work["createdThread"])
-        self.assertEqual(self.wait(next_work,timeout=0)["state"],"timeout")
+        idle = self.wait(next_work,timeout=0)
+        self.assertEqual(idle["state"],"active")
+        self.assertEqual(idle["wakeReason"],"timeout")
         self.assertEqual(self.client.call("codexConnect.work.read",{"threadId":work["threadId"]})["turnCount"],2)
 
-    def test_wait_progress_timeout_oversized_and_steer(self):
-        for scenario, expected in [("idle","timeout"),("progress","progress"),("oversized","progress")]:
+    def test_wait_ignores_progress_until_lease_expiry_and_preserves_journal(self):
+        for scenario in ("idle","progress","oversized"):
             work = self.start(scenario)
             result = self.wait(work,timeout=100)
-            self.assertEqual(result["state"],expected)
+            self.assertEqual(result["state"],"active")
+            self.assertEqual(result["wakeReason"],"timeout")
+            if scenario == "progress":
+                self.assertEqual(result["events"][0]["method"],"item/agentMessage/delta")
             if scenario == "oversized":
                 self.assertTrue(result["events"][0]["truncated"])
             self.client.call("codexConnect.work.steer",{"threadId":work["threadId"],"expectedTurnId":work["turnId"],"instruction":"continue"})
             self.client.call("codexConnect.work.interrupt",{"threadId":work["threadId"],"turnId":work["turnId"]})
-            self.assertEqual(self.wait(work)["turn"]["status"],"interrupted")
+            interrupted = self.wait(work)
+            self.assertEqual(interrupted["state"],"terminal")
+            self.assertEqual(interrupted["wakeReason"],"terminal")
+            self.assertEqual(interrupted["turn"]["status"],"interrupted")
 
     def test_oversized_wire_messages_are_contained(self):
         notification = self.start("wire_oversized")
         notification_result = self.wait(notification, timeout=5000)
-        self.assertEqual(notification_result["state"], "completed")
+        self.assertEqual(notification_result["state"], "terminal")
+        self.assertEqual(notification_result["wakeReason"], "terminal")
         self.assertTrue(notification_result["historyLost"])
 
         request = self.start("oversized_question")
         request_result = self.wait(request, timeout=5000)
-        if request_result["state"] != "completed":
+        if request_result["state"] != "terminal":
             request_result = self.wait(
                 request,
                 timeout=5000,
                 afterCursor=request_result["cursor"],
             )
-        self.assertEqual(request_result["state"], "completed")
+        self.assertEqual(request_result["state"], "terminal")
         self.assertEqual(request_result["pendingActions"], [])
 
         status = self.client.call("codexConnect.status")
@@ -266,7 +276,8 @@ class OperatorProtocolTests(unittest.TestCase):
     def test_questions_wake_wait_and_preserve_the_same_turn(self):
         work = self.start("delayed_question")
         result = self.wait(work,timeout=3000)
-        self.assertEqual(result["state"],"waitingForInput")
+        self.assertEqual(result["state"],"active")
+        self.assertEqual(result["wakeReason"],"inputRequired")
         pending = result["pendingActions"][0]
         self.assertEqual(pending["params"]["questions"][0]["id"],"format")
         self.assertTrue(pending["isBlocking"])
@@ -274,15 +285,18 @@ class OperatorProtocolTests(unittest.TestCase):
         self.client.call("codexConnect.approval.respond",{"requestId":request_id,"decision":"approve"},error=True)
         self.client.call("codexConnect.userInput.respond",{"requestId":request_id,"answers":{"wrong":["JSON"]}},error=True)
         self.client.call("codexConnect.userInput.respond",{"requestId":request_id,"answers":{"format":["JSON"]}})
-        self.assertEqual(self.wait(work)["state"],"completed")
+        completed = self.wait(work)
+        self.assertEqual(completed["state"],"terminal")
+        self.assertEqual(completed["wakeReason"],"terminal")
         self.client.call("codexConnect.userInput.respond",{"requestId":request_id,"answers":{"format":["JSON"]}},error=True)
         actions = self.client.call("codexConnect.pendingActions.list",{"threadId":work["threadId"]})["actions"]
         self.assertEqual(actions,[])
 
-    def test_nonblocking_question_is_progress_and_interrupt_cleans_up(self):
+    def test_nonblocking_question_does_not_wake_join_and_interrupt_cleans_up(self):
         work = self.start("nonblocking")
-        result = self.wait(work)
-        self.assertEqual(result["state"],"progress")
+        result = self.wait(work,timeout=100)
+        self.assertEqual(result["state"],"active")
+        self.assertEqual(result["wakeReason"],"timeout")
         self.assertFalse(result["pendingActions"][0]["isBlocking"])
         self.client.call("codexConnect.work.interrupt",{"threadId":work["threadId"],"turnId":work["turnId"]})
         self.assertEqual(self.client.call("codexConnect.pendingActions.list",{"threadId":work["threadId"]})["actions"],[])
@@ -299,21 +313,27 @@ class OperatorProtocolTests(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 work = self.start(scenario)
                 result = self.wait(work)
-                self.assertEqual(result["state"],"waitingForAction")
+                self.assertEqual(result["state"],"active")
+                self.assertEqual(result["wakeReason"],"actionRequired")
                 request_id = result["pendingActions"][0]["requestId"]
                 self.client.call(responder,{"requestId":request_id,**answer})
-                self.assertEqual(self.wait(work)["state"],"completed")
+                completed = self.wait(work)
+                self.assertEqual(completed["state"],"terminal")
+                self.assertEqual(completed["wakeReason"],"terminal")
 
     def test_review_and_discovery(self):
         source = self.start("complete")
-        self.assertEqual(self.wait(source)["state"],"completed")
+        source_result = self.wait(source)
+        self.assertEqual(source_result["state"],"terminal")
+        self.assertEqual(source_result["wakeReason"],"terminal")
         review = self.client.call("codexConnect.review",{
             "threadId": source["threadId"], "target":{"type":"uncommittedChanges"},
         })
         self.assertFalse(review["createdThread"])
         self.assertEqual(review["threadId"], source["threadId"])
         result = self.wait(review)
-        self.assertEqual(result["state"],"completed")
+        self.assertEqual(result["state"],"terminal")
+        self.assertEqual(result["wakeReason"],"terminal")
         self.assertEqual(result["threadId"], source["threadId"])
         self.assertEqual(result["turnId"], review["turnId"])
         self.client.call("model.list")
