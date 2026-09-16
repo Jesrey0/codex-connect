@@ -27,6 +27,8 @@ use tokio::time::{Duration, Instant};
 
 pub const MAX_WAIT_MS: u64 = 120_000;
 const WAIT_RECONCILE_MS: u64 = 1_000;
+const TURN_VISIBILITY_GRACE_MS: u64 = 1_000;
+const TURN_VISIBILITY_RETRY_MS: u64 = 25;
 pub const DEFAULT_COMMAND_MS: u64 = 30_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMAND_MS: u64 = 60 * 60 * 1_000;
@@ -335,7 +337,10 @@ impl Relay {
         after_cursor: u64,
         timeout_ms: u64,
     ) -> Result<Value, RelayError> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(MAX_WAIT_MS));
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_millis(timeout_ms.min(MAX_WAIT_MS));
+        let turn_visibility_deadline =
+            deadline.min(started_at + Duration::from_millis(TURN_VISIBILITY_GRACE_MS));
         // Subscribe before the authoritative read so actionable requests and terminal
         // notifications cannot race the wait setup.
         let mut transport_changes = self.app_server.changes();
@@ -346,9 +351,34 @@ impl Relay {
             }
             let thread = self.read_thread(thread_id.clone()).await?;
             let turn = match turn_id.as_deref() {
-                Some(id) => Some(thread.turns.iter().find(|t| t.id == id).ok_or_else(|| {
-                    RelayError::Invalid(format!("turn {id} does not exist in thread {thread_id}"))
-                })?),
+                Some(id) => match thread.turns.iter().find(|t| t.id == id) {
+                    Some(turn) => Some(turn),
+                    None if Instant::now() < turn_visibility_deadline => {
+                        tokio::select! {
+                            changed = transport_changes.changed() => {
+                                if changed.is_err() || !self.worker_available() {
+                                    return Err(AppServerError::Disconnected.into());
+                                }
+                            }
+                            changed = journal_changes.changed() => {
+                                if changed.is_err() {
+                                    return Err(AppServerError::Disconnected.into());
+                                }
+                            }
+                            _ = tokio::time::sleep_until(
+                                turn_visibility_deadline.min(
+                                    Instant::now() + Duration::from_millis(TURN_VISIBILITY_RETRY_MS),
+                                )
+                            ) => {}
+                        }
+                        continue;
+                    }
+                    None => {
+                        return Err(RelayError::Invalid(format!(
+                            "turn {id} does not exist in thread {thread_id}"
+                        )));
+                    }
+                },
                 None => thread.turns.last(),
             };
             let selected_id = turn.map(|t| t.id.as_str());
