@@ -28,7 +28,7 @@ use tokio::time::{Duration, Instant};
 pub const MAX_WAIT_MS: u64 = 120_000;
 pub const DEFAULT_COMMAND_MS: u64 = 30_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
-pub const MAX_COMMAND_MS: u64 = 300_000;
+pub const MAX_COMMAND_MS: u64 = 60 * 60 * 1_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const WORKSPACE_POLICY: &str = "Workspace policy: treat the working directory as a general filesystem workspace. Version control is optional. Do not initialize repositories, create branches, commits, or tags, or use Git as a checkpoint/workflow mechanism unless the task explicitly requests version-control operations. Existing VCS metadata may be read only when it is materially required by the task.";
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;

@@ -198,9 +198,13 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertNotIn("disableTimeout", schema)
         self.assertNotIn("disableOutputCap", schema)
         self.assertEqual(schema["timeoutMs"]["default"], 30000)
+        self.assertEqual(schema["timeoutMs"]["maximum"], 3600000)
         self.assertEqual(schema["outputBytesCap"]["default"], 65536)
         result = self.client.call("command.exec", {"command":["echo","fixture"]})
         self.assertEqual(result["exitCode"],0)
+        self.assertEqual(self.client.call("command.exec", {
+            "command":["echo","fixture"], "timeoutMs":3600000,
+        })["exitCode"], 0)
         absolute_root = str(self.project)
         self.assertEqual(self.client.call("command.exec", {
             "command":["echo","fixture"],
@@ -210,7 +214,7 @@ class OperatorProtocolTests(unittest.TestCase):
             {"command":[]}, {"command":["echo"],"tty":True},
             {"command":["echo"],"disableTimeout":True},
             {"command":["echo"],"disableOutputCap":True},
-            {"command":["echo"],"timeoutMs":300001},
+            {"command":["echo"],"timeoutMs":3600001},
             {"command":["echo"],"sandboxPolicy":{"type":"externalSandbox"}},
             {"command":["echo"],"sandboxPolicy":{"type":"workspaceWrite","writableRoots":["project"]}},
             {"command":["echo"],"cwd":"/etc"},

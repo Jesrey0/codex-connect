@@ -89,7 +89,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for an exact command argv, such as running cargo test. Non-interactive, with a 30-second default timeout (5-minute maximum) and 64 KiB default output cap (256 KiB maximum). networkAccess=false may block socket-based localhost tests; true enables broader network access, not only loopback. Use codexConnect.work.start for autonomous investigation or iteration.",
+                "Use for an exact command argv, such as running cargo test. Non-interactive, with a 30-second default timeout (60-minute maximum) and 64 KiB default output cap (256 KiB maximum). networkAccess=false may block socket-based localhost tests; true enables broader network access, not only loopback. Use codexConnect.work.start for autonomous investigation or iteration.",
                 false,
                 true,
                 true,

@@ -220,7 +220,7 @@ for line in sys.stdin:
         complete(params["threadId"], params["turnId"], status="interrupted")
     elif method == "command/exec":
         assert not any(key in params for key in ("tty", "streamStdin", "disableTimeout", "disableOutputCap"))
-        assert 0 < params["timeoutMs"] <= 300000
+        assert 0 < params["timeoutMs"] <= 3600000
         assert params["outputBytesCap"] <= 262144
         if params["command"] == ["disconnect"]:
             raise SystemExit
