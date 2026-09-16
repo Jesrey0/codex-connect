@@ -20,6 +20,28 @@ struct PendingCall {
     sender: oneshot::Sender<Result<Value, AppServerError>>,
 }
 
+pub(crate) struct DeferredCall {
+    connection: Arc<Connection>,
+    id: RpcId,
+    receiver: Option<oneshot::Receiver<Result<Value, AppServerError>>>,
+}
+
+impl DeferredCall {
+    pub async fn wait(mut self) -> Result<Value, AppServerError> {
+        self.receiver
+            .take()
+            .expect("deferred call receiver is consumed once")
+            .await
+            .map_err(|_| AppServerError::Disconnected)?
+    }
+}
+
+impl Drop for DeferredCall {
+    fn drop(&mut self) {
+        self.connection.calls.lock().unwrap().remove(&self.id);
+    }
+}
+
 struct PendingAction {
     request: Arc<PendingServerRequest>,
     deadline: Instant,
@@ -125,6 +147,22 @@ impl Connection {
         params: Value,
         duration: Duration,
     ) -> Result<Value, AppServerError> {
+        timeout(duration, async {
+            let call = self.start_call(method, params).await?;
+            call.wait().await
+        })
+        .await
+        .map_err(|_| AppServerError::Timeout {
+            method: method.into(),
+            timeout_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
+        })?
+    }
+
+    pub async fn start_call(
+        self: &Arc<Self>,
+        method: &'static str,
+        params: Value,
+    ) -> Result<DeferredCall, AppServerError> {
         if !self.available() {
             return Err(AppServerError::Disconnected);
         }
@@ -137,21 +175,19 @@ impl Connection {
             }
             calls.insert(id.clone(), PendingCall { method, sender });
         }
-        // Drop removes the call even if the MCP caller cancels its future.
-        let _guard = CallGuard {
+        let mut guard = CallGuard {
             connection: self.clone(),
             id: id.clone(),
+            armed: true,
         };
-        timeout(duration, async {
-            self.send(json!({"id":id,"method":method,"params":params}), None)
-                .await?;
-            receiver.await.map_err(|_| AppServerError::Disconnected)?
+        self.send(json!({"id":id,"method":method,"params":params}), None)
+            .await?;
+        guard.armed = false;
+        Ok(DeferredCall {
+            connection: self.clone(),
+            id,
+            receiver: Some(receiver),
         })
-        .await
-        .map_err(|_| AppServerError::Timeout {
-            method: method.into(),
-            timeout_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
-        })?
     }
 
     pub async fn send(
@@ -293,10 +329,13 @@ impl Connection {
 struct CallGuard {
     connection: Arc<Connection>,
     id: RpcId,
+    armed: bool,
 }
 impl Drop for CallGuard {
     fn drop(&mut self) {
-        self.connection.calls.lock().unwrap().remove(&self.id);
+        if self.armed {
+            self.connection.calls.lock().unwrap().remove(&self.id);
+        }
     }
 }
 
@@ -633,6 +672,26 @@ mod tests {
                 .count(),
             1
         );
+        connection.disconnect();
+    }
+
+    #[tokio::test]
+    async fn deferred_call_owns_pending_response_until_completion_or_drop() {
+        let writer = TestWriter::default();
+        let (connection, mut peer) = setup(writer.clone());
+        let deferred = connection
+            .start_call("command/exec", json!({"command":["sleep","1"]}))
+            .await
+            .unwrap();
+        assert_eq!(connection.calls.lock().unwrap().len(), 1);
+        drop(deferred);
+        assert!(connection.calls.lock().unwrap().is_empty());
+
+        peer.write_all(b"{\"id\":1,\"result\":{\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\"}}\n")
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(connection.available());
         connection.disconnect();
     }
 

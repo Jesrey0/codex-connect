@@ -60,6 +60,7 @@ def validate(value, schema):
 lock = threading.RLock()
 threads = {}
 pending = {}
+command_sessions = {}
 initialized = False
 handshake = False
 
@@ -72,6 +73,26 @@ def send(message):
 def respond(message, result):
     validate(result, CONTRACT["methods"][message["method"]]["outputSchema"])
     send({"id": message["id"], "result": result})
+
+
+def command_output(process_id, stream, text):
+    send({
+        "method": "command/exec/outputDelta",
+        "params": {
+            "processId": process_id,
+            "stream": stream,
+            "deltaBase64": base64.b64encode(text.encode()).decode(),
+            "capReached": False,
+        },
+    })
+
+
+def finish_command(process_id, exit_code=0):
+    with lock:
+        session = command_sessions.pop(process_id)
+        result = sample(CONTRACT["methods"]["command/exec"]["outputSchema"])
+        result.update(exitCode=exit_code, stdout="", stderr="")
+        respond(session["message"], result)
 
 
 def complete(thread_id, turn_id, status="completed", notify=True):
@@ -275,12 +296,67 @@ for line in sys.stdin:
                 send({"method":"serverRequest/resolved","params":{"threadId":thread_id,"requestId":request_id}})
         complete(params["threadId"], params["turnId"], status="interrupted")
     elif method == "command/exec":
-        assert not any(key in params for key in ("tty", "streamStdin", "disableTimeout", "disableOutputCap"))
-        assert 0 < params["timeoutMs"] <= 3600000
-        assert params["outputBytesCap"] <= 262144
-        if params["command"] == ["disconnect"]:
-            raise SystemExit
-        result.update(exitCode=0, stdout="fixture command\n", stderr="")
+        if "processId" not in params:
+            assert not any(key in params for key in ("tty", "streamStdin", "disableTimeout", "disableOutputCap"))
+            assert 0 < params["timeoutMs"] <= 3600000
+            assert params["outputBytesCap"] <= 262144
+            if params["command"] == ["disconnect"]:
+                raise SystemExit
+            result.update(exitCode=0, stdout="fixture command\n", stderr="")
+        else:
+            process_id = params["processId"]
+            assert params["streamStdin"] is True
+            assert params["streamStdoutStderr"] is True
+            assert params["disableTimeout"] is True
+            assert params["disableOutputCap"] is True
+            command_sessions[process_id] = {
+                "message": copy.deepcopy(message),
+                "tty": params["tty"],
+                "size": copy.deepcopy(params.get("size")),
+            }
+            scenario = params["command"][0]
+            if scenario == "fixture-stream":
+                command_output(process_id, "stdout", "ready\n")
+                command_output(process_id, "stderr", "warning\n")
+            elif scenario == "fixture-repl":
+                assert params["tty"] is True
+                command_output(process_id, "stdout", ">>> ")
+            elif scenario == "fixture-exit":
+                command_output(process_id, "stdout", "done\n")
+                finish_command(process_id, 0)
+            elif scenario == "fixture-delayed-exit":
+                timer = threading.Timer(0.25, finish_command, (process_id, 0))
+                timer.daemon = True
+                timer.start()
+            elif scenario == "fixture-bounded":
+                for _ in range(20):
+                    command_output(process_id, "stdout", "x" * 40000)
+            elif scenario == "fixture-sandbox":
+                command_output(process_id, "stdout", json.dumps(params["sandboxPolicy"]) + "\n")
+            elif scenario == "fixture-quiet":
+                pass
+            else:
+                raise AssertionError(f"unknown persistent command fixture: {scenario}")
+            continue
+    elif method == "command/exec/write":
+        process_id = params["processId"]
+        session = command_sessions[process_id]
+        text = base64.b64decode(params.get("deltaBase64") or "").decode()
+        if session["tty"] and text:
+            if text == "2+2\n":
+                command_output(process_id, "stdout", "4\n>>> ")
+            else:
+                command_output(process_id, "stdout", text)
+        if params.get("closeStdin"):
+            finish_command(process_id, 0)
+    elif method == "command/exec/resize":
+        process_id = params["processId"]
+        assert command_sessions[process_id]["tty"] is True
+        command_sessions[process_id]["size"] = copy.deepcopy(params["size"])
+    elif method == "command/exec/terminate":
+        process_id = params["processId"]
+        if process_id in command_sessions:
+            finish_command(process_id, 143)
     elif method == "fs/readFile":
         result["dataBase64"] = base64.b64encode(pathlib.Path(params["path"]).read_bytes()).decode()
     elif method == "fs/readDirectory":

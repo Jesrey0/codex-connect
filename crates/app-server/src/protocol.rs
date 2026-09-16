@@ -381,6 +381,79 @@ pub struct CommandExec {
 request!(CommandExec, "command/exec", CommandExecResponse);
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingCommandExec {
+    pub command: Vec<String>,
+    pub process_id: String,
+    pub stream_stdin: bool,
+    pub stream_stdout_stderr: bool,
+    pub disable_timeout: bool,
+    pub disable_output_cap: bool,
+    pub tty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<CommandExecTerminalSize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, Option<String>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_policy: Option<SandboxPolicy>,
+}
+request!(StreamingCommandExec, "command/exec", CommandExecResponse);
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct CommandExecTerminalSize {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecWrite {
+    pub process_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_stdin: Option<bool>,
+}
+request!(CommandExecWrite, "command/exec/write", EmptyResponse);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecResize {
+    pub process_id: String,
+    pub size: CommandExecTerminalSize,
+}
+request!(CommandExecResize, "command/exec/resize", EmptyResponse);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecTerminate {
+    pub process_id: String,
+}
+request!(
+    CommandExecTerminate,
+    "command/exec/terminate",
+    EmptyResponse
+);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandExecOutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecOutputDeltaNotification {
+    pub process_id: String,
+    pub stream: CommandExecOutputStream,
+    pub delta_base64: String,
+    pub cap_reached: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct FsReadFile {
     pub path: String,
 }

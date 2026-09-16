@@ -7,8 +7,8 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::response::Json;
 use codex_connect_relay::{
-    ApprovalDecision, ApprovalPolicy, ElicitationAction, MAX_WAIT_MS, ModelList, PermissionGrant,
-    PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
+    ApprovalDecision, ApprovalPolicy, CommandExecTerminalSize, ElicitationAction, MAX_WAIT_MS,
+    ModelList, PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
 };
 use codex_connect_scope::Scope;
 use rmcp::ErrorData as McpError;
@@ -37,6 +37,55 @@ pub struct RuntimeIdentity {
     pub build_id: String,
     pub binary_sha256: String,
     pub executable: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandStartArgs {
+    command: Vec<String>,
+    cwd: Option<String>,
+    env: Option<std::collections::BTreeMap<String, Option<String>>>,
+    sandbox_policy: Option<SandboxPolicy>,
+    #[serde(default)]
+    tty: bool,
+    size: Option<CommandExecTerminalSize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandReadArgs {
+    process_id: String,
+    #[serde(default)]
+    after_cursor: u64,
+    #[serde(default = "default_command_read_ms")]
+    timeout_ms: u64,
+}
+
+fn default_command_read_ms() -> u64 {
+    codex_connect_relay::DEFAULT_COMMAND_READ_MS
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandWriteArgs {
+    process_id: String,
+    input: Option<String>,
+    #[serde(default)]
+    close_stdin: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandResizeArgs {
+    process_id: String,
+    rows: u16,
+    cols: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandTerminateArgs {
+    process_id: String,
 }
 
 pub fn router(relay: Relay, scope: Scope, runtime: RuntimeIdentity) -> Router {
@@ -118,7 +167,7 @@ impl ServerHandler for McpHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("codex-connect", ""))
             .with_instructions(
-                "Codex Connect is a ChatGPT-native operator surface over a deliberately selected Codex App Server subset. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. Use codexConnect.inspect for read-only workspace inspection, command.exec for a known deterministic command, and codexConnect.work.start followed by codexConnect.work.wait for autonomous multi-step Codex work. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official thread and turn IDs remain authoritative.",
+                "Codex Connect is a ChatGPT-native operator surface over a deliberately selected Codex App Server subset. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. Use codexConnect.inspect for read-only workspace inspection; command.exec for a known one-shot deterministic command; command.start plus command.read/write/resize/terminate for deterministic persistent or interactive commands; and codexConnect.work.start followed by codexConnect.work.wait for autonomous multi-step Codex work. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server command session, thread, and turn lifecycles remain authoritative.",
             )
     }
 
@@ -344,6 +393,47 @@ async fn dispatch(
             .await
             .map(|v| serde_json::to_value(v).unwrap())
             .map_err(Into::into),
+        "command.start" => {
+            let a: CommandStartArgs = parse(arguments)?;
+            relay
+                .command_start(a.command, a.cwd, a.env, a.sandbox_policy, a.tty, a.size)
+                .await
+                .map_err(Into::into)
+        }
+        "command.read" => {
+            let a: CommandReadArgs = parse(arguments)?;
+            relay
+                .command_read(a.process_id, a.after_cursor, a.timeout_ms)
+                .await
+                .map_err(Into::into)
+        }
+        "command.write" => {
+            let a: CommandWriteArgs = parse(arguments)?;
+            relay
+                .command_write(a.process_id, a.input, a.close_stdin)
+                .await
+                .map_err(Into::into)
+        }
+        "command.resize" => {
+            let a: CommandResizeArgs = parse(arguments)?;
+            relay
+                .command_resize(
+                    a.process_id,
+                    CommandExecTerminalSize {
+                        rows: a.rows,
+                        cols: a.cols,
+                    },
+                )
+                .await
+                .map_err(Into::into)
+        }
+        "command.terminate" => {
+            let a: CommandTerminateArgs = parse(arguments)?;
+            relay
+                .command_terminate(a.process_id)
+                .await
+                .map_err(Into::into)
+        }
         "codexConnect.work.start" => {
             let a: WorkStartArgs = parse(arguments)?;
             relay
@@ -545,6 +635,14 @@ fn summary_for(name: &str, value: &Value) -> String {
         "command.exec" => format!(
             "Command finished with exit code {}.",
             value.get("exitCode").and_then(Value::as_i64).unwrap_or(-1)
+        ),
+        "command.start" => "Persistent command started.".into(),
+        "command.read" => format!(
+            "Persistent command state: {}.",
+            value
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
         ),
         "codexConnect.work.start" => "Codex work started.".into(),
         "codexConnect.work.wait" => format!(

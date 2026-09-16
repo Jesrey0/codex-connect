@@ -15,7 +15,17 @@ Codex App Server remains authoritative for Codex threads, turns, reviews, approv
 For deterministic host work:
 
 ```text
-codexConnect.inspect → command.exec / apply_patch
+codexConnect.inspect → command.exec / command.start / apply_patch
+```
+
+For persistent or interactive deterministic commands:
+
+```text
+command.start
+    ↓
+command.read ↔ command.write
+       ↘ command.resize   (PTY only)
+        ↘ command.terminate
 ```
 
 For autonomous Codex work:
@@ -32,17 +42,17 @@ codexConnect.approval.respond / permissions.respond / elicitation.respond
 codexConnect.work.wait
 ```
 
-Use `command.exec` when the exact command is already known. Use `codexConnect.work.start` when Codex should investigate, reason, edit, test, or iterate autonomously.
+Use `command.exec` when the exact command is already known and should finish synchronously. Use `command.start` when the command is still deterministic but must remain running or interactive. Use `codexConnect.work.start` when Codex should investigate, reason, edit, test, or iterate autonomously.
 
 ## Public MCP surface
 
-The canonical MCP surface contains 19 tools:
+The canonical MCP surface contains 24 tools:
 
 | Area | Tools |
 | --- | --- |
 | Orientation | `codexConnect.status`, `codexConnect.usage` |
 | Read-only host inspection | `codexConnect.inspect`, `view_image` |
-| Deterministic mutation/execution | `apply_patch`, `command.exec` |
+| Deterministic mutation/execution | `apply_patch`, `command.exec`, `command.start`, `.read`, `.write`, `.resize`, `.terminate` |
 | Autonomous Codex work | `codexConnect.work.start`, `.read`, `.wait`, `.steer`, `.interrupt` |
 | Operator/action loop | `codexConnect.pendingActions.list`, `codexConnect.approval.respond`, `codexConnect.permissions.respond`, `codexConnect.elicitation.respond`, `codexConnect.userInput.respond` |
 | Review/discovery | `codexConnect.review`, `model.list`, `skills.list` |

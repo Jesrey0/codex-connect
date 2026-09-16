@@ -10,6 +10,7 @@ use protocol::{Initialize, Request};
 use serde_json::{Value, json};
 pub use server_request::{PendingActionKind, PendingServerRequest, ServerRequestMethod};
 use std::env;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -30,6 +31,21 @@ pub struct AppServerConfig {
     pub working_directory: PathBuf,
     pub client_name: String,
     pub request_timeout: Duration,
+}
+
+pub struct DeferredRequest<R: Request> {
+    call: transport::DeferredCall,
+    marker: PhantomData<R>,
+}
+
+impl<R: Request> DeferredRequest<R> {
+    pub async fn wait(self) -> Result<R::Response, AppServerError> {
+        let value = self.call.wait().await?;
+        serde_json::from_value(value).map_err(|source| AppServerError::InvalidResponse {
+            method: R::METHOD.into(),
+            source,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +194,20 @@ impl AppServerClient {
         serde_json::from_value(value).map_err(|source| AppServerError::InvalidResponse {
             method: R::METHOD.into(),
             source,
+        })
+    }
+
+    pub async fn start_request<R: Request>(
+        &self,
+        request: R,
+    ) -> Result<DeferredRequest<R>, AppServerError> {
+        let call = self
+            .connection
+            .start_call(R::METHOD, serde_json::to_value(request)?)
+            .await?;
+        Ok(DeferredRequest {
+            call,
+            marker: PhantomData,
         })
     }
 

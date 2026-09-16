@@ -20,6 +20,7 @@ from support.mcp_client import McpClient
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 EXPECTED = {
     "codexConnect.status", "codexConnect.inspect", "apply_patch", "view_image", "command.exec",
+    "command.start", "command.read", "command.write", "command.resize", "command.terminate",
     "codexConnect.work.start", "codexConnect.work.read", "codexConnect.work.wait",
     "codexConnect.work.steer", "codexConnect.work.interrupt", "codexConnect.pendingActions.list",
     "codexConnect.approval.respond", "codexConnect.permissions.respond",
@@ -90,7 +91,7 @@ class OperatorProtocolTests(unittest.TestCase):
         })
 
     def test_catalog_and_status_are_canonical(self):
-        self.assertEqual(len(self.client.catalog), 19)
+        self.assertEqual(len(self.client.catalog), 24)
         self.assertEqual(set(self.client.tools), EXPECTED)
         wait_timeout = self.client.tools["codexConnect.work.wait"]["inputSchema"]["properties"]["timeoutMs"]
         self.assertEqual(wait_timeout["default"], 60000)
@@ -220,6 +221,118 @@ class OperatorProtocolTests(unittest.TestCase):
             {"command":["echo"],"cwd":"/etc"},
         ]:
             self.client.call("command.exec",arguments,error=True,validate_input=False)
+
+    def test_persistent_nonpty_streaming_and_sandbox(self):
+        started = self.client.call("command.start", {
+            "command": ["fixture-stream"],
+            "sandboxPolicy": {"type": "workspaceWrite", "writableRoots": [str(self.project)], "networkAccess": False},
+        })
+        self.assertEqual(started["state"], "running")
+        self.assertFalse(started["tty"])
+        result = self.client.call("command.read", {
+            "processId": started["processId"], "afterCursor": started["cursor"], "timeoutMs": 1000,
+        })
+        self.assertEqual(result["wakeReason"], "output")
+        self.assertEqual(result["stdout"], "ready\n")
+        self.assertEqual(result["stderr"], "warning\n")
+        self.client.call("command.resize", {
+            "processId": started["processId"], "rows": 24, "cols": 80,
+        }, error=True)
+        self.client.call("command.terminate", {"processId": started["processId"]})
+        exited = self.client.call("command.read", {
+            "processId": started["processId"], "afterCursor": result["cursor"], "timeoutMs": 1000,
+        })
+        self.assertEqual(exited["state"], "exited")
+        self.assertEqual(exited["wakeReason"], "exit")
+        self.assertEqual(exited["exitCode"], 143)
+
+        sandboxed = self.client.call("command.start", {
+            "command": ["fixture-sandbox"],
+            "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+        })
+        sandbox_output = self.client.call("command.read", {
+            "processId": sandboxed["processId"], "timeoutMs": 1000,
+        })
+        self.assertIn('"type": "readOnly"', sandbox_output["stdout"])
+        self.assertIn('"networkAccess": false', sandbox_output["stdout"])
+        self.client.call("command.terminate", {"processId": sandboxed["processId"]})
+
+    def test_persistent_pty_round_trip_resize_and_close(self):
+        started = self.client.call("command.start", {
+            "command": ["fixture-repl"],
+            "tty": True,
+            "size": {"rows": 24, "cols": 80},
+        })
+        prompt = self.client.call("command.read", {
+            "processId": started["processId"], "timeoutMs": 1000,
+        })
+        self.assertEqual(prompt["stdout"], ">>> ")
+        self.assertEqual(prompt["stderr"], "")
+        self.client.call("command.resize", {
+            "processId": started["processId"], "rows": 40, "cols": 120,
+        })
+        self.client.call("command.write", {
+            "processId": started["processId"], "input": "2+2\n",
+        })
+        answer = self.client.call("command.read", {
+            "processId": started["processId"], "afterCursor": prompt["cursor"], "timeoutMs": 1000,
+        })
+        self.assertEqual(answer["stdout"], "4\n>>> ")
+        self.client.call("command.write", {
+            "processId": started["processId"], "closeStdin": True,
+        })
+        exited = self.client.call("command.read", {
+            "processId": started["processId"], "afterCursor": answer["cursor"], "timeoutMs": 1000,
+        })
+        self.assertEqual(exited["state"], "exited")
+        self.assertEqual(exited["exitCode"], 0)
+        for tool, args in [
+            ("command.write", {"processId": started["processId"], "input": "x"}),
+            ("command.resize", {"processId": started["processId"], "rows": 1, "cols": 1}),
+            ("command.terminate", {"processId": started["processId"]}),
+        ]:
+            self.client.call(tool, args, error=True)
+
+    def test_persistent_read_timeout_exit_and_invalid_handle(self):
+        quiet = self.client.call("command.start", {"command": ["fixture-quiet"]})
+        timeout = self.client.call("command.read", {
+            "processId": quiet["processId"], "timeoutMs": 100,
+        })
+        self.assertEqual(timeout["state"], "running")
+        self.assertEqual(timeout["wakeReason"], "timeout")
+        self.assertEqual(timeout["stdout"], "")
+        self.client.call("command.terminate", {"processId": quiet["processId"]})
+
+        delayed = self.client.call("command.start", {"command": ["fixture-delayed-exit"]})
+        exited = self.client.call("command.read", {
+            "processId": delayed["processId"], "timeoutMs": 3000,
+        })
+        self.assertEqual(exited["state"], "exited")
+        self.assertEqual(exited["wakeReason"], "exit")
+
+        immediate = self.client.call("command.start", {"command": ["fixture-exit"]})
+        immediate_result = self.client.call("command.read", {
+            "processId": immediate["processId"], "timeoutMs": 1000,
+        })
+        self.assertEqual(immediate_result["stdout"], "done\n")
+        if immediate_result["state"] == "running":
+            immediate_result = self.client.call("command.read", {
+                "processId": immediate["processId"],
+                "afterCursor": immediate_result["cursor"],
+                "timeoutMs": 1000,
+            })
+        self.assertEqual(immediate_result["state"], "exited")
+        self.client.call("command.read", {"processId": "missing", "timeoutMs": 0}, error=True)
+
+    def test_persistent_output_retention_is_bounded(self):
+        started = self.client.call("command.start", {"command": ["fixture-bounded"]})
+        time.sleep(0.2)
+        result = self.client.call("command.read", {
+            "processId": started["processId"], "afterCursor": 0, "timeoutMs": 1000,
+        })
+        self.assertTrue(result["historyLost"])
+        self.assertLessEqual(len(result["stdout"].encode()), 128 * 1024)
+        self.client.call("command.terminate", {"processId": started["processId"]})
 
     def test_authoritative_completion_without_events_and_unknown_turn(self):
         work = self.start("no_event")
@@ -366,6 +479,8 @@ class OperatorProtocolTests(unittest.TestCase):
 
     def test_z_disconnect_exits_backend_for_service_recovery(self):
         self.start("question")
+        persistent = self.client.call("command.start", {"command": ["fixture-quiet"]})
+        self.assertEqual(persistent["state"], "running")
         try:
             self.client.call("command.exec",{"command":["disconnect"]},error=True)
         except (urllib.error.URLError, ConnectionError):

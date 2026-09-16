@@ -1,21 +1,26 @@
 //! ChatGPT-oriented composition over the pinned official App Server.
 
 mod actions;
+mod command_sessions;
 mod event_journal;
 
 pub use actions::{ApprovalDecision, ElicitationAction, PermissionGrant, PermissionScope};
 use base64::Engine;
 pub use codex_connect_app_server::protocol::{
-    ApprovalPolicy, CommandExec, ModelList, ReviewTarget, RpcId, SandboxPolicy,
+    ApprovalPolicy, CommandExec, CommandExecTerminalSize, ModelList, ReviewTarget, RpcId,
+    SandboxPolicy,
 };
 use codex_connect_app_server::protocol::{
-    CommandExecResponse, FsGetMetadata, FsGetMetadataResponse, FsReadDirectory,
+    CommandExecOutputDeltaNotification, CommandExecResize, CommandExecResponse,
+    CommandExecTerminate, CommandExecWrite, FsGetMetadata, FsGetMetadataResponse, FsReadDirectory,
     FsReadDirectoryResponse, FsReadFile, FuzzyFileSearch, FuzzyFileSearchResponse, RateLimitsRead,
-    ReviewStart, SkillsList, SortDirection, TextInput, Thread, ThreadItemsList, ThreadRead,
-    ThreadResume, ThreadStart, ThreadTurnsList, TurnInterrupt, TurnItemsView, TurnStart, TurnSteer,
+    ReviewStart, SkillsList, SortDirection, StreamingCommandExec, TextInput, Thread,
+    ThreadItemsList, ThreadRead, ThreadResume, ThreadStart, ThreadTurnsList, TurnInterrupt,
+    TurnItemsView, TurnStart, TurnSteer,
 };
 use codex_connect_app_server::{
-    AppServerClient, AppServerConfig, AppServerError, DEFAULT_REQUEST_TIMEOUT, MAX_WIRE_BYTES,
+    AppServerClient, AppServerConfig, AppServerError, DEFAULT_REQUEST_TIMEOUT, DeferredRequest,
+    MAX_WIRE_BYTES,
 };
 pub use codex_connect_app_server::{PendingActionKind, PendingServerRequest};
 use codex_connect_scope::{Scope, ScopeError};
@@ -23,6 +28,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
@@ -36,6 +42,9 @@ pub const DEFAULT_COMMAND_MS: u64 = 30_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMAND_MS: u64 = 60 * 60 * 1_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_COMMAND_READ_MS: u64 = 120_000;
+pub const DEFAULT_COMMAND_READ_MS: u64 = 30_000;
+pub const MAX_COMMAND_WRITE_BYTES: usize = 64 * 1024;
 const WORKSPACE_POLICY: &str = "Workspace policy: treat the working directory as a general filesystem workspace. Version control is optional. Do not initialize repositories, create branches, commits, or tags, or use Git as a checkpoint/workflow mechanism unless the task explicitly requests version-control operations. Existing VCS metadata may be read only when it is materially required by the task.";
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
 const MAX_APP_SERVER_RESPONSE_BYTES: usize = MAX_WIRE_BYTES - APP_SERVER_RESPONSE_HEADROOM_BYTES;
@@ -45,6 +54,32 @@ const MAX_FS_READ_FILE_BYTES: u64 = ((MAX_APP_SERVER_RESPONSE_BYTES / 4) * 3) as
 pub struct RelayConfig {
     pub codex_bin: PathBuf,
     pub scope_root: PathBuf,
+}
+
+struct CommandStartCleanup {
+    app_server: Arc<AppServerClient>,
+    sessions: command_sessions::CommandSessions,
+    process_id: String,
+    armed: bool,
+}
+
+impl Drop for CommandStartCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let app_server = self.app_server.clone();
+        let sessions = self.sessions.clone();
+        let process_id = self.process_id.clone();
+        tokio::spawn(async move {
+            let _ = app_server
+                .request(CommandExecTerminate {
+                    process_id: process_id.clone(),
+                })
+                .await;
+            sessions.remove(&process_id).await;
+        });
+    }
 }
 
 #[derive(Debug, Error)]
@@ -67,6 +102,8 @@ pub struct Relay {
     scope: Scope,
     journal: event_journal::EventJournal,
     live_turns: Arc<Mutex<LiveTurns>>,
+    command_sessions: command_sessions::CommandSessions,
+    next_command_id: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -133,6 +170,8 @@ impl Relay {
             scope,
             journal: event_journal::EventJournal::default(),
             live_turns: Arc::new(Mutex::new(LiveTurns::default())),
+            command_sessions: command_sessions::CommandSessions::default(),
+            next_command_id: Arc::new(AtomicU64::new(1)),
         };
         relay.start_event_loop();
         Ok(relay)
@@ -296,6 +335,193 @@ impl Relay {
             .app_server
             .request_with_timeout(request, duration)
             .await?)
+    }
+
+    pub async fn command_start(
+        &self,
+        command: Vec<String>,
+        cwd: Option<String>,
+        env: Option<std::collections::BTreeMap<String, Option<String>>>,
+        sandbox_policy: Option<SandboxPolicy>,
+        tty: bool,
+        size: Option<CommandExecTerminalSize>,
+    ) -> Result<Value, RelayError> {
+        validate_command_argv(&command)?;
+        if !tty && size.is_some() {
+            return Err(RelayError::Invalid(
+                "terminal size is only valid when tty is true".into(),
+            ));
+        }
+        let cwd = self
+            .scope
+            .resolve_app_server_directory(cwd.as_deref().unwrap_or("."))?;
+        let sandbox_policy = sandbox_policy
+            .map(|policy| self.root_sandbox_policy(policy))
+            .transpose()?;
+        let process_id = format!(
+            "cc-command-{}",
+            self.next_command_id.fetch_add(1, Ordering::Relaxed)
+        );
+        self.command_sessions
+            .insert(process_id.clone(), tty)
+            .await
+            .map_err(RelayError::Invalid)?;
+        let command_events = self.app_server.subscribe();
+
+        let mut cleanup = CommandStartCleanup {
+            app_server: self.app_server.clone(),
+            sessions: self.command_sessions.clone(),
+            process_id: process_id.clone(),
+            armed: true,
+        };
+        let deferred = self
+            .app_server
+            .start_request(StreamingCommandExec {
+                command,
+                process_id: process_id.clone(),
+                stream_stdin: true,
+                stream_stdout_stderr: true,
+                disable_timeout: true,
+                disable_output_cap: true,
+                tty,
+                size,
+                cwd: Some(cwd),
+                env,
+                sandbox_policy,
+            })
+            .await?;
+
+        let sessions = self.command_sessions.clone();
+        let completed_process_id = process_id.clone();
+        tokio::spawn(async move {
+            run_command_session(deferred, command_events, sessions, completed_process_id).await;
+        });
+        cleanup.armed = false;
+        Ok(json!({
+            "processId":process_id,
+            "state":"running",
+            "tty":tty,
+            "cursor":0,
+        }))
+    }
+
+    pub async fn command_read(
+        &self,
+        process_id: String,
+        after_cursor: u64,
+        timeout_ms: u64,
+    ) -> Result<Value, RelayError> {
+        let timeout_ms = timeout_ms.min(MAX_COMMAND_READ_MS);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut changes = self.command_sessions.changes();
+        loop {
+            if !self.worker_available() {
+                return Err(AppServerError::Disconnected.into());
+            }
+            let batch = self
+                .command_sessions
+                .read_after(&process_id, after_cursor)
+                .await
+                .map_err(RelayError::Invalid)?;
+            if batch.terminal || batch.changed_after {
+                let wake_reason = if batch.terminal { "exit" } else { "output" };
+                let mut value = batch.value;
+                value["wakeReason"] = json!(wake_reason);
+                return Ok(value);
+            }
+            if Instant::now() >= deadline {
+                let mut value = batch.value;
+                value["wakeReason"] = json!("timeout");
+                return Ok(value);
+            }
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return Err(AppServerError::Disconnected.into());
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        }
+    }
+
+    pub async fn command_write(
+        &self,
+        process_id: String,
+        input: Option<String>,
+        close_stdin: bool,
+    ) -> Result<Value, RelayError> {
+        let (_, stdin_open) = self
+            .command_sessions
+            .ensure_running(&process_id)
+            .await
+            .map_err(RelayError::Invalid)?;
+        if !stdin_open {
+            return Err(RelayError::Invalid(format!(
+                "stdin is already closed for command session {process_id}"
+            )));
+        }
+        let input = input.unwrap_or_default();
+        if input.is_empty() && !close_stdin {
+            return Err(RelayError::Invalid(
+                "command.write requires non-empty input or closeStdin: true".into(),
+            ));
+        }
+        if input.len() > MAX_COMMAND_WRITE_BYTES {
+            return Err(RelayError::Invalid(format!(
+                "command.write input must be at most {MAX_COMMAND_WRITE_BYTES} UTF-8 bytes"
+            )));
+        }
+        let delta_base64 = (!input.is_empty())
+            .then(|| base64::engine::general_purpose::STANDARD.encode(input.as_bytes()));
+        self.app_server
+            .request(CommandExecWrite {
+                process_id: process_id.clone(),
+                delta_base64,
+                close_stdin: Some(close_stdin),
+            })
+            .await?;
+        if close_stdin {
+            self.command_sessions.set_stdin_closed(&process_id).await;
+        }
+        Ok(json!({"processId":process_id,"written":true,"stdinClosed":close_stdin}))
+    }
+
+    pub async fn command_resize(
+        &self,
+        process_id: String,
+        size: CommandExecTerminalSize,
+    ) -> Result<Value, RelayError> {
+        let (tty, _) = self
+            .command_sessions
+            .ensure_running(&process_id)
+            .await
+            .map_err(RelayError::Invalid)?;
+        if !tty {
+            return Err(RelayError::Invalid(format!(
+                "command session {process_id} does not have a PTY"
+            )));
+        }
+        self.app_server
+            .request(CommandExecResize {
+                process_id: process_id.clone(),
+                size,
+            })
+            .await?;
+        Ok(json!({"processId":process_id,"resized":true}))
+    }
+
+    pub async fn command_terminate(&self, process_id: String) -> Result<Value, RelayError> {
+        self.command_sessions
+            .ensure_running(&process_id)
+            .await
+            .map_err(RelayError::Invalid)?;
+        self.app_server
+            .request(CommandExecTerminate {
+                process_id: process_id.clone(),
+            })
+            .await?;
+        Ok(json!({"processId":process_id,"terminationRequested":true}))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -709,6 +935,9 @@ impl Relay {
                                 journal.mark_gap().await;
                                 continue;
                             }
+                            if method == "command/exec/outputDelta" {
+                                continue;
+                            }
                             if matches!(method, "turn/started" | "turn/completed") {
                                 let params = event.get("params").unwrap_or(&Value::Null);
                                 if let (Some(thread_id), Some(turn)) = (
@@ -732,7 +961,7 @@ impl Relay {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        journal.mark_gap().await
+                        journal.mark_gap().await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -768,6 +997,77 @@ impl Relay {
     }
 }
 
+async fn run_command_session(
+    deferred: DeferredRequest<StreamingCommandExec>,
+    mut events: tokio::sync::broadcast::Receiver<Value>,
+    sessions: command_sessions::CommandSessions,
+    process_id: String,
+) {
+    let completion = deferred.wait();
+    tokio::pin!(completion);
+    let result = loop {
+        tokio::select! {
+            result = &mut completion => break result,
+            event = events.recv() => match event {
+                Ok(event) => record_command_event(&sessions, &process_id, event).await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    sessions.mark_process_gap(&process_id).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break completion.await,
+            }
+        }
+    };
+
+    loop {
+        match events.try_recv() {
+            Ok(event) => record_command_event(&sessions, &process_id, event).await,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                sessions.mark_process_gap(&process_id).await;
+            }
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => break,
+        }
+    }
+
+    match result {
+        Ok(response) => sessions.complete(&process_id, response).await,
+        Err(error) => sessions.fail(&process_id, error.to_string()).await,
+    }
+}
+
+async fn record_command_event(
+    sessions: &command_sessions::CommandSessions,
+    process_id: &str,
+    event: Value,
+) {
+    match event.get("method").and_then(Value::as_str) {
+        Some("command/exec/outputDelta") => {
+            let params = event.get("params").cloned().unwrap_or(Value::Null);
+            let Ok(delta) = serde_json::from_value::<CommandExecOutputDeltaNotification>(params)
+            else {
+                sessions.mark_process_gap(process_id).await;
+                return;
+            };
+            if delta.process_id != process_id {
+                return;
+            }
+            match base64::engine::general_purpose::STANDARD.decode(delta.delta_base64) {
+                Ok(bytes) => {
+                    sessions.push_output(process_id, delta.stream, bytes).await;
+                    if delta.cap_reached {
+                        sessions.mark_process_gap(process_id).await;
+                    }
+                }
+                Err(_) => sessions.mark_process_gap(process_id).await,
+            }
+        }
+        Some("codexConnect/appServerHistoryGap") => sessions.mark_process_gap(process_id).await,
+        _ => {}
+    }
+}
+
 fn ensure_directory_response_fits(path: &str) -> Result<(), RelayError> {
     let mut estimated_bytes = 64usize;
     for entry in std::fs::read_dir(path)? {
@@ -782,6 +1082,15 @@ fn ensure_directory_response_fits(path: &str) -> Result<(), RelayError> {
                 "directory listing exceeds the safe fs/readDirectory transport limit".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_command_argv(command: &[String]) -> Result<(), RelayError> {
+    if command.is_empty() || command[0].is_empty() {
+        return Err(RelayError::Invalid(
+            "command must contain an executable".into(),
+        ));
     }
     Ok(())
 }
@@ -818,11 +1127,7 @@ fn wait_wake(
 }
 
 fn validate_command(command: &CommandExec) -> Result<(), RelayError> {
-    if command.command.is_empty() || command.command[0].is_empty() {
-        return Err(RelayError::Invalid(
-            "command must contain an executable".into(),
-        ));
-    }
+    validate_command_argv(&command.command)?;
     if command
         .timeout_ms
         .is_some_and(|v| v == 0 || v > MAX_COMMAND_MS)

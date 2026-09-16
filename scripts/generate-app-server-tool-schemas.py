@@ -15,6 +15,9 @@ METHODS = {
     "initialize": ("InitializeParams", "InitializeResponse"),
     "account/rateLimits/read": ("v2/GetAccountRateLimitsParams", "v2/GetAccountRateLimitsResponse"),
     "command/exec": ("v2/CommandExecParams", "v2/CommandExecResponse"),
+    "command/exec/resize": ("v2/CommandExecResizeParams", "v2/CommandExecResizeResponse"),
+    "command/exec/terminate": ("v2/CommandExecTerminateParams", "v2/CommandExecTerminateResponse"),
+    "command/exec/write": ("v2/CommandExecWriteParams", "v2/CommandExecWriteResponse"),
     "fuzzyFileSearch": ("FuzzyFileSearchParams", "FuzzyFileSearchResponse"),
     "fs/getMetadata": ("v2/FsGetMetadataParams", "v2/FsGetMetadataResponse"),
     "fs/readDirectory": ("v2/FsReadDirectoryParams", "v2/FsReadDirectoryResponse"),
@@ -40,6 +43,7 @@ SERVER_REQUESTS = {
 }
 # These notifications receive semantic handling; other notifications are opaque journal data.
 NOTIFICATIONS = {
+    "command/exec/outputDelta": "v2/CommandExecOutputDeltaNotification",
     "serverRequest/resolved": "v2/ServerRequestResolvedNotification",
     "turn/completed": "v2/TurnCompletedNotification",
     "thread/started": "v2/ThreadStartedNotification",

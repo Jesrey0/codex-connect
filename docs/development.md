@@ -66,6 +66,11 @@ The MCP tests contain deterministic golden examples such as:
 
 - “find where Relay is defined” → `codexConnect.inspect`
 - “run cargo test” → `command.exec`
+- “start the dev server and keep it running” → `command.start`
+- “read the new output from the dev server” → `command.read`
+- “send input to the debugger” → `command.write`
+- “resize the debugger terminal” → `command.resize`
+- “stop the running dev server” → `command.terminate`
 - “investigate these failures and fix them” → `codexConnect.work.start`
 - “wait for the coding agent” → `codexConnect.work.wait`
 - “review uncommitted changes” → `codexConnect.review`

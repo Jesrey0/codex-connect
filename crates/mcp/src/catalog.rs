@@ -1,7 +1,8 @@
 //! Public operator catalog and compact MCP schemas.
 use super::{DEFAULT_WAIT_MS, MAX_INSPECT_OPERATIONS, MAX_WAIT_MS};
 use codex_connect_relay::{
-    DEFAULT_COMMAND_MS, DEFAULT_COMMAND_OUTPUT_BYTES, MAX_COMMAND_MS, MAX_COMMAND_OUTPUT_BYTES,
+    DEFAULT_COMMAND_MS, DEFAULT_COMMAND_OUTPUT_BYTES, DEFAULT_COMMAND_READ_MS, MAX_COMMAND_MS,
+    MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_READ_MS, MAX_COMMAND_WRITE_BYTES,
 };
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
@@ -68,6 +69,83 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
+                "command.start",
+                "Start Persistent Command",
+                "Use for a deterministic command that must remain running or interactive: dev servers, watchers, REPLs, debuggers, installers, prompts, or interactive CLIs. Returns a connection-scoped processId immediately after the official App Server command request is flushed; follow with command.read/write/resize/terminate. Set tty=true only when terminal semantics are needed.",
+                false,
+                true,
+                true,
+                false,
+            ),
+            command_start_schema(),
+            Some(command_started_schema()),
+        ),
+        tool(
+            meta(
+                "command.read",
+                "Read Persistent Command",
+                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. Use afterCursor from the previous start/read result to consume incrementally.",
+                true,
+                false,
+                false,
+                true,
+            ),
+            command_read_schema(),
+            Some(command_read_output_schema()),
+        ),
+        tool(
+            meta(
+                "command.write",
+                "Write Persistent Command",
+                "Write exact UTF-8 stdin bytes to a running command.start session, optionally closing stdin after the write. No newline is added automatically.",
+                false,
+                true,
+                false,
+                false,
+            ),
+            command_write_schema(),
+            Some(object_schema(
+                json!({"processId":{"type":"string"},"written":{"const":true},"stdinClosed":{"type":"boolean"}}),
+                &["processId", "written", "stdinClosed"],
+            )),
+        ),
+        tool(
+            meta(
+                "command.resize",
+                "Resize Command PTY",
+                "Resize a running PTY-backed command.start session. Valid only for sessions started with tty=true.",
+                false,
+                true,
+                false,
+                true,
+            ),
+            command_resize_schema(),
+            Some(object_schema(
+                json!({"processId":{"type":"string"},"resized":{"const":true}}),
+                &["processId", "resized"],
+            )),
+        ),
+        tool(
+            meta(
+                "command.terminate",
+                "Terminate Persistent Command",
+                "Request termination of a running command.start session through the official App Server. Follow with command.read to observe the authoritative final exit state.",
+                false,
+                true,
+                false,
+                true,
+            ),
+            object_schema(
+                json!({"processId":{"type":"string","minLength":1}}),
+                &["processId"],
+            ),
+            Some(object_schema(
+                json!({"processId":{"type":"string"},"terminationRequested":{"const":true}}),
+                &["processId", "terminationRequested"],
+            )),
+        ),
+        tool(
+            meta(
                 "view_image",
                 "View Image",
                 "Use to inspect an image file inside the configured host scope. Relative paths resolve against request cwd (default: scopeRoot).",
@@ -89,7 +167,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for an exact command argv, such as running cargo test. Non-interactive, with a 30-second default timeout (60-minute maximum) and 64 KiB default output cap (256 KiB maximum). networkAccess=false may block socket-based localhost tests; true enables broader network access, not only loopback. Use codexConnect.work.start for autonomous investigation or iteration.",
+                "Use for a known one-shot deterministic command that should finish and return one bounded result, such as git status or cargo test. Non-interactive, with a 30-second default timeout (60-minute maximum) and 64 KiB default output cap (256 KiB maximum). For long-running or interactive deterministic commands use command.start; for autonomous investigation/coding use codexConnect.work.start.",
                 false,
                 true,
                 true,
@@ -478,6 +556,99 @@ fn command_schema() -> Value {
         &["command"],
     )
 }
+fn terminal_size_schema() -> Value {
+    object_schema(
+        json!({
+            "rows":{"type":"integer","minimum":0,"maximum":65535},
+            "cols":{"type":"integer","minimum":0,"maximum":65535}
+        }),
+        &["rows", "cols"],
+    )
+}
+fn command_start_schema() -> Value {
+    object_schema(
+        json!({
+            "command":{"type":"array","minItems":1,"items":{"type":"string"}},
+            "cwd":{"type":["string","null"]},
+            "env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},
+            "sandboxPolicy":sandbox_schema(),
+            "tty":{"type":"boolean","default":false},
+            "size":nullable(terminal_size_schema())
+        }),
+        &["command"],
+    )
+}
+fn command_started_schema() -> Value {
+    object_schema(
+        json!({
+            "processId":{"type":"string"},
+            "state":{"const":"running"},
+            "tty":{"type":"boolean"},
+            "cursor":{"const":0}
+        }),
+        &["processId", "state", "tty", "cursor"],
+    )
+}
+fn command_read_schema() -> Value {
+    object_schema(
+        json!({
+            "processId":{"type":"string","minLength":1},
+            "afterCursor":{"type":"integer","minimum":0,"default":0},
+            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS}
+        }),
+        &["processId"],
+    )
+}
+fn command_read_output_schema() -> Value {
+    object_schema(
+        json!({
+            "processId":{"type":"string"},
+            "state":{"enum":["running","exited","failed"]},
+            "wakeReason":{"enum":["output","exit","timeout"]},
+            "tty":{"type":"boolean"},
+            "stdinOpen":{"type":"boolean"},
+            "cursor":{"type":"integer","minimum":0},
+            "historyLost":{"type":"boolean"},
+            "stdout":{"type":"string"},
+            "stderr":{"type":"string"},
+            "exitCode":{"type":["integer","null"]},
+            "error":{"type":["string","null"]}
+        }),
+        &[
+            "processId",
+            "state",
+            "wakeReason",
+            "tty",
+            "stdinOpen",
+            "cursor",
+            "historyLost",
+            "stdout",
+            "stderr",
+            "exitCode",
+            "error",
+        ],
+    )
+}
+fn command_write_schema() -> Value {
+    object_schema(
+        json!({
+            "processId":{"type":"string","minLength":1},
+            "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES},
+            "closeStdin":{"type":"boolean","default":false}
+        }),
+        &["processId"],
+    )
+}
+fn command_resize_schema() -> Value {
+    object_schema(
+        json!({
+            "processId":{"type":"string","minLength":1},
+            "rows":{"type":"integer","minimum":0,"maximum":65535},
+            "cols":{"type":"integer","minimum":0,"maximum":65535}
+        }),
+        &["processId", "rows", "cols"],
+    )
+}
 fn work_start_schema() -> Value {
     object_schema(
         json!({"task":{"type":"string","minLength":1},"cwd":{"type":"string"},"threadId":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string"},"serviceTier":{"type":"string"},"approvalPolicy":approval_policy_schema(),"sandboxPolicy":sandbox_schema()}),
@@ -686,6 +857,11 @@ mod tests {
             "codexConnect.work.steer",
             "codexConnect.work.wait",
             "command.exec",
+            "command.read",
+            "command.resize",
+            "command.start",
+            "command.terminate",
+            "command.write",
             "model.list",
             "skills.list",
             "view_image",
@@ -727,6 +903,17 @@ mod tests {
             ("find where Relay is defined", Some("codexConnect.inspect")),
             ("run cargo test", Some("command.exec")),
             (
+                "start the dev server and keep it running",
+                Some("command.start"),
+            ),
+            (
+                "read the new output from the dev server",
+                Some("command.read"),
+            ),
+            ("send `continue` to the debugger", Some("command.write")),
+            ("resize the debugger terminal", Some("command.resize")),
+            ("stop the running dev server", Some("command.terminate")),
+            (
                 "investigate these test failures and fix them",
                 Some("codexConnect.work.start"),
             ),
@@ -742,7 +929,7 @@ mod tests {
             ),
             ("what is the weather", None),
         ];
-        assert_eq!(cases.len(), 8);
+        assert_eq!(cases.len(), 13);
         assert!(cases.iter().all(|(_, tool)| {
             tool.is_none_or(|name| tool_catalog().iter().any(|t| t.name.as_ref() == name))
         }));

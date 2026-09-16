@@ -58,6 +58,9 @@ fn exact_internal_contracts_include_initialization_and_selected_actions() {
         TurnInterrupt::METHOD,
         ReviewStart::METHOD,
         CommandExec::METHOD,
+        CommandExecWrite::METHOD,
+        CommandExecResize::METHOD,
+        CommandExecTerminate::METHOD,
         FuzzyFileSearch::METHOD,
         FsReadFile::METHOD,
         FsReadDirectory::METHOD,
@@ -96,7 +99,73 @@ fn exact_internal_contracts_include_initialization_and_selected_actions() {
             .keys()
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["serverRequest/resolved", "turn/completed", "thread/started"])
+        BTreeSet::from([
+            "command/exec/outputDelta",
+            "serverRequest/resolved",
+            "turn/completed",
+            "thread/started",
+        ])
+    );
+}
+
+#[test]
+fn streaming_command_control_matches_the_pinned_wire_shape() {
+    let request = StreamingCommandExec {
+        command: vec!["python3".into(), "-i".into()],
+        process_id: "command-1".into(),
+        stream_stdin: true,
+        stream_stdout_stderr: true,
+        disable_timeout: true,
+        disable_output_cap: true,
+        tty: true,
+        size: Some(CommandExecTerminalSize { rows: 24, cols: 80 }),
+        cwd: Some("/scope".into()),
+        env: None,
+        sandbox_policy: Some(SandboxPolicy::ReadOnly {
+            network_access: false,
+        }),
+    };
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        json!({
+            "command":["python3","-i"],
+            "processId":"command-1",
+            "streamStdin":true,
+            "streamStdoutStderr":true,
+            "disableTimeout":true,
+            "disableOutputCap":true,
+            "tty":true,
+            "size":{"rows":24,"cols":80},
+            "cwd":"/scope",
+            "sandboxPolicy":{"type":"readOnly","networkAccess":false}
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(CommandExecWrite {
+            process_id: "command-1".into(),
+            delta_base64: Some("aGkK".into()),
+            close_stdin: Some(false),
+        })
+        .unwrap(),
+        json!({"processId":"command-1","deltaBase64":"aGkK","closeStdin":false})
+    );
+    assert_eq!(
+        serde_json::to_value(CommandExecResize {
+            process_id: "command-1".into(),
+            size: CommandExecTerminalSize {
+                rows: 40,
+                cols: 120
+            },
+        })
+        .unwrap(),
+        json!({"processId":"command-1","size":{"rows":40,"cols":120}})
+    );
+    assert_eq!(
+        serde_json::to_value(CommandExecTerminate {
+            process_id: "command-1".into(),
+        })
+        .unwrap(),
+        json!({"processId":"command-1"})
     );
 }
 
