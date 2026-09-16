@@ -238,12 +238,44 @@ impl ServiceManager for SystemdManager {
 }
 
 pub fn backend_unit(binary: &Path) -> Result<String> {
+    let path = std::env::var_os("PATH").context("PATH is not set")?;
+    backend_unit_with_path(binary, &path)
+}
+
+fn sanitized_path(path: &std::ffi::OsStr) -> Result<String> {
+    let mut directories = Vec::new();
+    for directory in std::env::split_paths(path) {
+        if directory.is_absolute() && !directories.contains(&directory) {
+            let text = directory
+                .to_str()
+                .context("PATH contains a non-UTF-8 directory")?;
+            if text.chars().any(char::is_control) {
+                bail!("PATH contains a control character");
+            }
+            directories.push(directory);
+        }
+    }
+    if directories.is_empty() {
+        bail!("PATH must contain at least one absolute directory");
+    }
+    std::env::join_paths(directories)?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("PATH is not UTF-8"))
+}
+
+fn backend_unit_with_path(binary: &Path, path: &std::ffi::OsStr) -> Result<String> {
+    let path = sanitized_path(path)?;
+    // Environment= uses systemd quoting and percent specifiers, not shell expansion.
+    let environment = format!("PATH={path}")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
     let binary = binary
         .canonicalize()
         .with_context(|| format!("Codex Connect binary does not exist: {}", binary.display()))?;
     let working_directory = binary.parent().unwrap_or(Path::new("/"));
     Ok(format!(
-        "[Unit]\nDescription=Codex Connect backend\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStartPre=/usr/bin/test -x {}\nExecStart={} run-backend\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Codex Connect backend\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment=\"{environment}\"\nWorkingDirectory={}\nExecStartPre=/usr/bin/test -x {}\nExecStart={} run-backend\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
         systemd_arg(working_directory),
         systemd_arg(&binary),
         systemd_arg(&binary),
@@ -322,6 +354,23 @@ fn systemd_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_path_keeps_absolute_entries_in_order_and_quotes_systemd_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("codex-connect");
+        fs::write(&binary, b"binary").unwrap();
+        let path = std::ffi::OsStr::new(
+            ":relative:.:/home/operator/.cargo/bin:/opt/tool chain:/usr/bin:/bin:/usr/bin:/opt/100%/$tools/\"quoted\"/back\\slash:",
+        );
+        let unit = backend_unit_with_path(&binary, path).unwrap();
+        assert!(unit.contains(r#"Environment="PATH=/home/operator/.cargo/bin:/opt/tool chain:/usr/bin:/bin:/opt/100%%/$tools/\"quoted\"/back\\slash""#));
+        assert!(!unit.contains("relative"));
+        assert!(!unit.contains("sh -"));
+        assert!(unit.contains(&format!("ExecStart={} run-backend", binary.display())));
+        assert!(sanitized_path(std::ffi::OsStr::new(":.:relative:")).is_err());
+        assert!(sanitized_path(std::ffi::OsStr::new("/bin:/bad\nentry")).is_err());
+    }
 
     #[test]
     fn maps_systemd_states_to_operator_labels() {

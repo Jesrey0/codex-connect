@@ -1,5 +1,8 @@
 //! Public operator catalog and compact MCP schemas.
 use super::{DEFAULT_WAIT_MS, MAX_INSPECT_OPERATIONS, MAX_WAIT_MS};
+use codex_connect_relay::{
+    DEFAULT_COMMAND_MS, DEFAULT_COMMAND_OUTPUT_BYTES, MAX_COMMAND_MS, MAX_COMMAND_OUTPUT_BYTES,
+};
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -35,7 +38,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codexConnect.inspect",
                 "Inspect Workspace",
-                "Use for read-only workspace understanding: text ranges, directories, metadata, content search, exact-ish name search, or ranked fuzzy file search. The workspace need not use version control. Prefer this over command.exec for inspection.",
+                "Use for read-only workspace understanding: text ranges, directories, metadata, content search, exact-ish name search, or ranked fuzzy file search. The workspace need not use version control. Relative paths resolve against request cwd (default: scopeRoot); omitted search paths mean cwd. scopeRoot remains the authorization boundary. Each result has a zero-based index and either result or error; operation failures retain other results. Prefer this over command.exec for inspection.",
                 true,
                 false,
                 false,
@@ -48,13 +51,16 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "apply_patch",
                 "Apply Patch",
-                "Use when the exact textual file change is already known. For autonomous multi-step coding, use codexConnect.work.start instead.",
+                "Use when the exact textual file change is already known. Relative patch paths resolve against request cwd (default: scopeRoot), within the configured scope. For autonomous multi-step coding, use codexConnect.work.start instead.",
                 false,
                 true,
                 false,
                 false,
             ),
-            object_schema(json!({"patch":{"type":"string","minLength":1}}), &["patch"]),
+            object_schema(
+                json!({"patch":{"type":"string","minLength":1},"cwd":cwd_schema()}),
+                &["patch"],
+            ),
             Some(object_schema(
                 json!({"applied":{"type":"array","items":{"type":"string"}}}),
                 &["applied"],
@@ -64,14 +70,14 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "view_image",
                 "View Image",
-                "Use to inspect an image file inside the configured host scope.",
+                "Use to inspect an image file inside the configured host scope. Relative paths resolve against request cwd (default: scopeRoot).",
                 true,
                 false,
                 false,
                 true,
             ),
             object_schema(
-                json!({"path":{"type":"string"},"detail":{"type":"string","enum":["high","original"],"default":"high"}}),
+                json!({"cwd":cwd_schema(),"path":{"type":"string"},"detail":{"type":"string","enum":["high","original"],"default":"high"}}),
                 &["path"],
             ),
             Some(object_schema(
@@ -83,7 +89,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for an exact command argv, such as running cargo test. Non-interactive, with a 5-minute maximum and bounded output. Use codexConnect.work.start for autonomous investigation or iteration.",
+                "Use for an exact command argv, such as running cargo test. Non-interactive, with a 30-second default timeout (5-minute maximum) and 64 KiB default output cap (256 KiB maximum). networkAccess=false may block socket-based localhost tests; true enables broader network access, not only loopback. Use codexConnect.work.start for autonomous investigation or iteration.",
                 false,
                 true,
                 true,
@@ -384,7 +390,10 @@ fn rpc_id_schema() -> Value {
 }
 fn results_schema() -> Value {
     object_schema(
-        json!({"results":{"type":"array","items":{"type":"object"}}}),
+        json!({"results":{"type":"array","items":{"oneOf":[
+            object_schema(json!({"index":{"type":"integer","minimum":0},"type":{"type":"string"},"result":{"type":"object"}}), &["index","type","result"]),
+            object_schema(json!({"index":{"type":"integer","minimum":0},"type":{"type":"string"},"error":{"type":"string"}}), &["index","type","error"])
+        ]}}}),
         &["results"],
     )
 }
@@ -429,7 +438,7 @@ fn work_wait_output_schema() -> Value {
 }
 fn inspect_schema() -> Value {
     object_schema(
-        json!({"operations":{"type":"array","minItems":1,"maxItems":MAX_INSPECT_OPERATIONS,"items":{"oneOf":[
+        json!({"cwd":cwd_schema(),"operations":{"type":"array","minItems":1,"maxItems":MAX_INSPECT_OPERATIONS,"items":{"oneOf":[
             object_schema(json!({"type":{"const":"readText"},"path":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1}}), &["type","path"]),
             object_schema(json!({"type":{"const":"readDirectory"},"path":{"type":"string"}}), &["type","path"]),
             object_schema(json!({"type":{"const":"metadata"},"path":{"type":"string"}}), &["type","path"]),
@@ -440,12 +449,18 @@ fn inspect_schema() -> Value {
         &["operations"],
     )
 }
+fn cwd_schema() -> Value {
+    json!({"type":["string","null"],"description":"Request working directory within scopeRoot. Relative cwd is resolved from scopeRoot; omitted or null cwd selects scopeRoot. Relative operation paths resolve from cwd, with no alternate-root retries."})
+}
+fn network_access_schema() -> Value {
+    json!({"type":"boolean","default":false,"description":"Upstream sandbox network access. false may block sockets, including socket-based localhost tests. true enables broader network access, not only loopback. No automatic escalation or retry."})
+}
 fn sandbox_schema() -> Value {
-    json!({"oneOf":[{"type":"object","properties":{"type":{"const":"readOnly"},"networkAccess":{"type":"boolean"}},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"workspaceWrite"},"writableRoots":{"type":"array","items":{"type":"string"}},"networkAccess":{"type":"boolean"},"excludeSlashTmp":{"type":"boolean"},"excludeTmpdirEnvVar":{"type":"boolean"}},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"dangerFullAccess"}},"required":["type"],"additionalProperties":false}]})
+    json!({"oneOf":[{"type":"object","properties":{"type":{"const":"readOnly"},"networkAccess":network_access_schema()},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"workspaceWrite"},"writableRoots":{"type":"array","description":"Absolute writable directory paths within scopeRoot, as required by the pinned upstream contract.","items":{"type":"string","pattern":"^/"}},"networkAccess":network_access_schema(),"excludeSlashTmp":{"type":"boolean"},"excludeTmpdirEnvVar":{"type":"boolean"}},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"dangerFullAccess"}},"required":["type"],"additionalProperties":false}]})
 }
 fn command_schema() -> Value {
     object_schema(
-        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"]},"disableTimeout":{"type":"boolean"},"outputBytesCap":{"type":["integer","null"],"minimum":0},"disableOutputCap":{"type":"boolean"},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},"sandboxPolicy":sandbox_schema()}),
+        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},"sandboxPolicy":sandbox_schema()}),
         &["command"],
     )
 }
@@ -569,6 +584,47 @@ fn permissions_schema() -> Value {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn command_schema_matches_bounded_runtime_and_upstream_sandbox_shape() {
+        let schema = command_schema();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("disableTimeout"));
+        assert!(!properties.contains_key("disableOutputCap"));
+        assert_eq!(properties["timeoutMs"]["default"], DEFAULT_COMMAND_MS);
+        assert_eq!(properties["timeoutMs"]["minimum"], 1);
+        assert_eq!(properties["timeoutMs"]["maximum"], MAX_COMMAND_MS);
+        assert_eq!(
+            properties["outputBytesCap"]["default"],
+            DEFAULT_COMMAND_OUTPUT_BYTES
+        );
+        assert_eq!(
+            properties["outputBytesCap"]["maximum"],
+            MAX_COMMAND_OUTPUT_BYTES
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        let sandbox = sandbox_schema();
+        for variant in &sandbox["oneOf"].as_array().unwrap()[..2] {
+            let network = &variant["properties"]["networkAccess"];
+            assert_eq!(network["default"], false);
+            let description = network["description"].as_str().unwrap();
+            assert!(description.contains("localhost"));
+            assert!(description.contains("broader network access"));
+            assert_eq!(variant["additionalProperties"], false);
+        }
+        assert!(!sandbox.to_string().contains("allowLoopback"));
+        assert_eq!(
+            sandbox["oneOf"][1]["properties"]["writableRoots"]["items"]["pattern"],
+            "^/"
+        );
+        assert_eq!(
+            sandbox["oneOf"][2]["properties"],
+            json!({"type":{"const":"dangerFullAccess"}})
+        );
+        for schema in [command_schema(), work_start_schema()] {
+            assert_eq!(schema["properties"]["sandboxPolicy"], sandbox);
+        }
+    }
 
     #[test]
     fn catalog_is_exactly_the_canonical_surface() {

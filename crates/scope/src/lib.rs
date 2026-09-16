@@ -72,6 +72,7 @@ fn search_names_tree(
     if paths.len() >= max_results {
         return Ok(());
     }
+
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Ok(());
@@ -173,6 +174,20 @@ impl Scope {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Resolve a request-local cwd; omission selects the authorization root.
+    pub fn resolve_cwd(&self, cwd: Option<&str>) -> Result<String, ScopeError> {
+        self.resolve_app_server_directory(cwd.unwrap_or("."))
+    }
+
+    /// Join against an already resolved cwd. The consumer must still fence the path.
+    pub fn path_from_cwd(cwd: &str, requested: &str) -> Result<String, ScopeError> {
+        Path::new(cwd)
+            .join(requested)
+            .to_str()
+            .map(str::to_owned)
+            .ok_or(ScopeError::NonUtf8Path)
     }
 
     pub fn resolve_app_server_existing(&self, requested: &str) -> Result<String, ScopeError> {
@@ -320,32 +335,33 @@ impl Scope {
         self.image_with_detail(requested, None)
     }
 
-    pub fn apply_patch(&self, patch: &str) -> Result<Vec<String>, ScopeError> {
+    pub fn apply_patch(&self, patch: &str, cwd: Option<&str>) -> Result<Vec<String>, ScopeError> {
         let document = parse_patch(patch)?;
         if document.environment_id.is_some() {
             return Err(ScopeError::PatchFailed(
                 "apply_patch environment selection is unavailable for this scope".to_string(),
             ));
         }
-        let plan = self.plan_patch(document.changes)?;
+        let cwd = self.resolve_cwd(cwd)?;
+        let plan = self.plan_patch(document.changes, &cwd)?;
         self.apply_patch_plan(plan)
     }
 
-    fn plan_patch(&self, changes: Vec<PatchChange>) -> Result<PatchPlan, ScopeError> {
+    fn plan_patch(&self, changes: Vec<PatchChange>, cwd: &str) -> Result<PatchPlan, ScopeError> {
         let mut actions = Vec::with_capacity(changes.len());
         let mut applied = Vec::with_capacity(changes.len());
         let mut touched = HashSet::new();
         for change in changes {
             match change {
                 PatchChange::Add { path, content } => {
-                    let path = self.resolve_mutation_path(&path)?;
+                    let path = self.resolve_mutation_path(&Self::path_from_cwd(cwd, &path)?)?;
                     ensure_patch_destination(&path)?;
                     register_patch_path(&mut touched, &path)?;
                     applied.push(self.relative(&path));
                     actions.push(PatchAction::Write { path, content });
                 }
                 PatchChange::Delete { path } => {
-                    let path = self.resolve_mutation_path(&path)?;
+                    let path = self.resolve_mutation_path(&Self::path_from_cwd(cwd, &path)?)?;
                     ensure_regular_file(&path)?;
                     register_patch_path(&mut touched, &path)?;
                     applied.push(self.relative(&path));
@@ -356,7 +372,7 @@ impl Scope {
                     move_path,
                     hunks,
                 } => {
-                    let source = self.resolve_mutation_path(&path)?;
+                    let source = self.resolve_mutation_path(&Self::path_from_cwd(cwd, &path)?)?;
                     ensure_regular_file(&source)?;
                     let original = fs::read(&source)?;
                     let original = std::str::from_utf8(&original).map_err(|_| {
@@ -367,7 +383,9 @@ impl Scope {
                     })?;
                     let content = apply_hunks(original, &hunks)?;
                     let destination = match move_path {
-                        Some(path) => self.resolve_mutation_path(&path)?,
+                        Some(path) => {
+                            self.resolve_mutation_path(&Self::path_from_cwd(cwd, &path)?)?
+                        }
                         None => source.clone(),
                     };
                     ensure_patch_destination(&destination)?;
@@ -1203,7 +1221,9 @@ mod tests {
     fn explains_the_expected_patch_format() {
         let temporary = tempfile::tempdir().unwrap();
         let scope = Scope::open(temporary.path()).unwrap();
-        let error = scope.apply_patch("--- a/file\n+++ b/file\n").unwrap_err();
+        let error = scope
+            .apply_patch("--- a/file\n+++ b/file\n", None)
+            .unwrap_err();
         assert!(error.to_string().contains("official"));
     }
 
@@ -1214,7 +1234,7 @@ mod tests {
         let scope = Scope::open(temporary.path()).unwrap();
         let changed = scope
             .apply_patch(
-                "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n*** End Patch\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n*** End Patch\n", None
             )
             .unwrap();
         assert_eq!(changed, vec!["file.txt"]);
@@ -1229,11 +1249,17 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let scope = Scope::open(temporary.path()).unwrap();
         let error = scope
-            .apply_patch("*** Begin Patch\n*** Add File: ../outside.txt\n+nope\n*** End Patch\n")
+            .apply_patch(
+                "*** Begin Patch\n*** Add File: ../outside.txt\n+nope\n*** End Patch\n",
+                None,
+            )
             .unwrap_err();
         assert!(matches!(error, ScopeError::OutsideRoot));
         scope
-            .apply_patch("*** Begin Patch\n*** Add File: nested/file.txt\n+inside\n*** End Patch\n")
+            .apply_patch(
+                "*** Begin Patch\n*** Add File: nested/file.txt\n+inside\n*** End Patch\n",
+                None,
+            )
             .unwrap();
         assert_eq!(
             fs::read_to_string(temporary.path().join("nested/file.txt")).unwrap(),
@@ -1242,12 +1268,49 @@ mod tests {
     }
 
     #[test]
+    fn request_cwd_rebases_paths_without_changing_the_scope_boundary() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("project")).unwrap();
+        fs::write(temporary.path().join("project/local.txt"), "inside").unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+
+        let cwd = scope.resolve_cwd(Some("project")).unwrap();
+        let local = Scope::path_from_cwd(&cwd, "local.txt").unwrap();
+        assert_eq!(
+            std::path::Path::new(&scope.resolve_app_server_existing(&local).unwrap()),
+            temporary
+                .path()
+                .join("project/local.txt")
+                .canonicalize()
+                .unwrap()
+        );
+
+        scope
+            .apply_patch(
+                "*** Begin Patch\n*** Add File: created.txt\n+created\n*** End Patch\n",
+                Some("project"),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("project/created.txt")).unwrap(),
+            "created\n"
+        );
+        assert!(matches!(
+            scope.apply_patch(
+                "*** Begin Patch\n*** Add File: ../outside.txt\n+nope\n*** End Patch\n",
+                Some("project")
+            ),
+            Err(ScopeError::OutsideRoot)
+        ));
+    }
+
+    #[test]
     fn patch_preflight_prevents_partial_application() {
         let temporary = tempfile::tempdir().unwrap();
         let scope = Scope::open(temporary.path()).unwrap();
         let error = scope
             .apply_patch(
-                "*** Begin Patch\n*** Add File: first.txt\n+created\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch\n",
+                "*** Begin Patch\n*** Add File: first.txt\n+created\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch\n", None
             )
             .unwrap_err();
         assert!(error.to_string().contains("scope operation failed"));
@@ -1261,7 +1324,7 @@ mod tests {
         let scope = Scope::open(temporary.path()).unwrap();
         scope
             .apply_patch(
-                "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n*** End of File\n*** End Patch\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n*** End of File\n*** End Patch\n", None
             )
             .unwrap();
         assert_eq!(

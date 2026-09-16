@@ -166,6 +166,7 @@ impl ServerHandler for McpHandler {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InspectArgs {
+    cwd: Option<String>,
     operations: Vec<InspectOperation>,
 }
 
@@ -207,12 +208,14 @@ enum InspectOperation {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PatchArgs {
+    cwd: Option<String>,
     patch: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ViewImageArgs {
+    cwd: Option<String>,
     path: String,
     detail: Option<String>,
 }
@@ -334,7 +337,7 @@ async fn dispatch(
         "codexConnect.inspect" => inspect(relay, scope, parse(arguments)?, context).await,
         "apply_patch" => {
             let args: PatchArgs = parse(arguments)?;
-            Ok(json!({"applied": scope.apply_patch(&args.patch)?}))
+            Ok(json!({"applied": scope.apply_patch(&args.patch, args.cwd.as_deref())?}))
         }
         "command.exec" => relay
             .command_exec(parse(arguments)?)
@@ -449,49 +452,59 @@ async fn inspect(
     if args.operations.is_empty() || args.operations.len() > MAX_INSPECT_OPERATIONS {
         anyhow::bail!("inspect requires 1 to {MAX_INSPECT_OPERATIONS} operations");
     }
+    let cwd = scope.resolve_cwd(args.cwd.as_deref())?;
     let mut results = Vec::with_capacity(args.operations.len());
     let mut output_bytes = 0usize;
-    for operation in args.operations {
+    for (index, operation) in args.operations.into_iter().enumerate() {
         if context.ct.is_cancelled() {
             anyhow::bail!("inspection cancelled");
         }
-        let result = match &operation {
-            InspectOperation::ReadText {
-                path,
-                start_line,
-                end_line,
-            } => serde_json::to_value(
-                relay
-                    .inspect_read_text(path, *start_line, *end_line)
-                    .await?,
-            ),
-            InspectOperation::ReadDirectory { path } => {
-                serde_json::to_value(relay.inspect_read_directory(path).await?)
-            }
-            InspectOperation::Metadata { path } => {
-                serde_json::to_value(relay.inspect_metadata(path).await?)
-            }
-            InspectOperation::SearchContent {
-                query,
-                path,
-                max_results,
-            } => serde_json::to_value(scope.search_with_cancel(
-                query,
-                path.as_deref(),
-                *max_results,
-                || context.ct.is_cancelled(),
-            )?),
-            InspectOperation::SearchNames {
-                query,
-                path,
-                max_results,
-            } => serde_json::to_value(scope.search_names(query, path.as_deref(), *max_results)?),
-            InspectOperation::FuzzyFileSearch { query, path } => serde_json::to_value(
-                relay
-                    .inspect_fuzzy_file_search(query, path.as_deref())
-                    .await?,
-            ),
-        }?;
+        let result: anyhow::Result<Value> = async {
+            let requested = match &operation {
+                InspectOperation::ReadText { path, .. }
+                | InspectOperation::ReadDirectory { path }
+                | InspectOperation::Metadata { path } => path.as_str(),
+                InspectOperation::SearchContent { path, .. }
+                | InspectOperation::SearchNames { path, .. }
+                | InspectOperation::FuzzyFileSearch { path, .. } => path.as_deref().unwrap_or("."),
+            };
+            let path = Scope::path_from_cwd(&cwd, requested)?;
+            Ok(match &operation {
+                InspectOperation::ReadText {
+                    start_line,
+                    end_line,
+                    ..
+                } => serde_json::to_value(
+                    relay
+                        .inspect_read_text(&path, *start_line, *end_line)
+                        .await?,
+                ),
+                InspectOperation::ReadDirectory { .. } => {
+                    serde_json::to_value(relay.inspect_read_directory(&path).await?)
+                }
+                InspectOperation::Metadata { .. } => {
+                    serde_json::to_value(relay.inspect_metadata(&path).await?)
+                }
+                InspectOperation::SearchContent {
+                    query, max_results, ..
+                } => serde_json::to_value(scope.search_with_cancel(
+                    query,
+                    Some(&path),
+                    *max_results,
+                    || context.ct.is_cancelled(),
+                )?),
+                InspectOperation::SearchNames {
+                    query, max_results, ..
+                } => serde_json::to_value(scope.search_names(query, Some(&path), *max_results)?),
+                InspectOperation::FuzzyFileSearch { query, .. } => {
+                    serde_json::to_value(relay.inspect_fuzzy_file_search(query, Some(&path)).await?)
+                }
+            }?)
+        }
+        .await;
+        if context.ct.is_cancelled() {
+            anyhow::bail!("inspection cancelled");
+        }
         let kind = match operation {
             InspectOperation::ReadText { .. } => "readText",
             InspectOperation::ReadDirectory { .. } => "readDirectory",
@@ -500,10 +513,14 @@ async fn inspect(
             InspectOperation::SearchNames { .. } => "searchNames",
             InspectOperation::FuzzyFileSearch { .. } => "fuzzyFileSearch",
         };
-        let row = json!({"type":kind,"result":result});
+        let row = match result {
+            Ok(result) => json!({"index":index,"type":kind,"result":result}),
+            Err(error) => json!({"index":index,"type":kind,"error":error.to_string()}),
+        };
         let size = serde_json::to_vec(&row)?.len();
         if output_bytes.saturating_add(size) > MAX_INSPECT_OUTPUT_BYTES {
-            results.push(json!({"type":kind,"error":"inspect output limit exceeded"}));
+            results
+                .push(json!({"index":index,"type":kind,"error":"inspect output limit exceeded"}));
         } else {
             output_bytes += size;
             results.push(row);
@@ -549,7 +566,9 @@ fn image_response(
 ) -> Result<rmcp::model::CallToolResponse, McpError> {
     let result = (|| -> anyhow::Result<_> {
         let args: ViewImageArgs = parse(arguments)?;
-        Ok(scope.image_with_detail(&args.path, args.detail.as_deref())?)
+        let cwd = scope.resolve_cwd(args.cwd.as_deref())?;
+        let path = Scope::path_from_cwd(&cwd, &args.path)?;
+        Ok(scope.image_with_detail(&path, args.detail.as_deref())?)
     })();
     match result {
         Ok(image) => {

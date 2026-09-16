@@ -4,6 +4,7 @@
 Run after cargo build -p codex-connect. Requires Python jsonschema.
 """
 
+import base64
 import json
 import pathlib
 import socket
@@ -37,6 +38,12 @@ class OperatorProtocolTests(unittest.TestCase):
         (cls.outside_path / "external_secret.txt").write_text("secret\n")
         (cls.scope / "escape").symlink_to(cls.outside_path, target_is_directory=True)
         (cls.scope / "sample.txt").write_text("one\ntwo\nthree\n")
+        cls.project = cls.scope / "project"
+        cls.project.mkdir()
+        (cls.project / "local.txt").write_text("project-local\n")
+        (cls.project / "pixel.png").write_bytes(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+        ))
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
@@ -129,35 +136,83 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(escaped["results"][0]["result"]["files"], [])
         large = self.scope / "large.txt"
         large.write_bytes(b"x" * (7 * 1024 * 1024))
-        self.client.call("codexConnect.inspect", {"operations": [
+        large_result = self.client.call("codexConnect.inspect", {"operations": [
             {"type": "readText", "path": "large.txt", "startLine": 1, "endLine": 1},
-        ]}, error=True)
+        ]})
+        self.assertEqual(large_result["results"][0]["index"], 0)
+        self.assertIn("safe fs/readFile transport limit", large_result["results"][0]["error"])
         large_directory = self.scope / "large-directory"
         large_directory.mkdir()
         suffix = "x" * 240
         for index in range(28_000):
             (large_directory / f"{index:05d}-{suffix}").touch()
-        self.client.call("codexConnect.inspect", {"operations": [
+        large_directory_result = self.client.call("codexConnect.inspect", {"operations": [
             {"type": "readDirectory", "path": "large-directory"},
-        ]}, error=True)
+        ]})
+        self.assertIn("directory listing exceeds", large_directory_result["results"][0]["error"])
         healthy = self.client.call("codexConnect.inspect", {"operations": [
             {"type": "readText", "path": "sample.txt", "startLine": 1, "endLine": 1},
         ]})
         self.assertEqual(healthy["results"][0]["result"]["text"], "one")
-        self.client.call("codexConnect.inspect", {"operations": [{"type":"readText","path":"/etc/passwd"}]}, error=True)
-        self.client.call("codexConnect.inspect", {"operations": [{"type":"fuzzyFileSearch","query":"etc","path":"/etc"}]}, error=True)
-        self.client.call("apply_patch", {"patch":"*** Begin Patch\n*** Add File: patch.txt\n+created\n*** End Patch"})
-        self.assertEqual((self.scope / "patch.txt").read_text(), "created\n")
+        partial = self.client.call("codexConnect.inspect", {"operations": [
+            {"type":"readText","path":"/etc/passwd"},
+            {"type":"readText","path":"sample.txt","startLine":3,"endLine":3},
+        ]})
+        self.assertEqual(partial["results"][0]["index"], 0)
+        self.assertIn("outside the configured scope root", partial["results"][0]["error"])
+        self.assertEqual(partial["results"][1]["index"], 1)
+        self.assertEqual(partial["results"][1]["result"]["text"], "three")
+        escaped_fuzzy = self.client.call("codexConnect.inspect", {"operations": [
+            {"type":"fuzzyFileSearch","query":"etc","path":"/etc"},
+        ]})
+        self.assertIn("outside the configured scope root", escaped_fuzzy["results"][0]["error"])
+        self.client.call("codexConnect.inspect", {
+            "cwd":"/etc", "operations":[{"type":"readDirectory","path":"."}],
+        }, error=True)
+
+    def test_request_cwd_applies_consistently_to_paths_patch_and_image(self):
+        cwd = str(self.project)
+        inspected = self.client.call("codexConnect.inspect", {"cwd":cwd,"operations":[
+            {"type":"readText","path":"local.txt"},
+            {"type":"searchContent","query":"project-local"},
+            {"type":"searchNames","query":"local"},
+        ]})
+        self.assertEqual(inspected["results"][0]["result"]["text"], "project-local")
+        self.assertEqual(inspected["results"][1]["result"]["matches"][0]["path"], "project/local.txt")
+        self.assertEqual(inspected["results"][2]["result"]["paths"], ["project/local.txt"])
+        self.client.call("apply_patch", {
+            "cwd":cwd,
+            "patch":"*** Begin Patch\n*** Add File: patch.txt\n+created\n*** End Patch",
+        })
+        self.assertEqual((self.project / "patch.txt").read_text(), "created\n")
+        image = self.client.call("view_image", {"cwd":cwd,"path":"pixel.png"})
+        self.assertEqual(image["path"], "project/pixel.png")
+        self.assertEqual(image["mimeType"], "image/png")
+        self.client.call("apply_patch", {
+            "cwd":cwd,
+            "patch":"*** Begin Patch\n*** Add File: ../escape.txt\n+nope\n*** End Patch",
+        }, error=True)
 
     def test_command_boundaries(self):
+        schema = self.client.tools["command.exec"]["inputSchema"]["properties"]
+        self.assertNotIn("disableTimeout", schema)
+        self.assertNotIn("disableOutputCap", schema)
+        self.assertEqual(schema["timeoutMs"]["default"], 30000)
+        self.assertEqual(schema["outputBytesCap"]["default"], 65536)
         result = self.client.call("command.exec", {"command":["echo","fixture"]})
         self.assertEqual(result["exitCode"],0)
+        absolute_root = str(self.project)
+        self.assertEqual(self.client.call("command.exec", {
+            "command":["echo","fixture"],
+            "sandboxPolicy":{"type":"workspaceWrite","writableRoots":[absolute_root],"networkAccess":False},
+        })["exitCode"], 0)
         for arguments in [
             {"command":[]}, {"command":["echo"],"tty":True},
             {"command":["echo"],"disableTimeout":True},
             {"command":["echo"],"disableOutputCap":True},
             {"command":["echo"],"timeoutMs":300001},
             {"command":["echo"],"sandboxPolicy":{"type":"externalSandbox"}},
+            {"command":["echo"],"sandboxPolicy":{"type":"workspaceWrite","writableRoots":["project"]}},
             {"command":["echo"],"cwd":"/etc"},
         ]:
             self.client.call("command.exec",arguments,error=True,validate_input=False)

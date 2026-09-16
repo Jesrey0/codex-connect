@@ -26,6 +26,8 @@ use thiserror::Error;
 use tokio::time::{Duration, Instant};
 
 pub const MAX_WAIT_MS: u64 = 120_000;
+pub const DEFAULT_COMMAND_MS: u64 = 30_000;
+pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMAND_MS: u64 = 300_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const WORKSPACE_POLICY: &str = "Workspace policy: treat the working directory as a general filesystem workspace. Version control is optional. Do not initialize repositories, create branches, commits, or tags, or use Git as a checkpoint/workflow mechanism unless the task explicitly requests version-control operations. Existing VCS metadata may be read only when it is materially required by the task.";
@@ -213,8 +215,12 @@ impl Relay {
             self.scope
                 .resolve_app_server_directory(request.cwd.as_deref().unwrap_or("."))?,
         );
-        request.timeout_ms = Some(request.timeout_ms.unwrap_or(30_000));
-        request.output_bytes_cap = Some(request.output_bytes_cap.unwrap_or(64 * 1024));
+        request.timeout_ms = Some(request.timeout_ms.unwrap_or(DEFAULT_COMMAND_MS));
+        request.output_bytes_cap = Some(
+            request
+                .output_bytes_cap
+                .unwrap_or(DEFAULT_COMMAND_OUTPUT_BYTES),
+        );
         request.sandbox_policy = request
             .sandbox_policy
             .map(|p| self.root_sandbox_policy(p))
@@ -522,7 +528,14 @@ impl Relay {
             } => Ok(SandboxPolicy::WorkspaceWrite {
                 writable_roots: writable_roots
                     .into_iter()
-                    .map(|v| self.scope.resolve_app_server_directory(&v))
+                    .map(|v| {
+                        if !Path::new(&v).is_absolute() {
+                            return Err(RelayError::Invalid(
+                                "writableRoots must contain absolute paths".into(),
+                            ));
+                        }
+                        Ok(self.scope.resolve_app_server_directory(&v)?)
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
                 network_access,
                 exclude_slash_tmp,
