@@ -20,13 +20,16 @@ use codex_connect_app_server::{
 pub use codex_connect_app_server::{PendingActionKind, PendingServerRequest};
 use codex_connect_scope::{Scope, ScopeError};
 use serde_json::{Value, json};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 pub const MAX_WAIT_MS: u64 = 120_000;
 const WAIT_RECONCILE_MS: u64 = 1_000;
+const MAX_LIVE_TURNS: usize = 256;
 pub const DEFAULT_COMMAND_MS: u64 = 30_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMAND_MS: u64 = 60 * 60 * 1_000;
@@ -61,6 +64,44 @@ pub struct Relay {
     app_server: Arc<AppServerClient>,
     scope: Scope,
     journal: event_journal::EventJournal,
+    live_turns: Arc<Mutex<LiveTurns>>,
+}
+
+#[derive(Default)]
+struct LiveTurns {
+    turns: HashMap<(String, String), codex_connect_app_server::protocol::Turn>,
+    order: VecDeque<(String, String)>,
+}
+
+impl LiveTurns {
+    fn insert(&mut self, thread_id: &str, turn: codex_connect_app_server::protocol::Turn) {
+        let key = (thread_id.to_string(), turn.id.clone());
+        if !self.turns.contains_key(&key) {
+            self.order.push_back(key.clone());
+        }
+        self.turns.insert(key, turn);
+        while self.turns.len() > MAX_LIVE_TURNS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.turns.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Option<codex_connect_app_server::protocol::Turn> {
+        self.turns
+            .get(&(thread_id.to_string(), turn_id.to_string()))
+            .cloned()
+    }
+
+    fn remove(&mut self, thread_id: &str, turn_id: &str) {
+        let key = (thread_id.to_string(), turn_id.to_string());
+        self.turns.remove(&key);
+        self.order.retain(|candidate| candidate != &key);
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -89,9 +130,30 @@ impl Relay {
             app_server,
             scope,
             journal: event_journal::EventJournal::default(),
+            live_turns: Arc::new(Mutex::new(LiveTurns::default())),
         };
         relay.start_event_loop();
         Ok(relay)
+    }
+
+    async fn remember_live_turn(
+        &self,
+        thread_id: &str,
+        turn: &codex_connect_app_server::protocol::Turn,
+    ) {
+        self.live_turns.lock().await.insert(thread_id, turn.clone());
+    }
+
+    async fn live_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Option<codex_connect_app_server::protocol::Turn> {
+        self.live_turns.lock().await.get(thread_id, turn_id)
+    }
+
+    async fn forget_live_turn(&self, thread_id: &str, turn_id: &str) {
+        self.live_turns.lock().await.remove(thread_id, turn_id);
     }
 
     pub fn worker_available(&self) -> bool {
@@ -268,6 +330,7 @@ impl Relay {
                 service_tier,
             })
             .await?;
+        self.remember_live_turn(&thread_id, &response.turn).await;
         Ok(
             json!({"threadId":thread_id,"turnId":response.turn.id,"createdThread":created,"cursor":cursor}),
         )
@@ -346,12 +409,36 @@ impl Relay {
             }
             let thread = self.read_thread(thread_id.clone()).await?;
             let turn = match turn_id.as_deref() {
-                Some(id) => Some(thread.turns.iter().find(|t| t.id == id).ok_or_else(|| {
-                    RelayError::Invalid(format!("turn {id} does not exist in thread {thread_id}"))
-                })?),
-                None => thread.turns.last(),
+                Some(id) => {
+                    let stored = thread.turns.iter().find(|t| t.id == id).cloned();
+                    let live = self.live_turn(&thread_id, id).await;
+                    let selected = match (stored, live) {
+                        (Some(stored), Some(live))
+                            if live.status.is_terminal() && !stored.status.is_terminal() =>
+                        {
+                            live
+                        }
+                        (Some(stored), _) => stored,
+                        (None, Some(live)) => live,
+                        (None, None) => {
+                            return Err(RelayError::Invalid(format!(
+                                "turn {id} does not exist in thread {thread_id}"
+                            )));
+                        }
+                    };
+                    if selected.status.is_terminal()
+                        && thread
+                            .turns
+                            .iter()
+                            .any(|turn| turn.id == id && turn.status.is_terminal())
+                    {
+                        self.forget_live_turn(&thread_id, id).await;
+                    }
+                    Some(selected)
+                }
+                None => thread.turns.last().cloned(),
             };
-            let selected_id = turn.map(|t| t.id.as_str());
+            let selected_id = turn.as_ref().map(|t| t.id.as_str());
             let pending = self
                 .app_server
                 .pending_requests(Some(&thread_id))
@@ -367,10 +454,11 @@ impl Relay {
                 .read_after(after_cursor, &thread_id, selected_id)
                 .await
                 .map_err(RelayError::Invalid)?;
-            if let Some((state, wake_reason)) = wait_wake(turn.map(|t| t.status), &pending) {
+            if let Some((state, wake_reason)) = wait_wake(turn.as_ref().map(|t| t.status), &pending)
+            {
                 return Ok(json!({
                     "threadId":thread_id,"turnId":selected_id,"state":state,"wakeReason":wake_reason,
-                    "turn":turn.map(turn_snapshot), "cursor":batch.cursor,
+                    "turn":turn.as_ref().map(turn_snapshot), "cursor":batch.cursor,
                     "historyLost":batch.history_lost,"events":batch.events,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 }));
@@ -378,7 +466,7 @@ impl Relay {
             if Instant::now() >= deadline {
                 return Ok(json!({
                     "threadId":thread_id,"turnId":selected_id,"state":"active","wakeReason":"timeout",
-                    "turn":turn.map(turn_snapshot), "cursor":batch.cursor,
+                    "turn":turn.as_ref().map(turn_snapshot), "cursor":batch.cursor,
                     "historyLost":batch.history_lost,"events":batch.events,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 }));
@@ -478,6 +566,7 @@ impl Relay {
                 delivery: "inline",
             })
             .await?;
+        self.remember_live_turn(&thread_id, &response.turn).await;
         // Live App Server 0.154.0 returns the inline review turn on the source thread even
         // when reviewThreadId names the internal reviewer thread. work.wait needs that pair.
         Ok(
@@ -532,6 +621,7 @@ impl Relay {
 
     fn start_event_loop(&self) {
         let journal = self.journal.clone();
+        let live_turns = self.live_turns.clone();
         let mut events = self.app_server.subscribe();
         tokio::spawn(async move {
             loop {
@@ -541,6 +631,20 @@ impl Relay {
                             if method == "codexConnect/appServerHistoryGap" {
                                 journal.mark_gap().await;
                                 continue;
+                            }
+                            if matches!(method, "turn/started" | "turn/completed") {
+                                let params = event.get("params").unwrap_or(&Value::Null);
+                                if let (Some(thread_id), Some(turn)) = (
+                                    params.get("threadId").and_then(Value::as_str),
+                                    params.get("turn").cloned(),
+                                ) {
+                                    if let Ok(turn) = serde_json::from_value::<
+                                        codex_connect_app_server::protocol::Turn,
+                                    >(turn)
+                                    {
+                                        live_turns.lock().await.insert(thread_id, turn);
+                                    }
+                                }
                             }
                             journal
                                 .push(method, event.get("params").unwrap_or(&Value::Null))
