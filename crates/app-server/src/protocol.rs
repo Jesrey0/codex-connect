@@ -132,6 +132,44 @@ pub struct ThreadRead {
 }
 request!(ThreadRead, "thread/read", ThreadReadResponse);
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemsList {
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<SortDirection>,
+}
+request!(
+    ThreadItemsList,
+    "thread/items/list",
+    ThreadItemsListResponse
+);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsList {
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<SortDirection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items_view: Option<TurnItemsView>,
+}
+request!(
+    ThreadTurnsList,
+    "thread/turns/list",
+    ThreadTurnsListResponse
+);
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ThreadResponse {
     pub thread: Thread,
@@ -141,6 +179,42 @@ pub struct ThreadResponse {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ThreadReadResponse {
     pub thread: Thread,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemsListResponse {
+    pub data: Vec<ThreadItemEntry>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemEntry {
+    pub turn_id: String,
+    pub item: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListResponse {
+    pub data: Vec<Turn>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnItemsView {
+    NotLoaded,
+    Summary,
+    Full,
 }
 
 #[derive(Clone, Debug, Deserialize)]

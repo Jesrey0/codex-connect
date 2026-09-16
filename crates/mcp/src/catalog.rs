@@ -230,7 +230,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codexConnect.elicitation.respond",
                 "Respond to MCP Elicitation",
-                "Use only for pending MCP elicitation. Accept a form with its requested object content; accept a completed URL flow without content. Decline/cancel carry no content.",
+                "Use only for pending MCP elicitation. Accept form/openai-form flows with their returned object content; accept a completed URL flow without content. Decline/cancel carry no content.",
                 false,
                 true,
                 true,
@@ -320,7 +320,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codexConnect.usage",
                 "Read Codex Usage",
-                "Use for a compact Codex account usage/rate-limit snapshot. This is remote account telemetry and is not workspace state.",
+                "Use for the authoritative Codex account usage/rate-limit snapshot, including ordinary-usage permission and reset-credit state when supplied. This is remote account telemetry and is not workspace state.",
                 true,
                 false,
                 true,
@@ -328,7 +328,14 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             ),
             empty_schema(),
             Some(object_schema(
-                json!({"rateLimits":{"type":["object","null"]},"rateLimitsByLimitId":{"type":["object","null"],"additionalProperties":{"type":"object"}}}),
+                json!({
+                    "accountId":{"type":["string","null"]},
+                    "ordinaryUsageAllowed":{"type":["boolean","null"]},
+                    "rateLimitResetCredits":{"type":["object","null"]},
+                    "rateLimitUpsell":{},
+                    "rateLimits":{"type":["object","null"]},
+                    "rateLimitsByLimitId":{"type":["object","null"],"additionalProperties":{"type":"object"}}
+                }),
                 &["rateLimits"],
             )),
         ),
@@ -426,8 +433,8 @@ fn work_started_schema() -> Value {
 }
 fn work_read_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnCount":{"type":"integer"},"latestTurn":nullable(turn_schema()),"cursor":{"type":"integer"}}),
-        &["threadId", "turnCount", "cursor"],
+        json!({"threadId":{"type":"string"},"latestTurn":nullable(turn_schema()),"cursor":{"type":"integer"}}),
+        &["threadId", "cursor"],
     )
 }
 fn work_wait_output_schema() -> Value {

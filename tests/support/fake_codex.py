@@ -93,6 +93,7 @@ def action(thread_id, turn_id, scenario):
             "file": "item/fileChange/requestApproval",
             "permissions": "item/permissions/requestApproval",
             "form": "mcpServer/elicitation/request",
+            "openai_form": "mcpServer/elicitation/request",
             "url": "mcpServer/elicitation/request",
         }[scenario]
         params = sample(CONTRACT["serverRequests"][method]["paramsSchema"])
@@ -109,6 +110,8 @@ def action(thread_id, turn_id, scenario):
             params.update(cwd=os.getcwd(), permissions={"network": {"enabled": True}})
         elif scenario == "form":
             params.update(serverName="fixture", mode="form", message="Name", requestedSchema={"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]})
+        elif scenario == "openai_form":
+            params = {"threadId": thread_id, "turnId": turn_id, "serverName": "fixture", "mode": "openai/form", "message": "Name", "requestedSchema": {"opaque": True}}
         elif scenario == "url":
             params = {"threadId": thread_id, "turnId": turn_id, "serverName": "fixture", "mode": "url", "message": "Authorize", "url": "https://example.com/authorize", "elicitationId": "url1"}
         validate(params, CONTRACT["serverRequests"][method]["paramsSchema"])
@@ -153,10 +156,33 @@ for line in sys.stdin:
         result["cwd"] = thread["cwd"]
     elif method in ("thread/resume", "thread/read"):
         thread = copy.deepcopy(threads[params["threadId"]])
+        if method == "thread/read":
+            assert params["includeTurns"] is False
+            thread["turns"] = []
         result["thread"] = thread
         if method == "thread/resume":
             thread["cwd"] = params.get("cwd", thread["cwd"])
             result["cwd"] = thread["cwd"]
+    elif method == "thread/items/list":
+        entries = []
+        for turn in threads[params["threadId"]]["turns"]:
+            if params.get("turnId") not in (None, turn["id"]):
+                continue
+            entries.extend({"turnId": turn["id"], "item": copy.deepcopy(item)} for item in turn["items"])
+        if params.get("sortDirection", "asc") == "desc":
+            entries.reverse()
+        start = int(params.get("cursor") or 0)
+        limit = params.get("limit") or 100
+        result["data"] = entries[start:start + limit]
+        result["nextCursor"] = str(start + limit) if start + limit < len(entries) else None
+    elif method == "thread/turns/list":
+        turns = copy.deepcopy(threads[params["threadId"]]["turns"])
+        if params.get("sortDirection", "desc") == "desc":
+            turns.reverse()
+        start = int(params.get("cursor") or 0)
+        limit = params.get("limit") or 50
+        result["data"] = turns[start:start + limit]
+        result["nextCursor"] = str(start + limit) if start + limit < len(turns) else None
     elif method == "turn/start":
         thread_id = params["threadId"]
         thread = threads[thread_id]
@@ -177,11 +203,22 @@ for line in sys.stdin:
             complete(thread_id, turn_id)
         elif scenario == "idle":
             pass
+        elif scenario == "inflate_history":
+            for index in range(60):
+                filler = copy.deepcopy(turn)
+                filler.update(
+                    id=f"{thread_id}-filler-{index}",
+                    status="completed",
+                    items=[],
+                    error=None,
+                )
+                thread["turns"].append(filler)
+            complete(thread_id, turn_id)
         elif scenario == "delayed_question":
             timer = threading.Timer(0.25, action, (thread_id, turn_id, "question"))
             timer.daemon = True
             timer.start()
-        elif scenario in ("question", "oversized_question", "nonblocking", "approval", "file", "permissions", "form", "url"):
+        elif scenario in ("question", "oversized_question", "nonblocking", "approval", "file", "permissions", "form", "openai_form", "url"):
             action(thread_id, turn_id, scenario)
         else:
             complete(thread_id, turn_id)
@@ -273,4 +310,13 @@ for line in sys.stdin:
             "score": 100,
             "indices": [0, 2],
         }] if candidate.is_file() else []
+    elif method == "account/rateLimits/read":
+        result.update(
+            accountId="fixture-account",
+            ordinaryUsageAllowed=False,
+            rateLimitResetCredits={"availableCount": 2, "credits": None},
+            rateLimitUpsell={"message": "fixture upsell"},
+            rateLimits={"limitId": "codex", "primary": {"usedPercent": 100}},
+            rateLimitsByLimitId={"codex": {"limitId": "codex", "primary": {"usedPercent": 100}}},
+        )
     respond(message, result)

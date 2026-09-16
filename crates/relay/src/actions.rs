@@ -225,14 +225,15 @@ fn elicitation_response(
                 }
                 Value::Null
             }
-            Some("form") => {
+            Some("form" | "openai/form" | "openaiForm") => {
                 let content = content.filter(Value::is_object).ok_or_else(|| {
                     RelayError::Invalid("accepted form elicitation requires object content".into())
                 })?;
-                if let Some(required) = request
-                    .params
-                    .pointer("/requestedSchema/required")
-                    .and_then(Value::as_array)
+                if request.params.get("mode").and_then(Value::as_str) == Some("form")
+                    && let Some(required) = request
+                        .params
+                        .pointer("/requestedSchema/required")
+                        .and_then(Value::as_array)
                 {
                     for key in required.iter().filter_map(Value::as_str) {
                         if content.get(key).is_none() {
@@ -363,6 +364,21 @@ mod tests {
             elicitation_response(&form, ElicitationAction::Cancel, Some(json!({"name":"A"})))
                 .is_err()
         );
+        for mode in ["openai/form", "openaiForm"] {
+            let openai_form = request(
+                PendingActionKind::Elicitation,
+                json!({"mode":mode,"requestedSchema":{"opaque":true}}),
+            );
+            assert_eq!(
+                elicitation_response(
+                    &openai_form,
+                    ElicitationAction::Accept,
+                    Some(json!({"name":"Ada"})),
+                )
+                .unwrap()["content"],
+                json!({"name":"Ada"})
+            );
+        }
     }
 
     #[test]

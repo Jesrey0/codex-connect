@@ -7,6 +7,42 @@ fn artifact() -> Value {
 }
 
 #[test]
+fn turn_pagination_matches_the_pinned_wire_shape() {
+    assert_eq!(
+        serde_json::to_value(ThreadItemsList {
+            thread_id: "thread-1".into(),
+            turn_id: Some("turn-1".into()),
+            cursor: None,
+            limit: Some(100),
+            sort_direction: Some(SortDirection::Asc),
+        })
+        .unwrap(),
+        json!({
+            "threadId":"thread-1",
+            "turnId":"turn-1",
+            "limit":100,
+            "sortDirection":"asc"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(ThreadTurnsList {
+            thread_id: "thread-1".into(),
+            cursor: None,
+            limit: Some(50),
+            sort_direction: Some(SortDirection::Desc),
+            items_view: Some(TurnItemsView::Full),
+        })
+        .unwrap(),
+        json!({
+            "threadId":"thread-1",
+            "limit":50,
+            "sortDirection":"desc",
+            "itemsView":"full"
+        })
+    );
+}
+
+#[test]
 fn exact_internal_contracts_include_initialization_and_selected_actions() {
     let artifact = artifact();
     assert_eq!(artifact["codexPin"], CODEX_PIN.trim());
@@ -15,6 +51,8 @@ fn exact_internal_contracts_include_initialization_and_selected_actions() {
         ThreadStart::METHOD,
         ThreadResume::METHOD,
         ThreadRead::METHOD,
+        ThreadItemsList::METHOD,
+        ThreadTurnsList::METHOD,
         TurnStart::METHOD,
         TurnSteer::METHOD,
         TurnInterrupt::METHOD,

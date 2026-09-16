@@ -11,8 +11,8 @@ pub use codex_connect_app_server::protocol::{
 use codex_connect_app_server::protocol::{
     CommandExecResponse, FsGetMetadata, FsGetMetadataResponse, FsReadDirectory,
     FsReadDirectoryResponse, FsReadFile, FuzzyFileSearch, FuzzyFileSearchResponse, RateLimitsRead,
-    ReviewStart, SkillsList, TextInput, Thread, ThreadRead, ThreadResume, ThreadStart,
-    TurnInterrupt, TurnStart, TurnSteer,
+    ReviewStart, SkillsList, SortDirection, TextInput, Thread, ThreadItemsList, ThreadRead,
+    ThreadResume, ThreadStart, ThreadTurnsList, TurnInterrupt, TurnItemsView, TurnStart, TurnSteer,
 };
 use codex_connect_app_server::{
     AppServerClient, AppServerConfig, AppServerError, DEFAULT_REQUEST_TIMEOUT, MAX_WIRE_BYTES,
@@ -30,6 +30,8 @@ use tokio::time::{Duration, Instant};
 pub const MAX_WAIT_MS: u64 = 120_000;
 const WAIT_RECONCILE_MS: u64 = 1_000;
 const MAX_LIVE_TURNS: usize = 256;
+const TURN_PAGE_SIZE: u32 = 50;
+const ITEM_PAGE_SIZE: u32 = 100;
 pub const DEFAULT_COMMAND_MS: u64 = 30_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMAND_MS: u64 = 60 * 60 * 1_000;
@@ -346,7 +348,7 @@ impl Relay {
             .transpose()?;
         let response = if let Some(id) = thread_id {
             // Verify the stored cwd before resume can load hooks or tools for it.
-            self.read_thread(id.clone()).await?;
+            self.read_thread_metadata(id.clone()).await?;
             self.app_server
                 .request(ThreadResume {
                     thread_id: id,
@@ -369,12 +371,12 @@ impl Relay {
         Ok((response.thread.id, cwd))
     }
 
-    async fn read_thread(&self, thread_id: String) -> Result<Thread, RelayError> {
+    async fn read_thread_metadata(&self, thread_id: String) -> Result<Thread, RelayError> {
         let response = self
             .app_server
             .request(ThreadRead {
                 thread_id,
-                include_turns: true,
+                include_turns: false,
             })
             .await?;
         self.scope
@@ -382,11 +384,91 @@ impl Relay {
         Ok(response.thread)
     }
 
+    async fn latest_stored_turn(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<codex_connect_app_server::protocol::Turn>, RelayError> {
+        let response = self
+            .app_server
+            .request(ThreadTurnsList {
+                thread_id: thread_id.to_string(),
+                cursor: None,
+                limit: Some(1),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::NotLoaded),
+            })
+            .await?;
+        match response.data.into_iter().next() {
+            Some(mut turn) => {
+                self.hydrate_turn_items(thread_id, &mut turn).await?;
+                Ok(Some(turn))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn hydrate_turn_items(
+        &self,
+        thread_id: &str,
+        turn: &mut codex_connect_app_server::protocol::Turn,
+    ) -> Result<(), RelayError> {
+        let mut cursor = None;
+        let mut items = Vec::new();
+        loop {
+            let response = self
+                .app_server
+                .request(ThreadItemsList {
+                    thread_id: thread_id.to_string(),
+                    turn_id: Some(turn.id.clone()),
+                    cursor,
+                    limit: Some(ITEM_PAGE_SIZE),
+                    sort_direction: Some(SortDirection::Asc),
+                })
+                .await?;
+            items.extend(response.data.into_iter().map(|entry| entry.item));
+            match response.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        turn.items = items;
+        Ok(())
+    }
+
+    async fn find_stored_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<codex_connect_app_server::protocol::Turn>, RelayError> {
+        let mut cursor = None;
+        loop {
+            let response = self
+                .app_server
+                .request(ThreadTurnsList {
+                    thread_id: thread_id.to_string(),
+                    cursor,
+                    limit: Some(TURN_PAGE_SIZE),
+                    sort_direction: Some(SortDirection::Desc),
+                    items_view: Some(TurnItemsView::NotLoaded),
+                })
+                .await?;
+            if let Some(mut turn) = response.data.into_iter().find(|turn| turn.id == turn_id) {
+                self.hydrate_turn_items(thread_id, &mut turn).await?;
+                return Ok(Some(turn));
+            }
+            match response.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(None),
+            }
+        }
+    }
+
     pub async fn work_read(&self, thread_id: String) -> Result<Value, RelayError> {
-        let thread = self.read_thread(thread_id).await?;
+        let thread = self.read_thread_metadata(thread_id).await?;
+        let latest_turn = self.latest_stored_turn(&thread.id).await?;
         Ok(json!({
-            "threadId":thread.id, "turnCount":thread.turns.len(),
-            "latestTurn":thread.turns.last().map(turn_snapshot),
+            "threadId":thread.id,
+            "latestTurn":latest_turn.as_ref().map(turn_snapshot),
             "cursor":self.journal.cursor().await,
         }))
     }
@@ -403,14 +485,17 @@ impl Relay {
         // notifications cannot race the wait setup.
         let mut transport_changes = self.app_server.changes();
         let mut journal_changes = self.journal.changes();
+        self.read_thread_metadata(thread_id.clone()).await?;
         loop {
             if !self.worker_available() {
                 return Err(AppServerError::Disconnected.into());
             }
-            let thread = self.read_thread(thread_id.clone()).await?;
             let turn = match turn_id.as_deref() {
                 Some(id) => {
-                    let stored = thread.turns.iter().find(|t| t.id == id).cloned();
+                    let stored = self.find_stored_turn(&thread_id, id).await?;
+                    let stored_terminal = stored
+                        .as_ref()
+                        .is_some_and(|turn| turn.status.is_terminal());
                     let live = self.live_turn(&thread_id, id).await;
                     let selected = match (stored, live) {
                         (Some(stored), Some(live))
@@ -426,17 +511,12 @@ impl Relay {
                             )));
                         }
                     };
-                    if selected.status.is_terminal()
-                        && thread
-                            .turns
-                            .iter()
-                            .any(|turn| turn.id == id && turn.status.is_terminal())
-                    {
+                    if selected.status.is_terminal() && stored_terminal {
                         self.forget_live_turn(&thread_id, id).await;
                     }
                     Some(selected)
                 }
-                None => thread.turns.last().cloned(),
+                None => self.latest_stored_turn(&thread_id).await?,
             };
             let selected_id = turn.as_ref().map(|t| t.id.as_str());
             let pending = self
@@ -522,7 +602,7 @@ impl Relay {
         if instruction.trim().is_empty() {
             return Err(RelayError::Invalid("instruction must not be empty".into()));
         }
-        self.read_thread(thread_id.clone()).await?;
+        self.read_thread_metadata(thread_id.clone()).await?;
         let response = self
             .app_server
             .request(TurnSteer {
@@ -539,7 +619,7 @@ impl Relay {
         thread_id: String,
         turn_id: String,
     ) -> Result<Value, RelayError> {
-        self.read_thread(thread_id.clone()).await?;
+        self.read_thread_metadata(thread_id.clone()).await?;
         self.app_server
             .request(TurnInterrupt {
                 thread_id,
@@ -607,16 +687,13 @@ impl Relay {
     }
 
     pub async fn usage(&self) -> Result<Value, RelayError> {
-        let value = self
+        Ok(self
             .app_server
             .request(RateLimitsRead {
                 supports_luna_reserve: true,
                 exclude_reset_credit_details: true,
             })
-            .await?;
-        Ok(
-            json!({"rateLimits":value.get("rateLimits"),"rateLimitsByLimitId":value.get("rateLimitsByLimitId")}),
-        )
+            .await?)
     }
 
     fn start_event_loop(&self) {

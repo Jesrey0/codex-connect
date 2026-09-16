@@ -233,7 +233,14 @@ class OperatorProtocolTests(unittest.TestCase):
         idle = self.wait(next_work,timeout=0)
         self.assertEqual(idle["state"],"active")
         self.assertEqual(idle["wakeReason"],"timeout")
-        self.assertEqual(self.client.call("codexConnect.work.read",{"threadId":work["threadId"]})["turnCount"],2)
+        read = self.client.call("codexConnect.work.read",{"threadId":work["threadId"]})
+        self.assertEqual(read["latestTurn"]["id"], next_work["turnId"])
+
+    def test_wait_uses_paginated_turn_lookup(self):
+        work = self.start("inflate_history")
+        result = self.wait(work, timeout=1000)
+        self.assertEqual(result["state"], "terminal")
+        self.assertEqual(result["turnId"], work["turnId"])
 
     def test_wait_ignores_progress_until_lease_expiry_and_preserves_journal(self):
         for scenario in ("idle","progress","oversized"):
@@ -307,6 +314,7 @@ class OperatorProtocolTests(unittest.TestCase):
             ("file","codexConnect.approval.respond",{"decision":"decline"}),
             ("permissions","codexConnect.permissions.respond",{"permissions":{"network":{"enabled":True}},"scope":"turn"}),
             ("form","codexConnect.elicitation.respond",{"action":"accept","content":{"name":"Ada"}}),
+            ("openai_form","codexConnect.elicitation.respond",{"action":"accept","content":{"name":"Ada"}}),
             ("url","codexConnect.elicitation.respond",{"action":"accept"}),
         ]
         for scenario, responder, answer in cases:
@@ -338,7 +346,10 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["turnId"], review["turnId"])
         self.client.call("model.list")
         self.client.call("skills.list")
-        self.client.call("codexConnect.usage")
+        usage = self.client.call("codexConnect.usage")
+        self.assertFalse(usage["ordinaryUsageAllowed"])
+        self.assertEqual(usage["rateLimitResetCredits"]["availableCount"], 2)
+        self.assertEqual(usage["accountId"], "fixture-account")
 
     def test_wait_tracks_review_turn_before_thread_history_catches_up(self):
         source = self.start("complete")
