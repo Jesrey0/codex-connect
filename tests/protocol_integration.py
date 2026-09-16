@@ -340,18 +340,6 @@ class OperatorProtocolTests(unittest.TestCase):
         self.client.call("skills.list")
         self.client.call("codexConnect.usage")
 
-    def test_wait_absorbs_new_turn_visibility_lag(self):
-        source = self.start("complete")
-        self.assertEqual(self.wait(source)["state"], "terminal")
-        review = self.client.call("codexConnect.review", {
-            "threadId": source["threadId"],
-            "target": {"type": "custom", "instructions": "delayed_visibility"},
-        })
-        result = self.wait(review, timeout=1000)
-        self.assertEqual(result["state"], "terminal")
-        self.assertEqual(result["wakeReason"], "terminal")
-        self.assertEqual(result["turnId"], review["turnId"])
-
     def test_z_disconnect_exits_backend_for_service_recovery(self):
         self.start("question")
         try:

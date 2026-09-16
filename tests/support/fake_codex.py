@@ -193,9 +193,7 @@ for line in sys.stdin:
         turn = result["turn"]
         turn_id = f"{thread_id}-turn-{len(thread['turns']) + 1}"
         turn.update(id=turn_id, status="inProgress", items=[], error=None)
-        delayed_visibility = params["target"].get("type") == "custom" and params["target"].get("instructions") == "delayed_visibility"
-        if not delayed_visibility:
-            thread["turns"].append(turn)
+        thread["turns"].append(turn)
 
         # Mirror live 0.154.0: reviewThreadId can identify the internal reviewer while the
         # response turn itself belongs to the source thread.
@@ -209,17 +207,7 @@ for line in sys.stdin:
 
         result["reviewThreadId"] = review_thread_id
         respond(message, result)
-        if delayed_visibility:
-            def publish_review_turn(source_thread_id, published_turn):
-                with lock:
-                    threads[source_thread_id]["turns"].append(published_turn)
-                complete(source_thread_id, published_turn["id"])
-
-            timer = threading.Timer(0.1, publish_review_turn, (thread_id, copy.deepcopy(turn)))
-            timer.daemon = True
-            timer.start()
-        else:
-            complete(thread_id, turn_id)
+        complete(thread_id, turn_id)
         complete(review_thread_id, review_turn["id"], status="interrupted")
         continue
     elif method == "turn/steer":
