@@ -723,9 +723,9 @@ enum CompletedPatchAction {
 }
 
 fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
-    let lines = patch.lines().collect::<Vec<_>>();
-    if lines.first().copied() != Some("*** Begin Patch")
-        || lines.last().copied() != Some("*** End Patch")
+    let lines = patch.trim().lines().collect::<Vec<_>>();
+    if lines.first().map(|s| s.trim()) != Some("*** Begin Patch")
+        || lines.last().map(|s| s.trim()) != Some("*** End Patch")
     {
         return Err(ScopeError::PatchFailed(
             "expected the official `*** Begin Patch` / `*** End Patch` format".to_string(),
@@ -799,6 +799,10 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
             let mut hunks = Vec::new();
             while index < end && !lines[index].starts_with("*** ") {
                 let header = lines[index];
+                if header.trim().is_empty() {
+                    index += 1;
+                    continue;
+                }
                 if !header.starts_with("@@") {
                     return Err(ScopeError::PatchFailed(
                         "updated files require `@@` hunk headers".to_string(),
@@ -819,6 +823,18 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
                         Some('+') => PatchLine::Add(line[1..].to_string()),
                         Some('-') => PatchLine::Remove(line[1..].to_string()),
                         _ => {
+                            if line.trim().is_empty() {
+                                let next_non_empty =
+                                    lines[index..=end].iter().find(|l| !l.trim().is_empty());
+                                if let Some(next) = next_non_empty {
+                                    if next.starts_with("@@") || next.starts_with("*** ") {
+                                        while index < end && lines[index].trim().is_empty() {
+                                            index += 1;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
                             return Err(ScopeError::PatchFailed(
                                 "patch hunk lines must start with ` `, `+`, or `-`".to_string(),
                             ));
@@ -840,6 +856,9 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
                     end_of_file,
                 });
                 if end_of_file {
+                    while index < end && lines[index].trim().is_empty() {
+                        index += 1;
+                    }
                     break;
                 }
             }
@@ -1225,6 +1244,120 @@ mod tests {
             .apply_patch("--- a/file\n+++ b/file\n", None)
             .unwrap_err();
         assert!(error.to_string().contains("official"));
+    }
+
+    #[test]
+    fn patch_tolerates_outer_whitespace_and_marker_padding() {
+        let temporary = tempfile::tempdir().unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+        let changed = scope
+            .apply_patch(
+                "\n\n  *** Begin Patch  \n*** Add File: a.txt\n+a\n  *** End Patch  \n\n",
+                None,
+            )
+            .unwrap();
+        assert_eq!(changed, vec!["a.txt"]);
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("a.txt")).unwrap(),
+            "a\n"
+        );
+    }
+
+    #[test]
+    fn patch_rejects_blank_separator_in_added_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+        let error = scope
+            .apply_patch(
+                "*** Begin Patch\n*** Add File: a.txt\n+a\n\n*** End Patch\n",
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("must start with `+`"));
+    }
+
+    #[test]
+    fn patch_rejects_blank_separator_after_deleted_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("a.txt"), "a\n").unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+        let error = scope
+            .apply_patch(
+                "*** Begin Patch\n*** Delete File: a.txt\n\n*** Add File: b.txt\n+b\n*** End Patch\n",
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown patch directive"));
+    }
+
+    #[test]
+    fn patch_tolerates_blank_lines_before_end_patch_in_update_hunk() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("file.txt"), "before\nafter\n").unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+        let changed = scope
+            .apply_patch(
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n\n\n*** End Patch\n",
+                None,
+            )
+            .unwrap();
+        assert_eq!(changed, vec!["file.txt"]);
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("file.txt")).unwrap(),
+            "changed\nafter\n"
+        );
+    }
+
+    #[test]
+    fn patch_rejects_unprefixed_blank_line_inside_added_content() {
+        let temporary = tempfile::tempdir().unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+        let error = scope
+            .apply_patch(
+                "*** Begin Patch\n*** Add File: a.txt\n+a\n\n+b\n*** End Patch\n",
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("must start with `+`"));
+    }
+
+    #[test]
+    fn patch_tolerates_blank_lines_before_end_of_file_marker() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("file.txt"), "before\nafter\n").unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+        scope
+            .apply_patch(
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n\n\n*** End of File\n*** End Patch\n",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("file.txt")).unwrap(),
+            "changed\nafter"
+        );
+    }
+
+    #[test]
+    fn patch_tolerates_blank_lines_after_end_of_file_marker() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("file.txt"), "before\nafter\n").unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+        let changed = scope
+            .apply_patch(
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n*** End of File\n\n\n*** Add File: added.txt\n+added\n*** End Patch\n",
+                None,
+            )
+            .unwrap();
+        assert_eq!(changed, vec!["file.txt", "added.txt"]);
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("file.txt")).unwrap(),
+            "changed\nafter"
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("added.txt")).unwrap(),
+            "added\n"
+        );
     }
 
     #[test]
