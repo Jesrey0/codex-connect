@@ -6,6 +6,7 @@ Run after cargo build -p codex-connect. Requires Python jsonschema.
 
 import base64
 import json
+import os
 import pathlib
 import socket
 import subprocess
@@ -18,6 +19,7 @@ import urllib.request
 from support.mcp_client import McpClient
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+CONTRACT = json.loads((ROOT / "config/app-server-tool-schemas.json").read_text())
 EXPECTED = {
     "codexConnect.status", "codexConnect.inspect", "apply_patch", "view_image", "command.exec",
     "command.start", "command.read", "command.write", "command.resize", "command.terminate",
@@ -41,6 +43,7 @@ class OperatorProtocolTests(unittest.TestCase):
         (cls.scope / "sample.txt").write_text("one\ntwo\nthree\n")
         cls.project = cls.scope / "project"
         cls.project.mkdir()
+        cls.coverage_path = cls.scope / "fake-app-server-coverage.jsonl"
         (cls.project / "local.txt").write_text("project-local\n")
         (cls.project / "pixel.png").write_bytes(base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
@@ -53,7 +56,10 @@ class OperatorProtocolTests(unittest.TestCase):
         cls.process = subprocess.Popen([
             str(ROOT / "target/debug/codex-connect"), "serve", "--scope-root", str(cls.scope),
             "--codex-bin", str(ROOT / "tests/support/fake_codex.py"), "--listen", f"127.0.0.1:{port}",
-        ], stdout=cls.log, stderr=cls.log)
+        ], stdout=cls.log, stderr=cls.log, env={
+            **os.environ,
+            "CODEX_CONNECT_FAKE_COVERAGE_FILE": str(cls.coverage_path),
+        })
         try:
             for _ in range(200):
                 if cls.process.poll() is not None:
@@ -61,8 +67,10 @@ class OperatorProtocolTests(unittest.TestCase):
                 try:
                     with urllib.request.urlopen(cls.url + "/healthz", timeout=1):
                         break
-                except urllib.error.URLError:
+                except (urllib.error.URLError, TimeoutError):
                     time.sleep(0.025)
+            else:
+                raise RuntimeError("fixture backend did not become healthy")
             cls.client = McpClient(cls.url)
         except Exception:
             cls.tearDownClass()
@@ -396,9 +404,14 @@ class OperatorProtocolTests(unittest.TestCase):
             self.client.call("command.start", arguments, error=True, validate_input=False)
 
         started = self.client.call("command.start", {"command": ["fixture-stream"]})
-        first = self.client.call("command.read", {
-            "processId": started["processId"], "afterCursor": 0, "timeoutMs": 1000,
-        })
+        for _ in range(4):
+            first = self.client.call("command.read", {
+                "processId": started["processId"], "afterCursor": 0, "timeoutMs": 1000,
+            })
+            if first["stdout"] == "ready\n" and first["stderr"] == "warning\n":
+                break
+        self.assertEqual(first["stdout"], "ready\n")
+        self.assertEqual(first["stderr"], "warning\n")
         second = self.client.call("command.read", {
             "processId": started["processId"], "afterCursor": 0, "timeoutMs": 1000,
         })
@@ -445,9 +458,10 @@ class OperatorProtocolTests(unittest.TestCase):
             self.assertEqual(result["state"],"active")
             self.assertEqual(result["wakeReason"],"timeout")
             if scenario == "progress":
-                self.assertEqual(result["events"][0]["method"],"item/agentMessage/delta")
+                self.assertIn("turn/started", [event["method"] for event in result["events"]])
+                self.assertIn("item/agentMessage/delta", [event["method"] for event in result["events"]])
             if scenario == "oversized":
-                self.assertTrue(result["events"][0]["truncated"])
+                self.assertTrue(any(event["truncated"] for event in result["events"]))
             self.client.call("codexConnect.work.steer",{"threadId":work["threadId"],"expectedTurnId":work["turnId"],"instruction":"continue"})
             self.client.call("codexConnect.work.interrupt",{"threadId":work["threadId"],"turnId":work["turnId"]})
             interrupted = self.wait(work)
@@ -559,6 +573,73 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["wakeReason"], "terminal")
         self.assertEqual(result["turnId"], review["turnId"])
         self.assertEqual(result["turn"]["status"], "failed")
+
+    def test_contract_surface_is_completely_reachable_and_schema_valid(self):
+        inspected = self.client.call("codexConnect.inspect", {"operations": [
+            {"type": "readText", "path": "sample.txt"},
+            {"type": "readDirectory", "path": "."},
+            {"type": "metadata", "path": "sample.txt"},
+            {"type": "fuzzyFileSearch", "query": "sample", "path": "."},
+        ]})
+        self.assertEqual(len(inspected["results"]), 4)
+
+        source = self.start("complete")
+        self.assertEqual(self.wait(source)["state"], "terminal")
+        self.client.call("codexConnect.work.read", {"threadId": source["threadId"]})
+
+        resumed = self.start("idle", threadId=source["threadId"])
+        self.client.call("codexConnect.work.steer", {
+            "threadId": resumed["threadId"],
+            "expectedTurnId": resumed["turnId"],
+            "instruction": "continue",
+        })
+        self.client.call("codexConnect.work.interrupt", {
+            "threadId": resumed["threadId"], "turnId": resumed["turnId"],
+        })
+        self.assertEqual(self.wait(resumed)["state"], "terminal")
+
+        review = self.client.call("codexConnect.review", {
+            "threadId": source["threadId"], "target": {"type": "uncommittedChanges"},
+        })
+        self.assertEqual(self.wait(review)["state"], "terminal")
+
+        self.client.call("command.exec", {"command": ["echo", "coverage"]})
+        repl = self.client.call("command.start", {
+            "command": ["fixture-repl"], "tty": True, "size": {"rows": 24, "cols": 80},
+        })
+        self.client.call("command.read", {"processId": repl["processId"], "timeoutMs": 1000})
+        self.client.call("command.resize", {"processId": repl["processId"], "rows": 30, "cols": 100})
+        self.client.call("command.write", {
+            "processId": repl["processId"], "input": "2+2\n", "closeStdin": True,
+        })
+        self.client.call("command.read", {"processId": repl["processId"], "timeoutMs": 1000})
+        quiet = self.client.call("command.start", {"command": ["fixture-quiet"]})
+        self.client.call("command.terminate", {"processId": quiet["processId"]})
+        self.client.call("command.read", {"processId": quiet["processId"], "timeoutMs": 1000})
+
+        for scenario, responder, answer in [
+            ("approval", "codexConnect.approval.respond", {"decision": "approve"}),
+            ("file", "codexConnect.approval.respond", {"decision": "decline"}),
+            ("permissions", "codexConnect.permissions.respond", {"permissions": {"network": {"enabled": True}}, "scope": "turn"}),
+            ("form", "codexConnect.elicitation.respond", {"action": "accept", "content": {"name": "Ada"}}),
+            ("question", "codexConnect.userInput.respond", {"answers": {"format": ["JSON"]}}),
+        ]:
+            work = self.start(scenario)
+            pending = self.wait(work)["pendingActions"][0]
+            self.client.call(responder, {"requestId": pending["requestId"], **answer})
+            self.assertEqual(self.wait(work)["state"], "terminal")
+
+        self.client.call("model.list")
+        self.client.call("skills.list")
+        self.client.call("codexConnect.usage")
+
+        observed = {"method": set(), "serverRequest": set(), "notification": set()}
+        for line in self.coverage_path.read_text().splitlines():
+            entry = json.loads(line)
+            observed[entry["kind"]].add(entry["name"])
+        self.assertEqual(observed["method"], set(CONTRACT["methods"]))
+        self.assertEqual(observed["serverRequest"], set(CONTRACT["serverRequests"]))
+        self.assertEqual(observed["notification"], set(CONTRACT["notifications"]))
 
     def test_z_disconnect_exits_backend_for_service_recovery(self):
         self.start("question")

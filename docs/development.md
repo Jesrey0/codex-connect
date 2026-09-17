@@ -24,11 +24,55 @@ The schema check requires the project-pinned Codex CLI to be installed and avail
 `scripts/generate-app-server-tool-schemas.py`:
 
 1. verifies the installed Codex release equals the pin,
-2. runs `codex app-server generate-json-schema`,
+2. runs `codex app-server generate-json-schema --experimental`, because the adapter
+   explicitly negotiates `experimentalApi = true`,
 3. verifies the request definitions used internally by the adapter, and
 4. writes the self-contained subset to `config/app-server-tool-schemas.json`.
 
 The artifact is an **internal protocol drift guard**, not the MCP catalog.
+Its method, server-request, and notification sets must match the protocol paths the
+adapter actually consumes semantically. Opaque journal-only notifications do not belong
+in this closure.
+
+The protocol integration fixture validates every selected App Server request and response
+against this artifact and asserts that the complete selected method/server-request/
+semantic-notification set is exercised. This is the contract-coverage gate; ordinary Rust
+line coverage is useful separately but is not a substitute for protocol conformance.
+
+### Contract coverage ledger
+
+| Dependency | Authority | Enforcement |
+| --- | --- | --- |
+| Selected request/response field shapes, enums, requiredness, and experimental fields | JSON Schema emitted by the pinned Codex CLI | schema regeneration `--check`, schema tests, schema-valid fake App Server |
+| `initialize` → `initialized`, negotiated capabilities, and required process feature flags | App Server initialization/experimental API contract | fake-peer handshake assertions plus app-server launch/capability tests |
+| Thread/turn ownership, resume/read/pagination, start/steer/interrupt, review, and terminal reconciliation | App Server thread/turn lifecycle contract | protocol integration tests and the complete contract-surface smoke test |
+| Command/file approvals, permissions, MCP elicitation, and request-user-input responses | App Server server-request/approval contract | exact selected server-request schemas, typed action unit tests, protocol integration responses |
+| Connection-scoped streaming command control and `command/exec/outputDelta` | App Server streaming command contract | persistent command integration tests plus semantic-notification schema validation |
+| Public ChatGPT-facing tool names and input/output projection | Codex Connect architecture, not the raw App Server catalog | exact MCP catalog tests plus Draft 2020-12 validation of every integration tool call/result |
+
+When changing `config/codex-cli-pin`, review the generated schema diff and the official App
+Server documentation sections for initialization, events/lifecycle, approvals/server
+requests, streaming command behavior, and experimental API opt-in. Add a schema contract
+only when Codex Connect semantically depends on it. Notifications retained solely as opaque
+journal data remain intentionally outside the typed closure. Any newly selected contract
+must also be traversed by the complete contract-surface integration test before the pin bump
+is accepted.
+
+## Dependency and compile budget
+
+Compile cost is part of the operator experience. Keep required validation and release paths
+lean rather than adding instrumentation or utility crates by default:
+
+- prefer the standard library and existing workspace dependencies for small utilities;
+- disable dependency default features when the operator contract needs only a smaller set;
+- review `cargo tree -d --workspace` when adding or upgrading dependencies;
+- do not add line/branch-coverage tooling to the required gate merely to produce a percentage;
+- keep deployment Cargo output as a reusable build cache only. Content-addressed installed
+  binaries and deployment records remain the release authority.
+
+The deployment release target is intentionally stable across operations so Cargo can reuse
+dependency artifacts. A deployment-wide build lock serializes release builds that share this
+cache; changing operation IDs must not force a cold dependency rebuild.
 
 ## Public MCP ownership
 

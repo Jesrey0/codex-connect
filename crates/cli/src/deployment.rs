@@ -19,6 +19,45 @@ struct OperationLock {
     _file: File,
 }
 
+pub(crate) struct BuildLock {
+    _file: File,
+}
+
+#[cfg(unix)]
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+impl BuildLock {
+    pub(crate) fn acquire() -> Result<Self> {
+        let directory = deployment_directory()?;
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("unable to create {}", directory.display()))?;
+        let path = directory.join("build.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("unable to open deployment build lock {}", path.display()))?;
+        crate::config::set_file_mode(&file, 0o600)?;
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("unable to lock deployment build cache");
+            }
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 #[cfg(unix)]
 impl Drop for ActivationLock {
     fn drop(&mut self) {
@@ -465,9 +504,7 @@ pub(crate) fn activation_delay() -> &'static str {
 
 pub(crate) fn build_target(operation_id: &str, source: &Path) -> Result<PathBuf> {
     validate_operation_id(operation_id)?;
-    Ok(source
-        .join("target/codex-connect-deploy")
-        .join(operation_id))
+    Ok(source.join("target/codex-connect-deploy/build"))
 }
 
 fn verify_expected_sha(record: &DeploymentRecord, expected_sha256: &str) -> Result<()> {
@@ -613,10 +650,7 @@ fn launch_environment() -> Result<LaunchEnvironment> {
 }
 
 fn deployment_directory() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or(crate::config::home_dir()?.join(".local/state"));
-    Ok(base.join("codex-connect/deployments"))
+    Ok(crate::config::state_root()?.join("codex-connect/deployments"))
 }
 
 fn record_path(operation_id: &str) -> Result<PathBuf> {
@@ -804,6 +838,18 @@ mod tests {
     #[test]
     fn activation_handoff_leaves_response_headroom() {
         assert_eq!(activation_delay(), "3s");
+    }
+
+    #[test]
+    fn deployment_build_target_is_a_stable_shared_cache() {
+        let source = Path::new("/work/codex-connect");
+        let first = build_target("0123456789abcdef01234567", source).unwrap();
+        let second = build_target("fedcba9876543210fedcba98", source).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            PathBuf::from("/work/codex-connect/target/codex-connect-deploy/build")
+        );
     }
 
     #[test]

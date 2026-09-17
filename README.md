@@ -68,14 +68,17 @@ For a fresh machine, follow **[Getting Started](docs/getting-started.md)**.
 If prerequisites are already installed:
 
 ```bash
-cargo build --release -p codex-connect --locked
-target/release/codex-connect setup
-export PATH="$HOME/.local/bin:$PATH"
+bootstrap_target=target/codex-connect-bootstrap
+rm -rf "$bootstrap_target"
+CARGO_TARGET_DIR="$bootstrap_target" cargo build --release -p codex-connect --locked
+"$bootstrap_target/release/codex-connect" setup
+rm -rf "$bootstrap_target"
+export PATH="$HOME/projects/.local/bin:$PATH"
 codex-connect doctor
 codex-connect status
 ```
 
-`setup` installs the binary into the content-addressed build store under `~/.local/lib/codex-connect/builds/`, points `~/.local/bin/codex-connect` at that build, installs the user service, and verifies backend health. After source changes, use the explicit deployment workflow: `codex-connect deploy prepare`, poll `codex-connect deploy status <operation-id>` until it reports `prepared`, then run `codex-connect deploy activate <operation-id>` and verify the same operation after reconnect. Both the potentially long release build and the disruptive backend activation run as detached systemd jobs, so foreground operator commands remain short and deterministic. The tunnel runtime remains untouched.
+`setup` installs the bootstrap binary into the workspace-local content-addressed build store under `~/projects/.local/lib/codex-connect/builds/`, points `~/projects/.local/bin/codex-connect` at that build, keeps configuration/state under `~/projects/.config` and `~/projects/.local/state`, installs the user service, and verifies backend health. The one-time `target/codex-connect-bootstrap/` build directory is disposable and should be removed after setup; it is not a runtime installation. After source changes, use the explicit deployment workflow: `codex-connect deploy prepare`, poll `codex-connect deploy status <operation-id>` until it reports `prepared`, then run `codex-connect deploy activate <operation-id>` and verify the same operation after reconnect. Deployment builds use the persistent `target/codex-connect-deploy/build/` compiler cache, but the content-addressed workspace-local build store remains the only runtime artifact authority. Both the potentially long release build and the disruptive backend activation run as detached systemd jobs, so foreground operator commands remain short and deterministic. The tunnel runtime remains untouched.
 
 Configure the official tunnel client separately to connect its long-lived runtime to `http://127.0.0.1:8767/mcp`. The ChatGPT custom app/connector uses **no authentication**. The tunnel runtime owns its OpenAI control-plane credential and organization context. Codex Connect accepts MCP only on loopback, has no application-level authentication, and manages only its own backend service.
 
@@ -86,7 +89,7 @@ codex-connect status
 codex-connect restart
 codex-connect doctor
 codex-connect logs --follow
-codex-connect probe --codex-bin ~/.local/bin/codex --cwd ~/projects/example-project
+codex-connect probe --codex-bin ~/projects/.tools/bin/codex --cwd ~/projects/example-project
 ```
 
 After a computer restart, verify the backend first, then inspect/resume the existing tunnel runtime with `tunnel-client runtimes status codex-connect --json`. See [Operations](docs/operations.md#after-a-computer-restart).

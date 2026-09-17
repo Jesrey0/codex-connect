@@ -14,8 +14,8 @@ repository = "https://github.com/Jesrey0/codex-connect"
 [workspace.dependencies]
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
+base64 = "0.23"
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage"] }
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

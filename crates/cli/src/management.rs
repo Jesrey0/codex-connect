@@ -1,6 +1,7 @@
 use crate::artifact;
 use crate::config::{
-    BACKEND_SERVICE, BackendConfig, Config, ConfigStore, display_path, expand_path,
+    BACKEND_SERVICE, BackendConfig, Config, ConfigStore, default_workspace_root, display_path,
+    expand_path,
 };
 use crate::deployment;
 use crate::service::{ServiceManager, SystemdManager, UnitState, backend_unit};
@@ -101,7 +102,7 @@ async fn deployment_effect_visible(record: &deployment::DeploymentRecord) -> Res
         .sha256
         .as_deref()
         .context("deployment has no SHA-256")?;
-    let operator = crate::config::home_dir()?.join(".local/bin/codex-connect");
+    let operator = operator_path()?;
     let operator_matches = operator.is_file()
         && artifact::for_path(&operator)
             .map(|identity| identity.sha256 == expected_sha256)
@@ -172,16 +173,9 @@ async fn prepare_deployment_inner(operation_id: &str, source: &Path) -> Result<(
         }
     }
 
+    let _build_lock = deployment::BuildLock::acquire()?;
     let build_root = deployment::build_target(operation_id, &source)?;
     let build = (|| -> Result<_> {
-        if build_root.exists() {
-            fs::remove_dir_all(&build_root).with_context(|| {
-                format!(
-                    "unable to clear temporary build tree {}",
-                    build_root.display()
-                )
-            })?;
-        }
         let cargo = find_executable("cargo").or_else(|_| {
             let candidate = crate::config::home_dir()?.join(".cargo/bin/cargo");
             ensure_executable(&candidate)?;
@@ -206,14 +200,6 @@ async fn prepare_deployment_inner(operation_id: &str, source: &Path) -> Result<(
 
     match build {
         Ok((identity, installed)) => {
-            if build_root.exists() {
-                if let Err(error) = fs::remove_dir_all(&build_root) {
-                    eprintln!(
-                        "warning: unable to remove temporary build tree {}: {error}",
-                        build_root.display()
-                    );
-                }
-            }
             let record = deployment::mark_prepared(operation_id, &identity, &installed)?;
             println!(
                 "✓ Deployment operation {} prepared build {}.",
@@ -221,10 +207,7 @@ async fn prepare_deployment_inner(operation_id: &str, source: &Path) -> Result<(
             );
             Ok(())
         }
-        Err(error) => {
-            let _ = fs::remove_dir_all(&build_root);
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -420,9 +403,14 @@ pub async fn setup(no_start: bool) -> Result<()> {
         bail!("scope root is not a directory: {}", root.display());
     }
     config.scope.root = display_path(&root);
-    if resolve_executable(&config.backend.codex_bin).is_err() {
-        config.backend.codex_bin = display_path(&find_executable("codex")?);
-    }
+    let workspace_root = default_workspace_root()?;
+    let workspace_codex = workspace_root.join(".tools/bin/codex");
+    let codex = if workspace_codex.is_file() && is_executable(&workspace_codex) {
+        workspace_codex
+    } else {
+        resolve_executable(&config.backend.codex_bin).or_else(|_| find_executable("codex"))?
+    };
+    config.backend.codex_bin = codex.display().to_string();
     let binary = install_artifact(
         &artifact::current()?.executable,
         &artifact::current()?.sha256,
@@ -431,7 +419,7 @@ pub async fn setup(no_start: bool) -> Result<()> {
     let old_state = manager.unit_state(BACKEND_SERVICE)?;
     let installation = (|| -> Result<()> {
         store.save(&config)?;
-        manager.install_unit(BACKEND_SERVICE, &backend_unit(&binary)?)?;
+        manager.install_unit(BACKEND_SERVICE, &backend_unit(&binary, &workspace_root)?)?;
         manager.daemon_reload()
     })();
     if let Err(error) = installation {
@@ -681,9 +669,18 @@ fn source_tree() -> Result<PathBuf> {
     }
     bail!("current directory is not inside the Codex Connect source tree")
 }
+
+fn workspace_local_root() -> Result<PathBuf> {
+    Ok(default_workspace_root()?.join(".local"))
+}
+
+fn operator_path() -> Result<PathBuf> {
+    Ok(workspace_local_root()?.join("bin/codex-connect"))
+}
+
 fn install_artifact(built: &Path, sha256: &str) -> Result<PathBuf> {
-    let directory = crate::config::home_dir()?
-        .join(".local/lib/codex-connect/builds")
+    let directory = workspace_local_root()?
+        .join("lib/codex-connect/builds")
         .join(&sha256[..12]);
     fs::create_dir_all(&directory)?;
     let destination = directory.join("codex-connect");
@@ -714,7 +711,7 @@ fn install_artifact(built: &Path, sha256: &str) -> Result<PathBuf> {
     Ok(destination.canonicalize()?)
 }
 fn activate_operator_symlink(installed: &Path) -> Result<()> {
-    let directory = crate::config::home_dir()?.join(".local/bin");
+    let directory = workspace_local_root()?.join("bin");
     fs::create_dir_all(&directory)?;
     let destination = directory.join("codex-connect");
     let temporary = directory.join(format!(".codex-connect-link-{}", std::process::id()));

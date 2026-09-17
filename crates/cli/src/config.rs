@@ -147,11 +147,26 @@ fn config_path() -> Result<PathBuf> {
 pub fn systemd_user_dir() -> Result<PathBuf> {
     Ok(config_root()?.join("systemd/user"))
 }
-fn config_root() -> Result<PathBuf> {
+pub fn systemd_registration_dir() -> Result<PathBuf> {
+    // The user manager discovers registrations here. Canonical unit contents
+    // remain under the workspace-local XDG config root; this directory should
+    // contain only registration links for Codex Connect-managed units.
+    Ok(home_dir()?.join(".config/systemd/user"))
+}
+pub fn config_root() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
-    Ok(home_dir()?.join(".config"))
+    Ok(default_workspace_root()?.join(".config"))
+}
+pub fn state_root() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(default_workspace_root()?.join(".local/state"))
+}
+pub fn default_workspace_root() -> Result<PathBuf> {
+    Ok(home_dir()?.join("projects"))
 }
 pub fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")

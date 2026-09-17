@@ -63,11 +63,26 @@ pending = {}
 command_sessions = {}
 initialized = False
 handshake = False
+coverage_file = os.environ.get("CODEX_CONNECT_FAKE_COVERAGE_FILE")
+
+
+def record_coverage(kind, name):
+    if not coverage_file:
+        return
+    with lock:
+        with open(coverage_file, "a", encoding="utf-8") as output:
+            output.write(json.dumps({"kind": kind, "name": name}) + "\n")
 
 
 def send(message):
     with lock:
         print(json.dumps(message), flush=True)
+
+
+def notify(method, params):
+    validate(params, CONTRACT["notifications"][method])
+    record_coverage("notification", method)
+    send({"method": method, "params": params})
 
 
 def respond(message, result):
@@ -76,15 +91,15 @@ def respond(message, result):
 
 
 def command_output(process_id, stream, text):
-    send({
-        "method": "command/exec/outputDelta",
-        "params": {
+    notify(
+        "command/exec/outputDelta",
+        {
             "processId": process_id,
             "stream": stream,
             "deltaBase64": base64.b64encode(text.encode()).decode(),
             "capReached": False,
         },
-    })
+    )
 
 
 def finish_command(process_id, exit_code=0):
@@ -95,13 +110,13 @@ def finish_command(process_id, exit_code=0):
         respond(session["message"], result)
 
 
-def complete(thread_id, turn_id, status="completed", notify=True):
+def complete(thread_id, turn_id, status="completed", emit_notification=True):
     with lock:
         turn = next(t for t in threads[thread_id]["turns"] if t["id"] == turn_id)
         turn["status"] = status
         turn["items"] = [{"type": "agentMessage", "id": "answer", "text": "fixture complete", "phase": "final_answer"}]
-        if notify:
-            send({"method": "turn/completed", "params": {"threadId": thread_id, "turn": turn}})
+        if emit_notification:
+            notify("turn/completed", {"threadId": thread_id, "turn": turn})
 
 
 def action(thread_id, turn_id, scenario):
@@ -136,6 +151,7 @@ def action(thread_id, turn_id, scenario):
         elif scenario == "url":
             params = {"threadId": thread_id, "turnId": turn_id, "serverName": "fixture", "mode": "url", "message": "Authorize", "url": "https://example.com/authorize", "elicitationId": "url1"}
         validate(params, CONTRACT["serverRequests"][method]["paramsSchema"])
+        record_coverage("serverRequest", method)
         request_id = f"request-{turn_id}"
         pending[request_id] = (method, thread_id, turn_id)
         send({"id": request_id, "method": method, "params": params})
@@ -147,7 +163,7 @@ for line in sys.stdin:
         method, thread_id, turn_id = pending.pop(message["id"])
         if "result" in message:
             validate(message["result"], CONTRACT["serverRequests"][method]["responseSchema"])
-        send({"method": "serverRequest/resolved", "params": {"threadId": thread_id, "requestId": message["id"]}})
+        notify("serverRequest/resolved", {"threadId": thread_id, "requestId": message["id"]})
         complete(thread_id, turn_id)
         continue
     method = message["method"]
@@ -157,6 +173,7 @@ for line in sys.stdin:
         initialized = True
         continue
     validate(params, CONTRACT["methods"][method]["inputSchema"])
+    record_coverage("method", method)
     result = sample(CONTRACT["methods"][method]["outputSchema"])
     if method == "initialize":
         assert not handshake
@@ -213,8 +230,9 @@ for line in sys.stdin:
         thread["turns"].append(turn)
         scenario = params["input"][0]["text"]
         respond(message, result)
+        notify("turn/started", {"threadId": thread_id, "turn": turn})
         if scenario == "no_event":
-            complete(thread_id, turn_id, notify=False)
+            complete(thread_id, turn_id, emit_notification=False)
         elif scenario == "progress":
             send({"method":"item/agentMessage/delta","params":{"threadId":thread_id,"turnId":turn_id,"delta":"Working"}})
         elif scenario == "oversized":
@@ -293,7 +311,7 @@ for line in sys.stdin:
         for request_id, (_, thread_id, turn_id) in list(pending.items()):
             if turn_id == params["turnId"]:
                 pending.pop(request_id)
-                send({"method":"serverRequest/resolved","params":{"threadId":thread_id,"requestId":request_id}})
+                notify("serverRequest/resolved", {"threadId": thread_id, "requestId": request_id})
         complete(params["threadId"], params["turnId"], status="interrupted")
     elif method == "command/exec":
         if "processId" not in params:

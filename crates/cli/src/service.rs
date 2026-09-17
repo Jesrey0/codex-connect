@@ -1,4 +1,7 @@
-use crate::config::{set_file_mode, sync_directory, systemd_user_dir};
+use crate::config::{
+    config_root, set_file_mode, state_root, sync_directory, systemd_registration_dir,
+    systemd_user_dir,
+};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::Write;
@@ -150,13 +153,37 @@ impl ServiceManager for SystemdManager {
             .map_err(|error| error.error)
             .with_context(|| format!("unable to install {}", path.display()))?;
         sync_directory(&directory)?;
+
+        let registration_directory = systemd_registration_dir()?;
+        fs::create_dir_all(&registration_directory).with_context(|| {
+            format!(
+                "unable to create systemd registration directory {}",
+                registration_directory.display()
+            )
+        })?;
+        let registration = registration_directory.join(unit);
+        let temporary_registration =
+            registration_directory.join(format!(".{unit}-link-{}", std::process::id()));
+        if temporary_registration.symlink_metadata().is_ok() {
+            fs::remove_file(&temporary_registration)?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&path, &temporary_registration)?;
+        #[cfg(not(unix))]
+        fs::copy(&path, &temporary_registration)?;
+        fs::rename(&temporary_registration, &registration)?;
+        sync_directory(&registration_directory)?;
         Ok(())
     }
 
     fn remove_unit(&self, unit: &str) -> Result<()> {
         let path = self.unit_path(unit)?;
-        if path.exists() {
+        if path.exists() || path.symlink_metadata().is_ok() {
             fs::remove_file(path)?;
+        }
+        let registration = systemd_registration_dir()?.join(unit);
+        if registration.exists() || registration.symlink_metadata().is_ok() {
+            fs::remove_file(registration)?;
         }
         Ok(())
     }
@@ -237,9 +264,9 @@ impl ServiceManager for SystemdManager {
     }
 }
 
-pub fn backend_unit(binary: &Path) -> Result<String> {
+pub fn backend_unit(binary: &Path, scope_root: &Path) -> Result<String> {
     let path = std::env::var_os("PATH").context("PATH is not set")?;
-    backend_unit_with_path(binary, &path)
+    backend_unit_with_path(binary, scope_root, &path)
 }
 
 fn sanitized_path(path: &std::ffi::OsStr) -> Result<String> {
@@ -263,10 +290,31 @@ fn sanitized_path(path: &std::ffi::OsStr) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("PATH is not UTF-8"))
 }
 
-fn backend_unit_with_path(binary: &Path, path: &std::ffi::OsStr) -> Result<String> {
-    let path = sanitized_path(path)?;
+fn backend_unit_with_path(
+    binary: &Path,
+    scope_root: &Path,
+    path: &std::ffi::OsStr,
+) -> Result<String> {
+    let inherited_path = sanitized_path(path)?;
+    let mut path_entries = vec![scope_root.join(".tools/bin"), scope_root.join(".local/bin")];
+    for entry in std::env::split_paths(std::ffi::OsStr::new(&inherited_path)) {
+        if !path_entries.contains(&entry) {
+            path_entries.push(entry);
+        }
+    }
+    let path = std::env::join_paths(path_entries)?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("PATH is not UTF-8"))?;
     // Environment= uses systemd quoting and percent specifiers, not shell expansion.
     let environment = format!("PATH={path}")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    let config_environment = format!("XDG_CONFIG_HOME={}", config_root()?.display())
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    let state_environment = format!("XDG_STATE_HOME={}", state_root()?.display())
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('%', "%%");
@@ -275,7 +323,7 @@ fn backend_unit_with_path(binary: &Path, path: &std::ffi::OsStr) -> Result<Strin
         .with_context(|| format!("Codex Connect binary does not exist: {}", binary.display()))?;
     let working_directory = binary.parent().unwrap_or(Path::new("/"));
     Ok(format!(
-        "[Unit]\nDescription=Codex Connect backend\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment=\"{environment}\"\nWorkingDirectory={}\nExecStartPre=/usr/bin/test -x {}\nExecStart={} run-backend\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Codex Connect backend\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment=\"{environment}\"\nEnvironment=\"{config_environment}\"\nEnvironment=\"{state_environment}\"\nWorkingDirectory={}\nExecStartPre=/usr/bin/test -x {}\nExecStart={} run-backend\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
         systemd_arg(working_directory),
         systemd_arg(&binary),
         systemd_arg(&binary),
@@ -363,8 +411,16 @@ mod tests {
         let path = std::ffi::OsStr::new(
             ":relative:.:/home/operator/.cargo/bin:/opt/tool chain:/usr/bin:/bin:/usr/bin:/opt/100%/$tools/\"quoted\"/back\\slash:",
         );
-        let unit = backend_unit_with_path(&binary, path).unwrap();
-        assert!(unit.contains(r#"Environment="PATH=/home/operator/.cargo/bin:/opt/tool chain:/usr/bin:/bin:/opt/100%%/$tools/\"quoted\"/back\\slash""#));
+        let unit = backend_unit_with_path(&binary, directory.path(), path).unwrap();
+        let workspace_tools = directory.path().join(".tools/bin");
+        let workspace_local = directory.path().join(".local/bin");
+        assert!(unit.contains(&format!(
+            r#"Environment="PATH={}:{}:/home/operator/.cargo/bin:/opt/tool chain:/usr/bin:/bin:/opt/100%%/$tools/\"quoted\"/back\\slash""#,
+            workspace_tools.display(),
+            workspace_local.display()
+        )));
+        assert!(unit.contains("Environment=\"XDG_CONFIG_HOME="));
+        assert!(unit.contains("Environment=\"XDG_STATE_HOME="));
         assert!(!unit.contains("relative"));
         assert!(!unit.contains("sh -"));
         assert!(unit.contains(&format!("ExecStart={} run-backend", binary.display())));
@@ -398,7 +454,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let unit = backend_unit(&binary).unwrap();
+        let unit = backend_unit(&binary, directory.path()).unwrap();
         assert!(unit.contains("run-backend"));
         assert!(!unit.contains("--scope-root"));
         assert!(!unit.contains("127.0.0.1:8767"));
@@ -415,6 +471,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        assert!(!backend_unit(&binary).unwrap().contains("NoNewPrivileges"));
+        assert!(
+            !backend_unit(&binary, directory.path())
+                .unwrap()
+                .contains("NoNewPrivileges")
+        );
     }
 }

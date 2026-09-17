@@ -60,7 +60,8 @@ else
   fail "tunnel-client missing; install OpenAI Secure MCP Tunnel client"
 fi
 
-if [[ -f "$HOME/.config/codex-connect/config.toml" ]]; then
+config_home="${XDG_CONFIG_HOME:-$HOME/projects/.config}"
+if [[ -f "$config_home/codex-connect/config.toml" ]]; then
   pass "existing Codex Connect configuration found"
 else
   warn "Codex Connect is not configured yet; this is expected before codex-connect setup"

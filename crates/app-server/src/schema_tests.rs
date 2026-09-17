@@ -103,7 +103,7 @@ fn exact_internal_contracts_include_initialization_and_selected_actions() {
             "command/exec/outputDelta",
             "serverRequest/resolved",
             "turn/completed",
-            "thread/started",
+            "turn/started",
         ])
     );
 }

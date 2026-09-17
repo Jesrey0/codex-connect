@@ -46,7 +46,7 @@ NOTIFICATIONS = {
     "command/exec/outputDelta": "v2/CommandExecOutputDeltaNotification",
     "serverRequest/resolved": "v2/ServerRequestResolvedNotification",
     "turn/completed": "v2/TurnCompletedNotification",
-    "thread/started": "v2/ThreadStartedNotification",
+    "turn/started": "v2/TurnStartedNotification",
 }
 
 
@@ -128,7 +128,10 @@ def main():
     if output.strip() != f"codex-cli {PIN}":
         raise SystemExit(f"Codex release mismatch: expected codex-cli {PIN}, found {output.strip()}")
     with tempfile.TemporaryDirectory(prefix="codex-connect-schemas-") as directory:
-        subprocess.run(["codex", "app-server", "generate-json-schema", "--out", directory], check=True)
+        subprocess.run(
+            ["codex", "app-server", "generate-json-schema", "--experimental", "--out", directory],
+            check=True,
+        )
         generated = build_artifact(pathlib.Path(directory))
     if args.check:
         if ARTIFACT.read_text() != generated:

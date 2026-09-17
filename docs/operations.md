@@ -5,14 +5,17 @@ For first-time installation, prerequisites, Secure MCP Tunnel, and ChatGPT custo
 ## Install
 
 ```bash
-cargo build --release -p codex-connect --locked
-target/release/codex-connect setup
-export PATH="$HOME/.local/bin:$PATH"
+bootstrap_target=target/codex-connect-bootstrap
+rm -rf "$bootstrap_target"
+CARGO_TARGET_DIR="$bootstrap_target" cargo build --release -p codex-connect --locked
+"$bootstrap_target/release/codex-connect" setup
+rm -rf "$bootstrap_target"
+export PATH="$HOME/projects/.local/bin:$PATH"
 codex-connect doctor
 codex-connect status
 ```
 
-`setup` converges the bootstrap binary into the canonical runtime layout: one content-addressed artifact under `~/.local/lib/codex-connect/builds/`, `~/.local/bin/codex-connect` as the operator symlink, and `codex-connect.service` pointing at that artifact.
+`setup` converges the bootstrap binary into the canonical workspace-local runtime layout: one content-addressed artifact under `~/projects/.local/lib/codex-connect/builds/`, `~/projects/.local/bin/codex-connect` as the operator symlink, workspace configuration under `~/projects/.config/codex-connect/`, workspace deployment state under `~/projects/.local/state/codex-connect/`, and `codex-connect.service` pointing at that artifact. The temporary `target/codex-connect-bootstrap/` tree is build-only and should be deleted after setup. Steady-state deployments may retain `target/codex-connect-deploy/build/` as a compiler cache, but no executable under `target/` is runtime authority. The user systemd manager may retain its registration file under its native user-unit directory; that registration is not application-state authority.
 
 Configure the official tunnel client separately to connect its long-lived runtime to `http://127.0.0.1:8767/mcp`. The ChatGPT custom app uses **no authentication**. The tunnel runtime authenticates to OpenAI with its own runtime API key; Codex Connect's MCP endpoint is deliberately loopback-only and has no application-level authentication. Use the tunnel client's native lifecycle commands:
 
@@ -21,7 +24,7 @@ tunnel-client runtimes connect ...
 tunnel-client runtimes status <alias>
 ```
 
-The canonical tunnel-client profile is `~/.config/tunnel-client/codex-connect.yaml`. It is tunnel-client-owned; Codex Connect does not read or manage the tunnel ID.
+The canonical tunnel-client profile is `~/projects/.config/tunnel-client/codex-connect.yaml`. It remains tunnel-client-owned; Codex Connect does not read or manage the tunnel ID or its runtime lifecycle.
 
 The exact connection parameters and credentials remain tunnel-client-owned. `codex-connect restart` restarts only the backend and intentionally leaves the native tunnel runtime alone.
 
@@ -43,7 +46,7 @@ codex-connect status
 codex-connect restart
 codex-connect doctor
 codex-connect logs --follow
-codex-connect probe --codex-bin ~/.local/bin/codex --cwd ~/projects/example-project
+codex-connect probe --codex-bin ~/projects/.tools/bin/codex --cwd ~/projects/example-project
 ```
 
 `codex-connect restart` also enables the backend service if it was installed but disabled, so a successful recovery restores the next-boot invariant.
@@ -69,7 +72,7 @@ tunnel-client runtimes status codex-connect --json
 
 If the native runtime is stopped, execute the `repair_command` returned by `runtimes status`, then run the status command again. The repair command is tunnel-client-owned and is derived from the saved alias/profile state, so it is preferable to reconstructing account-specific flags by hand.
 
-The canonical profile remains `~/.config/tunnel-client/codex-connect.yaml`. Do not recreate the profile, invent a second alias, or add a systemd tunnel unit for routine reboot recovery.
+The canonical profile remains `~/projects/.config/tunnel-client/codex-connect.yaml`. Do not recreate the profile, invent a second alias, or add a systemd tunnel unit for routine reboot recovery.
 
 ## Recovery
 
@@ -89,7 +92,7 @@ Do not add a per-client backend or systemd tunnel unit. The only persistent Code
 
 ## Configuration
 
-The configuration at `~/.config/codex-connect/config.toml` is deliberately small:
+The configuration at `~/projects/.config/codex-connect/config.toml` is deliberately small:
 
 ```toml
 [scope]
@@ -97,10 +100,10 @@ root = "~/projects"
 
 [backend]
 listen = "127.0.0.1:8767"
-codex_bin = "codex"
+codex_bin = "/home/you/projects/.tools/bin/codex"
 ```
 
-This is the canonical configuration shape for the pre-release backend. Historical configuration forms are not retained.
+`setup` persists an absolute executable path and prefers the workspace tool at `~/projects/.tools/bin/codex`; a bare PATH lookup is only a bootstrap fallback. This is the canonical configuration shape for the pre-release backend. Historical configuration forms are not retained.
 
 ## Deployment boundary
 
@@ -113,7 +116,7 @@ codex-connect deploy activate <operation-id>
 codex-connect deploy status <operation-id>
 ```
 
-`deploy prepare` is a short enqueue operation: it creates a versioned durable record under the user state directory, records the source tree, assigns an operation id, and hands the potentially long release build to a detached systemd unit. The build itself requires neither Git nor a clean working tree, uses an operation-specific temporary Cargo target directory, installs a content-addressed artifact, and records `prepared` or `failed` without touching the running backend. `deploy activate` is also short: an operation-scoped OS lock serializes competing callers, the prepared artifact is validated, `activationQueued` is persisted, and the detached activation is handed to systemd before the foreground command returns. If handoff fails, the record is rolled back to `prepared`; if a detached worker later disappears without recording completion, `deploy status` reconciles that condition to `succeeded` only when the exact runtime and operator artifact prove activation completed, otherwise to `failed`. Successful normal activation is not considered verified until the live backend reports the exact prepared SHA-256. Installed content-addressed artifacts are retained rather than automatically deleted, so activating one durable operation cannot invalidate another prepared operation.
+`deploy prepare` is a short enqueue operation: it creates a versioned durable record under the user state directory, records the source tree, assigns an operation id, and hands the potentially long release build to a detached systemd unit. The build itself requires neither Git nor a clean working tree. Deployment builds are serialized by a deployment-wide build lock and reuse one persistent Cargo release target at `target/codex-connect-deploy/build`; that directory is only a compilation cache and is never deployment authority. The completed binary is installed as a content-addressed artifact, and the operation records `prepared` or `failed` without touching the running backend. `deploy activate` is also short: an operation-scoped OS lock serializes competing callers, the prepared artifact is validated, `activationQueued` is persisted, and the detached activation is handed to systemd before the foreground command returns. If handoff fails, the record is rolled back to `prepared`; if a detached worker later disappears without recording completion, `deploy status` reconciles that condition to `succeeded` only when the exact runtime and operator artifact prove activation completed, otherwise to `failed`. Successful normal activation is not considered verified until the live backend reports the exact prepared SHA-256. Installed content-addressed artifacts are retained rather than automatically deleted, so activating one durable operation cannot invalidate another prepared operation.
 
 That boundary is intentional. Backend deployment must not become tunnel lifecycle orchestration.
 

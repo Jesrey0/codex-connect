@@ -94,13 +94,16 @@ The tunnel client is independently owned. Codex Connect does not install it, cre
 ## 4. Build and install Codex Connect
 
 ```bash
-cargo build --release -p codex-connect --locked
-target/release/codex-connect setup
-export PATH="$HOME/.local/bin:$PATH"
+bootstrap_target=target/codex-connect-bootstrap
+rm -rf "$bootstrap_target"
+CARGO_TARGET_DIR="$bootstrap_target" cargo build --release -p codex-connect --locked
+"$bootstrap_target/release/codex-connect" setup
+rm -rf "$bootstrap_target"
+export PATH="$HOME/projects/.local/bin:$PATH"
 codex-connect doctor
 ```
 
-`setup` is the one-time backend installer. It installs the running binary into the content-addressed build store under `~/.local/lib/codex-connect/builds/`, points `~/.local/bin/codex-connect` at that artifact, creates the default host scope (`~/projects` if absent), writes the local configuration, installs and enables `codex-connect.service` as a user service, starts it, and waits for backend health.
+`setup` is the one-time backend installer. It installs the running bootstrap binary into the content-addressed build store under `~/projects/.local/lib/codex-connect/builds/`, points `~/projects/.local/bin/codex-connect` at that artifact, creates the default host scope (`~/projects` if absent), writes configuration under `~/projects/.config/codex-connect/`, keeps deployment state under `~/projects/.local/state/codex-connect/`, installs and enables `codex-connect.service` as a user service, starts it, and waits for backend health. The one-time `target/codex-connect-bootstrap/` directory is disposable and should be removed after setup; it is never a runtime authority. Setup prefers the pinned workspace tool path `~/projects/.tools/bin/codex` and persists that absolute path so backend launch is not PATH-order dependent.
 
 For later source updates, run:
 
@@ -114,7 +117,7 @@ codex-connect deploy activate <operation-id>
 codex-connect deploy status <operation-id>
 ```
 
-`deploy prepare` immediately writes a durable operation record and queues the release build as a detached user-systemd job, then returns without waiting for compilation. The build uses an operation-scoped temporary target directory, installs the resulting content-addressed artifact, cleans its temporary build tree, and moves the operation from `building` to `prepared` (or `failed`) without changing the running backend. `deploy activate` validates that prepared artifact, serializes competing activation requests for that operation, queues detached activation, and returns before the backend restart begins. The detached activation restarts only the Codex Connect backend, verifies backend health, and records success or failure. `deploy status` is authoritative for the whole transaction: it also converts an abandoned detached job into a terminal result instead of leaving a deployment permanently pending, and after success it verifies that the live backend is running the exact prepared SHA-256. Installed content-addressed builds are retained so one prepared operation cannot be invalidated by activating another. Deployment never restarts or recreates the independent tunnel runtime.
+`deploy prepare` immediately writes a durable operation record and queues the release build as a detached user-systemd job, then returns without waiting for compilation. Deployment builds serialize through a deployment-wide build lock and reuse the persistent Cargo release target at `target/codex-connect-deploy/build`; that directory is only a compilation cache. The resulting binary is installed as a content-addressed artifact, and the operation moves from `building` to `prepared` (or `failed`) without changing the running backend. `deploy activate` validates that prepared artifact, serializes competing activation requests for that operation, queues detached activation, and returns before the backend restart begins. The detached activation restarts only the Codex Connect backend, verifies backend health, and records success or failure. `deploy status` is authoritative for the whole transaction: it also converts an abandoned detached job into a terminal result instead of leaving a deployment permanently pending, and after success it verifies that the live backend is running the exact prepared SHA-256. Installed content-addressed builds are retained so one prepared operation cannot be invalidated by activating another. Deployment never restarts or recreates the independent tunnel runtime.
 
 Expected final state: `deploy status` reports `state=succeeded verified=true`, and `codex-connect status` reports the backend service running at `http://127.0.0.1:8767/mcp`.
 
@@ -157,11 +160,11 @@ tunnel-client runtimes connect \
   --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" \
   --runtime-api-key env:CONTROL_PLANE_API_KEY \
   --profile codex-connect \
-  --profile-dir "$HOME/.config/tunnel-client" \
+  --profile-dir "$HOME/projects/.config/tunnel-client" \
   --mcp-server-url http://127.0.0.1:8767/mcp
 ```
 
-The canonical tunnel-client profile path is `~/.config/tunnel-client/codex-connect.yaml`. It is owned by the tunnel client and remains independent of Codex Connect's backend configuration.
+The canonical tunnel-client profile path is `~/projects/.config/tunnel-client/codex-connect.yaml`. It is owned by the tunnel client and remains independent of Codex Connect's backend configuration and lifecycle.
 
 `CONTROL_PLANE_API_KEY` authenticates `tunnel-client` to OpenAI's tunnel control plane. `CONTROL_PLANE_ORGANIZATION_ID` selects the active organization context for those requests. Neither is a Codex Connect credential, and neither should be supplied to the ChatGPT connector.
 
