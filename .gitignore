@@ -1,6 +1,8 @@
-/target/
-__pycache__/
+!.env.example
+**/__pycache__/
+*.pyc
+.cargo/
 .env
 .env.*
-!.env.example
 /config/tunnel-client/codex-connect.yaml
+/target/

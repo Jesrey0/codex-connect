@@ -3,6 +3,7 @@ members = ["crates/app-server", "crates/relay", "crates/scope", "crates/mcp", "c
 resolver = "2"
 
 [workspace.package]
+version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"

@@ -267,7 +267,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codex-connect"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "codex-connect-app-server"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -295,23 +295,21 @@ dependencies = [
 
 [[package]]
 name = "codex-connect-mcp"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
  "codex-connect-relay",
  "codex-connect-scope",
  "rmcp",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 
 [[package]]
 name = "codex-connect-relay"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64 0.22.1",
  "codex-connect-app-server",
@@ -324,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "codex-connect-scope"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64 0.22.1",
  "image",
