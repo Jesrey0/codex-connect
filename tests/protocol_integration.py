@@ -21,13 +21,13 @@ from support.mcp_client import McpClient
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONTRACT = json.loads((ROOT / "config/app-server-tool-schemas.json").read_text())
 EXPECTED = {
-    "codexConnect.status", "codexConnect.inspect", "apply_patch", "view_image", "command.exec",
+    "status", "inspect", "apply_patch", "view_image", "command.exec",
     "command.start", "command.read", "command.write", "command.resize", "command.terminate",
-    "codexConnect.work.start", "codexConnect.work.read", "codexConnect.work.wait",
-    "codexConnect.work.steer", "codexConnect.work.interrupt", "codexConnect.pendingActions.list",
-    "codexConnect.approval.respond", "codexConnect.permissions.respond",
-    "codexConnect.elicitation.respond", "codexConnect.userInput.respond",
-    "codexConnect.review", "model.list", "skills.list", "codexConnect.usage",
+    "codex.work.start", "codex.work.read", "codex.work.wait",
+    "codex.work.steer", "codex.work.interrupt", "codex.pendingActions.list",
+    "codex.approval.respond", "codex.permissions.respond",
+    "codex.elicitation.respond", "codex.userInput.respond",
+    "codex.review", "codex.model.list", "codex.skills.list", "codex.usage",
 }
 
 
@@ -94,10 +94,10 @@ class OperatorProtocolTests(unittest.TestCase):
             "sandboxPolicy",
             {"type": "workspaceWrite", "networkAccess": True},
         )
-        return self.client.call("codexConnect.work.start", {"task": scenario, **arguments})
+        return self.client.call("codex.work.start", {"task": scenario, **arguments})
 
     def wait(self, work, timeout=1000, **arguments):
-        return self.client.call("codexConnect.work.wait", {
+        return self.client.call("codex.work.wait", {
             "threadId": work["threadId"], "turnId": work["turnId"], "afterCursor": work["cursor"],
             "timeoutMs": timeout, **arguments,
         })
@@ -105,7 +105,7 @@ class OperatorProtocolTests(unittest.TestCase):
     def test_catalog_and_status_are_canonical(self):
         self.assertEqual(len(self.client.catalog), 24)
         self.assertEqual(set(self.client.tools), EXPECTED)
-        wait_timeout = self.client.tools["codexConnect.work.wait"]["inputSchema"]["properties"]["timeoutMs"]
+        wait_timeout = self.client.tools["codex.work.wait"]["inputSchema"]["properties"]["timeoutMs"]
         self.assertEqual(wait_timeout["default"], 60000)
         self.assertEqual(wait_timeout["maximum"], 120000)
         start_size = self.client.tools["command.start"]["inputSchema"]["properties"]["size"]["anyOf"][0]
@@ -114,15 +114,15 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(start_size["properties"]["cols"]["minimum"], 1)
         self.assertEqual(resize["rows"]["minimum"], 1)
         self.assertEqual(resize["cols"]["minimum"], 1)
-        work_start = self.client.tools["codexConnect.work.start"]["inputSchema"]
+        work_start = self.client.tools["codex.work.start"]["inputSchema"]
         self.assertIn("sandboxPolicy", work_start["required"])
         self.client.call(
-            "codexConnect.work.start",
+            "codex.work.start",
             {"task": "no_event"},
             error=True,
             validate_input=False,
         )
-        status = self.client.call("codexConnect.status")
+        status = self.client.call("status")
         self.assertTrue(status["healthy"])
         self.assertTrue(status["experimentalApi"])
         self.assertEqual(set(status), {
@@ -136,7 +136,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 404)
 
     def test_inspection_uses_advertised_camel_case_and_scope(self):
-        result = self.client.call("codexConnect.inspect", {"operations": [
+        result = self.client.call("inspect", {"operations": [
             {"type": "readText", "path": "sample.txt", "startLine": 2, "endLine": 2},
             {"type": "searchContent", "query": "two", "maxResults": 1},
             {"type": "metadata", "path": "sample.txt"},
@@ -156,13 +156,13 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(fuzzy["path"], "sample.txt")
         self.assertEqual(fuzzy["match_type"], "file")
         self.assertEqual(fuzzy["score"], 100)
-        escaped = self.client.call("codexConnect.inspect", {"operations": [
+        escaped = self.client.call("inspect", {"operations": [
             {"type": "fuzzyFileSearch", "query": "external", "path": "."},
         ]})
         self.assertEqual(escaped["results"][0]["result"]["files"], [])
         large = self.scope / "large.txt"
         large.write_bytes(b"x" * (7 * 1024 * 1024))
-        large_result = self.client.call("codexConnect.inspect", {"operations": [
+        large_result = self.client.call("inspect", {"operations": [
             {"type": "readText", "path": "large.txt", "startLine": 1, "endLine": 1},
         ]})
         self.assertEqual(large_result["results"][0]["index"], 0)
@@ -172,15 +172,15 @@ class OperatorProtocolTests(unittest.TestCase):
         suffix = "x" * 240
         for index in range(28_000):
             (large_directory / f"{index:05d}-{suffix}").touch()
-        large_directory_result = self.client.call("codexConnect.inspect", {"operations": [
+        large_directory_result = self.client.call("inspect", {"operations": [
             {"type": "readDirectory", "path": "large-directory"},
         ]})
         self.assertIn("directory listing exceeds", large_directory_result["results"][0]["error"])
-        healthy = self.client.call("codexConnect.inspect", {"operations": [
+        healthy = self.client.call("inspect", {"operations": [
             {"type": "readText", "path": "sample.txt", "startLine": 1, "endLine": 1},
         ]})
         self.assertEqual(healthy["results"][0]["result"]["text"], "one")
-        partial = self.client.call("codexConnect.inspect", {"operations": [
+        partial = self.client.call("inspect", {"operations": [
             {"type":"readText","path":"/etc/passwd"},
             {"type":"readText","path":"sample.txt","startLine":3,"endLine":3},
         ]})
@@ -188,17 +188,17 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIn("outside the configured scope root", partial["results"][0]["error"])
         self.assertEqual(partial["results"][1]["index"], 1)
         self.assertEqual(partial["results"][1]["result"]["text"], "three")
-        escaped_fuzzy = self.client.call("codexConnect.inspect", {"operations": [
+        escaped_fuzzy = self.client.call("inspect", {"operations": [
             {"type":"fuzzyFileSearch","query":"etc","path":"/etc"},
         ]})
         self.assertIn("outside the configured scope root", escaped_fuzzy["results"][0]["error"])
-        self.client.call("codexConnect.inspect", {
+        self.client.call("inspect", {
             "cwd":"/etc", "operations":[{"type":"readDirectory","path":"."}],
         }, error=True)
 
     def test_request_cwd_applies_consistently_to_paths_patch_and_image(self):
         cwd = str(self.project)
-        inspected = self.client.call("codexConnect.inspect", {"cwd":cwd,"operations":[
+        inspected = self.client.call("inspect", {"cwd":cwd,"operations":[
             {"type":"readText","path":"local.txt"},
             {"type":"searchContent","query":"project-local"},
         ]})
@@ -457,13 +457,13 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"],"terminal")
         self.assertEqual(result["wakeReason"],"terminal")
         self.assertEqual(result["turn"]["output"][0]["text"],"fixture complete")
-        self.client.call("codexConnect.work.wait",{"threadId":work["threadId"],"turnId":"missing","timeoutMs":0},error=True)
+        self.client.call("codex.work.wait",{"threadId":work["threadId"],"turnId":"missing","timeoutMs":0},error=True)
         next_work = self.start("idle",threadId=work["threadId"])
         self.assertFalse(next_work["createdThread"])
         idle = self.wait(next_work,timeout=0)
         self.assertEqual(idle["state"],"active")
         self.assertEqual(idle["wakeReason"],"timeout")
-        read = self.client.call("codexConnect.work.read",{"threadId":work["threadId"]})
+        read = self.client.call("codex.work.read",{"threadId":work["threadId"]})
         self.assertEqual(read["latestTurn"]["id"], next_work["turnId"])
 
     def test_wait_uses_paginated_turn_lookup(self):
@@ -483,8 +483,8 @@ class OperatorProtocolTests(unittest.TestCase):
                 self.assertIn("item/agentMessage/delta", [event["method"] for event in result["events"]])
             if scenario == "oversized":
                 self.assertTrue(any(event["truncated"] for event in result["events"]))
-            self.client.call("codexConnect.work.steer",{"threadId":work["threadId"],"expectedTurnId":work["turnId"],"instruction":"continue"})
-            self.client.call("codexConnect.work.interrupt",{"threadId":work["threadId"],"turnId":work["turnId"]})
+            self.client.call("codex.work.steer",{"threadId":work["threadId"],"expectedTurnId":work["turnId"],"instruction":"continue"})
+            self.client.call("codex.work.interrupt",{"threadId":work["threadId"],"turnId":work["turnId"]})
             interrupted = self.wait(work)
             self.assertEqual(interrupted["state"],"terminal")
             self.assertEqual(interrupted["wakeReason"],"terminal")
@@ -508,7 +508,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(request_result["state"], "terminal")
         self.assertEqual(request_result["pendingActions"], [])
 
-        status = self.client.call("codexConnect.status")
+        status = self.client.call("status")
         self.assertTrue(status["healthy"])
 
     def test_questions_wake_wait_and_preserve_the_same_turn(self):
@@ -520,14 +520,14 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(pending["params"]["questions"][0]["id"],"format")
         self.assertTrue(pending["isBlocking"])
         request_id = pending["requestId"]
-        self.client.call("codexConnect.approval.respond",{"requestId":request_id,"decision":"approve"},error=True)
-        self.client.call("codexConnect.userInput.respond",{"requestId":request_id,"answers":{"wrong":["JSON"]}},error=True)
-        self.client.call("codexConnect.userInput.respond",{"requestId":request_id,"answers":{"format":["JSON"]}})
+        self.client.call("codex.approval.respond",{"requestId":request_id,"decision":"approve"},error=True)
+        self.client.call("codex.userInput.respond",{"requestId":request_id,"answers":{"wrong":["JSON"]}},error=True)
+        self.client.call("codex.userInput.respond",{"requestId":request_id,"answers":{"format":["JSON"]}})
         completed = self.wait(work)
         self.assertEqual(completed["state"],"terminal")
         self.assertEqual(completed["wakeReason"],"terminal")
-        self.client.call("codexConnect.userInput.respond",{"requestId":request_id,"answers":{"format":["JSON"]}},error=True)
-        actions = self.client.call("codexConnect.pendingActions.list",{"threadId":work["threadId"]})["actions"]
+        self.client.call("codex.userInput.respond",{"requestId":request_id,"answers":{"format":["JSON"]}},error=True)
+        actions = self.client.call("codex.pendingActions.list",{"threadId":work["threadId"]})["actions"]
         self.assertEqual(actions,[])
 
     def test_nonblocking_question_does_not_wake_join_and_interrupt_cleans_up(self):
@@ -536,17 +536,17 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"],"active")
         self.assertEqual(result["wakeReason"],"timeout")
         self.assertFalse(result["pendingActions"][0]["isBlocking"])
-        self.client.call("codexConnect.work.interrupt",{"threadId":work["threadId"],"turnId":work["turnId"]})
-        self.assertEqual(self.client.call("codexConnect.pendingActions.list",{"threadId":work["threadId"]})["actions"],[])
+        self.client.call("codex.work.interrupt",{"threadId":work["threadId"],"turnId":work["turnId"]})
+        self.assertEqual(self.client.call("codex.pendingActions.list",{"threadId":work["threadId"]})["actions"],[])
 
     def test_typed_approval_permission_and_elicitation_wire_responses(self):
         cases = [
-            ("approval","codexConnect.approval.respond",{"decision":"approve"}),
-            ("file","codexConnect.approval.respond",{"decision":"decline"}),
-            ("permissions","codexConnect.permissions.respond",{"permissions":{"network":{"enabled":True}},"scope":"turn"}),
-            ("form","codexConnect.elicitation.respond",{"action":"accept","content":{"name":"Ada"}}),
-            ("openai_form","codexConnect.elicitation.respond",{"action":"accept","content":{"name":"Ada"}}),
-            ("url","codexConnect.elicitation.respond",{"action":"accept"}),
+            ("approval","codex.approval.respond",{"decision":"approve"}),
+            ("file","codex.approval.respond",{"decision":"decline"}),
+            ("permissions","codex.permissions.respond",{"permissions":{"network":{"enabled":True}},"scope":"turn"}),
+            ("form","codex.elicitation.respond",{"action":"accept","content":{"name":"Ada"}}),
+            ("openai_form","codex.elicitation.respond",{"action":"accept","content":{"name":"Ada"}}),
+            ("url","codex.elicitation.respond",{"action":"accept"}),
         ]
         for scenario, responder, answer in cases:
             with self.subTest(scenario=scenario):
@@ -565,7 +565,7 @@ class OperatorProtocolTests(unittest.TestCase):
         source_result = self.wait(source)
         self.assertEqual(source_result["state"],"terminal")
         self.assertEqual(source_result["wakeReason"],"terminal")
-        review = self.client.call("codexConnect.review",{
+        review = self.client.call("codex.review",{
             "threadId": source["threadId"], "target":{"type":"uncommittedChanges"},
         })
         self.assertFalse(review["createdThread"])
@@ -575,9 +575,9 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["wakeReason"],"terminal")
         self.assertEqual(result["threadId"], source["threadId"])
         self.assertEqual(result["turnId"], review["turnId"])
-        self.client.call("model.list")
-        self.client.call("skills.list")
-        usage = self.client.call("codexConnect.usage")
+        self.client.call("codex.model.list")
+        self.client.call("codex.skills.list")
+        usage = self.client.call("codex.usage")
         self.assertFalse(usage["ordinaryUsageAllowed"])
         self.assertEqual(usage["rateLimitResetCredits"]["availableCount"], 2)
         self.assertEqual(usage["accountId"], "fixture-account")
@@ -585,7 +585,7 @@ class OperatorProtocolTests(unittest.TestCase):
     def test_wait_tracks_review_turn_before_thread_history_catches_up(self):
         source = self.start("complete")
         self.assertEqual(self.wait(source)["state"], "terminal")
-        review = self.client.call("codexConnect.review", {
+        review = self.client.call("codex.review", {
             "threadId": source["threadId"],
             "target": {"type": "custom", "instructions": "delayed_visibility"},
         })
@@ -596,7 +596,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["turn"]["status"], "failed")
 
     def test_contract_surface_is_completely_reachable_and_schema_valid(self):
-        inspected = self.client.call("codexConnect.inspect", {"operations": [
+        inspected = self.client.call("inspect", {"operations": [
             {"type": "readText", "path": "sample.txt"},
             {"type": "readDirectory", "path": "."},
             {"type": "metadata", "path": "sample.txt"},
@@ -606,20 +606,20 @@ class OperatorProtocolTests(unittest.TestCase):
 
         source = self.start("complete")
         self.assertEqual(self.wait(source)["state"], "terminal")
-        self.client.call("codexConnect.work.read", {"threadId": source["threadId"]})
+        self.client.call("codex.work.read", {"threadId": source["threadId"]})
 
         resumed = self.start("idle", threadId=source["threadId"])
-        self.client.call("codexConnect.work.steer", {
+        self.client.call("codex.work.steer", {
             "threadId": resumed["threadId"],
             "expectedTurnId": resumed["turnId"],
             "instruction": "continue",
         })
-        self.client.call("codexConnect.work.interrupt", {
+        self.client.call("codex.work.interrupt", {
             "threadId": resumed["threadId"], "turnId": resumed["turnId"],
         })
         self.assertEqual(self.wait(resumed)["state"], "terminal")
 
-        review = self.client.call("codexConnect.review", {
+        review = self.client.call("codex.review", {
             "threadId": source["threadId"], "target": {"type": "uncommittedChanges"},
         })
         self.assertEqual(self.wait(review)["state"], "terminal")
@@ -639,20 +639,20 @@ class OperatorProtocolTests(unittest.TestCase):
         self.client.call("command.read", {"processId": quiet["processId"], "timeoutMs": 1000})
 
         for scenario, responder, answer in [
-            ("approval", "codexConnect.approval.respond", {"decision": "approve"}),
-            ("file", "codexConnect.approval.respond", {"decision": "decline"}),
-            ("permissions", "codexConnect.permissions.respond", {"permissions": {"network": {"enabled": True}}, "scope": "turn"}),
-            ("form", "codexConnect.elicitation.respond", {"action": "accept", "content": {"name": "Ada"}}),
-            ("question", "codexConnect.userInput.respond", {"answers": {"format": ["JSON"]}}),
+            ("approval", "codex.approval.respond", {"decision": "approve"}),
+            ("file", "codex.approval.respond", {"decision": "decline"}),
+            ("permissions", "codex.permissions.respond", {"permissions": {"network": {"enabled": True}}, "scope": "turn"}),
+            ("form", "codex.elicitation.respond", {"action": "accept", "content": {"name": "Ada"}}),
+            ("question", "codex.userInput.respond", {"answers": {"format": ["JSON"]}}),
         ]:
             work = self.start(scenario)
             pending = self.wait(work)["pendingActions"][0]
             self.client.call(responder, {"requestId": pending["requestId"], **answer})
             self.assertEqual(self.wait(work)["state"], "terminal")
 
-        self.client.call("model.list")
-        self.client.call("skills.list")
-        self.client.call("codexConnect.usage")
+        self.client.call("codex.model.list")
+        self.client.call("codex.skills.list")
+        self.client.call("codex.usage")
 
         observed = {"method": set(), "serverRequest": set(), "notification": set()}
         for line in self.coverage_path.read_text().splitlines():

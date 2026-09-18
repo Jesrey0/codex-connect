@@ -24,7 +24,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
     vec![
         tool(
             meta(
-                "codexConnect.status",
+                "status",
                 "Read Operator Status",
                 "Use first to orient to Codex Connect health, workspace scope, and build identity.",
                 true,
@@ -37,7 +37,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.inspect",
+                "inspect",
                 "Inspect Workspace",
                 "Use for structured read-only workspace exploration. Batch independent text reads, directory listings, metadata checks, content searches, and ranked App Server fuzzy file searches in one call whenever possible. The workspace need not use version control. Relative paths resolve against request cwd (default: scopeRoot); omitted search paths mean cwd. Each operation returns an indexed result or error without discarding successful siblings. Use command.exec instead when the answer is naturally produced by one deterministic repository/tool command.",
                 true,
@@ -52,7 +52,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "apply_patch",
                 "Apply Patch",
-                "Use when the exact textual file change is already known. Relative patch paths resolve against request cwd (default: scopeRoot), within the configured scope. For autonomous multi-step coding, use codexConnect.work.start instead.",
+                "Use when the exact textual file change is already known. Relative patch paths resolve against request cwd (default: scopeRoot), within the configured scope. For autonomous multi-step coding, use codex.work.start instead.",
                 false,
                 true,
                 false,
@@ -167,7 +167,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for one known bounded deterministic command, including a shell command that composes several related read-only repository/tool queries into one result. This is the App Server command/exec path, not a separate executor. Non-interactive, with a 30-second default timeout (60-minute maximum) and 64 KiB default output cap (256 KiB maximum). Omit sandboxPolicy to inherit App Server policy. For long-running or interactive commands use command.start; for autonomous investigation/coding use codexConnect.work.start.",
+                "Use for one known bounded deterministic command, including a shell command that composes several related read-only repository/tool queries into one result. This is the App Server command/exec path, not a separate executor. Non-interactive, with a 30-second default timeout (60-minute maximum) and 64 KiB default output cap (256 KiB maximum). Omit sandboxPolicy to inherit App Server policy. For long-running or interactive commands use command.start; for autonomous investigation/coding use codex.work.start.",
                 false,
                 true,
                 true,
@@ -181,9 +181,9 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.work.start",
+                "codex.work.start",
                 "Start Codex Work",
-                "Use for autonomous multi-step engineering work. Creates or resumes an official Codex thread and starts one official turn; follow with codexConnect.work.wait. sandboxPolicy is required on every call so the operator explicitly selects the sandbox/network policy for each delegated turn instead of inheriting a hidden default.",
+                "Use for autonomous multi-step engineering work. Creates or resumes an official Codex thread and starts one official turn; follow with codex.work.wait. sandboxPolicy is required on every call so the operator explicitly selects the sandbox/network policy for each delegated turn instead of inheriting a hidden default.",
                 false,
                 true,
                 true,
@@ -194,9 +194,9 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.work.read",
+                "codex.work.read",
                 "Read Codex Work",
-                "Use for a compact authoritative snapshot of an official Codex thread. Use work.wait to quietly join delegated work until completion, required operator action, or the wait lease expires.",
+                "Use for a compact authoritative snapshot of an official Codex thread. Use codex.work.wait to quietly join Codex work until completion, required operator action, or the wait lease expires.",
                 true,
                 false,
                 false,
@@ -207,7 +207,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.work.wait",
+                "codex.work.wait",
                 "Wait for Codex Work",
                 "Quietly join delegated Codex work for up to 120 seconds. Routine tool calls, file changes, and worker commentary remain journaled but do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required; otherwise returns when the wait lease expires.",
                 true,
@@ -220,7 +220,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.work.steer",
+                "codex.work.steer",
                 "Steer Active Codex Work",
                 "Use to add instructions to the currently steerable official turn without creating a new thread.",
                 false,
@@ -239,7 +239,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.work.interrupt",
+                "codex.work.interrupt",
                 "Interrupt Codex Work",
                 "Use to stop an active official Codex turn.",
                 false,
@@ -258,9 +258,9 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.pendingActions.list",
+                "codex.pendingActions.list",
                 "List Pending Codex Actions",
-                "Use when work.wait returns wakeReason=actionRequired or inputRequired, or to inspect outstanding approvals, permissions, elicitations, and semantic questions. Check isBlocking before treating a question as a blocked turn.",
+                "Use when codex.work.wait returns wakeReason=actionRequired or inputRequired, or to inspect outstanding approvals, permissions, elicitations, and semantic questions. Check isBlocking before treating a question as a blocked turn.",
                 true,
                 false,
                 false,
@@ -274,9 +274,9 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.approval.respond",
+                "codex.approval.respond",
                 "Respond to Codex Approval",
-                "Use only for a pending command or file-change approval returned by pendingActions.list. Decisions are normalized and translated to the pinned official response shape.",
+                "Use only for a pending command or file-change approval returned by codex.pendingActions.list. Decisions are normalized and translated to the pinned official response shape.",
                 false,
                 true,
                 true,
@@ -290,7 +290,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.permissions.respond",
+                "codex.permissions.respond",
                 "Respond to Permission Request",
                 "Use only for a pending Codex permission request. Grants the explicit official permission profile for this turn or session.",
                 false,
@@ -306,7 +306,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.elicitation.respond",
+                "codex.elicitation.respond",
                 "Respond to MCP Elicitation",
                 "Use only for pending MCP elicitation. Accept form/openai-form flows with their returned object content; accept a completed URL flow without content. Decline/cancel carry no content.",
                 false,
@@ -322,9 +322,9 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.userInput.respond",
+                "codex.userInput.respond",
                 "Answer Codex Question",
-                "Use only for a pending Codex user-input question returned by work.wait or pendingActions.list. Map every official question id to selected or free-form strings; an empty array skips that question. This is the single deliberate experimental App Server capability exposed by Codex Connect.",
+                "Use only for a pending Codex user-input question returned by codex.work.wait or codex.pendingActions.list. Map every official question id to selected or free-form strings; an empty array skips that question. This is the single deliberate experimental App Server capability exposed by Codex Connect.",
                 false,
                 true,
                 true,
@@ -348,9 +348,9 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.review",
+                "codex.review",
                 "Start Code Review",
-                "Use when the user explicitly requests an official Codex review. Custom review instructions work without version control; uncommitted-change, branch, and commit targets require an existing VCS context. Follow with work.wait for the result.",
+                "Use when the user explicitly requests an official Codex review. Custom review instructions work without version control; uncommitted-change, branch, and commit targets require an existing VCS context. Follow with codex.work.wait for the result.",
                 false,
                 true,
                 true,
@@ -361,7 +361,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "model.list",
+                "codex.model.list",
                 "List Codex Models",
                 "Use when model choice or supported reasoning effort must be discovered before starting Codex work.",
                 true,
@@ -377,7 +377,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "skills.list",
+                "codex.skills.list",
                 "List Codex Skills",
                 "Use to discover Codex skills available for one or more scope-fenced working directories.",
                 true,
@@ -396,7 +396,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codexConnect.usage",
+                "codex.usage",
                 "Read Codex Usage",
                 "Use for the authoritative Codex account usage/rate-limit snapshot, including ordinary-usage permission and reset-credit state when supplied. This is remote account telemetry and is not workspace state.",
                 true,
@@ -656,7 +656,7 @@ fn work_start_schema() -> Value {
 }
 fn work_wait_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by work.start/work.wait. Matching events after this cursor are returned when the quiet join ends but do not wake it by themselves."},"timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet-join lease in milliseconds. Set to 0 for a non-blocking state/journal pull."}}),
+        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by codex.work.start/codex.work.wait. Matching events after this cursor are returned when the quiet join ends but do not wake it by themselves."},"timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet-join lease in milliseconds. Set to 0 for a non-blocking state/journal pull."}}),
         &["threadId"],
     )
 }
@@ -855,28 +855,28 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let expected = [
             "apply_patch",
-            "codexConnect.approval.respond",
-            "codexConnect.elicitation.respond",
-            "codexConnect.inspect",
-            "codexConnect.pendingActions.list",
-            "codexConnect.permissions.respond",
-            "codexConnect.review",
-            "codexConnect.status",
-            "codexConnect.usage",
-            "codexConnect.userInput.respond",
-            "codexConnect.work.interrupt",
-            "codexConnect.work.read",
-            "codexConnect.work.start",
-            "codexConnect.work.steer",
-            "codexConnect.work.wait",
+            "codex.approval.respond",
+            "codex.elicitation.respond",
+            "codex.model.list",
+            "codex.pendingActions.list",
+            "codex.permissions.respond",
+            "codex.review",
+            "codex.skills.list",
+            "codex.usage",
+            "codex.userInput.respond",
+            "codex.work.interrupt",
+            "codex.work.read",
+            "codex.work.start",
+            "codex.work.steer",
+            "codex.work.wait",
             "command.exec",
             "command.read",
             "command.resize",
             "command.start",
             "command.terminate",
             "command.write",
-            "model.list",
-            "skills.list",
+            "inspect",
+            "status",
             "view_image",
         ]
         .into_iter()
@@ -920,7 +920,7 @@ mod tests {
     #[test]
     fn golden_tool_selection_fixture_is_unambiguous() {
         let cases = [
-            ("find where Relay is defined", Some("codexConnect.inspect")),
+            ("find where Relay is defined", Some("inspect")),
             (
                 "show status, recent commits, and changed files",
                 Some("command.exec"),
@@ -939,17 +939,17 @@ mod tests {
             ("stop the running dev server", Some("command.terminate")),
             (
                 "investigate these test failures and fix them",
-                Some("codexConnect.work.start"),
+                Some("codex.work.start"),
             ),
             (
                 "wait for the coding agent to finish",
-                Some("codexConnect.work.wait"),
+                Some("codex.work.wait"),
             ),
-            ("review my uncommitted changes", Some("codexConnect.review")),
+            ("review my uncommitted changes", Some("codex.review")),
             ("show me this png", Some("view_image")),
             (
                 "answer the coding agent's question",
-                Some("codexConnect.userInput.respond"),
+                Some("codex.userInput.respond"),
             ),
             ("what is the weather", None),
         ];

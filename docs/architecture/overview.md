@@ -32,10 +32,10 @@ flowchart TD
 Codex Connect does **not** define another agent/session model.
 
 - App Server owns thread and turn state.
-- `work.start` composes `thread/start` or `thread/resume` with `turn/start`.
-- `work.steer` maps to `turn/steer`.
-- `work.interrupt` maps to `turn/interrupt`.
-- `review` maps to inline `review/start`.
+- `codex.work.start` composes `thread/start` or `thread/resume` with `turn/start`.
+- `codex.work.steer` maps to `turn/steer`.
+- `codex.work.interrupt` maps to `turn/interrupt`.
+- `codex.review` maps to inline `review/start`.
 - Every public result preserves official App Server identifiers.
 
 Connect-owned state is observational or transport-specific only: the bounded event journal, pending server-request registry, and bounded live-turn cache seeded from official turn-start responses/lifecycle events. None is authoritative Codex state; persisted thread history remains App Server-owned.
@@ -48,16 +48,18 @@ The public surface therefore falls into three implementation classes:
 
 | Class | Public surface | App Server authority / justification |
 | --- | --- | --- |
-| Projection | `model.list`, `skills.list`, `codexConnect.usage` | Narrow projections of `model/list`, `skills/list`, and `account/rateLimits/read`. |
+| Projection | `codex.model.list`, `codex.skills.list`, `codex.usage` | Narrow projections of `model/list`, `skills/list`, and `account/rateLimits/read`. |
 | Adapter | `command.exec`, `command.start/read/write/resize/terminate` | Official sandboxed `command/exec` and its streaming control RPCs; Connect adds scope normalization, bounded journals, and MCP lifecycle projection. |
-| Adapter | `codexConnect.work.start/read/wait/steer/interrupt` | Official `thread/*` and `turn/*` state remains authoritative; Connect composes the small operator workflow and quiet-join journal. |
-| Adapter | `codexConnect.review` | Official `review/start`, with scoped thread preparation and work-result projection. |
-| Adapter | `codexConnect.pendingActions.list` and typed responders | Official App Server server requests remain authoritative; Connect keeps only the pending-response routing needed to answer them over MCP. |
+| Adapter | `codex.work.start/read/wait/steer/interrupt` | Official `thread/*` and `turn/*` state remains authoritative; Connect composes the small operator workflow and quiet-join journal. |
+| Adapter | `codex.review` | Official `review/start`, with scoped thread preparation and work-result projection. |
+| Adapter | `codex.pendingActions.list` and typed responders | Official App Server server requests remain authoritative; Connect keeps only the pending-response routing needed to answer them over MCP. |
 | Adapter | `inspect.readText/readDirectory/metadata/fuzzyFileSearch` | Official `fs/readFile`, `fs/readDirectory`, `fs/getMetadata`, and `fuzzyFileSearch`; Connect adds durable-scope fencing and presentation bounds. |
 | Adapter | `view_image` | Image bytes come from official `fs/readFile`; Connect only validates/resizes them and emits an MCP image content block. |
 | Bridge | `inspect.searchContent` | The pinned App Server has no workspace-content-search RPC. The bridge is bounded, scope-fenced, cancellation-aware, and skips known build/cache trees. |
 | Bridge | `apply_patch` | The pinned App Server exposes byte-level filesystem mutations but no deterministic patch semantic RPC. Connect owns patch parsing/preflight/rollback semantics. |
-| Bridge | `codexConnect.status` | Operator/runtime health and content-addressed build identity are Connect deployment concerns, not Codex thread state. |
+| Bridge | `status` | Operator/runtime health and content-addressed build identity are Connect deployment concerns, not Codex thread state. |
+
+`codex.*` is the public namespace for interacting with the Codex CLI/App Server agent domain. `codex-connect` remains the implementation/product identity of the bridge, while host/operator operations such as `status`, `inspect`, `apply_patch`, `view_image`, and `command.*` speak for the connector environment directly.
 
 An upstream method is not automatically public merely because it exists. For example, the pinned App Server also exposes fuzzy-file-search session methods intended for interactive picker-style clients; ChatGPT's one-shot exploration path does not need that lifecycle, so Codex Connect exposes only the one-shot ranked search. Conversely, a bridge must be removed or reduced when a future pinned App Server version gains the equivalent semantic capability.
 
@@ -71,25 +73,25 @@ sequenceDiagram
     participant X as Codex Connect
     participant A as Codex App Server
 
-    C->>X: work.start(task, sandboxPolicy)
+    C->>X: codex.work.start(task, sandboxPolicy)
     X->>A: thread/start or thread/resume
     X->>A: turn/start
     A-->>X: official notifications
     X-->>C: threadId + turnId + cursor
-    C->>X: work.wait(afterCursor)
+    C->>X: codex.work.wait(afterCursor)
     X-->>C: terminal / operator action / lease timeout
 ```
 
-`work.wait` is a bounded quiet join, not a progress subscription. Routine item lifecycle notifications, tool activity, file changes, and agent commentary continue to enter the bounded event journal but do not resolve the wait. The wait returns early only when the selected turn becomes terminal or operator action/input is required; otherwise it returns when its lease expires. A zero-duration wait can be used to pull the accumulated journal without blocking. The relay treats the official `turn/start` / `review/start` response as immediately valid live state, then reconciles against paginated `thread/turns/list` history with turn items omitted during scans. Only the selected turn is hydrated through filtered `thread/items/list` pages. Metadata checks use `thread/read(includeTurns=false)`; full-history hydration is deliberately avoided on the wait path.
+`codex.work.wait` is a bounded quiet join, not a progress subscription. Routine item lifecycle notifications, tool activity, file changes, and agent commentary continue to enter the bounded event journal but do not resolve the wait. The wait returns early only when the selected turn becomes terminal or operator action/input is required; otherwise it returns when its lease expires. A zero-duration wait can be used to pull the accumulated journal without blocking. The relay treats the official `turn/start` / `review/start` response as immediately valid live state, then reconciles against paginated `thread/turns/list` history with turn items omitted during scans. Only the selected turn is hydrated through filtered `thread/items/list` pages. Metadata checks use `thread/read(includeTurns=false)`; full-history hydration is deliberately avoided on the wait path.
 
 ## Typed action loop
 
 Operator-actionable server requests are normalized into four categories:
 
-- command/file approvals → `codexConnect.approval.respond`
-- permission grants → `codexConnect.permissions.respond`
-- MCP elicitation → `codexConnect.elicitation.respond`
-- Codex semantic questions → `codexConnect.userInput.respond`
+- command/file approvals → `codex.approval.respond`
+- permission grants → `codex.permissions.respond`
+- MCP elicitation → `codex.elicitation.respond`
+- Codex semantic questions → `codex.userInput.respond`
 
 The pending registry preserves the exact official request ID, method, params, and correlated thread ID. Responders validate the action category and translate the compact public decision into the pinned official response shape. Unsupported server requests fail closed.
 
@@ -97,7 +99,7 @@ The pending registry preserves the exact official request ID, method, params, an
 
 ## Host inspection boundary
 
-`codexConnect.inspect` is the single read-only host inspection primitive. It supports batched:
+`inspect` is the single read-only host inspection primitive. It supports batched:
 
 - `readText`
 - `readDirectory`
@@ -127,7 +129,7 @@ Persistent deterministic commands use a separate `command.start` / `command.read
 
 App Server owns the actual process lifecycle. Codex Connect owns only the bounded client-side projection required to expose that long-running RPC asynchronously over MCP. There is deliberately no `command.list`: the pinned App Server has no authoritative standalone command-session enumeration RPC, so exposing relay bookkeeping as a list would imply authority it does not have. Command-session handles do not survive backend/App Server restart. The pinned protocol states that streaming command sessions are connection-scoped and are terminated if the originating connection closes; after restart an old `processId` is therefore stale and rejected.
 
-The separate experimental App Server `process/*` API is not used for this surface because current upstream semantics place it outside Codex sandbox execution, while the operator contract here requires the existing sandbox/network controls. Autonomous investigation or coding still belongs in `work.start`, where Codex owns its normal command/file lifecycle and reasoning loop. Every public `work.start` call requires `sandboxPolicy`; Codex Connect roots workspace-write paths and always sends that operator-selected policy on the corresponding official `turn/start`. The lower-level App Server protocol keeps the field optional because that is the pinned upstream wire contract, but the public operator surface intentionally does not inherit it.
+The separate experimental App Server `process/*` API is not used for this surface because current upstream semantics place it outside Codex sandbox execution, while the operator contract here requires the existing sandbox/network controls. Autonomous investigation or coding still belongs in `codex.work.start`, where Codex owns its normal command/file lifecycle and reasoning loop. Every public `codex.work.start` call requires `sandboxPolicy`; Codex Connect roots workspace-write paths and always sends that operator-selected policy on the corresponding official `turn/start`. The lower-level App Server protocol keeps the field optional because that is the pinned upstream wire contract, but the public operator surface intentionally does not inherit it.
 
 Workspace-write `writableRoots` must be absolute paths inside the durable scope. For an explicitly supplied policy, the upstream `networkAccess` boolean is passed through deliberately: `false` can prohibit socket creation, including localhost-based tests, while `true` is broader network access rather than a loopback-only grant. Codex Connect does not silently retry with broader permissions.
 
@@ -147,7 +149,7 @@ The dedicated pinned App Server process is launched with `default_mode_request_u
 
 Because `openai/form` is advertised during initialization, the elicitation responder accepts both standard `form` payloads and the `openai/form` / legacy `openaiForm` variants. URL-mode elicitation remains content-free on acceptance.
 
-`codexConnect.usage` preserves the pinned App Server account usage payload rather than projecting only percentages. This includes `ordinaryUsageAllowed`, reset-credit summary state, per-limit snapshots, and other top-level fields supplied by `account/rateLimits/read`, so the operator does not infer availability from percentages or reset timestamps.
+`codex.usage` preserves the pinned App Server account usage payload rather than projecting only percentages. This includes `ordinaryUsageAllowed`, reset-credit summary state, per-limit snapshots, and other top-level fields supplied by `account/rateLimits/read`, so the operator does not infer availability from percentages or reset timestamps.
 
 The generated schema artifact contains only the internal requests and server-response contracts needed by the adapter, including the explicitly selected user-input request contract. Upstream App Server schema identifiers are preserved verbatim and do not define generations of the Codex Connect MCP surface. Adding an App Server method to that artifact does not make it a public MCP tool; public tools are deliberately designed around ChatGPT goals.
 

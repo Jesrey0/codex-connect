@@ -120,11 +120,11 @@ A bridge needs an explicit architectural justification and should be reconsidere
 
 Host `command.exec` / `command.start` must preserve an omitted `sandboxPolicy` all the way to App Server. **Absence is semantic:** Codex Connect sends no synthetic policy, so App Server uses the effective upstream Codex configuration from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Do not replace omission with an equivalent-looking `workspaceWrite` object, because doing so would duplicate upstream defaults and create configuration drift.
 
-`codexConnect.work.start` has the opposite contract: it must reject omission and always send the operator-supplied `sandboxPolicy` on `turn/start`. Do not add Codex Connect configuration fields for `sandbox_mode` or `sandbox_workspace_write.network_access`.
+`codex.work.start` has the opposite contract: it must reject omission and always send the operator-supplied `sandboxPolicy` on `turn/start`. Do not add Codex Connect configuration fields for `sandbox_mode` or `sandbox_workspace_write.network_access`.
 
 The MCP tests contain deterministic golden examples such as:
 
-- “find where Relay is defined” → one batched `codexConnect.inspect` call
+- “find where Relay is defined” → one batched `inspect` call
 - “show status, recent commits, and changed files” → one composed `command.exec` call
 - “run cargo test” → `command.exec`
 - “start the dev server and keep it running” → `command.start`
@@ -132,9 +132,9 @@ The MCP tests contain deterministic golden examples such as:
 - “send input to the debugger” → `command.write`
 - “resize the debugger terminal” → `command.resize`
 - “stop the running dev server” → `command.terminate`
-- “investigate these failures and fix them” → `codexConnect.work.start`
-- “wait for the coding agent” → `codexConnect.work.wait`
-- “review uncommitted changes” → `codexConnect.review`
+- “investigate these failures and fix them” → `codex.work.start`
+- “wait for the coding agent” → `codex.work.wait`
+- “review uncommitted changes” → `codex.review`
 - unrelated prompts → no Codex Connect tool
 
 Extend this fixture when adding or materially changing tool metadata.

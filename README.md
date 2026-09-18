@@ -17,7 +17,7 @@ Codex App Server remains authoritative for Codex threads, turns, reviews, approv
 For deterministic host work:
 
 ```text
-codexConnect.inspect → command.exec / command.start / apply_patch
+inspect → command.exec / command.start / apply_patch
 ```
 
 For persistent or interactive deterministic commands:
@@ -33,20 +33,21 @@ command.read ↔ command.write
 For autonomous Codex work:
 
 ```text
-codexConnect.work.start
+codex.work.start
         ↓
-codexConnect.work.wait
+codex.work.wait
         ↓
 [pending typed action, if any]
         ↓
-codexConnect.approval.respond / permissions.respond / elicitation.respond
+codex.approval.respond / codex.permissions.respond /
+codex.elicitation.respond / codex.userInput.respond
         ↓
-codexConnect.work.wait
+codex.work.wait
 ```
 
-Use `codexConnect.inspect` for structured read-only exploration, and batch independent inspection operations in one call. Use `command.exec` when the answer is naturally produced by one bounded deterministic command; compose related repository/tool reads into that single command rather than chaining tiny calls. Use `command.start` when the command is still deterministic but must remain running or interactive. Use `codexConnect.work.start` when Codex should investigate, reason, edit, test, or iterate autonomously.
+Use `inspect` for structured read-only host exploration, and batch independent inspection operations in one call. Use `command.exec` when the answer is naturally produced by one bounded deterministic host command; compose related repository/tool reads into that single command rather than chaining tiny calls. Use `command.start` when the host command is still deterministic but must remain running or interactive. Use `codex.work.start` when the Codex CLI/agent should investigate, reason, edit, test, or iterate autonomously.
 
-**Host sandbox invariant:** when `command.exec` or `command.start` omits `sandboxPolicy`, Codex Connect sends **no synthetic policy**. The field remains absent on the App Server request, so App Server uses the effective upstream Codex configuration from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Codex Connect must not mirror those defaults locally. Callers may still supply an explicit per-command override, including `dangerFullAccess`. By contrast, `codexConnect.work.start` requires an explicit `sandboxPolicy` on every delegated turn so operator-selected authority is never inherited implicitly.
+**Host sandbox invariant:** when `command.exec` or `command.start` omits `sandboxPolicy`, Codex Connect sends **no synthetic policy**. The field remains absent on the App Server request, so App Server uses the effective upstream Codex configuration from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Codex Connect must not mirror those defaults locally. Callers may still supply an explicit per-command override, including `dangerFullAccess`. By contrast, `codex.work.start` requires an explicit `sandboxPolicy` on every delegated turn so operator-selected authority is never inherited implicitly.
 
 ## Public MCP surface
 
@@ -54,12 +55,14 @@ The canonical MCP surface contains 24 tools:
 
 | Area | Tools |
 | --- | --- |
-| Orientation | `codexConnect.status`, `codexConnect.usage` |
-| Read-only host inspection | `codexConnect.inspect`, `view_image` |
-| Deterministic mutation/execution | `apply_patch`, `command.exec`, `command.start`, `.read`, `.write`, `.resize`, `.terminate` |
-| Autonomous Codex work | `codexConnect.work.start`, `.read`, `.wait`, `.steer`, `.interrupt` |
-| Operator/action loop | `codexConnect.pendingActions.list`, `codexConnect.approval.respond`, `codexConnect.permissions.respond`, `codexConnect.elicitation.respond`, `codexConnect.userInput.respond` |
-| Review/discovery | `codexConnect.review`, `model.list`, `skills.list` |
+| Host orientation | `status` |
+| Read-only host inspection | `inspect`, `view_image` |
+| Deterministic mutation/execution | `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.write`, `command.resize`, `command.terminate` |
+| Codex work | `codex.work.start`, `codex.work.read`, `codex.work.wait`, `codex.work.steer`, `codex.work.interrupt` |
+| Codex operator/action loop | `codex.pendingActions.list`, `codex.approval.respond`, `codex.permissions.respond`, `codex.elicitation.respond`, `codex.userInput.respond` |
+| Codex review/discovery/usage | `codex.review`, `codex.model.list`, `codex.skills.list`, `codex.usage` |
+
+`codex.*` is the public namespace for interacting with the Codex CLI/App Server agent domain. `codex-connect` and `@codexConnect` remain the implementation and connector/product identities of the bridge; host/operator tools remain un-namespaced or under `command.*`.
 
 The App Server is initialized with `experimentalApi: true` and advertises `extensions["openai/form"]` for the official structured collaboration paths Codex Connect exposes. Its dedicated App Server process also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` feature flags so those catalog responders can be exercised without relying on a user's global Codex configuration.
 

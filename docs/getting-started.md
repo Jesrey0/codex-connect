@@ -4,7 +4,7 @@ This is the shortest supported path from a fresh Linux host to a working Codex C
 
 The target success condition is simple:
 
-> From ChatGPT, `@codexConnect` can call `codexConnect.status` and receive the live backend/App Server status from your machine.
+> From ChatGPT, `@codexConnect` can call `status` and receive the live backend/App Server status from your machine.
 
 ## Current support boundary
 
@@ -235,7 +235,7 @@ Start a new ChatGPT conversation with the custom app/connector enabled and ask:
 @codexConnect check status
 ```
 
-A working installation should return live data from `codexConnect.status`, including an available worker and `stdio` App Server transport.
+A working installation should return live data from `status`, including an available worker and `stdio` App Server transport.
 
 Then test the useful boundary, not just connectivity:
 
@@ -250,7 +250,7 @@ That demonstrates the actual architecture: ChatGPT is the remote control plane, 
 
 If you are giving the source tree to a coding agent, use this prompt:
 
-> Set up Codex Connect end-to-end by following `docs/getting-started.md`. Keep Codex Connect, Codex App Server, ChatGPT, and Secure MCP Tunnel as separate lifecycle owners. Treat the host scope as a general workspace and do not introduce Git/version-control workflow unless explicitly requested. Never expose or print credentials. Use the project-pinned Codex CLI release. Stop only when human interaction is required in OpenAI/ChatGPT account UI. Before declaring success, verify `codex-connect doctor`, `codex-connect status`, `tunnel-client runtimes status codex-connect --json`, and finally have me confirm that `@codexConnect` can call `codexConnect.status` from ChatGPT.
+> Set up Codex Connect end-to-end by following `docs/getting-started.md`. Keep Codex Connect, Codex App Server, ChatGPT, and Secure MCP Tunnel as separate lifecycle owners. Treat the host scope as a general workspace and do not introduce Git/version-control workflow unless explicitly requested. Never expose or print credentials. Use the project-pinned Codex CLI release. Stop only when human interaction is required in OpenAI/ChatGPT account UI. Before declaring success, verify `codex-connect doctor`, `codex-connect status`, `tunnel-client runtimes status codex-connect --json`, and finally have me confirm that `@codexConnect` can call `status` from ChatGPT.
 
 The agent should not replace Secure MCP Tunnel with ngrok or another ad-hoc ingress, create duplicate services, or add alternate protocol paths around the official App Server contract.
 
@@ -265,7 +265,7 @@ Use the boundary that failed rather than restarting everything:
 | `codex-connect status` | the local loopback MCP backend is alive |
 | `tunnel-client runtimes status codex-connect --json` | the outbound Secure MCP Tunnel runtime is alive/healthy |
 | ChatGPT tool scan | ChatGPT can reach the MCP backend through the tunnel with connector authentication set to None |
-| `codexConnect.status` from ChatGPT | the complete control path is working |
+| `status` from ChatGPT | the complete control path is working |
 
 For backend problems, use `codex-connect logs --follow`. For tunnel problems, use `tunnel-client help troubleshooting`. Do not restart both failure domains blindly.
 

@@ -167,7 +167,7 @@ impl ServerHandler for McpHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("codex-connect", ""))
             .with_instructions(
-                "Codex Connect is a ChatGPT-native operator surface over a deliberately selected Codex App Server subset. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. For read-only exploration, batch independent reads/searches in one codexConnect.inspect call. For a deterministic repository or tool query that composes naturally as commands, prefer one bounded command.exec call over a chain of tiny calls. Use command.start plus command.read/write/resize/terminate only for persistent or interactive commands, and codexConnect.work.start followed by codexConnect.work.wait for autonomous multi-step Codex work. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect scopes, batches, and projects those capabilities rather than reimplementing them.",
+                "Codex Connect is the bridge between ChatGPT and the official Codex App Server. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. Use inspect for structured read-only host exploration, batching independent reads and searches when possible. Use command.exec for bounded deterministic host commands and command.start plus command.read/write/resize/terminate only for persistent or interactive deterministic commands. Use codex.work.start followed by codex.work.wait for autonomous Codex CLI/agent work, and codex.review for official Codex review. The codex.* namespace represents the Codex CLI/App Server agent domain; un-namespaced host tools and command.* represent connector/operator facilities. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect scopes, batches, and projects those capabilities rather than reimplementing them.",
             )
     }
 
@@ -374,11 +374,11 @@ async fn dispatch(
     context: &RequestContext<RoleServer>,
 ) -> anyhow::Result<Value> {
     match name {
-        "codexConnect.status" => {
+        "status" => {
             ensure_empty(arguments)?;
             Ok(serde_json::to_value(OperatorStatus::read(relay, runtime))?)
         }
-        "codexConnect.inspect" => inspect(relay, scope, parse(arguments)?, context).await,
+        "inspect" => inspect(relay, scope, parse(arguments)?, context).await,
         "apply_patch" => {
             let args: PatchArgs = parse(arguments)?;
             Ok(json!({"applied": scope.apply_patch(&args.patch, args.cwd.as_deref())?}))
@@ -429,7 +429,7 @@ async fn dispatch(
                 .await
                 .map_err(Into::into)
         }
-        "codexConnect.work.start" => {
+        "codex.work.start" => {
             let a: WorkStartArgs = parse(arguments)?;
             relay
                 .work_start(
@@ -445,82 +445,82 @@ async fn dispatch(
                 .await
                 .map_err(Into::into)
         }
-        "codexConnect.work.read" => {
+        "codex.work.read" => {
             let a: WorkReadArgs = parse(arguments)?;
             relay.work_read(a.thread_id).await.map_err(Into::into)
         }
-        "codexConnect.work.wait" => {
+        "codex.work.wait" => {
             let a: WorkWaitArgs = parse(arguments)?;
             relay
                 .work_wait(a.thread_id, a.turn_id, a.after_cursor, a.timeout_ms)
                 .await
                 .map_err(Into::into)
         }
-        "codexConnect.work.steer" => {
+        "codex.work.steer" => {
             let a: WorkSteerArgs = parse(arguments)?;
             relay
                 .work_steer(a.thread_id, a.expected_turn_id, a.instruction)
                 .await
                 .map_err(Into::into)
         }
-        "codexConnect.work.interrupt" => {
+        "codex.work.interrupt" => {
             let a: WorkInterruptArgs = parse(arguments)?;
             relay
                 .work_interrupt(a.thread_id, a.turn_id)
                 .await
                 .map_err(Into::into)
         }
-        "codexConnect.pendingActions.list" => {
+        "codex.pendingActions.list" => {
             let a: PendingActionsArgs = parse(arguments)?;
             Ok(json!({"actions":relay.pending_actions(a.thread_id.as_deref()).await}))
         }
-        "codexConnect.approval.respond" => {
+        "codex.approval.respond" => {
             let a: ApprovalRespondArgs = parse(arguments)?;
             relay
                 .respond_approval(a.request_id, a.decision)
                 .await
                 .map_err(Into::into)
         }
-        "codexConnect.permissions.respond" => {
+        "codex.permissions.respond" => {
             let a: PermissionsRespondArgs = parse(arguments)?;
             relay
                 .respond_permissions(a.request_id, a.permissions, a.scope)
                 .await
                 .map_err(Into::into)
         }
-        "codexConnect.elicitation.respond" => {
+        "codex.elicitation.respond" => {
             let a: ElicitationRespondArgs = parse(arguments)?;
             relay
                 .respond_elicitation(a.request_id, a.action, a.content)
                 .await
                 .map_err(Into::into)
         }
-        "codexConnect.userInput.respond" => {
+        "codex.userInput.respond" => {
             let a: UserInputRespondArgs = parse(arguments)?;
             relay
                 .respond_user_input(a.request_id, a.answers)
                 .await
                 .map_err(Into::into)
         }
-        "codexConnect.review" => {
+        "codex.review" => {
             let a: ReviewArgs = parse(arguments)?;
             relay
                 .review(a.cwd, a.thread_id, a.target)
                 .await
                 .map_err(Into::into)
         }
-        "model.list" => {
+        "codex.model.list" => {
             let a: ModelList = parse(arguments)?;
             relay.model_list(a).await.map_err(Into::into)
         }
-        "skills.list" => {
+        "codex.skills.list" => {
             let a: SkillsArgs = parse(arguments)?;
             relay
                 .skills_list(a.cwds, a.force_reload)
                 .await
                 .map_err(Into::into)
         }
-        "codexConnect.usage" => {
+        "codex.usage" => {
             ensure_empty(arguments)?;
             relay.usage().await.map_err(Into::into)
         }
@@ -634,16 +634,16 @@ fn summary_for(name: &str, value: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
         ),
-        "codexConnect.work.start" => "Codex work started.".into(),
-        "codexConnect.work.wait" => format!(
+        "codex.work.start" => "Codex work started.".into(),
+        "codex.work.wait" => format!(
             "Codex work state: {}.",
             value
                 .get("state")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
         ),
-        "codexConnect.review" => "Codex review started.".into(),
-        "codexConnect.inspect" => "Inspection completed.".into(),
+        "codex.review" => "Codex review started.".into(),
+        "inspect" => "Inspection completed.".into(),
         _ => "Operation completed.".into(),
     }
 }

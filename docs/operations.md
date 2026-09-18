@@ -118,7 +118,7 @@ sandbox_mode = "workspace-write"
 network_access = true
 ```
 
-`codexConnect.work.start` is different by design: its public MCP contract requires an explicit `sandboxPolicy` for every turn, so delegated agent authority is selected by the operator at task start rather than inherited from that host default.
+`codex.work.start` is different by design: its public MCP contract requires an explicit `sandboxPolicy` for every turn, so delegated agent authority is selected by the operator at task start rather than inherited from that host default.
 
 ## Deployment boundary
 
