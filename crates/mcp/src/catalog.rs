@@ -39,7 +39,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "inspect",
                 "Inspect Workspace",
-                "Use for structured read-only workspace exploration. Batch independent text reads, directory listings, metadata checks, content searches, and ranked App Server fuzzy file searches in one call whenever possible. The workspace need not use version control. Relative paths resolve against request cwd (default: scopeRoot); omitted search paths mean cwd. Each operation returns an indexed result or error without discarding successful siblings. Use command.exec instead when the answer is naturally produced by one deterministic repository/tool command.",
+                "Use for structured read-only workspace exploration. Batch independent text reads, directory listings, metadata checks, content searches, and ranked App Server fuzzy file searches in one call whenever possible. The workspace need not use version control. Relative paths resolve against request cwd (default: scopeRoot); omitted search paths mean cwd. Relative paths containing parent (..) components are rejected lexically even when normalization would remain in scope; use an absolute in-scope path when intentionally reaching outside request cwd. Each operation returns an indexed result or error without discarding successful siblings. Use command.exec instead when the answer is naturally produced by one deterministic repository/tool command.",
                 true,
                 false,
                 false,
@@ -52,7 +52,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "apply_patch",
                 "Apply Patch",
-                "Use when the exact textual file change is already known. Relative patch paths resolve against request cwd (default: scopeRoot), within the configured scope. For autonomous multi-step coding, use codex.work.start instead.",
+                "Use when the exact textual file change is already known. Relative patch paths resolve against request cwd (default: scopeRoot), within the configured scope. Parent (..) components are rejected lexically; use an absolute in-scope path instead of parent traversal. For autonomous multi-step coding, use codex.work.start instead.",
                 false,
                 true,
                 false,
@@ -84,7 +84,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.read",
                 "Read Persistent Command",
-                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. Use afterCursor from the previous start/read result to consume incrementally. Retained output is bounded internally; historyLost=true means afterCursor predates retained history.",
+                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. Use afterCursor from the previous start/read result to consume incrementally. Process state and output consumption are independent: state=exited/failed can be returned while newer retained output still exists. Continue reading with the returned cursor until the cursor stops advancing and stdout/stderr are empty. Retained output is bounded internally; historyLost=true means afterCursor predates retained history.",
                 true,
                 false,
                 false,
@@ -129,7 +129,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.terminate",
                 "Terminate Persistent Command",
-                "Request termination of a running command.start session through the official App Server. Follow with command.read to observe the authoritative final exit state.",
+                "Request termination of a running command.start session through the official App Server. This is a stop request, not a graceful-shutdown guarantee; do not rely on signal traps or cleanup handlers running. Follow with command.read to observe the authoritative final exit state and drain retained output.",
                 false,
                 true,
                 false,
@@ -148,7 +148,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "view_image",
                 "View Image",
-                "Use to inspect an image file inside the configured host scope. Relative paths resolve against request cwd (default: scopeRoot).",
+                "Use to inspect an image file inside the configured host scope. Relative paths resolve against request cwd (default: scopeRoot). Parent (..) components are rejected lexically; use an absolute in-scope path instead of parent traversal.",
                 true,
                 false,
                 false,
@@ -167,7 +167,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for one known bounded deterministic command, including a shell command that composes several related read-only repository/tool queries into one result. This is the App Server command/exec path, not a separate executor. Non-interactive, with a 30-second default timeout (60-minute maximum) and 64 KiB default output cap (256 KiB maximum). Omit sandboxPolicy to inherit App Server policy. For long-running or interactive commands use command.start; for autonomous investigation/coding use codex.work.start.",
+                "Use for one known bounded deterministic command, including a shell command that composes several related read-only repository/tool queries into one result. This is the App Server command/exec path, not a separate executor. Non-interactive, with a 30-second default process timeout (60-minute maximum) and 64 KiB per-stream default output cap (256 KiB maximum). timeoutMs is not an end-to-end API latency ceiling because final App Server response delivery gets a finite allowance. The upstream buffered response has no truncation flag, so stdout/stderr whose byte length equals outputBytesCap must be treated as potentially incomplete. Omit sandboxPolicy to inherit App Server policy. For long-running or interactive commands use command.start; for autonomous investigation/coding use codex.work.start.",
                 false,
                 true,
                 true,
@@ -541,17 +541,17 @@ fn inspect_schema() -> Value {
     )
 }
 fn cwd_schema() -> Value {
-    json!({"type":["string","null"],"description":"Request working directory within scopeRoot. Relative cwd is resolved from scopeRoot; omitted or null cwd selects scopeRoot. Relative operation paths resolve from cwd, with no alternate-root retries."})
+    json!({"type":["string","null"],"description":"Request working directory within scopeRoot. Relative cwd is resolved from scopeRoot; omitted or null cwd selects scopeRoot. Relative operation paths resolve from cwd, with no alternate-root retries. Parent (..) components are rejected lexically even when normalization would remain inside scopeRoot; use an absolute in-scope path when that traversal is intentional."})
 }
 fn network_access_schema() -> Value {
     json!({"type":"boolean","default":false,"description":"Network access for an explicitly supplied sandbox policy. false may block sockets, including socket-based localhost tests. true enables broader network access, not only loopback. This default does not apply when the entire sandboxPolicy is omitted; host commands then inherit Codex App Server's effective configuration. No automatic escalation or retry."})
 }
 fn sandbox_schema() -> Value {
-    json!({"oneOf":[{"type":"object","properties":{"type":{"const":"readOnly"},"networkAccess":network_access_schema()},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"workspaceWrite"},"writableRoots":{"type":"array","description":"Absolute writable directory paths within scopeRoot, as required by the pinned upstream contract.","items":{"type":"string","pattern":"^/"}},"networkAccess":network_access_schema(),"excludeSlashTmp":{"type":"boolean"},"excludeTmpdirEnvVar":{"type":"boolean"}},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"dangerFullAccess"}},"required":["type"],"additionalProperties":false}]})
+    json!({"oneOf":[{"type":"object","properties":{"type":{"const":"readOnly"},"networkAccess":network_access_schema()},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"workspaceWrite"},"writableRoots":{"type":"array","description":"Additional absolute writable directory paths within scopeRoot, as required by the pinned upstream contract. They are not an exclusive allowlist and do not narrow App Server's base workspace. For host command.exec/command.start, Codex Connect launches App Server with scopeRoot as its working directory, so workspaceWrite leaves scopeRoot writable even when this list is empty; per-command cwd only selects the process working directory and does not narrow write authority.","items":{"type":"string","pattern":"^/"}},"networkAccess":network_access_schema(),"excludeSlashTmp":{"type":"boolean"},"excludeTmpdirEnvVar":{"type":"boolean"}},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"dangerFullAccess"}},"required":["type"],"additionalProperties":false}]})
 }
 fn command_schema() -> Value {
     object_schema(
-        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},"sandboxPolicy":sandbox_schema()}),
+        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Process execution timeout in milliseconds. App Server enforces the process timeout; the MCP call may complete later while the final response is delivered."},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Per-stream stdout/stderr capture cap in bytes. The pinned App Server buffered response has no truncation flag; if a returned stream is exactly this many bytes, treat it as potentially incomplete."},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},"sandboxPolicy":sandbox_schema()}),
         &["command"],
     )
 }
@@ -778,6 +778,12 @@ mod tests {
         assert_eq!(properties["timeoutMs"]["default"], DEFAULT_COMMAND_MS);
         assert_eq!(properties["timeoutMs"]["minimum"], 1);
         assert_eq!(properties["timeoutMs"]["maximum"], MAX_COMMAND_MS);
+        assert!(
+            properties["timeoutMs"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("may complete later")
+        );
         assert_eq!(
             properties["outputBytesCap"]["default"],
             DEFAULT_COMMAND_OUTPUT_BYTES
@@ -785,6 +791,12 @@ mod tests {
         assert_eq!(
             properties["outputBytesCap"]["maximum"],
             MAX_COMMAND_OUTPUT_BYTES
+        );
+        assert!(
+            properties["outputBytesCap"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("potentially incomplete")
         );
         assert_eq!(schema["additionalProperties"], false);
         let sandbox = sandbox_schema();
@@ -801,6 +813,13 @@ mod tests {
             sandbox["oneOf"][1]["properties"]["writableRoots"]["items"]["pattern"],
             "^/"
         );
+        let writable_roots_description =
+            sandbox["oneOf"][1]["properties"]["writableRoots"]["description"]
+                .as_str()
+                .unwrap();
+        assert!(writable_roots_description.contains("not an exclusive allowlist"));
+        assert!(writable_roots_description.contains("scopeRoot writable"));
+        assert!(writable_roots_description.contains("does not narrow write authority"));
         assert_eq!(
             sandbox["oneOf"][2]["properties"],
             json!({"type":{"const":"dangerFullAccess"}})
@@ -822,6 +841,33 @@ mod tests {
                 .iter()
                 .any(|value| value == "sandboxPolicy")
         );
+    }
+
+    #[test]
+    fn command_metadata_documents_terminal_drain_and_stop_semantics() {
+        let tools = tool_catalog();
+        let read = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "command.read")
+            .unwrap();
+        let read_description = read.description.as_deref().unwrap();
+        assert!(read_description.contains("cursor stops advancing"));
+        assert!(read_description.contains("state=exited/failed"));
+
+        let terminate = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "command.terminate")
+            .unwrap();
+        let terminate_description = terminate.description.as_deref().unwrap();
+        assert!(terminate_description.contains("not a graceful-shutdown guarantee"));
+
+        let exec = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "command.exec")
+            .unwrap();
+        let exec_description = exec.description.as_deref().unwrap();
+        assert!(exec_description.contains("not an end-to-end API latency ceiling"));
+        assert!(exec_description.contains("potentially incomplete"));
     }
 
     #[test]

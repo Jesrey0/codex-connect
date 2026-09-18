@@ -415,6 +415,57 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertTrue(stale["historyLost"])
         self.client.call("command.terminate", {"processId": started["processId"]})
 
+    def test_persistent_terminal_state_does_not_imply_output_is_drained(self):
+        started = self.client.call("command.start", {"command": ["fixture-drain"]})
+        self.client.call("command.write", {
+            "processId": started["processId"], "input": "produce\n",
+        })
+
+        cursor = 0
+        output = ""
+        for _ in range(3):
+            batch = self.client.call("command.read", {
+                "processId": started["processId"], "afterCursor": cursor, "timeoutMs": 1000,
+            })
+            self.assertEqual(batch["state"], "running")
+            self.assertGreater(batch["cursor"], cursor)
+            cursor = batch["cursor"]
+            output += batch["stdout"]
+            if len(output.encode()) == (128 * 1024) + 20000:
+                break
+        self.assertEqual(len(output.encode()), (128 * 1024) + 20000)
+
+        self.client.call("command.write", {
+            "processId": started["processId"], "closeStdin": True,
+        })
+        terminal = self.client.call("command.read", {
+            "processId": started["processId"], "afterCursor": cursor, "timeoutMs": 1000,
+        })
+        self.assertEqual(terminal["state"], "exited")
+        self.assertEqual(terminal["stdout"], "")
+
+        first = self.client.call("command.read", {
+            "processId": started["processId"], "afterCursor": 0, "timeoutMs": 0,
+        })
+        self.assertEqual(first["state"], "exited")
+        self.assertLess(first["cursor"], terminal["cursor"])
+        self.assertEqual(len(first["stdout"].encode()), 128 * 1024)
+
+        second = self.client.call("command.read", {
+            "processId": started["processId"], "afterCursor": first["cursor"], "timeoutMs": 0,
+        })
+        self.assertEqual(second["state"], "exited")
+        self.assertGreater(second["cursor"], first["cursor"])
+        self.assertEqual(second["stdout"], "c" * 20000)
+
+        drained = self.client.call("command.read", {
+            "processId": started["processId"], "afterCursor": second["cursor"], "timeoutMs": 0,
+        })
+        self.assertEqual(drained["state"], "exited")
+        self.assertEqual(drained["cursor"], second["cursor"])
+        self.assertEqual(drained["stdout"], "")
+        self.assertEqual(drained["stderr"], "")
+
     def test_persistent_command_validation_and_independent_reads(self):
         for arguments in [
             {"command": []},

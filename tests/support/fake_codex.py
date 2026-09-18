@@ -337,6 +337,7 @@ for line in sys.stdin:
                 "message": copy.deepcopy(message),
                 "tty": params["tty"],
                 "size": copy.deepcopy(params.get("size")),
+                "scenario": params["command"][0],
             }
             scenario = params["command"][0]
             if scenario == "fixture-stream":
@@ -348,6 +349,8 @@ for line in sys.stdin:
             elif scenario == "fixture-exit":
                 command_output(process_id, "stdout", "done\n")
                 finish_command(process_id, 0)
+            elif scenario == "fixture-drain":
+                pass
             elif scenario == "fixture-delayed-exit":
                 timer = threading.Timer(0.25, finish_command, (process_id, 0))
                 timer.daemon = True
@@ -372,6 +375,11 @@ for line in sys.stdin:
         process_id = params["processId"]
         session = command_sessions[process_id]
         text = base64.b64decode(params.get("deltaBase64") or "").decode()
+        if session["scenario"] == "fixture-drain" and text:
+            assert text == "produce\n"
+            command_output(process_id, "stdout", "a" * (64 * 1024))
+            command_output(process_id, "stdout", "b" * (64 * 1024))
+            command_output(process_id, "stdout", "c" * 20000)
         if session["tty"] and text:
             if text == "2+2\n":
                 command_output(process_id, "stdout", "4\n>>> ")
