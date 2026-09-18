@@ -84,7 +84,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.read",
                 "Read Persistent Command",
-                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. Use afterCursor from the previous start/read result to consume incrementally. Process state and output consumption are independent: state=exited/failed can be returned while newer retained output still exists. Continue reading with the returned cursor until the cursor stops advancing and stdout/stderr are empty. Retained output is bounded internally; historyLost=true means afterCursor predates retained history.",
+                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. Use afterCursor from the previous start/read result to consume incrementally. Process state and output consumption are independent: state=exited/failed can be returned while newer retained output still exists. hasMoreOutput reports whether a newer retained chunk was withheld by the per-read response bound; drained=true means the command is terminal and all currently retained output has been consumed by this read. historyLost=true independently means older output was already evicted.",
                 true,
                 false,
                 false,
@@ -167,7 +167,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for one known bounded deterministic command, including a shell command that composes several related read-only repository/tool queries into one result. This is the App Server command/exec path, not a separate executor. Non-interactive, with a 30-second default process timeout (60-minute maximum) and 64 KiB per-stream default output cap (256 KiB maximum). timeoutMs is not an end-to-end API latency ceiling because final App Server response delivery gets a finite allowance. The upstream buffered response has no truncation flag, so stdout/stderr whose byte length equals outputBytesCap must be treated as potentially incomplete. Omit sandboxPolicy to inherit App Server policy. For long-running or interactive commands use command.start; for autonomous investigation/coding use codex.work.start.",
+                "Use for one known bounded deterministic command, including a shell command that composes several related read-only repository/tool queries into one result. This is the App Server command/exec path, not a separate executor. Non-interactive, with a 30-second default process timeout (60-minute maximum) and 64 KiB per-stream default output cap (256 KiB maximum). timeoutMs is not an end-to-end API latency ceiling because final App Server response delivery gets a finite allowance. stdoutMayBeTruncated/stderrMayBeTruncated conservatively report when the returned byte count exactly reached outputBytesCap; the upstream buffered response does not prove whether additional bytes existed. durationMs is Connect-observed App Server request wall time. Omit sandboxPolicy to inherit App Server policy. For long-running or interactive commands use command.start; for autonomous investigation/coding use codex.work.start.",
                 false,
                 true,
                 true,
@@ -175,8 +175,26 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             ),
             command_schema(),
             Some(object_schema(
-                json!({"exitCode":{"type":"integer"},"stdout":{"type":"string"},"stderr":{"type":"string"}}),
-                &["exitCode", "stdout", "stderr"],
+                json!({
+                    "exitCode":{"type":"integer"},
+                    "stdout":{"type":"string"},
+                    "stderr":{"type":"string"},
+                    "stdoutBytes":{"type":"integer","minimum":0},
+                    "stderrBytes":{"type":"integer","minimum":0},
+                    "stdoutMayBeTruncated":{"type":"boolean","description":"True when stdout byte length exactly reached outputBytesCap. Upstream does not expose a definitive truncation flag."},
+                    "stderrMayBeTruncated":{"type":"boolean","description":"True when stderr byte length exactly reached outputBytesCap. Upstream does not expose a definitive truncation flag."},
+                    "durationMs":{"type":"integer","minimum":0,"description":"Codex Connect-observed wall time for the App Server command request, in milliseconds."}
+                }),
+                &[
+                    "exitCode",
+                    "stdout",
+                    "stderr",
+                    "stdoutBytes",
+                    "stderrBytes",
+                    "stdoutMayBeTruncated",
+                    "stderrMayBeTruncated",
+                    "durationMs",
+                ],
             )),
         ),
         tool(
@@ -474,10 +492,80 @@ fn rpc_id_schema() -> Value {
     json!({"oneOf":[{"type":"string","minLength":1},{"type":"integer"}]})
 }
 fn results_schema() -> Value {
+    let read_text = object_schema(
+        json!({
+            "path":{"type":"string"},
+            "startLine":{"type":"integer","minimum":1},
+            "endLine":{"type":"integer","minimum":0},
+            "totalLines":{"type":"integer","minimum":0},
+            "text":{"type":"string"}
+        }),
+        &["path", "startLine", "endLine", "totalLines", "text"],
+    );
+    let read_directory = object_schema(
+        json!({"entries":{"type":"array","items":object_schema(json!({
+            "fileName":{"type":"string"},
+            "isDirectory":{"type":"boolean"},
+            "isFile":{"type":"boolean"}
+        }), &["fileName","isDirectory","isFile"])}}),
+        &["entries"],
+    );
+    let metadata = object_schema(
+        json!({
+            "createdAtMs":{"type":"integer"},
+            "modifiedAtMs":{"type":"integer"},
+            "isFile":{"type":"boolean"},
+            "isDirectory":{"type":"boolean"},
+            "isSymlink":{"type":"boolean"}
+        }),
+        &[
+            "createdAtMs",
+            "modifiedAtMs",
+            "isFile",
+            "isDirectory",
+            "isSymlink",
+        ],
+    );
+    let search_content = object_schema(
+        json!({
+            "matches":{"type":"array","items":object_schema(json!({
+                "path":{"type":"string"},
+                "line":{"type":"integer","minimum":1},
+                "text":{"type":"string"}
+            }), &["path","line","text"] )},
+            "truncated":{"type":"boolean"}
+        }),
+        &["matches", "truncated"],
+    );
+    let fuzzy_file_search = object_schema(
+        json!({"files":{"type":"array","items":object_schema(json!({
+            "root":{"type":"string"},
+            "path":{"type":"string"},
+            "match_type":{"enum":["file","directory"]},
+            "file_name":{"type":"string"},
+            "score":{"type":"integer","minimum":0},
+            "indices":{"type":["array","null"],"items":{"type":"integer","minimum":0}}
+        }), &["root","path","match_type","file_name","score","indices"])}}),
+        &["files"],
+    );
+    let success = |kind: &'static str, result: Value| {
+        object_schema(
+            json!({"index":{"type":"integer","minimum":0},"type":{"const":kind},"result":result}),
+            &["index", "type", "result"],
+        )
+    };
     object_schema(
         json!({"results":{"type":"array","items":{"oneOf":[
-            object_schema(json!({"index":{"type":"integer","minimum":0},"type":{"type":"string"},"result":{"type":"object"}}), &["index","type","result"]),
-            object_schema(json!({"index":{"type":"integer","minimum":0},"type":{"type":"string"},"error":{"type":"string"}}), &["index","type","error"])
+            success("readText", read_text),
+            success("readDirectory", read_directory),
+            success("metadata", metadata),
+            success("searchContent", search_content),
+            success("fuzzyFileSearch", fuzzy_file_search),
+            object_schema(json!({
+                "index":{"type":"integer","minimum":0},
+                "type":{"enum":["readText","readDirectory","metadata","searchContent","fuzzyFileSearch"]},
+                "error":{"type":"string"}
+            }), &["index","type","error"])
         ]}}}),
         &["results"],
     )
@@ -646,6 +734,8 @@ fn command_read_output_schema() -> Value {
             "stdinOpen":{"type":"boolean"},
             "cursor":{"type":"integer","minimum":0},
             "historyLost":{"type":"boolean"},
+            "hasMoreOutput":{"type":"boolean","description":"True when a newer retained output chunk exists but was withheld by the per-read response bound."},
+            "drained":{"type":"boolean","description":"True when the command is terminal and this read consumed all currently retained output. historyLost may still indicate older evicted output."},
             "stdout":{"type":"string"},
             "stderr":{"type":"string"},
             "exitCode":{"type":["integer","null"]},
@@ -659,6 +749,8 @@ fn command_read_output_schema() -> Value {
             "stdinOpen",
             "cursor",
             "historyLost",
+            "hasMoreOutput",
+            "drained",
             "stdout",
             "stderr",
             "exitCode",
@@ -917,8 +1009,24 @@ mod tests {
             .find(|tool| tool.name.as_ref() == "command.read")
             .unwrap();
         let read_description = read.description.as_deref().unwrap();
-        assert!(read_description.contains("cursor stops advancing"));
         assert!(read_description.contains("state=exited/failed"));
+        assert!(read_description.contains("hasMoreOutput"));
+        assert!(read_description.contains("drained=true"));
+        let read_output = command_read_output_schema();
+        assert!(
+            read_output["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "hasMoreOutput")
+        );
+        assert!(
+            read_output["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "drained")
+        );
 
         let terminate = tools
             .iter()
@@ -933,7 +1041,18 @@ mod tests {
             .unwrap();
         let exec_description = exec.description.as_deref().unwrap();
         assert!(exec_description.contains("not an end-to-end API latency ceiling"));
-        assert!(exec_description.contains("potentially incomplete"));
+        assert!(exec_description.contains("stdoutMayBeTruncated"));
+        assert!(exec_description.contains("durationMs"));
+        let exec_output = exec.output_schema.as_ref().unwrap();
+        for field in [
+            "stdoutBytes",
+            "stderrBytes",
+            "stdoutMayBeTruncated",
+            "stderrMayBeTruncated",
+            "durationMs",
+        ] {
+            assert!(exec_output["properties"].get(field).is_some());
+        }
     }
 
     #[test]
@@ -1002,6 +1121,53 @@ mod tests {
         let schema = inspect_schema().to_string();
         assert!(schema.contains("fuzzyFileSearch"));
         assert!(!schema.contains("searchNames"));
+    }
+
+    #[test]
+    fn inspect_output_schema_types_every_success_variant() {
+        let schema = results_schema();
+        let variants = schema["properties"]["results"]["items"]["oneOf"]
+            .as_array()
+            .unwrap();
+        for kind in [
+            "readText",
+            "readDirectory",
+            "metadata",
+            "searchContent",
+            "fuzzyFileSearch",
+        ] {
+            let success = variants.iter().find(|variant| {
+                variant["properties"]["type"]["const"].as_str() == Some(kind)
+                    && variant["properties"].get("result").is_some()
+            });
+            assert!(success.is_some(), "missing typed inspect result for {kind}");
+        }
+        let read_text = variants
+            .iter()
+            .find(|variant| variant["properties"]["type"]["const"] == "readText")
+            .unwrap();
+        assert_eq!(
+            read_text["properties"]["result"]["properties"]["totalLines"]["type"],
+            "integer"
+        );
+        let search = variants
+            .iter()
+            .find(|variant| variant["properties"]["type"]["const"] == "searchContent")
+            .unwrap();
+        assert_eq!(
+            search["properties"]["result"]["properties"]["truncated"]["type"],
+            "boolean"
+        );
+        let fuzzy = variants
+            .iter()
+            .find(|variant| variant["properties"]["type"]["const"] == "fuzzyFileSearch")
+            .unwrap();
+        let fuzzy_properties =
+            &fuzzy["properties"]["result"]["properties"]["files"]["items"]["properties"];
+        assert!(fuzzy_properties.get("match_type").is_some());
+        assert!(fuzzy_properties.get("file_name").is_some());
+        assert!(fuzzy_properties.get("matchType").is_none());
+        assert!(fuzzy_properties.get("fileName").is_none());
     }
 
     #[test]

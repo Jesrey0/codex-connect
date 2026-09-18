@@ -139,4 +139,6 @@ The MCP tests contain deterministic golden examples such as:
 
 Extend this fixture when adding or materially changing tool metadata.
 
+Operator-facing output schemas should expose state that Connect already knows rather than forcing the caller to reverse-engineer bounds. In particular, streaming command reads expose `hasMoreOutput` and `drained`, buffered commands expose byte-count/cap telemetry without claiming definitive upstream truncation, and batched inspection keeps concrete result schemas for every operation type.
+
 For the architectural rationale, see [Architecture](architecture/overview.md).

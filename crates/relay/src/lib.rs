@@ -11,12 +11,11 @@ pub use codex_connect_app_server::protocol::{
     SandboxPolicy,
 };
 use codex_connect_app_server::protocol::{
-    CommandExecOutputDeltaNotification, CommandExecResize, CommandExecResponse,
-    CommandExecTerminate, CommandExecWrite, FsGetMetadata, FsGetMetadataResponse, FsReadDirectory,
-    FsReadDirectoryResponse, FsReadFile, FuzzyFileSearch, FuzzyFileSearchResponse, RateLimitsRead,
-    ReviewStart, SkillsList, SortDirection, StreamingCommandExec, TextInput, Thread,
-    ThreadItemsList, ThreadRead, ThreadResume, ThreadStart, ThreadTurnsList, TurnInterrupt,
-    TurnItemsView, TurnStart, TurnSteer,
+    CommandExecOutputDeltaNotification, CommandExecResize, CommandExecTerminate, CommandExecWrite,
+    FsGetMetadata, FsGetMetadataResponse, FsReadDirectory, FsReadDirectoryResponse, FsReadFile,
+    FuzzyFileSearch, FuzzyFileSearchResponse, RateLimitsRead, ReviewStart, SkillsList,
+    SortDirection, StreamingCommandExec, TextInput, Thread, ThreadItemsList, ThreadRead,
+    ThreadResume, ThreadStart, ThreadTurnsList, TurnInterrupt, TurnItemsView, TurnStart, TurnSteer,
 };
 use codex_connect_app_server::{
     AppServerClient, AppServerConfig, AppServerError, DEFAULT_REQUEST_TIMEOUT, DeferredRequest,
@@ -24,6 +23,7 @@ use codex_connect_app_server::{
 };
 pub use codex_connect_app_server::{PendingActionKind, PendingServerRequest};
 use codex_connect_scope::{MAX_IMAGE_BYTES, Scope, ScopeError};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -54,6 +54,19 @@ const MAX_FS_READ_FILE_BYTES: u64 = ((MAX_APP_SERVER_RESPONSE_BYTES / 4) * 3) as
 pub struct RelayConfig {
     pub codex_bin: PathBuf,
     pub scope_root: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+    pub stdout_may_be_truncated: bool,
+    pub stderr_may_be_truncated: bool,
+    pub duration_ms: u64,
 }
 
 struct CommandStartCleanup {
@@ -336,7 +349,7 @@ impl Relay {
     pub async fn command_exec(
         &self,
         mut request: CommandExec,
-    ) -> Result<CommandExecResponse, RelayError> {
+    ) -> Result<CommandExecResult, RelayError> {
         validate_command(&request)?;
         request.cwd = Some(
             self.scope
@@ -348,16 +361,30 @@ impl Relay {
                 .output_bytes_cap
                 .unwrap_or(DEFAULT_COMMAND_OUTPUT_BYTES),
         );
+        let output_bytes_cap = request.output_bytes_cap.unwrap();
         request.sandbox_policy = request
             .sandbox_policy
             .map(|p| self.root_sandbox_policy(p))
             .transpose()?;
         // App Server enforces process timeout; transport adds a small finite delivery allowance.
         let duration = Duration::from_millis(request.timeout_ms.unwrap() + 5_000);
-        Ok(self
+        let started = Instant::now();
+        let response = self
             .app_server
             .request_with_timeout(request, duration)
-            .await?)
+            .await?;
+        let stdout_bytes = response.stdout.len();
+        let stderr_bytes = response.stderr.len();
+        Ok(CommandExecResult {
+            exit_code: response.exit_code,
+            stdout: response.stdout,
+            stderr: response.stderr,
+            stdout_bytes,
+            stderr_bytes,
+            stdout_may_be_truncated: stdout_bytes == output_bytes_cap,
+            stderr_may_be_truncated: stderr_bytes == output_bytes_cap,
+            duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        })
     }
 
     pub async fn command_start(

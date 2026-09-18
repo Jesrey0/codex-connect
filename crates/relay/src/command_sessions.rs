@@ -241,6 +241,8 @@ impl CommandSessions {
                 "stdinOpen":session.stdin_open,
                 "cursor":cursor,
                 "historyLost":history_lost,
+                "hasMoreOutput":omitted_newer_chunk,
+                "drained":terminal && !omitted_newer_chunk,
                 "stdout":String::from_utf8_lossy(&stdout),
                 "stderr":String::from_utf8_lossy(&stderr),
                 "exitCode":exit_code,
@@ -253,4 +255,58 @@ impl CommandSessions {
 fn stale_handle() -> String {
     "unknown, evicted, or stale processId; completed command-session projections may be evicted by bounded retention, and all handles are App Server connection-scoped and do not survive connector restart"
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn terminal_reads_report_retained_output_drain_state() {
+        let sessions = CommandSessions::default();
+        sessions.insert("process".into(), false).await.unwrap();
+        sessions
+            .push_output(
+                "process",
+                CommandExecOutputStream::Stdout,
+                vec![b'a'; 64 * 1024],
+            )
+            .await;
+        sessions
+            .push_output(
+                "process",
+                CommandExecOutputStream::Stderr,
+                vec![b'b'; 64 * 1024],
+            )
+            .await;
+        sessions
+            .push_output(
+                "process",
+                CommandExecOutputStream::Stdout,
+                vec![b'c'; 64 * 1024],
+            )
+            .await;
+        sessions
+            .complete(
+                "process",
+                CommandExecResponse {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .await;
+
+        let first = sessions.read_after("process", 0).await.unwrap();
+        assert!(first.terminal);
+        assert_eq!(first.value["hasMoreOutput"], true);
+        assert_eq!(first.value["drained"], false);
+        let cursor = first.value["cursor"].as_u64().unwrap();
+
+        let second = sessions.read_after("process", cursor).await.unwrap();
+        assert!(second.terminal);
+        assert_eq!(second.value["hasMoreOutput"], false);
+        assert_eq!(second.value["drained"], true);
+        assert_eq!(second.value["cursor"].as_u64(), Some(4));
+    }
 }

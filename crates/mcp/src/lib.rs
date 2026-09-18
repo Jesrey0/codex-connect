@@ -685,18 +685,44 @@ fn ensure_empty(arguments: JsonObject) -> anyhow::Result<()> {
 
 fn summary_for(name: &str, value: &Value) -> String {
     match name {
-        "command.exec" => format!(
-            "Command finished with exit code {}.",
-            value.get("exitCode").and_then(Value::as_i64).unwrap_or(-1)
-        ),
+        "command.exec" => {
+            let exit_code = value.get("exitCode").and_then(Value::as_i64).unwrap_or(-1);
+            let duration_ms = value.get("durationMs").and_then(Value::as_u64).unwrap_or(0);
+            let capped = value
+                .get("stdoutMayBeTruncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || value
+                    .get("stderrMayBeTruncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            format!(
+                "Command finished with exit code {exit_code} in {duration_ms} ms{}.",
+                if capped {
+                    "; output cap may have been reached"
+                } else {
+                    ""
+                }
+            )
+        }
         "command.start" => "Persistent command started.".into(),
-        "command.read" => format!(
-            "Persistent command state: {}.",
-            value
+        "command.read" => {
+            let state = value
                 .get("state")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown")
-        ),
+                .unwrap_or("unknown");
+            let drained = value
+                .get("drained")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let has_more = value
+                .get("hasMoreOutput")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            format!(
+                "Persistent command state: {state}; drained={drained}; hasMoreOutput={has_more}."
+            )
+        }
         "codex.work.start" => "Codex work started.".into(),
         "codex.work.wait" => format!(
             "Codex work state: {}.",
