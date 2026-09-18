@@ -44,6 +44,8 @@ codexConnect.work.wait
 
 Use `command.exec` when the exact command is already known and should finish synchronously. Use `command.start` when the command is still deterministic but must remain running or interactive. Use `codexConnect.work.start` when Codex should investigate, reason, edit, test, or iterate autonomously.
 
+**Host sandbox invariant:** when `command.exec` or `command.start` omits `sandboxPolicy`, Codex Connect sends **no synthetic policy**. The field remains absent on the App Server request, so App Server uses the effective upstream Codex configuration from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Codex Connect must not mirror those defaults locally. Callers may still supply an explicit per-command override, including `dangerFullAccess`. By contrast, `codexConnect.work.start` requires an explicit `sandboxPolicy` on every delegated turn so operator-selected authority is never inherited implicitly.
+
 ## Public MCP surface
 
 The canonical MCP surface contains 24 tools:

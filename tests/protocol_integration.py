@@ -90,6 +90,10 @@ class OperatorProtocolTests(unittest.TestCase):
         cls.outside.cleanup()
 
     def start(self, scenario, **arguments):
+        arguments.setdefault(
+            "sandboxPolicy",
+            {"type": "workspaceWrite", "networkAccess": True},
+        )
         return self.client.call("codexConnect.work.start", {"task": scenario, **arguments})
 
     def wait(self, work, timeout=1000, **arguments):
@@ -110,6 +114,14 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(start_size["properties"]["cols"]["minimum"], 1)
         self.assertEqual(resize["rows"]["minimum"], 1)
         self.assertEqual(resize["cols"]["minimum"], 1)
+        work_start = self.client.tools["codexConnect.work.start"]["inputSchema"]
+        self.assertIn("sandboxPolicy", work_start["required"])
+        self.client.call(
+            "codexConnect.work.start",
+            {"task": "no_event"},
+            error=True,
+            validate_input=False,
+        )
         status = self.client.call("codexConnect.status")
         self.assertTrue(status["healthy"])
         self.assertTrue(status["experimentalApi"])
@@ -215,6 +227,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(schema["timeoutMs"]["default"], 30000)
         self.assertEqual(schema["timeoutMs"]["maximum"], 3600000)
         self.assertEqual(schema["outputBytesCap"]["default"], 65536)
+        inherited = self.client.call("command.exec", {"command":["fixture-policy"]})
+        self.assertIsNone(json.loads(inherited["stdout"]))
         result = self.client.call("command.exec", {"command":["echo","fixture"]})
         self.assertEqual(result["exitCode"],0)
         self.assertEqual(self.client.call("command.exec", {
@@ -291,6 +305,7 @@ class OperatorProtocolTests(unittest.TestCase):
         decoded = json.loads(context_output["stdout"])
         self.assertEqual(decoded["cwd"], str(self.project))
         self.assertEqual(decoded["env"], {"CC_TEST": "yes", "CC_UNSET": None})
+        self.assertIsNone(decoded["sandboxPolicy"])
         self.client.call("command.terminate", {"processId": context["processId"]})
 
     def test_persistent_pty_round_trip_resize_and_close(self):

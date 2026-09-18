@@ -538,14 +538,12 @@ impl Relay {
         effort: Option<String>,
         service_tier: Option<String>,
         approval_policy: Option<ApprovalPolicy>,
-        sandbox_policy: Option<SandboxPolicy>,
+        sandbox_policy: SandboxPolicy,
     ) -> Result<Value, RelayError> {
         if task.trim().is_empty() {
             return Err(RelayError::Invalid("task must not be empty".into()));
         }
-        let sandbox_policy = sandbox_policy
-            .map(|p| self.root_sandbox_policy(p))
-            .transpose()?;
+        let sandbox_policy = self.root_sandbox_policy(sandbox_policy)?;
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
         let (thread_id, cwd) = self.prepare_thread(cwd, thread_id).await?;
@@ -556,7 +554,7 @@ impl Relay {
                 input: vec![TextInput::Text { text: task }],
                 cwd,
                 approval_policy,
-                sandbox_policy,
+                sandbox_policy: Some(sandbox_policy),
                 model,
                 effort,
                 service_tier,

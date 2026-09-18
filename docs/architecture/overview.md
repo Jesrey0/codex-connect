@@ -50,7 +50,7 @@ sequenceDiagram
     participant X as Codex Connect
     participant A as Codex App Server
 
-    C->>X: work.start(task)
+    C->>X: work.start(task, sandboxPolicy)
     X->>A: thread/start or thread/resume
     X->>A: turn/start
     A-->>X: official notifications
@@ -97,13 +97,19 @@ All resolved paths are fenced to the configured durable root before an App Serve
 
 `command.exec` is reserved for a known deterministic command that should finish synchronously. It remains unchanged and bounded: the default timeout is 30 seconds, callers may extend it to 60 minutes, and captured stdout/stderr remains capped rather than allowing unbounded buffering.
 
+### Host sandbox inheritance invariant
+
+> **Invariant:** when a host `command.exec` or `command.start` call omits `sandboxPolicy`, Codex Connect MUST send **no synthetic sandbox policy** to App Server. The `sandboxPolicy` field stays absent from the official `command/exec` request, and App Server applies the effective upstream Codex configuration it already loaded from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`).
+
+This makes upstream Codex configuration the single source of truth for host-command defaults. Codex Connect must not parse, copy, persist, materialize, or otherwise mirror `sandbox_mode` or `sandbox_workspace_write.network_access` as its own defaults. An explicit per-command `sandboxPolicy` is an override only and is scope-normalized before being sent upstream.
+
 Persistent deterministic commands use a separate `command.start` / `command.read` / `command.write` / `command.resize` / `command.terminate` surface backed by the official sandboxed `command/exec` streaming session contract. `command.start` supplies a client-generated, connection-scoped `processId`, enables streamed stdout/stderr and stdin control, and runs the still-pending `command/exec` RPC in a relay task until the App Server returns its authoritative final response. PTY mode is explicit; non-PTY sessions still support streaming output and stdin. `command.read` uses a bounded per-session cursor journal and wakes on new output, terminal state, or lease expiry. Output retention and each MCP response are bounded; history loss is surfaced rather than hidden.
 
 App Server owns the actual process lifecycle. Codex Connect owns only the bounded client-side projection required to expose that long-running RPC asynchronously over MCP. There is deliberately no `command.list`: the pinned App Server has no authoritative standalone command-session enumeration RPC, so exposing relay bookkeeping as a list would imply authority it does not have. Command-session handles do not survive backend/App Server restart. The pinned protocol states that streaming command sessions are connection-scoped and are terminated if the originating connection closes; after restart an old `processId` is therefore stale and rejected.
 
-The separate experimental App Server `process/*` API is not used for this surface because current upstream semantics place it outside Codex sandbox execution, while the operator contract here requires the existing sandbox/network controls. Autonomous investigation or coding still belongs in `work.start`, where Codex owns its normal command/file lifecycle and reasoning loop.
+The separate experimental App Server `process/*` API is not used for this surface because current upstream semantics place it outside Codex sandbox execution, while the operator contract here requires the existing sandbox/network controls. Autonomous investigation or coding still belongs in `work.start`, where Codex owns its normal command/file lifecycle and reasoning loop. Every public `work.start` call requires `sandboxPolicy`; Codex Connect roots workspace-write paths and always sends that operator-selected policy on the corresponding official `turn/start`. The lower-level App Server protocol keeps the field optional because that is the pinned upstream wire contract, but the public operator surface intentionally does not inherit it.
 
-Workspace-write `writableRoots` must be absolute paths inside the durable scope. The upstream `networkAccess` boolean is passed through deliberately: `false` can prohibit socket creation, including localhost-based tests, while `true` is broader network access rather than a loopback-only grant. Codex Connect does not silently retry with broader permissions.
+Workspace-write `writableRoots` must be absolute paths inside the durable scope. For an explicitly supplied policy, the upstream `networkAccess` boolean is passed through deliberately: `false` can prohibit socket creation, including localhost-based tests, while `true` is broader network access rather than a loopback-only grant. Codex Connect does not silently retry with broader permissions.
 
 Setup sanitizes its execution `PATH` to absolute, non-empty directories and embeds that PATH in the persistent user-systemd backend unit. This gives App Server commands and workers the operator toolchain environment without wrapping commands in login shells or adding executable-specific lookup fallbacks.
 

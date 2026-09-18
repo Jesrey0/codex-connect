@@ -105,6 +105,21 @@ codex_bin = "/home/you/projects/.tools/bin/codex"
 
 `setup` persists an absolute executable path and prefers the workspace tool at `~/projects/.tools/bin/codex`; a bare PATH lookup is only a bootstrap fallback. This is the canonical configuration shape for the pre-release backend. Historical configuration forms are not retained.
 
+### Host sandbox source of truth
+
+**Operational invariant:** Codex Connect does not synthesize a default `sandboxPolicy` for host commands. When `command.exec` or `command.start` omits that field, Codex Connect also omits it on the official App Server request. App Server therefore uses the effective configuration already loaded from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`).
+
+Sandbox defaults are intentionally not duplicated in Codex Connect configuration. For a workspace-write host baseline with network access, configure Codex itself:
+
+```toml
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true
+```
+
+`codexConnect.work.start` is different by design: its public MCP contract requires an explicit `sandboxPolicy` for every turn, so delegated agent authority is selected by the operator at task start rather than inherited from that host default.
+
 ## Deployment boundary
 
 Deployment is deliberately two-phase so an operator invoking the CLI through the running backend never has to interpret a self-inflicted transport disconnect as command failure.

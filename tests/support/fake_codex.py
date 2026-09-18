@@ -222,6 +222,7 @@ for line in sys.stdin:
         result["data"] = turns[start:start + limit]
         result["nextCursor"] = str(start + limit) if start + limit < len(turns) else None
     elif method == "turn/start":
+        assert "sandboxPolicy" in params
         thread_id = params["threadId"]
         thread = threads[thread_id]
         turn = result["turn"]
@@ -320,7 +321,12 @@ for line in sys.stdin:
             assert params["outputBytesCap"] <= 262144
             if params["command"] == ["disconnect"]:
                 raise SystemExit
-            result.update(exitCode=0, stdout="fixture command\n", stderr="")
+            stdout = (
+                json.dumps(params.get("sandboxPolicy")) + "\n"
+                if params["command"] == ["fixture-policy"]
+                else "fixture command\n"
+            )
+            result.update(exitCode=0, stdout=stdout, stderr="")
         else:
             process_id = params["processId"]
             assert params["streamStdin"] is True
@@ -355,6 +361,7 @@ for line in sys.stdin:
                 command_output(process_id, "stdout", json.dumps({
                     "cwd": params.get("cwd"),
                     "env": params.get("env"),
+                    "sandboxPolicy": params.get("sandboxPolicy"),
                 }) + "\n")
             elif scenario == "fixture-quiet":
                 pass

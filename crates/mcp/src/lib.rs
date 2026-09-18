@@ -279,7 +279,7 @@ struct WorkStartArgs {
     effort: Option<String>,
     service_tier: Option<String>,
     approval_policy: Option<ApprovalPolicy>,
-    sandbox_policy: Option<SandboxPolicy>,
+    sandbox_policy: SandboxPolicy,
 }
 
 #[derive(Deserialize)]

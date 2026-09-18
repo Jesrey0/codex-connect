@@ -106,6 +106,12 @@ Server-request response shapes must come from the pinned generated schemas. Publ
 
 ## Tool-selection calibration
 
+### Sandbox ownership invariant
+
+Host `command.exec` / `command.start` must preserve an omitted `sandboxPolicy` all the way to App Server. **Absence is semantic:** Codex Connect sends no synthetic policy, so App Server uses the effective upstream Codex configuration from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Do not replace omission with an equivalent-looking `workspaceWrite` object, because doing so would duplicate upstream defaults and create configuration drift.
+
+`codexConnect.work.start` has the opposite contract: it must reject omission and always send the operator-supplied `sandboxPolicy` on `turn/start`. Do not add Codex Connect configuration fields for `sandbox_mode` or `sandbox_workspace_write.network_access`.
+
 The MCP tests contain deterministic golden examples such as:
 
 - “find where Relay is defined” → `codexConnect.inspect`

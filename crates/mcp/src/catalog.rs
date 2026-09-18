@@ -71,7 +71,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.start",
                 "Start Persistent Command",
-                "Use for a deterministic command that must remain running or interactive: dev servers, watchers, REPLs, debuggers, installers, prompts, or interactive CLIs. Returns a connection-scoped processId immediately after the official App Server command request is flushed; follow with command.read/write/resize/terminate. Set tty=true only when terminal semantics are needed.",
+                "Use for a deterministic command that must remain running or interactive: dev servers, watchers, REPLs, debuggers, installers, prompts, or interactive CLIs. Returns a connection-scoped processId immediately after the official App Server command request is flushed; follow with command.read/write/resize/terminate. Set tty=true only when terminal semantics are needed. sandboxPolicy is an optional per-call override; omit it to inherit the effective sandbox configuration loaded by Codex App Server.",
                 false,
                 true,
                 true,
@@ -167,7 +167,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for a known one-shot deterministic command that should finish and return one bounded result, such as git status or cargo test. Non-interactive, with a 30-second default timeout (60-minute maximum) and 64 KiB default output cap (256 KiB maximum). For long-running or interactive deterministic commands use command.start; for autonomous investigation/coding use codexConnect.work.start.",
+                "Use for a known one-shot deterministic command that should finish and return one bounded result, such as git status or cargo test. Non-interactive, with a 30-second default timeout (60-minute maximum) and 64 KiB default output cap (256 KiB maximum). sandboxPolicy is an optional per-call override; omit it to inherit the effective sandbox configuration loaded by Codex App Server. For long-running or interactive deterministic commands use command.start; for autonomous investigation/coding use codexConnect.work.start.",
                 false,
                 true,
                 true,
@@ -183,7 +183,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codexConnect.work.start",
                 "Start Codex Work",
-                "Use for autonomous multi-step engineering work. Creates or resumes an official Codex thread and starts one official turn; follow with codexConnect.work.wait.",
+                "Use for autonomous multi-step engineering work. Creates or resumes an official Codex thread and starts one official turn; follow with codexConnect.work.wait. sandboxPolicy is required on every call so the operator explicitly selects the sandbox/network policy for each delegated turn instead of inheriting a hidden default.",
                 false,
                 true,
                 true,
@@ -545,7 +545,7 @@ fn cwd_schema() -> Value {
     json!({"type":["string","null"],"description":"Request working directory within scopeRoot. Relative cwd is resolved from scopeRoot; omitted or null cwd selects scopeRoot. Relative operation paths resolve from cwd, with no alternate-root retries."})
 }
 fn network_access_schema() -> Value {
-    json!({"type":"boolean","default":false,"description":"Upstream sandbox network access. false may block sockets, including socket-based localhost tests. true enables broader network access, not only loopback. No automatic escalation or retry."})
+    json!({"type":"boolean","default":false,"description":"Network access for an explicitly supplied sandbox policy. false may block sockets, including socket-based localhost tests. true enables broader network access, not only loopback. This default does not apply when the entire sandboxPolicy is omitted; host commands then inherit Codex App Server's effective configuration. No automatic escalation or retry."})
 }
 fn sandbox_schema() -> Value {
     json!({"oneOf":[{"type":"object","properties":{"type":{"const":"readOnly"},"networkAccess":network_access_schema()},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"workspaceWrite"},"writableRoots":{"type":"array","description":"Absolute writable directory paths within scopeRoot, as required by the pinned upstream contract.","items":{"type":"string","pattern":"^/"}},"networkAccess":network_access_schema(),"excludeSlashTmp":{"type":"boolean"},"excludeTmpdirEnvVar":{"type":"boolean"}},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"dangerFullAccess"}},"required":["type"],"additionalProperties":false}]})
@@ -652,7 +652,7 @@ fn command_resize_schema() -> Value {
 fn work_start_schema() -> Value {
     object_schema(
         json!({"task":{"type":"string","minLength":1},"cwd":{"type":"string"},"threadId":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string"},"serviceTier":{"type":"string"},"approvalPolicy":approval_policy_schema(),"sandboxPolicy":sandbox_schema()}),
-        &["task"],
+        &["task", "sandboxPolicy"],
     )
 }
 fn work_wait_schema() -> Value {
@@ -771,7 +771,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn command_schema_matches_bounded_runtime_and_upstream_sandbox_shape() {
+    fn sandbox_contract_separates_host_inheritance_from_explicit_work_policy() {
         let schema = command_schema();
         let properties = schema["properties"].as_object().unwrap();
         assert!(!properties.contains_key("disableTimeout"));
@@ -809,6 +809,20 @@ mod tests {
         for schema in [command_schema(), work_start_schema()] {
             assert_eq!(schema["properties"]["sandboxPolicy"], sandbox);
         }
+        assert!(
+            !command_schema()["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "sandboxPolicy")
+        );
+        assert!(
+            work_start_schema()["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "sandboxPolicy")
+        );
     }
 
     #[test]
