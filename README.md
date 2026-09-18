@@ -4,6 +4,20 @@ Codex Connect connects ChatGPT to your host workspace and Codex CLI. Inspect fil
 
 > **Pre-release:** Codex Connect is a single-user, self-hosted integration under active development. This repository represents only the current canonical implementation; abandoned development-era paths are not retained.
 
+> **Unofficial project:** Codex Connect is an independent open-source project. It is not affiliated with, endorsed by, or distributed by OpenAI.
+
+## Who this is for
+
+Codex Connect is developer infrastructure for people who deliberately want a high-trust bridge from their own ChatGPT account to their own persistent development host. It is aimed at Linux workstations, development servers, homelabs, and similar single-user environments where the operator is comfortable reviewing source, running a local service, and managing developer credentials.
+
+The managed setup currently targets **Linux with systemd user services**. It requires an authenticated Codex CLI, OpenAI Secure MCP Tunnel, and a ChatGPT account where Developer mode/custom MCP app creation is available. The repository builds from source; prebuilt packages are not currently distributed.
+
+The default host scope and workspace-local installation layout use `~/projects`. Codex Connect keeps its backend on loopback and does not expose port `8767` directly to the internet.
+
+## Security model
+
+This is a **high-trust host execution bridge**, not a read-only data connector. Depending on the selected sandbox and permissions, ChatGPT can cause file mutations, command execution, persistent processes, and autonomous Codex work on the host. Read [SECURITY.md](SECURITY.md) before installation and do not run the backend under an OS account whose privileges exceed what you intend ChatGPT to exercise.
+
 ```text
 ChatGPT → official OpenAI tunnel-client → Codex Connect → Codex App Server
 ```
@@ -97,6 +111,7 @@ codex-connect restart
 codex-connect doctor
 codex-connect logs --follow
 codex-connect probe --codex-bin ~/projects/.tools/bin/codex --cwd ~/projects/example-project
+codex-connect uninstall
 ```
 
 After a computer restart, verify the backend first, then inspect/resume the existing tunnel runtime with `tunnel-client runtimes status codex-connect --json`. See [Operations](docs/operations.md#after-a-computer-restart).
@@ -110,5 +125,6 @@ After a computer restart, verify the backend first, then inspect/resume the exis
 - [Development](docs/development.md)
 - [Security](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
 
 The backend is a high-trust host execution bridge. Read [SECURITY.md](SECURITY.md) before exposing or operating it outside its intended single-user environment.

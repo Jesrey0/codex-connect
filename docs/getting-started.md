@@ -10,6 +10,8 @@ The target success condition is simple:
 
 Codex Connect's managed setup currently targets **Linux with systemd user services**. The underlying Codex CLI and Secure MCP Tunnel support additional platforms, but `codex-connect setup` uses a systemd user service today.
 
+The pre-release installation layout is intentionally opinionated: `~/projects` is the default host scope, and the managed operator symlink/build store live under `~/projects/.local`. Configuration and deployment state default to `~/projects/.config` and `~/projects/.local/state` respectively, while honoring explicit `XDG_CONFIG_HOME` / `XDG_STATE_HOME`. You can change the configured host scope after setup; doing so does not relocate the managed operator/build store.
+
 ### ChatGPT plan scope
 
 This pre-release project currently documents **paid ChatGPT accounts only**.
@@ -246,6 +248,18 @@ write a small file, read it back, and start a disposable Codex thread in that pr
 ```
 
 That demonstrates the actual architecture: ChatGPT is the remote control plane, Codex Connect exposes the persistent host, and official Codex App Server semantics own the reasoning/session lifecycle.
+
+## Remove Codex Connect
+
+To remove the managed backend from the host:
+
+```bash
+codex-connect uninstall
+```
+
+`uninstall` stops/disables and removes `codex-connect.service`, removes Codex Connect's managed configuration and deployment state, deletes the workspace-local operator symlink and installed content-addressed builds, and reloads the user systemd manager. It deliberately does **not** delete the source tree, Codex CLI, or `tunnel-client` state.
+
+If the ChatGPT connection is no longer needed, stop/remove the corresponding tunnel-client runtime/profile separately using the tunnel client's own lifecycle commands. Do not delete tunnel credentials or profiles through Codex Connect.
 
 ## Agent handoff
 

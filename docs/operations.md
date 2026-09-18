@@ -51,6 +51,18 @@ codex-connect probe --codex-bin ~/projects/.tools/bin/codex --cwd ~/projects/exa
 
 `codex-connect restart` also enables the backend service if it was installed but disabled, so a successful recovery restores the next-boot invariant.
 
+## Uninstall
+
+Remove only the state owned by Codex Connect with:
+
+```bash
+codex-connect uninstall
+```
+
+The command stops/disables and removes the persistent backend service, reloads the user systemd manager, removes Codex Connect configuration and deployment state, removes the workspace-local operator symlink, and removes installed content-addressed Codex Connect builds.
+
+The source tree, Codex CLI, and all `tunnel-client` state are intentionally left untouched. If the corresponding ChatGPT tunnel is no longer needed, stop/remove that runtime or profile separately with `tunnel-client`; backend uninstall must not become tunnel lifecycle orchestration.
+
 ## After a computer restart
 
 The backend and tunnel are separate failure domains. Do not rerun installation just because the machine restarted.

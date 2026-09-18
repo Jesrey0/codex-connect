@@ -20,3 +20,4 @@
 
 - [Security](../SECURITY.md)
 - [Contributing](../CONTRIBUTING.md)
+- [Changelog](../CHANGELOG.md)

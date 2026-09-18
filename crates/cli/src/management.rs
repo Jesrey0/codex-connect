@@ -1,7 +1,7 @@
 use crate::artifact;
 use crate::config::{
-    BACKEND_SERVICE, BackendConfig, Config, ConfigStore, default_workspace_root, display_path,
-    expand_path,
+    BACKEND_SERVICE, BackendConfig, Config, ConfigStore, config_root, default_workspace_root,
+    display_path, expand_path, state_root,
 };
 use crate::deployment;
 use crate::service::{ServiceManager, SystemdManager, UnitState, backend_unit};
@@ -142,6 +142,38 @@ pub async fn deploy_prepare() -> Result<()> {
         "DEPLOYMENT_PREPARE operation_id={} state={}",
         record.operation_id,
         record.state.as_str()
+    );
+    Ok(())
+}
+
+pub async fn uninstall() -> Result<()> {
+    let manager = SystemdManager;
+    manager.available()?;
+    let state = manager.unit_state(BACKEND_SERVICE)?;
+
+    if state.load_state != "not-found" && state.active_state != "inactive" {
+        manager.stop(BACKEND_SERVICE)?;
+    }
+    if matches!(
+        state.unit_file_state.as_str(),
+        "enabled" | "enabled-runtime"
+    ) {
+        manager.disable(BACKEND_SERVICE)?;
+    }
+    manager.remove_unit(BACKEND_SERVICE)?;
+    manager.daemon_reload()?;
+
+    remove_file_if_present(&operator_path()?)?;
+    remove_tree_if_present(&workspace_local_root()?.join("lib/codex-connect"))?;
+    remove_tree_if_present(&config_root()?.join("codex-connect"))?;
+    remove_tree_if_present(&state_root()?.join("codex-connect"))?;
+
+    println!(
+        "✓ Removed Codex Connect-managed backend service, configuration, state, and installed binaries."
+    );
+    println!("The source tree, Codex CLI, and tunnel-client state were not changed.");
+    println!(
+        "If you no longer need the ChatGPT connection, stop/remove its tunnel-client runtime separately."
     );
     Ok(())
 }
@@ -686,6 +718,20 @@ fn workspace_local_root() -> Result<PathBuf> {
 
 fn operator_path() -> Result<PathBuf> {
     Ok(workspace_local_root()?.join("bin/codex-connect"))
+}
+
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    if path.symlink_metadata().is_ok() {
+        fs::remove_file(path).with_context(|| format!("unable to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn remove_tree_if_present(path: &Path) -> Result<()> {
+    if path.symlink_metadata().is_ok() {
+        fs::remove_dir_all(path).with_context(|| format!("unable to remove {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn install_artifact(built: &Path, sha256: &str) -> Result<PathBuf> {

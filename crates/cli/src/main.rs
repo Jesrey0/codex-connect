@@ -53,6 +53,8 @@ enum CommandName {
         #[arg(long)]
         no_start: bool,
     },
+    /// Remove Codex Connect-managed backend state from this host.
+    Uninstall,
     /// Show the managed backend state.
     Status,
     /// Start or restart the backend and ensure its user service is enabled.
@@ -145,6 +147,7 @@ async fn main() -> Result<()> {
             }
         },
         CommandName::Setup { no_start } => management::setup(no_start).await,
+        CommandName::Uninstall => management::uninstall().await,
         CommandName::Status => management::status().await,
         CommandName::Restart => management::restart().await,
         CommandName::Logs { lines, follow } => management::logs(lines, follow).await,
@@ -379,6 +382,10 @@ mod tests {
         };
         assert_eq!(codex_bin, PathBuf::from("/opt/codex"));
         assert_eq!(cwd, PathBuf::from("/work"));
+
+        let uninstall =
+            Cli::try_parse_from(["codex-connect", "uninstall"]).expect("uninstall should parse");
+        assert!(matches!(uninstall.command, CommandName::Uninstall));
 
         assert!(
             Cli::try_parse_from(["codex-connect", "doctor", "--codex-bin", "/opt/codex"]).is_err()
