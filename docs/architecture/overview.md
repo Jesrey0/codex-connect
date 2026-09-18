@@ -57,7 +57,7 @@ The public surface therefore falls into three implementation classes:
 | Adapter | `view_image` | Image bytes come from official `fs/readFile`; Connect only validates/resizes them and emits an MCP image content block. |
 | Bridge | `inspect.searchContent` | The pinned App Server has no workspace-content-search RPC. The bridge is bounded, scope-fenced, cancellation-aware, and skips known build/cache trees. |
 | Bridge | `apply_patch` | The pinned App Server exposes byte-level filesystem mutations but no deterministic patch semantic RPC. Connect owns patch parsing/preflight/rollback semantics. |
-| Bridge | `status` | Operator/runtime health and content-addressed build identity are Connect deployment concerns, not Codex thread state. |
+| Bridge | `status` | Operator/runtime health, content-addressed build identity, global Codex configuration provenance, and App Server launch context are Connect deployment concerns, not Codex thread state. |
 
 `codex.*` is the public namespace for interacting with the Codex CLI/App Server agent domain. `codex-connect` remains the implementation/product identity of the bridge, while host/operator operations such as `status`, `inspect`, `apply_patch`, `view_image`, and `command.*` speak for the connector environment directly.
 

@@ -529,15 +529,42 @@ pub async fn status() -> Result<()> {
     println!("Endpoint: http://{}/mcp", config.backend.listen);
     println!("Scope root: {}", config.scope.root);
     match backend_status_once(&config.backend).await {
-        Ok(runtime) => println!(
-            "Health: ready ✓  build {}{}",
-            runtime.build_id,
-            if runtime.binary_sha256 == operator.sha256 {
-                " ✓"
-            } else {
-                " ≠"
-            }
-        ),
+        Ok(runtime) => {
+            println!(
+                "Health: ready ✓  build {}{}",
+                runtime.build_id,
+                if runtime.binary_sha256 == operator.sha256 {
+                    " ✓"
+                } else {
+                    " ≠"
+                }
+            );
+            println!(
+                "Codex CLI: {} ({})",
+                runtime.codex.binary, runtime.codex.release
+            );
+            println!(
+                "Codex home: {} ({})",
+                runtime.codex.home, runtime.codex.home_source
+            );
+            println!(
+                "Codex global config: {} [{}]",
+                runtime.codex.global_config.path,
+                if runtime.codex.global_config.parsed {
+                    "parsed"
+                } else if runtime.codex.global_config.exists {
+                    "unparsed"
+                } else {
+                    "missing"
+                }
+            );
+            println!(
+                "App Server: {}  user-agent={}  cwd={}",
+                runtime.app_server.transport,
+                runtime.app_server.user_agent,
+                runtime.app_server.working_directory
+            );
+        }
         Err(error) => println!("Health: {error}"),
     }
     println!(

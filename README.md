@@ -83,7 +83,7 @@ The canonical MCP surface contains 24 tools:
 
 | Area | Tools |
 | --- | --- |
-| Host orientation | `status` |
+| Host orientation | `status` (health, build identity, global Codex config provenance, App Server launch context) |
 | Read-only host inspection | `inspect`, `view_image` |
 | Deterministic mutation/execution | `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.write`, `command.resize`, `command.terminate` |
 | Codex work | `codex.work.start`, `codex.work.read`, `codex.work.wait`, `codex.work.steer`, `codex.work.interrupt` |

@@ -26,7 +26,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "status",
                 "Read Operator Status",
-                "Use first to orient to Codex Connect health, workspace scope, and build identity.",
+                "Use first to orient to Codex Connect health, workspace scope, build identity, global Codex configuration provenance, and App Server launch context.",
                 true,
                 false,
                 false,
@@ -490,13 +490,51 @@ fn action_response_schema() -> Value {
 }
 fn status_schema() -> Value {
     object_schema(
-        json!({"healthy":{"type":"boolean"},"scopeRoot":{"type":"string"},"buildId":{"type":"string"},"binarySha256":{"type":"string"},"executable":{"type":"string"},"appServerTransport":{"const":"stdio"},"experimentalApi":{"const":true}}),
+        json!({
+            "healthy":{"type":"boolean"},
+            "scopeRoot":{"type":"string"},
+            "endpoint":{"type":"string"},
+            "buildId":{"type":"string"},
+            "binarySha256":{"type":"string"},
+            "executable":{"type":"string"},
+            "appServerTransport":{"const":"stdio"},
+            "experimentalApi":{"const":true},
+            "codex":object_schema(json!({
+                "binary":{"type":"string"},
+                "release":{"type":"string"},
+                "home":{"type":"string"},
+                "homeSource":{"type":"string","enum":["default","CODEX_HOME"]},
+                "globalConfig":object_schema(json!({
+                    "path":{"type":"string"},
+                    "exists":{"type":"boolean"},
+                    "parsed":{"type":"boolean"},
+                    "model":{"type":["string","null"]},
+                    "reasoningEffort":{"type":["string","null"]},
+                    "serviceTier":{"type":["string","null"]},
+                    "approvalPolicy":{"type":["string","null"]},
+                    "sandboxMode":{"type":["string","null"]},
+                    "workspaceWriteNetworkAccess":{"type":["boolean","null"]}
+                }), &["path","exists","parsed","model","reasoningEffort","serviceTier","approvalPolicy","sandboxMode","workspaceWriteNetworkAccess"])
+            }), &["binary","release","home","homeSource","globalConfig"]),
+            "appServer":object_schema(json!({
+                "transport":{"const":"stdio"},
+                "workingDirectory":{"type":"string"},
+                "userAgent":{"type":"string"},
+                "experimentalApi":{"const":true},
+                "launchOverrides":{"type":"array","items":{"type":"string"}}
+            }), &["transport","workingDirectory","userAgent","experimentalApi","launchOverrides"])
+        }),
         &[
             "healthy",
             "scopeRoot",
+            "endpoint",
             "buildId",
+            "binarySha256",
+            "executable",
             "appServerTransport",
             "experimentalApi",
+            "codex",
+            "appServer",
         ],
     )
 }
@@ -768,6 +806,34 @@ fn permissions_schema() -> Value {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn status_schema_exposes_codex_provenance_and_app_server_launch_context() {
+        let schema = status_schema();
+        let properties = &schema["properties"];
+        assert_eq!(properties["codex"]["type"], "object");
+        assert_eq!(properties["appServer"]["type"], "object");
+        assert_eq!(properties["endpoint"]["type"], "string");
+        assert_eq!(
+            properties["codex"]["properties"]["homeSource"]["enum"],
+            json!(["default", "CODEX_HOME"])
+        );
+        assert!(
+            properties["codex"]["properties"]["globalConfig"]["properties"]
+                .get("sandboxMode")
+                .is_some()
+        );
+        assert!(
+            properties["appServer"]["properties"]
+                .get("launchOverrides")
+                .is_some()
+        );
+        assert!(
+            properties["appServer"]["properties"]
+                .get("userAgent")
+                .is_some()
+        );
+    }
 
     #[test]
     fn sandbox_contract_separates_host_inheritance_from_explicit_work_policy() {

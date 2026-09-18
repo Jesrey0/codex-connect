@@ -8,11 +8,13 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
+use codex_connect_app_server::APP_SERVER_FEATURE_OVERRIDES;
 use codex_connect_app_server::AppServerClient;
 use codex_connect_app_server::AppServerConfig;
 use codex_connect_app_server::DEFAULT_REQUEST_TIMEOUT;
 use codex_connect_app_server::ServerRequestMethod;
 use codex_connect_app_server::verify_codex_pin;
+use codex_connect_mcp::CodexGlobalConfigSummary;
 use codex_connect_mcp::RuntimeIdentity;
 use codex_connect_mcp::router as mcp_router;
 use codex_connect_mcp::serve_router;
@@ -22,12 +24,51 @@ use codex_connect_scope::Scope;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
+use std::{env, fs};
 
 #[derive(Debug)]
 pub(crate) struct ServeConfig {
     pub(crate) codex_bin: PathBuf,
     pub(crate) scope_root: PathBuf,
     pub(crate) listen: std::net::SocketAddr,
+}
+
+fn codex_home() -> Result<(PathBuf, String)> {
+    if let Some(path) = env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
+        return Ok((PathBuf::from(path), "CODEX_HOME".to_string()));
+    }
+    Ok((config::home_dir()?.join(".codex"), "default".to_string()))
+}
+
+fn codex_global_config_summary(codex_home: &Path) -> CodexGlobalConfigSummary {
+    let path = codex_home.join("config.toml");
+    let exists = path.is_file();
+    let parsed = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Value>().ok());
+    let string_value = |key: &str| {
+        parsed
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+    };
+    let workspace_write_network_access = parsed
+        .as_ref()
+        .and_then(|value| value.get("sandbox_workspace_write"))
+        .and_then(|value| value.get("network_access"))
+        .and_then(toml::Value::as_bool);
+    CodexGlobalConfigSummary {
+        path: path.display().to_string(),
+        exists,
+        parsed: parsed.is_some(),
+        model: string_value("model"),
+        reasoning_effort: string_value("model_reasoning_effort"),
+        service_tier: string_value("service_tier"),
+        approval_policy: string_value("approval_policy"),
+        sandbox_mode: string_value("sandbox_mode"),
+        workspace_write_network_access,
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -195,6 +236,7 @@ async fn serve_mcp(config: ServeConfig) -> Result<()> {
         })
         .canonicalize()
         .context("unable to access scope root")?;
+    let codex_binary = codex_bin.display().to_string();
     let relay = Relay::start(RelayConfig {
         codex_bin,
         scope_root: scope_root.clone(),
@@ -206,10 +248,25 @@ async fn serve_mcp(config: ServeConfig) -> Result<()> {
         .await
         .with_context(|| format!("unable to listen on {listen}"))?;
     let artifact = artifact::current()?;
+    let (codex_home, codex_home_source) = codex_home()?;
+    let codex_global_config = codex_global_config_summary(&codex_home);
     let runtime = RuntimeIdentity {
         build_id: artifact.build_id,
         binary_sha256: artifact.sha256,
         executable: artifact.executable.display().to_string(),
+        endpoint: format!("http://{listen}/mcp"),
+        codex_binary,
+        codex_release: codex_connect_app_server::protocol::CODEX_PIN
+            .trim()
+            .to_string(),
+        codex_home: codex_home.display().to_string(),
+        codex_home_source,
+        codex_global_config,
+        app_server_working_directory: scope_root.display().to_string(),
+        app_server_launch_overrides: APP_SERVER_FEATURE_OVERRIDES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
     };
     let mut changes = relay.changes();
     let router = mcp_router(relay.clone(), scope, runtime);
@@ -303,8 +360,48 @@ mod tests {
     use super::Cli;
     use super::CommandName;
     use super::DeployCommand;
+    use super::codex_global_config_summary;
     use clap::Parser;
+    use std::fs;
     use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    #[test]
+    fn codex_global_config_summary_exposes_only_operator_safe_defaults() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("config.toml"),
+            r#"
+model = "gpt-test"
+model_reasoning_effort = "medium"
+service_tier = "default"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true
+
+[mcp_servers.example]
+bearer_token = "must-not-surface"
+"#,
+        )
+        .unwrap();
+
+        let summary = codex_global_config_summary(directory.path());
+        assert!(summary.exists);
+        assert!(summary.parsed);
+        assert_eq!(summary.model.as_deref(), Some("gpt-test"));
+        assert_eq!(summary.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(summary.service_tier.as_deref(), Some("default"));
+        assert_eq!(summary.approval_policy.as_deref(), Some("on-request"));
+        assert_eq!(summary.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert_eq!(summary.workspace_write_network_access, Some(true));
+        assert!(
+            !serde_json::to_string(&summary)
+                .unwrap()
+                .contains("must-not-surface")
+        );
+    }
 
     #[test]
     fn serve_uses_per_thread_sandbox_selection() {

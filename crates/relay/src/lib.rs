@@ -203,6 +203,9 @@ impl Relay {
     pub fn scope_root(&self) -> String {
         self.scope.root().display().to_string()
     }
+    pub fn app_server_user_agent(&self) -> String {
+        self.app_server.user_agent().to_string()
+    }
     pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.app_server.changes()
     }

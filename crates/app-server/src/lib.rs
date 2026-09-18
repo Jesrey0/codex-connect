@@ -71,6 +71,12 @@ mod launch_tests {
     }
 }
 
+pub const APP_SERVER_FEATURE_OVERRIDES: &[&str] = &[
+    "features.default_mode_request_user_input=true",
+    "features.request_permissions_tool=true",
+    "features.exec_permission_approvals=true",
+];
+
 const APP_SERVER_ARGS: &[&str] = &[
     "app-server",
     "-c",
@@ -138,6 +144,7 @@ pub struct AppServerClient {
     child: Mutex<Child>,
     connection: Arc<Connection>,
     request_timeout: Duration,
+    user_agent: String,
 }
 
 impl AppServerClient {
@@ -154,12 +161,16 @@ impl AppServerClient {
             .map_err(AppServerError::Start)?;
         let stdin = child.stdin.take().ok_or(AppServerError::MissingStdio)?;
         let stdout = child.stdout.take().ok_or(AppServerError::MissingStdio)?;
-        let client = Self {
+        let mut client = Self {
             child: Mutex::new(child),
             connection: Connection::start(stdout, stdin),
             request_timeout: config.request_timeout,
+            user_agent: String::new(),
         };
-        client.request(Initialize::new(config.client_name)).await?;
+        client.user_agent = client
+            .request(Initialize::new(config.client_name))
+            .await?
+            .user_agent;
         client
             .connection
             .send(json!({"method":"initialized","params":{}}), None)
@@ -175,6 +186,9 @@ impl AppServerClient {
     }
     pub fn is_available(&self) -> bool {
         self.connection.available()
+    }
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
     }
 
     pub async fn request<R: Request>(&self, request: R) -> Result<R::Response, AppServerError> {

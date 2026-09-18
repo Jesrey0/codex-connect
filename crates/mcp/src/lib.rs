@@ -37,6 +37,48 @@ pub struct RuntimeIdentity {
     pub build_id: String,
     pub binary_sha256: String,
     pub executable: String,
+    pub endpoint: String,
+    pub codex_binary: String,
+    pub codex_release: String,
+    pub codex_home: String,
+    pub codex_home_source: String,
+    pub codex_global_config: CodexGlobalConfigSummary,
+    pub app_server_working_directory: String,
+    pub app_server_launch_overrides: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexGlobalConfigSummary {
+    pub path: String,
+    pub exists: bool,
+    pub parsed: bool,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub approval_policy: Option<String>,
+    pub sandbox_mode: Option<String>,
+    pub workspace_write_network_access: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOperatorStatus {
+    pub binary: String,
+    pub release: String,
+    pub home: String,
+    pub home_source: String,
+    pub global_config: CodexGlobalConfigSummary,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppServerOperatorStatus {
+    pub transport: String,
+    pub working_directory: String,
+    pub user_agent: String,
+    pub experimental_api: bool,
+    pub launch_overrides: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -135,11 +177,14 @@ struct McpHandler {
 pub struct OperatorStatus {
     pub healthy: bool,
     pub scope_root: String,
+    pub endpoint: String,
     pub build_id: String,
     pub binary_sha256: String,
     pub executable: String,
     pub app_server_transport: String,
     pub experimental_api: bool,
+    pub codex: CodexOperatorStatus,
+    pub app_server: AppServerOperatorStatus,
 }
 
 impl OperatorStatus {
@@ -147,11 +192,26 @@ impl OperatorStatus {
         Self {
             healthy: relay.worker_available(),
             scope_root: relay.scope_root(),
+            endpoint: runtime.endpoint.clone(),
             build_id: runtime.build_id.clone(),
             binary_sha256: runtime.binary_sha256.clone(),
             executable: runtime.executable.clone(),
             app_server_transport: "stdio".into(),
             experimental_api: true,
+            codex: CodexOperatorStatus {
+                binary: runtime.codex_binary.clone(),
+                release: runtime.codex_release.clone(),
+                home: runtime.codex_home.clone(),
+                home_source: runtime.codex_home_source.clone(),
+                global_config: runtime.codex_global_config.clone(),
+            },
+            app_server: AppServerOperatorStatus {
+                transport: "stdio".into(),
+                working_directory: runtime.app_server_working_directory.clone(),
+                user_agent: relay.app_server_user_agent(),
+                experimental_api: true,
+                launch_overrides: runtime.app_server_launch_overrides.clone(),
+            },
         }
     }
 }
