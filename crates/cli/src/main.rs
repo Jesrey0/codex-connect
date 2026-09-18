@@ -31,7 +31,10 @@ pub(crate) struct ServeConfig {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "codex-connect", about = "Codex Connect local MCP sidecar")]
+#[command(
+    name = "codex-connect",
+    about = "Connect ChatGPT to your host workspace and Codex CLI"
+)]
 struct Cli {
     #[command(subcommand)]
     command: CommandName,

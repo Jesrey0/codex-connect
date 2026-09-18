@@ -165,9 +165,12 @@ impl McpHandler {
 impl ServerHandler for McpHandler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("codex-connect", ""))
+            .with_server_info(Implementation::new(
+                "codex-connect",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions(
-                "Codex Connect is the bridge between ChatGPT and the official Codex App Server. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. Use inspect for structured read-only host exploration, batching independent reads and searches when possible. Use command.exec for bounded deterministic host commands and command.start plus command.read/write/resize/terminate only for persistent or interactive deterministic commands. Use codex.work.start followed by codex.work.wait for autonomous Codex CLI/agent work, and codex.review for official Codex review. The codex.* namespace represents the Codex CLI/App Server agent domain; un-namespaced host tools and command.* represent connector/operator facilities. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect scopes, batches, and projects those capabilities rather than reimplementing them.",
+                "Codex Connect connects ChatGPT to the host workspace and Codex CLI through the official Codex App Server. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. Use inspect for structured read-only host exploration, batching independent reads and searches when possible. Use command.exec for bounded deterministic host commands and command.start plus command.read/write/resize/terminate only for persistent or interactive deterministic commands. Use codex.work.start followed by codex.work.wait for autonomous Codex CLI/agent work, and codex.review for official Codex review. The codex.* namespace represents the Codex CLI/App Server agent domain; un-namespaced host tools and command.* represent connector/operator facilities. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect scopes, batches, and projects those capabilities rather than reimplementing them.",
             )
     }
 

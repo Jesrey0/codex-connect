@@ -7,7 +7,7 @@ version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
-description = "A local MCP sidecar that lets ChatGPT operate the official Codex App Server"
+description = "Connect ChatGPT to your host workspace and Codex CLI through the official Codex App Server"
 readme = "README.md"
 repository = "https://github.com/Jesrey0/codex-connect"
 

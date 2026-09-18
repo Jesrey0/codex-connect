@@ -1,8 +1,8 @@
 # Codex Connect
 
-Codex Connect is a local MCP backend designed for **ChatGPT as the primary operator** of the official Codex App Server.
+Codex Connect connects ChatGPT to your host workspace and Codex CLI. Inspect files, run commands, edit code, and delegate autonomous engineering work to Codex through the official Codex App Server.
 
-> **Pre-release:** Codex Connect is a single-user, self-hosted backend under active development. This repository represents only the current canonical implementation; abandoned development-era paths are not retained.
+> **Pre-release:** Codex Connect is a single-user, self-hosted integration under active development. This repository represents only the current canonical implementation; abandoned development-era paths are not retained.
 
 ```text
 ChatGPT → official OpenAI tunnel-client → Codex Connect → Codex App Server

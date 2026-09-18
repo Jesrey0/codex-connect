@@ -217,11 +217,12 @@ Perform initial custom app/connector setup from the ChatGPT settings surface whe
 
 1. Open ChatGPT settings.
 2. Go to **Apps** and enable **Developer mode** / custom MCP app creation. UI wording can change as the feature evolves.
-3. Create a custom app/connector.
-4. Choose **Tunnel** as the connection type when that option is presented.
-5. Select the tunnel created above or paste its tunnel ID.
-6. Set **Authentication** to **None / No authentication**.
-7. Scan/discover the tools and create the app.
+3. Create a custom app/connector named **Codex Connect**.
+4. Set its description to: **Connect ChatGPT to your host workspace and Codex CLI. Inspect files, run commands, edit code, and delegate autonomous engineering work to Codex through the official Codex App Server.**
+5. Choose **Tunnel** as the connection type when that option is presented.
+6. Select the tunnel created above or paste its tunnel ID.
+7. Set **Authentication** to **None / No authentication**.
+8. Scan/discover the tools and create the app.
 
 Do not paste the OpenAI tunnel runtime key into the ChatGPT connector. It belongs only to `tunnel-client`; Codex Connect has no connector credential.
 

@@ -1,6 +1,6 @@
 # Architecture
 
-Codex Connect is a ChatGPT-native operator adapter over the official Codex App Server. It deliberately keeps one authority for Codex state: App Server.
+Codex Connect is the bridge from ChatGPT to a persistent host workspace and the official Codex App Server. It deliberately keeps one authority for Codex state: App Server.
 
 ## Topology
 
