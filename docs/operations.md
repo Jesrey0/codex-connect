@@ -46,7 +46,7 @@ codex-connect status
 codex-connect restart
 codex-connect doctor
 codex-connect logs --follow
-codex-connect probe --codex-bin ~/projects/.tools/bin/codex --cwd ~/projects/example-project
+codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/projects/example-project
 ```
 
 `codex-connect restart` also enables the backend service if it was installed but disabled, so a successful recovery restores the next-boot invariant.
@@ -112,10 +112,10 @@ root = "~/projects"
 
 [backend]
 listen = "127.0.0.1:8767"
-codex_bin = "/home/you/projects/.tools/bin/codex"
+codex_bin = "/home/you/.local/bin/codex"
 ```
 
-`setup` persists an absolute executable path and prefers the workspace tool at `~/projects/.tools/bin/codex`; a bare PATH lookup is only a bootstrap fallback. This is the canonical configuration shape for the pre-release backend. Historical configuration forms are not retained.
+`setup` persists an absolute executable path for the user-global Codex CLI. It first reuses a valid configured executable and otherwise resolves `codex` from `PATH`. The exact absolute path depends on the user's installation method (for example npm under NVM may live beneath `~/.nvm`). Codex Connect does not install or prefer a workspace-local Codex binary. This is the canonical configuration shape for the pre-release backend. Historical configuration forms are not retained.
 
 ### Host sandbox source of truth
 

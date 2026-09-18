@@ -446,12 +446,8 @@ pub async fn setup(no_start: bool) -> Result<()> {
     }
     config.scope.root = display_path(&root);
     let workspace_root = default_workspace_root()?;
-    let workspace_codex = workspace_root.join(".tools/bin/codex");
-    let codex = if workspace_codex.is_file() && is_executable(&workspace_codex) {
-        workspace_codex
-    } else {
-        resolve_executable(&config.backend.codex_bin).or_else(|_| find_executable("codex"))?
-    };
+    let codex =
+        resolve_executable(&config.backend.codex_bin).or_else(|_| find_executable("codex"))?;
     config.backend.codex_bin = codex.display().to_string();
     let binary = install_artifact(
         &artifact::current()?.executable,

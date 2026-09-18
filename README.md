@@ -112,7 +112,7 @@ codex-connect status
 codex-connect restart
 codex-connect doctor
 codex-connect logs --follow
-codex-connect probe --codex-bin ~/projects/.tools/bin/codex --cwd ~/projects/example-project
+codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/projects/example-project
 codex-connect uninstall
 ```
 
