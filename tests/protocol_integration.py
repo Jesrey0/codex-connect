@@ -126,9 +126,22 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertTrue(status["healthy"])
         self.assertTrue(status["experimentalApi"])
         self.assertEqual(set(status), {
-            "healthy", "scopeRoot", "buildId", "binarySha256",
-            "executable", "appServerTransport", "experimentalApi",
+            "healthy", "scopeRoot", "endpoint", "buildId", "binarySha256",
+            "executable", "appServerTransport", "experimentalApi", "codex", "appServer",
         })
+        self.assertEqual(set(status["codex"]), {
+            "binary", "release", "home", "homeSource", "globalConfig",
+        })
+        self.assertEqual(set(status["codex"]["globalConfig"]), {
+            "path", "exists", "parsed", "model", "reasoningEffort", "serviceTier",
+            "approvalPolicy", "sandboxMode", "workspaceWriteNetworkAccess",
+        })
+        self.assertEqual(set(status["appServer"]), {
+            "transport", "workingDirectory", "userAgent", "experimentalApi", "launchOverrides",
+        })
+        self.assertEqual(status["appServer"]["transport"], "stdio")
+        self.assertTrue(status["appServer"]["experimentalApi"])
+        self.assertEqual(status["appServerTransport"], status["appServer"]["transport"])
         with urllib.request.urlopen(self.url + "/status") as response:
             self.assertEqual(status, json.load(response))
         with self.assertRaises(urllib.error.HTTPError) as error:
@@ -237,6 +250,11 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIsNone(json.loads(inherited["stdout"]))
         result = self.client.call("command.exec", {"command":["echo","fixture"]})
         self.assertEqual(result["exitCode"],0)
+        self.assertEqual(result["stdoutBytes"], len(result["stdout"].encode()))
+        self.assertEqual(result["stderrBytes"], len(result["stderr"].encode()))
+        self.assertFalse(result["stdoutMayBeTruncated"])
+        self.assertFalse(result["stderrMayBeTruncated"])
+        self.assertGreaterEqual(result["durationMs"], 0)
         self.assertEqual(self.client.call("command.exec", {
             "command":["echo","fixture"], "timeoutMs":3600000,
         })["exitCode"], 0)
@@ -448,6 +466,8 @@ class OperatorProtocolTests(unittest.TestCase):
             "processId": started["processId"], "afterCursor": 0, "timeoutMs": 0,
         })
         self.assertEqual(first["state"], "exited")
+        self.assertTrue(first["hasMoreOutput"])
+        self.assertFalse(first["drained"])
         self.assertLess(first["cursor"], terminal["cursor"])
         self.assertEqual(len(first["stdout"].encode()), 128 * 1024)
 
@@ -455,6 +475,8 @@ class OperatorProtocolTests(unittest.TestCase):
             "processId": started["processId"], "afterCursor": first["cursor"], "timeoutMs": 0,
         })
         self.assertEqual(second["state"], "exited")
+        self.assertFalse(second["hasMoreOutput"])
+        self.assertTrue(second["drained"])
         self.assertGreater(second["cursor"], first["cursor"])
         self.assertEqual(second["stdout"], "c" * 20000)
 
@@ -463,6 +485,8 @@ class OperatorProtocolTests(unittest.TestCase):
         })
         self.assertEqual(drained["state"], "exited")
         self.assertEqual(drained["cursor"], second["cursor"])
+        self.assertFalse(drained["hasMoreOutput"])
+        self.assertTrue(drained["drained"])
         self.assertEqual(drained["stdout"], "")
         self.assertEqual(drained["stderr"], "")
 
