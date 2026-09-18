@@ -14,6 +14,18 @@ The managed setup currently targets **Linux with systemd user services**. It req
 
 The default host scope and workspace-local installation layout use `~/projects`. Codex Connect keeps its backend on loopback and does not expose port `8767` directly to the internet.
 
+### Dependency ownership boundary
+
+Codex Connect is downstream of two independently managed upstream dependencies. Their installation and owned state are deliberately **not** part of the Codex Connect workspace layout:
+
+| Component | Ownership | Canonical location model |
+| --- | --- | --- |
+| Codex CLI / App Server | User-global, Codex-owned | Install outside `~/projects`; Codex state/config remains under the normal `~/.codex` home unless the user explicitly changes it. |
+| OpenAI `tunnel-client` | User-global, tunnel-client-owned | Install outside `~/projects`; profiles and native runtime state use user-global XDG locations such as `~/.config/tunnel-client` and `~/.local/state/tunnel-client`. |
+| Codex Connect | Workspace-local, Codex Connect-owned | Source under the workspace; managed config/state/artifacts live under `~/projects/.config/codex-connect` and `~/projects/.local/...`. |
+
+**Ownership invariant:** Codex Connect may call or reference Codex CLI/App Server and Secure MCP Tunnel, but it must not install, relocate, duplicate, upgrade, delete, or supervise either upstream dependency or its owned configuration/state.
+
 ## Security model
 
 This is a **high-trust host execution bridge**, not a read-only data connector. Depending on the selected sandbox and permissions, ChatGPT can cause file mutations, command execution, persistent processes, and autonomous Codex work on the host. Read [SECURITY.md](SECURITY.md) before installation and do not run the backend under an OS account whose privileges exceed what you intend ChatGPT to exercise.
@@ -103,7 +115,7 @@ codex-connect status
 
 `setup` installs the bootstrap binary into the workspace-local content-addressed build store under `~/projects/.local/lib/codex-connect/builds/`, points `~/projects/.local/bin/codex-connect` at that build, keeps configuration/state under `~/projects/.config` and `~/projects/.local/state`, installs the user service, and verifies backend health. The one-time `target/codex-connect-bootstrap/` build directory is disposable and should be removed after setup; it is not a runtime installation. After source changes, use the explicit deployment workflow: `codex-connect deploy prepare`, poll `codex-connect deploy status <operation-id>` until it reports `prepared`, then run `codex-connect deploy activate <operation-id>` and verify the same operation after reconnect. Deployment builds use the persistent `target/codex-connect-deploy/build/` compiler cache, but the content-addressed workspace-local build store remains the only runtime artifact authority. Both the potentially long release build and the disruptive backend activation run as detached systemd jobs, so foreground operator commands remain short and deterministic. The tunnel runtime remains untouched.
 
-Configure the official tunnel client separately to connect its long-lived runtime to `http://127.0.0.1:8767/mcp`. The ChatGPT custom app/connector uses **no authentication**. The tunnel runtime owns its OpenAI control-plane credential and organization context. Codex Connect accepts MCP only on loopback, has no application-level authentication, and manages only its own backend service.
+Configure the user-global official tunnel client separately to connect its long-lived runtime to `http://127.0.0.1:8767/mcp`. Its binary, profiles, credentials, and native runtime state remain outside `~/projects`. The ChatGPT custom app/connector uses **no authentication**. The tunnel runtime owns its OpenAI control-plane credential and organization context. Codex Connect accepts MCP only on loopback, has no application-level authentication, and manages only its own backend service.
 
 Routine backend commands are:
 

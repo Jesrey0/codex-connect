@@ -165,6 +165,12 @@ Path fencing is not a machine-wide sandbox. Commands, network access, `dangerFul
 
 ## Runtime ownership
 
-Codex Connect owns only its backend process. The official tunnel client owns tunnel credentials, profile state, reconnection, and lifecycle. Restarting or deploying Codex Connect must not recreate or supervise the tunnel runtime.
+Codex Connect is downstream of both Codex CLI/App Server and Secure MCP Tunnel. Those are user-global upstream dependencies, not components of the Codex Connect workspace installation.
+
+- Codex CLI/App Server owns Codex execution/session semantics and Codex-owned state/configuration. Codex Connect may launch the configured global CLI but must not install, relocate, duplicate, upgrade, or delete it or its `~/.codex` state.
+- The official `tunnel-client` owns its executable installation, credentials, profiles, native runtime state, reconnection, and lifecycle. Its owned paths remain outside `~/projects` (normally `~/.config/tunnel-client` and `~/.local/state/tunnel-client`). Codex Connect must not install, relocate, duplicate, upgrade, delete, recreate, or supervise the tunnel runtime.
+- Codex Connect owns only its own backend process, workspace-scoped configuration/deployment state, and installed backend artifacts.
+
+Restarting, deploying, setting up, or uninstalling Codex Connect must therefore leave both upstream dependency installations and their owned state intact.
 
 Deployment uses one durable operation id across an explicit prepare/status/activate/status transaction. `prepare` persists `building` and returns after handing compilation to a detached systemd job; that job eventually records the content-addressed artifact as `prepared` or records `failed`. Operation-scoped file locking serializes readers and state-changing activation requests. `activate` durably records `activationQueued`, hands a delayed detached job to systemd, and returns before that job restarts the backend; failed handoff restores `prepared`. The durable phases are `building`, `prepared`, `activationQueued`, `activating`, `succeeded`, and `failed`. Status reconciles an unexpectedly vanished detached job instead of leaving an operation permanently pending, and post-reconnect success is verified against the exact prepared SHA-256. Installed content-addressed artifacts are not automatically pruned because another durable prepared operation may still reference them. This keeps both long compilation and backend self-restart outside foreground operator-command lifetimes.

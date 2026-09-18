@@ -37,6 +37,8 @@ Before obtaining the source tree, you need:
 
 The tunnel keeps the MCP backend on localhost. Do **not** expose port `8767` directly to the public internet.
 
+Codex CLI and Secure MCP Tunnel are **user-global prerequisites**, not Codex Connect workspace tools. Do not install either under `~/projects/.tools`, and do not place their owned configuration/state under `~/projects/.config` or `~/projects/.local/state`. Codex Connect is downstream of both and owns only its own backend/configuration/deployment state.
+
 ## 1. Obtain the source and check the host
 
 Download and extract the Codex Connect source archive, or clone it with Git if you prefer a contributor workflow. Git is not required to build, deploy, or operate the backend.
@@ -65,6 +67,8 @@ codex --version
 ```
 
 The release printed by `codex --version` must match `config/codex-cli-pin`.
+
+Keep this installation user-global. Do not copy or install the Codex binary under `~/projects/.tools`, and do not relocate Codex-owned state/configuration into the workspace. The normal Codex home remains `~/.codex` unless you explicitly choose another user-global `CODEX_HOME`.
 
 If you do not use npm, install the matching release from the official Codex releases page instead:
 
@@ -95,7 +99,9 @@ tunnel-client --version
 tunnel-client help quickstart
 ```
 
-The tunnel client is independently owned. Codex Connect does not install it, create its credentials, or supervise its lifecycle.
+Install `tunnel-client` into a user-global executable location outside `~/projects` (for example `~/.local/bin`). Its profiles, credentials, logs, health metadata, alias metadata, and native runtime state must also remain user-global; the normal locations used in this guide are `~/.config/tunnel-client` and `~/.local/state/tunnel-client`.
+
+The tunnel client is independently owned. Codex Connect does not install, relocate, duplicate, upgrade, delete, configure, or supervise it. If your current shell has workspace-scoped `XDG_CONFIG_HOME` or `XDG_STATE_HOME` values, do not use those values when managing `tunnel-client`; use your normal user-global XDG locations instead.
 
 ## 4. Build and install Codex Connect
 
@@ -160,17 +166,18 @@ Codex Connect deliberately has **no application-level authentication**. Its MCP 
 Use the native long-lived runtime lifecycle:
 
 ```bash
+XDG_CONFIG_HOME="$HOME/.config" XDG_STATE_HOME="$HOME/.local/state" \
 tunnel-client runtimes connect \
   --alias codex-connect \
   --organization-id "$CONTROL_PLANE_ORGANIZATION_ID" \
   --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" \
   --runtime-api-key env:CONTROL_PLANE_API_KEY \
   --profile codex-connect \
-  --profile-dir "$HOME/projects/.config/tunnel-client" \
+  --profile-dir "$HOME/.config/tunnel-client" \
   --mcp-server-url http://127.0.0.1:8767/mcp
 ```
 
-The canonical tunnel-client profile path is `~/projects/.config/tunnel-client/codex-connect.yaml`. It is owned by the tunnel client and remains independent of Codex Connect's backend configuration and lifecycle.
+The canonical tunnel-client profile path for this guide is `~/.config/tunnel-client/codex-connect.yaml`, with native runtime state under `~/.local/state/tunnel-client`. Both are tunnel-client-owned and remain outside the Codex Connect workspace, backend configuration, and lifecycle.
 
 `CONTROL_PLANE_API_KEY` authenticates `tunnel-client` to OpenAI's tunnel control plane. `CONTROL_PLANE_ORGANIZATION_ID` selects the active organization context for those requests. Neither is a Codex Connect credential, and neither should be supplied to the ChatGPT connector.
 

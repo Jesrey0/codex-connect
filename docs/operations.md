@@ -2,6 +2,14 @@
 
 For first-time installation, prerequisites, Secure MCP Tunnel, and ChatGPT custom app setup, start with [Getting Started](getting-started.md). This document covers steady-state operation after installation.
 
+## Ownership boundary
+
+Codex Connect is downstream of both the user-global Codex CLI/App Server and the user-global OpenAI `tunnel-client`. Codex Connect owns only its own backend, workspace-scoped configuration, deployment state, and installed backend artifacts. It must not install, relocate, duplicate, upgrade, delete, or supervise either upstream dependency or its owned configuration/state.
+
+- Codex CLI remains outside `~/projects`, with Codex-owned state/configuration in the normal `~/.codex` home unless the user explicitly selects another global location.
+- `tunnel-client` remains outside `~/projects`; this guide uses `~/.config/tunnel-client` for profiles and `~/.local/state/tunnel-client` for native runtime state.
+- Workspace `XDG_CONFIG_HOME` / `XDG_STATE_HOME` overrides must not be used to relocate tunnel-client-owned state under `~/projects`.
+
 ## Install
 
 ```bash
@@ -17,14 +25,14 @@ codex-connect status
 
 `setup` converges the bootstrap binary into the canonical workspace-local runtime layout: one content-addressed artifact under `~/projects/.local/lib/codex-connect/builds/`, `~/projects/.local/bin/codex-connect` as the operator symlink, workspace configuration under `~/projects/.config/codex-connect/`, workspace deployment state under `~/projects/.local/state/codex-connect/`, and `codex-connect.service` pointing at that artifact. The temporary `target/codex-connect-bootstrap/` tree is build-only and should be deleted after setup. Steady-state deployments may retain `target/codex-connect-deploy/build/` as a compiler cache, but no executable under `target/` is runtime authority. The user systemd manager may retain its registration file under its native user-unit directory; that registration is not application-state authority.
 
-Configure the official tunnel client separately to connect its long-lived runtime to `http://127.0.0.1:8767/mcp`. The ChatGPT custom app uses **no authentication**. The tunnel runtime authenticates to OpenAI with its own runtime API key; Codex Connect's MCP endpoint is deliberately loopback-only and has no application-level authentication. Use the tunnel client's native lifecycle commands:
+Configure the user-global official tunnel client separately to connect its long-lived runtime to `http://127.0.0.1:8767/mcp`. The ChatGPT custom app uses **no authentication**. The tunnel runtime authenticates to OpenAI with its own runtime API key; Codex Connect's MCP endpoint is deliberately loopback-only and has no application-level authentication. Use the tunnel client's native lifecycle commands:
 
 ```bash
 tunnel-client runtimes connect ...
 tunnel-client runtimes status <alias>
 ```
 
-The canonical tunnel-client profile is `~/projects/.config/tunnel-client/codex-connect.yaml`. It remains tunnel-client-owned; Codex Connect does not read or manage the tunnel ID or its runtime lifecycle.
+The canonical tunnel-client profile for this guide is `~/.config/tunnel-client/codex-connect.yaml`, with native runtime state under `~/.local/state/tunnel-client`. It remains tunnel-client-owned; Codex Connect does not read or manage the tunnel ID or its runtime lifecycle.
 
 The exact connection parameters and credentials remain tunnel-client-owned. `codex-connect restart` restarts only the backend and intentionally leaves the native tunnel runtime alone.
 
@@ -84,7 +92,7 @@ tunnel-client runtimes status codex-connect --json
 
 If the native runtime is stopped, execute the `repair_command` returned by `runtimes status`, then run the status command again. The repair command is tunnel-client-owned and is derived from the saved alias/profile state, so it is preferable to reconstructing account-specific flags by hand.
 
-The canonical profile remains `~/projects/.config/tunnel-client/codex-connect.yaml`. Do not recreate the profile, invent a second alias, or add a systemd tunnel unit for routine reboot recovery.
+The canonical profile remains `~/.config/tunnel-client/codex-connect.yaml`. Do not recreate the profile, invent a second alias, or add a systemd tunnel unit for routine reboot recovery.
 
 ## Recovery
 
