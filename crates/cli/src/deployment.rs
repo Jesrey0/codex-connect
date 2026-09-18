@@ -19,6 +19,19 @@ struct OperationLock {
     _file: File,
 }
 
+pub(crate) fn verify_prepared_artifact(record: &DeploymentRecord) -> Result<()> {
+    let (sha256, executable) = prepared_artifact(record)?;
+    let actual = crate::artifact::for_path(&executable)
+        .with_context(|| format!("prepared artifact is unavailable: {}", executable.display()))?;
+    if actual.sha256 != sha256 {
+        bail!(
+            "prepared artifact hash mismatch: expected {sha256}, found {}",
+            actual.sha256
+        );
+    }
+    Ok(())
+}
+
 pub(crate) struct BuildLock {
     _file: File,
 }
@@ -374,15 +387,7 @@ pub(crate) fn queue_activation(
         }
     }
 
-    let (sha256, executable) = prepared_artifact(&record)?;
-    let actual = crate::artifact::for_path(&executable)
-        .with_context(|| format!("prepared artifact is unavailable: {}", executable.display()))?;
-    if actual.sha256 != sha256 {
-        bail!(
-            "prepared artifact hash mismatch: expected {sha256}, found {}",
-            actual.sha256
-        );
-    }
+    verify_prepared_artifact(&record)?;
 
     // The per-operation lock serializes competing activation requests and readers, so the
     // queued intent can be durable before handoff without exposing an unowned intermediate
@@ -987,5 +992,35 @@ mod tests {
         record = prepared_record();
         record.executable = Some("relative/codex-connect".into());
         assert!(validate_record(&record).is_err());
+    }
+
+    #[test]
+    fn prepared_artifact_verification_rejects_missing_or_changed_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("codex-connect");
+        std::fs::write(&executable, b"prepared bytes").unwrap();
+        let identity = crate::artifact::for_path(&executable).unwrap();
+        let mut record = prepared_record();
+        record.build_id = Some(identity.build_id);
+        record.sha256 = Some(identity.sha256);
+        record.executable = Some(executable.display().to_string());
+
+        verify_prepared_artifact(&record).unwrap();
+
+        std::fs::write(&executable, b"changed bytes").unwrap();
+        assert!(
+            verify_prepared_artifact(&record)
+                .unwrap_err()
+                .to_string()
+                .contains("hash mismatch")
+        );
+
+        std::fs::remove_file(&executable).unwrap();
+        assert!(
+            verify_prepared_artifact(&record)
+                .unwrap_err()
+                .to_string()
+                .contains("prepared artifact is unavailable")
+        );
     }
 }

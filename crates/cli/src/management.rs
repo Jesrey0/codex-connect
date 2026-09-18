@@ -70,6 +70,16 @@ async fn reconcile_deployment(operation_id: &str) -> Result<deployment::Deployme
                 ),
             )
         }
+        deployment::DeploymentState::Prepared => {
+            if let Err(error) = deployment::verify_prepared_artifact(&record) {
+                return deployment::mark_failed_if_state(
+                    operation_id,
+                    &[deployment::DeploymentState::Prepared],
+                    error.to_string(),
+                );
+            }
+            Ok(record)
+        }
         _ => Ok(record),
     }
 }
