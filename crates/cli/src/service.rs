@@ -1,5 +1,5 @@
 use crate::config::{
-    config_root, set_file_mode, state_root, sync_directory, systemd_registration_dir,
+    config_root, home_dir, set_file_mode, state_root, sync_directory, systemd_registration_dir,
     systemd_user_dir,
 };
 use anyhow::{Context, Result, bail};
@@ -314,6 +314,11 @@ fn backend_unit_with_path(
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('%', "%%");
+    let gh_config_environment =
+        format!("GH_CONFIG_DIR={}", home_dir()?.join(".config/gh").display())
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%");
     let state_environment = format!("XDG_STATE_HOME={}", state_root()?.display())
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -323,7 +328,7 @@ fn backend_unit_with_path(
         .with_context(|| format!("Codex Connect binary does not exist: {}", binary.display()))?;
     let working_directory = binary.parent().unwrap_or(Path::new("/"));
     Ok(format!(
-        "[Unit]\nDescription=Codex Connect backend\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment=\"{environment}\"\nEnvironment=\"{config_environment}\"\nEnvironment=\"{state_environment}\"\nWorkingDirectory={}\nExecStartPre=/usr/bin/test -x {}\nExecStart={} run-backend\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Codex Connect backend\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment=\"{environment}\"\nEnvironment=\"{config_environment}\"\nEnvironment=\"{gh_config_environment}\"\nEnvironment=\"{state_environment}\"\nWorkingDirectory={}\nExecStartPre=/usr/bin/test -x {}\nExecStart={} run-backend\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
         systemd_arg(working_directory),
         systemd_arg(&binary),
         systemd_arg(&binary),
@@ -420,6 +425,7 @@ mod tests {
             workspace_local.display()
         )));
         assert!(unit.contains("Environment=\"XDG_CONFIG_HOME="));
+        assert!(unit.contains("Environment=\"GH_CONFIG_DIR="));
         assert!(unit.contains("Environment=\"XDG_STATE_HOME="));
         assert!(!unit.contains("relative"));
         assert!(!unit.contains("sh -"));
