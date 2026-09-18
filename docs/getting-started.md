@@ -46,6 +46,10 @@ cd codex-connect
 
 The checker is intentionally read-only. On a fresh machine it may report missing Codex or tunnel-client; install them in the next steps and rerun it.
 
+Fast builds (optional): for the mold linker plus the sccache cache, copy
+`.cargo/config.toml.example` to `.cargo/config.toml` with your home substituted
+(the example header shows the one-line sed). Plain `cargo build` works without it.
+
 ## 2. Install the pinned Codex CLI
 
 Codex Connect generates and validates its forwarded App Server schemas against the exact CLI release in `config/codex-cli-pin`. Do not silently substitute another release.
