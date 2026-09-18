@@ -104,6 +104,16 @@ Server-request response shapes must come from the pinned generated schemas. Publ
 
 `experimentalApi` is enabled because Codex Connect intentionally supports `item/tool/requestUserInput`. The dedicated App Server launch also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` flags, while initialize advertises the `openai/form` extension. These are explicit integration requirements, not blanket permission to expose unrelated experimental methods.
 
+## App Server reuse gate
+
+Before implementing or retaining a public MCP behavior, generate or inspect the protocol schema from the pinned Codex CLI and search for an equivalent App Server method. Prefer, in order:
+
+1. a narrow projection of the official method;
+2. a scope/bounds/transport adapter around the official method;
+3. a Connect-only bridge only when the pinned App Server lacks the semantic operation.
+
+A bridge needs an explicit architectural justification and should be reconsidered whenever the Codex pin changes. Do not keep parallel implementations for convenience alone. In particular, file/directory name discovery belongs to App Server `fuzzyFileSearch`; `inspect.searchContent` remains Connect-owned only because the current pin has no workspace-content-search RPC.
+
 ## Tool-selection calibration
 
 ### Sandbox ownership invariant
@@ -114,7 +124,8 @@ Host `command.exec` / `command.start` must preserve an omitted `sandboxPolicy` a
 
 The MCP tests contain deterministic golden examples such as:
 
-- “find where Relay is defined” → `codexConnect.inspect`
+- “find where Relay is defined” → one batched `codexConnect.inspect` call
+- “show status, recent commits, and changed files” → one composed `command.exec` call
 - “run cargo test” → `command.exec`
 - “start the dev server and keep it running” → `command.start`
 - “read the new output from the dev server” → `command.read`

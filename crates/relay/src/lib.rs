@@ -23,7 +23,7 @@ use codex_connect_app_server::{
     MAX_WIRE_BYTES,
 };
 pub use codex_connect_app_server::{PendingActionKind, PendingServerRequest};
-use codex_connect_scope::{Scope, ScopeError};
+use codex_connect_scope::{MAX_IMAGE_BYTES, Scope, ScopeError};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -248,6 +248,26 @@ impl Relay {
                 lines[(start - 1)..end.min(total_lines)].join("\n")
             },
         })
+    }
+
+    /// Image bytes still come from App Server's authoritative fs/readFile
+    /// primitive; Connect only adds scope fencing, transport preflight, and
+    /// prompt-oriented image presentation after this read.
+    pub async fn inspect_image_bytes(&self, requested: &str) -> Result<Vec<u8>, RelayError> {
+        let path = self.scope.resolve_app_server_existing(requested)?;
+        if std::fs::metadata(&path)?.len() > MAX_IMAGE_BYTES as u64 {
+            return Err(ScopeError::LargeImage.into());
+        }
+        let response = self.app_server.request(FsReadFile { path }).await?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(response.data_base64)
+            .map_err(|error| {
+                RelayError::Invalid(format!("fs/readFile returned invalid base64: {error}"))
+            })?;
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(ScopeError::LargeImage.into());
+        }
+        Ok(bytes)
     }
 
     pub async fn inspect_read_directory(

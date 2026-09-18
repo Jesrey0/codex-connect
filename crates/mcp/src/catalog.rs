@@ -39,7 +39,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codexConnect.inspect",
                 "Inspect Workspace",
-                "Use for read-only workspace understanding: text ranges, directories, metadata, content search, exact-ish name search, or ranked fuzzy file search. The workspace need not use version control. Relative paths resolve against request cwd (default: scopeRoot); omitted search paths mean cwd. scopeRoot remains the authorization boundary. Each result has a zero-based index and either result or error; operation failures retain other results. Prefer this over command.exec for inspection.",
+                "Use for structured read-only workspace exploration. Batch independent text reads, directory listings, metadata checks, content searches, and ranked App Server fuzzy file searches in one call whenever possible. The workspace need not use version control. Relative paths resolve against request cwd (default: scopeRoot); omitted search paths mean cwd. Each operation returns an indexed result or error without discarding successful siblings. Use command.exec instead when the answer is naturally produced by one deterministic repository/tool command.",
                 true,
                 false,
                 false,
@@ -167,7 +167,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for a known one-shot deterministic command that should finish and return one bounded result, such as git status or cargo test. Non-interactive, with a 30-second default timeout (60-minute maximum) and 64 KiB default output cap (256 KiB maximum). sandboxPolicy is an optional per-call override; omit it to inherit the effective sandbox configuration loaded by Codex App Server. For long-running or interactive deterministic commands use command.start; for autonomous investigation/coding use codexConnect.work.start.",
+                "Use for one known bounded deterministic command, including a shell command that composes several related read-only repository/tool queries into one result. This is the App Server command/exec path, not a separate executor. Non-interactive, with a 30-second default timeout (60-minute maximum) and 64 KiB default output cap (256 KiB maximum). Omit sandboxPolicy to inherit App Server policy. For long-running or interactive commands use command.start; for autonomous investigation/coding use codexConnect.work.start.",
                 false,
                 true,
                 true,
@@ -535,7 +535,6 @@ fn inspect_schema() -> Value {
             object_schema(json!({"type":{"const":"readDirectory"},"path":{"type":"string"}}), &["type","path"]),
             object_schema(json!({"type":{"const":"metadata"},"path":{"type":"string"}}), &["type","path"]),
             object_schema(json!({"type":{"const":"searchContent"},"query":{"type":"string","minLength":1},"path":{"type":"string"},"maxResults":{"type":"integer","minimum":1,"maximum":1000}}), &["type","query"]),
-            object_schema(json!({"type":{"const":"searchNames"},"query":{"type":"string","minLength":1},"path":{"type":"string"},"maxResults":{"type":"integer","minimum":1,"maximum":1000}}), &["type","query"]),
             object_schema(json!({"type":{"const":"fuzzyFileSearch"},"query":{"type":"string","minLength":1},"path":{"type":"string"}}), &["type","query"])
         ]}}}),
         &["operations"],
@@ -887,6 +886,13 @@ mod tests {
     }
 
     #[test]
+    fn inspect_uses_app_server_fuzzy_search_instead_of_a_second_name_search() {
+        let schema = inspect_schema().to_string();
+        assert!(schema.contains("fuzzyFileSearch"));
+        assert!(!schema.contains("searchNames"));
+    }
+
+    #[test]
     fn every_tool_has_explicit_metadata_and_compact_schema() {
         let value = serde_json::to_value(tool_catalog()).unwrap();
         for tool in value.as_array().unwrap() {
@@ -915,6 +921,10 @@ mod tests {
     fn golden_tool_selection_fixture_is_unambiguous() {
         let cases = [
             ("find where Relay is defined", Some("codexConnect.inspect")),
+            (
+                "show status, recent commits, and changed files",
+                Some("command.exec"),
+            ),
             ("run cargo test", Some("command.exec")),
             (
                 "start the dev server and keep it running",
@@ -943,7 +953,7 @@ mod tests {
             ),
             ("what is the weather", None),
         ];
-        assert_eq!(cases.len(), 13);
+        assert_eq!(cases.len(), 14);
         assert!(cases.iter().all(|(_, tool)| {
             tool.is_none_or(|name| tool_catalog().iter().any(|t| t.name.as_ref() == name))
         }));

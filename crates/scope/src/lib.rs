@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 const MAX_SEARCH_RESULTS: usize = 100;
-const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
 const PROMPT_IMAGE_PATCH_SIZE: u32 = 32;
 const HIGH_IMAGE_MAX_DIMENSION: u32 = 2_048;
@@ -62,54 +62,6 @@ pub enum ScopeError {
     RootMutation,
 }
 
-fn search_names_tree(
-    root: &Path,
-    path: &Path,
-    query: &str,
-    max_results: usize,
-    paths: &mut Vec<String>,
-) -> Result<(), ScopeError> {
-    if paths.len() >= max_results {
-        return Ok(());
-    }
-
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    if path != root
-        && path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().contains(query))
-    {
-        paths.push(
-            path.strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string(),
-        );
-    }
-    if metadata.is_dir() {
-        if path != root && should_skip_directory(path) {
-            return Ok(());
-        }
-        for entry in fs::read_dir(path)? {
-            search_names_tree(root, &entry?.path(), query, max_results, paths)?;
-            if paths.len() >= max_results {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NameSearchResults {
-    pub paths: Vec<String>,
-    pub truncated: bool,
-}
-
 #[derive(Clone, Debug)]
 pub struct Scope {
     root: PathBuf,
@@ -149,27 +101,6 @@ impl Scope {
             return Err(ScopeError::OutsideRoot);
         }
         Ok(Self { root })
-    }
-
-    pub fn search_names(
-        &self,
-        query: &str,
-        requested: Option<&str>,
-        max_results: Option<usize>,
-    ) -> Result<NameSearchResults, ScopeError> {
-        if query.is_empty() {
-            return Err(ScopeError::EmptyQuery);
-        }
-        let root = match requested {
-            Some(path) => self.resolve_existing(path)?,
-            None => self.root.clone(),
-        };
-        let limit = max_results.unwrap_or(MAX_SEARCH_RESULTS).clamp(1, 1_000);
-        let mut paths = Vec::new();
-        search_names_tree(&self.root, &root, query, limit + 1, &mut paths)?;
-        let truncated = paths.len() > limit;
-        paths.truncate(limit);
-        Ok(NameSearchResults { paths, truncated })
     }
 
     pub fn root(&self) -> &Path {
@@ -251,9 +182,10 @@ impl Scope {
         self.search_with_cancel(query, requested, max_results, || false)
     }
 
-    pub fn image_with_detail(
+    pub fn image_from_bytes(
         &self,
         requested: &str,
+        bytes: Vec<u8>,
         detail: Option<&str>,
     ) -> Result<ImageFile, ScopeError> {
         let detail = match detail {
@@ -262,11 +194,6 @@ impl Scope {
             Some(_) => return Err(ScopeError::InvalidImageDetail),
         };
         let path = self.resolve_existing(requested)?;
-        let mut file = fs::File::open(&path)?;
-        let mut bytes = Vec::with_capacity(MAX_IMAGE_BYTES.saturating_add(1));
-        file.by_ref()
-            .take(MAX_IMAGE_BYTES.saturating_add(1) as u64)
-            .read_to_end(&mut bytes)?;
         if bytes.len() > MAX_IMAGE_BYTES {
             return Err(ScopeError::LargeImage);
         }
@@ -328,6 +255,16 @@ impl Scope {
             detail: detail.to_string(),
             base64_data: STANDARD.encode(bytes),
         })
+    }
+
+    #[cfg(test)]
+    fn image_with_detail(
+        &self,
+        requested: &str,
+        detail: Option<&str>,
+    ) -> Result<ImageFile, ScopeError> {
+        let bytes = fs::read(self.resolve_existing(requested)?)?;
+        self.image_from_bytes(requested, bytes, detail)
     }
 
     #[cfg(test)]
@@ -1464,35 +1401,5 @@ mod tests {
             fs::read_to_string(temporary.path().join("file.txt")).unwrap(),
             "changed\r\nafter"
         );
-    }
-
-    #[test]
-    fn name_search_remains_scope_fenced_and_skips_build_directories() {
-        let temporary = tempfile::tempdir().unwrap();
-        fs::create_dir_all(temporary.path().join("src")).unwrap();
-        fs::create_dir_all(temporary.path().join("target/generated")).unwrap();
-        fs::write(temporary.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-        fs::write(
-            temporary.path().join("src/main_test.rs"),
-            "fn main_test() {}\n",
-        )
-        .unwrap();
-        fs::write(
-            temporary.path().join("target/generated/main.rs"),
-            "ignored\n",
-        )
-        .unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-
-        let names = scope.search_names("main.rs", None, None).unwrap();
-        assert_eq!(names.paths, vec!["src/main.rs"]);
-        assert_eq!(
-            scope.search_names("src", None, None).unwrap().paths,
-            vec!["src"]
-        );
-        let limited = scope.search_names("main", None, Some(1)).unwrap();
-        assert_eq!(limited.paths.len(), 1);
-        assert!(limited.truncated);
-        assert!(scope.resolve_app_server_existing("../outside").is_err());
     }
 }

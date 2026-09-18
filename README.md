@@ -10,6 +10,8 @@ ChatGPT → official OpenAI tunnel-client → Codex Connect → Codex App Server
 
 Codex App Server remains authoritative for Codex threads, turns, reviews, approvals, models, and execution semantics. Codex Connect does not mirror that RPC vocabulary into MCP. Instead it composes a deliberately selected App Server protocol subset into a small, goal-oriented tool surface while preserving official thread IDs, turn IDs, request IDs, and raw event traceability.
 
+**Reuse invariant:** before adding a Connect capability, inspect the generated schema from the pinned Codex CLI. If App Server already owns the semantic operation, Connect projects or adapts it; Connect-only bridges exist only for semantics the pin does not provide.
+
 ## Operator mental model
 
 For deterministic host work:
@@ -42,7 +44,7 @@ codexConnect.approval.respond / permissions.respond / elicitation.respond
 codexConnect.work.wait
 ```
 
-Use `command.exec` when the exact command is already known and should finish synchronously. Use `command.start` when the command is still deterministic but must remain running or interactive. Use `codexConnect.work.start` when Codex should investigate, reason, edit, test, or iterate autonomously.
+Use `codexConnect.inspect` for structured read-only exploration, and batch independent inspection operations in one call. Use `command.exec` when the answer is naturally produced by one bounded deterministic command; compose related repository/tool reads into that single command rather than chaining tiny calls. Use `command.start` when the command is still deterministic but must remain running or interactive. Use `codexConnect.work.start` when Codex should investigate, reason, edit, test, or iterate autonomously.
 
 **Host sandbox invariant:** when `command.exec` or `command.start` omits `sandboxPolicy`, Codex Connect sends **no synthetic policy**. The field remains absent on the App Server request, so App Server uses the effective upstream Codex configuration from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Codex Connect must not mirror those defaults locally. Callers may still supply an explicit per-command override, including `dangerFullAccess`. By contrast, `codexConnect.work.start` requires an explicit `sandboxPolicy` on every delegated turn so operator-selected authority is never inherited implicitly.
 

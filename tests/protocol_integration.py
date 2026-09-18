@@ -139,21 +139,20 @@ class OperatorProtocolTests(unittest.TestCase):
         result = self.client.call("codexConnect.inspect", {"operations": [
             {"type": "readText", "path": "sample.txt", "startLine": 2, "endLine": 2},
             {"type": "searchContent", "query": "two", "maxResults": 1},
-            {"type": "searchNames", "query": "sample", "maxResults": 1},
             {"type": "metadata", "path": "sample.txt"},
             {"type": "readDirectory", "path": "."},
             {"type": "fuzzyFileSearch", "query": "smp", "path": "."},
         ]})
         self.assertEqual(result["results"][0]["result"]["text"], "two")
-        self.assertEqual(set(result["results"][3]["result"]), {
+        self.assertEqual(set(result["results"][2]["result"]), {
             "createdAtMs", "isDirectory", "isFile", "isSymlink", "modifiedAtMs",
         })
-        self.assertTrue(result["results"][3]["result"]["isFile"])
+        self.assertTrue(result["results"][2]["result"]["isFile"])
         self.assertIn(
             "sample.txt",
-            {entry["fileName"] for entry in result["results"][4]["result"]["entries"]},
+            {entry["fileName"] for entry in result["results"][3]["result"]["entries"]},
         )
-        fuzzy = result["results"][5]["result"]["files"][0]
+        fuzzy = result["results"][4]["result"]["files"][0]
         self.assertEqual(fuzzy["path"], "sample.txt")
         self.assertEqual(fuzzy["match_type"], "file")
         self.assertEqual(fuzzy["score"], 100)
@@ -202,19 +201,26 @@ class OperatorProtocolTests(unittest.TestCase):
         inspected = self.client.call("codexConnect.inspect", {"cwd":cwd,"operations":[
             {"type":"readText","path":"local.txt"},
             {"type":"searchContent","query":"project-local"},
-            {"type":"searchNames","query":"local"},
         ]})
         self.assertEqual(inspected["results"][0]["result"]["text"], "project-local")
         self.assertEqual(inspected["results"][1]["result"]["matches"][0]["path"], "project/local.txt")
-        self.assertEqual(inspected["results"][2]["result"]["paths"], ["project/local.txt"])
         self.client.call("apply_patch", {
             "cwd":cwd,
             "patch":"*** Begin Patch\n*** Add File: patch.txt\n+created\n*** End Patch",
         })
         self.assertEqual((self.project / "patch.txt").read_text(), "created\n")
+        before_image_reads = sum(
+            json.loads(line) == {"kind": "method", "name": "fs/readFile"}
+            for line in self.coverage_path.read_text().splitlines()
+        )
         image = self.client.call("view_image", {"cwd":cwd,"path":"pixel.png"})
         self.assertEqual(image["path"], "project/pixel.png")
         self.assertEqual(image["mimeType"], "image/png")
+        after_image_reads = sum(
+            json.loads(line) == {"kind": "method", "name": "fs/readFile"}
+            for line in self.coverage_path.read_text().splitlines()
+        )
+        self.assertEqual(after_image_reads, before_image_reads + 1)
         self.client.call("apply_patch", {
             "cwd":cwd,
             "patch":"*** Begin Patch\n*** Add File: ../escape.txt\n+nope\n*** End Patch",

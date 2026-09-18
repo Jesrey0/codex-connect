@@ -167,7 +167,7 @@ impl ServerHandler for McpHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("codex-connect", ""))
             .with_instructions(
-                "Codex Connect is a ChatGPT-native operator surface over a deliberately selected Codex App Server subset. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. Use codexConnect.inspect for read-only workspace inspection; command.exec for a known one-shot deterministic command; command.start plus command.read/write/resize/terminate for deterministic persistent or interactive commands; and codexConnect.work.start followed by codexConnect.work.wait for autonomous multi-step Codex work. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server command session, thread, and turn lifecycles remain authoritative.",
+                "Codex Connect is a ChatGPT-native operator surface over a deliberately selected Codex App Server subset. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. For read-only exploration, batch independent reads/searches in one codexConnect.inspect call. For a deterministic repository or tool query that composes naturally as commands, prefer one bounded command.exec call over a chain of tiny calls. Use command.start plus command.read/write/resize/terminate only for persistent or interactive commands, and codexConnect.work.start followed by codexConnect.work.wait for autonomous multi-step Codex work. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect scopes, batches, and projects those capabilities rather than reimplementing them.",
             )
     }
 
@@ -187,7 +187,7 @@ impl ServerHandler for McpHandler {
         let name = request.name.as_ref();
         let arguments = request.arguments.unwrap_or_default();
         if name == "view_image" {
-            return image_response(&self.scope, arguments);
+            return image_response(&self.relay, &self.scope, arguments).await;
         }
         match dispatch(
             &self.relay,
@@ -239,11 +239,6 @@ enum InspectOperation {
         path: String,
     },
     SearchContent {
-        query: String,
-        path: Option<String>,
-        max_results: Option<usize>,
-    },
-    SearchNames {
         query: String,
         path: Option<String>,
         max_results: Option<usize>,
@@ -555,7 +550,6 @@ async fn inspect(
                 | InspectOperation::ReadDirectory { path }
                 | InspectOperation::Metadata { path } => path.as_str(),
                 InspectOperation::SearchContent { path, .. }
-                | InspectOperation::SearchNames { path, .. }
                 | InspectOperation::FuzzyFileSearch { path, .. } => path.as_deref().unwrap_or("."),
             };
             let path = Scope::path_from_cwd(&cwd, requested)?;
@@ -583,9 +577,6 @@ async fn inspect(
                     *max_results,
                     || context.ct.is_cancelled(),
                 )?),
-                InspectOperation::SearchNames {
-                    query, max_results, ..
-                } => serde_json::to_value(scope.search_names(query, Some(&path), *max_results)?),
                 InspectOperation::FuzzyFileSearch { query, .. } => {
                     serde_json::to_value(relay.inspect_fuzzy_file_search(query, Some(&path)).await?)
                 }
@@ -600,7 +591,6 @@ async fn inspect(
             InspectOperation::ReadDirectory { .. } => "readDirectory",
             InspectOperation::Metadata { .. } => "metadata",
             InspectOperation::SearchContent { .. } => "searchContent",
-            InspectOperation::SearchNames { .. } => "searchNames",
             InspectOperation::FuzzyFileSearch { .. } => "fuzzyFileSearch",
         };
         let row = match result {
@@ -658,16 +648,19 @@ fn summary_for(name: &str, value: &Value) -> String {
     }
 }
 
-fn image_response(
+async fn image_response(
+    relay: &Relay,
     scope: &Scope,
     arguments: JsonObject,
 ) -> Result<rmcp::model::CallToolResponse, McpError> {
-    let result = (|| -> anyhow::Result<_> {
+    let result = async {
         let args: ViewImageArgs = parse(arguments)?;
         let cwd = scope.resolve_cwd(args.cwd.as_deref())?;
         let path = Scope::path_from_cwd(&cwd, &args.path)?;
-        Ok(scope.image_with_detail(&path, args.detail.as_deref())?)
-    })();
+        let bytes = relay.inspect_image_bytes(&path).await?;
+        Ok::<_, anyhow::Error>(scope.image_from_bytes(&path, bytes, args.detail.as_deref())?)
+    }
+    .await;
     match result {
         Ok(image) => {
             let metadata =

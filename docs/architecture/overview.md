@@ -40,6 +40,27 @@ Codex Connect does **not** define another agent/session model.
 
 Connect-owned state is observational or transport-specific only: the bounded event journal, pending server-request registry, and bounded live-turn cache seeded from official turn-start responses/lifecycle events. None is authoritative Codex state; persisted thread history remains App Server-owned.
 
+## App Server reuse invariant
+
+Before adding or retaining a Codex Connect capability, inspect the generated schema from the pinned Codex CLI. If App Server already owns the semantic operation, Connect must project or adapt that method instead of implementing a parallel host primitive. A Connect-only bridge is justified only when the pinned App Server has no equivalent semantic operation required by ChatGPT.
+
+The public surface therefore falls into three implementation classes:
+
+| Class | Public surface | App Server authority / justification |
+| --- | --- | --- |
+| Projection | `model.list`, `skills.list`, `codexConnect.usage` | Narrow projections of `model/list`, `skills/list`, and `account/rateLimits/read`. |
+| Adapter | `command.exec`, `command.start/read/write/resize/terminate` | Official sandboxed `command/exec` and its streaming control RPCs; Connect adds scope normalization, bounded journals, and MCP lifecycle projection. |
+| Adapter | `codexConnect.work.start/read/wait/steer/interrupt` | Official `thread/*` and `turn/*` state remains authoritative; Connect composes the small operator workflow and quiet-join journal. |
+| Adapter | `codexConnect.review` | Official `review/start`, with scoped thread preparation and work-result projection. |
+| Adapter | `codexConnect.pendingActions.list` and typed responders | Official App Server server requests remain authoritative; Connect keeps only the pending-response routing needed to answer them over MCP. |
+| Adapter | `inspect.readText/readDirectory/metadata/fuzzyFileSearch` | Official `fs/readFile`, `fs/readDirectory`, `fs/getMetadata`, and `fuzzyFileSearch`; Connect adds durable-scope fencing and presentation bounds. |
+| Adapter | `view_image` | Image bytes come from official `fs/readFile`; Connect only validates/resizes them and emits an MCP image content block. |
+| Bridge | `inspect.searchContent` | The pinned App Server has no workspace-content-search RPC. The bridge is bounded, scope-fenced, cancellation-aware, and skips known build/cache trees. |
+| Bridge | `apply_patch` | The pinned App Server exposes byte-level filesystem mutations but no deterministic patch semantic RPC. Connect owns patch parsing/preflight/rollback semantics. |
+| Bridge | `codexConnect.status` | Operator/runtime health and content-addressed build identity are Connect deployment concerns, not Codex thread state. |
+
+An upstream method is not automatically public merely because it exists. For example, the pinned App Server also exposes fuzzy-file-search session methods intended for interactive picker-style clients; ChatGPT's one-shot exploration path does not need that lifecycle, so Codex Connect exposes only the one-shot ranked search. Conversely, a bridge must be removed or reduced when a future pinned App Server version gains the equivalent semantic capability.
+
 ## Event-driven work
 
 App Server emits turn, item, plan, diff, usage, and lifecycle notifications. The relay records a bounded recent journal with a monotonically increasing local cursor while retaining the original method and params.
@@ -82,20 +103,19 @@ The pending registry preserves the exact official request ID, method, params, an
 - `readDirectory`
 - `metadata`
 - `searchContent`
-- `searchNames`
 - `fuzzyFileSearch`
 
 Each inspection request may select a `cwd` inside the durable scope. Relative operation paths resolve from that request-local directory; omitted search paths mean the selected `cwd`, and omitted `cwd` means the durable scope root. The scope root remains the authorization boundary: there is no active-project state, alternate-root retry, or path fallback. One failed inspection operation is returned as an indexed error beside successful results; malformed batches and cancellation still fail the whole request.
 
 All resolved paths are fenced to the configured durable root before an App Server filesystem request is sent. `readText`, `readDirectory`, and `metadata` use the pinned `fs/readFile`, `fs/readDirectory`, and `fs/getMetadata` RPCs. `readText` rejects files that cannot fit safely inside the shared App Server JSONL frame before issuing `fs/readFile`, then decodes the base64 payload and applies its existing line-range presentation. `readDirectory` similarly estimates the pinned response size from entry names and rejects listings that could exceed the shared transport frame before issuing the RPC; App Server remains authoritative for the returned entry data. `fuzzyFileSearch` uses the pinned App Server RPC of the same name and preserves its ranked result contract (`root`, relative `path`, `match_type`, `file_name`, `score`, and optional `indices`) without adding synthetic limits or truncation semantics; returned roots and paths are canonicalized and any match that escapes the selected scoped root, including through descendant symlinks, is dropped. Directory and metadata results use the App Server field names; in particular, metadata has `createdAtMs`, `modifiedAtMs`, `isFile`, `isDirectory`, and `isSymlink`, and no synthetic `sizeBytes` field because the official metadata RPC does not report one.
 
-`searchContent` and `searchNames` remain native scoped operations. `searchNames` remains distinct from `fuzzyFileSearch`: it provides deterministic substring matching with caller-controlled result limits and an explicit truncation signal, while App Server fuzzy search returns ranked matches and may classify matches as files or directories. Content/name search does not follow symlinks, and build/cache directories are skipped where appropriate.
+`searchContent` remains the one native inspection bridge because the pinned App Server does not expose workspace-content search. It does not follow symlinks, skips known build/cache directories, supports cancellation, and returns an explicit truncation signal. Codex Connect deliberately does **not** maintain a second name-search implementation: ranked file/directory discovery is delegated to App Server `fuzzyFileSearch`.
 
-`apply_patch` and `view_image` remain native host primitives because their content semantics are more useful to ChatGPT than byte-oriented filesystem RPCs. They use the same request-local `cwd` convention as inspection.
+`apply_patch` remains a native bridge because App Server has no patch semantic RPC. `view_image` is an adapter: file bytes are read through App Server `fs/readFile`, while Connect performs the prompt-oriented image validation/resizing and MCP image projection. Both use the same request-local `cwd` convention as inspection.
 
 ## Command boundary
 
-`command.exec` is reserved for a known deterministic command that should finish synchronously. It remains unchanged and bounded: the default timeout is 30 seconds, callers may extend it to 60 minutes, and captured stdout/stderr remains capped rather than allowing unbounded buffering.
+`command.exec` is reserved for a known deterministic command that should finish synchronously. It is also the intended composition escape hatch for repository/tool queries that are naturally expressed as one bounded command (for example, several related `git`, `rg`, or build-system reads in one shell invocation) rather than a chain of tiny MCP calls. The default timeout is 30 seconds, callers may extend it to 60 minutes, and captured stdout/stderr remains capped rather than allowing unbounded buffering.
 
 ### Host sandbox inheritance invariant
 
