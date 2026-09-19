@@ -798,23 +798,6 @@ fn summary_for(name: &str, value: &Value) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SERVER_INSTRUCTIONS;
-
-    #[test]
-    fn server_instructions_calibrate_control_plane_and_delegation() {
-        assert!(SERVER_INSTRUCTIONS.contains("primary host and Codex control plane"));
-        assert!(
-            SERVER_INSTRUCTIONS.contains("do not invoke the Codex CLI through host command tools")
-        );
-        assert!(SERVER_INSTRUCTIONS.contains("do not inherit the ChatGPT conversation"));
-        assert!(SERVER_INSTRUCTIONS.contains("delegation is an optimization, not the default"));
-        assert!(SERVER_INSTRUCTIONS.contains("model usage is constrained"));
-        assert!(SERVER_INSTRUCTIONS.contains("batch independent discovery with codex.info"));
-    }
-}
-
 async fn image_response(
     relay: &Relay,
     scope: &Scope,
@@ -847,5 +830,22 @@ async fn image_response(
             Ok(response.into())
         }
         Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error.to_string())]).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SERVER_INSTRUCTIONS;
+
+    #[test]
+    fn server_instructions_calibrate_control_plane_and_delegation() {
+        assert!(SERVER_INSTRUCTIONS.contains("primary host and Codex control plane"));
+        assert!(
+            SERVER_INSTRUCTIONS.contains("do not invoke the Codex CLI through host command tools")
+        );
+        assert!(SERVER_INSTRUCTIONS.contains("do not inherit the ChatGPT conversation"));
+        assert!(SERVER_INSTRUCTIONS.contains("delegation is an optimization, not the default"));
+        assert!(SERVER_INSTRUCTIONS.contains("model usage is constrained"));
+        assert!(SERVER_INSTRUCTIONS.contains("batch independent discovery with codex.info"));
     }
 }
