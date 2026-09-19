@@ -32,10 +32,10 @@ flowchart TD
 Codex Connect does **not** define another agent/session model.
 
 - App Server owns thread and turn state.
-- `codex.work.start` composes `thread/start` or `thread/resume` with `turn/start`.
-- `codex.work.steer` maps to `turn/steer`.
-- `codex.work.interrupt` maps to `turn/interrupt`.
-- `codex.review` maps to inline `review/start`.
+- `codex.start(mode=work)` composes `thread/start` or `thread/resume` with `turn/start`.
+- `codex.start(mode=review)` maps to inline `review/start`.
+- `codex.control(action=steer|interrupt)` maps to `turn/steer` / `turn/interrupt`.
+- `codex.wait` projects official turn state plus the bounded event journal and pending requests; `timeoutMs=0` is the snapshot path.
 - Every public result preserves official App Server identifiers.
 
 Connect-owned state is observational or transport-specific only: the bounded event journal, pending server-request registry, and bounded live-turn cache seeded from official turn-start responses/lifecycle events. None is authoritative Codex state; persisted thread history remains App Server-owned.
@@ -48,16 +48,15 @@ The public surface therefore falls into three implementation classes:
 
 | Class | Public surface | App Server authority / justification |
 | --- | --- | --- |
-| Projection | `codex.model.list`, `codex.skills.list`, `codex.usage` | Narrow projections of `model/list`, `skills/list`, and `account/rateLimits/read`. |
-| Adapter | `command.exec`, `command.start/read/write/resize/terminate` | Official sandboxed `command/exec` and its streaming control RPCs; Connect adds scope normalization, bounded journals, and MCP lifecycle projection. |
-| Adapter | `codex.work.start/read/wait/steer/interrupt` | Official `thread/*` and `turn/*` state remains authoritative; Connect composes the small operator workflow and quiet-join journal. |
-| Adapter | `codex.review` | Official `review/start`, with scoped thread preparation and work-result projection. |
-| Adapter | `codex.pendingActions.list` and typed responders | Official App Server server requests remain authoritative; Connect keeps only the pending-response routing needed to answer them over MCP. |
+| Projection | `codex.info` | Batched narrow projections of `model/list`, `skills/list`, and `account/rateLimits/read`. |
+| Adapter | `command.exec`, `command.start/read/control` | Official sandboxed `command/exec` and its streaming write/resize/terminate RPCs; Connect adds scope normalization, bounded journals, and MCP lifecycle projection. |
+| Adapter | `codex.start/wait/control` | Official `thread/*`, `turn/*`, and `review/start` state remains authoritative; Connect composes one start/read-control workflow and quiet-join journal. |
+| Adapter | `codex.action.respond` | Official approval, permission, and user-input server requests remain authoritative; Connect keeps only the pending-response routing needed to answer these three public collaboration categories over MCP. |
 | Adapter | `inspect.readText/readDirectory/metadata/fuzzyFileSearch` | Official `fs/readFile`, `fs/readDirectory`, `fs/getMetadata`, and `fuzzyFileSearch`; Connect adds durable-scope fencing and presentation bounds. |
 | Adapter | `view_image` | Image bytes come from official `fs/readFile`; Connect only validates/resizes them and emits an MCP image content block. |
 | Bridge | `inspect.searchContent` | The pinned App Server has no workspace-content-search RPC. The bridge is bounded, scope-fenced, cancellation-aware, and skips known build/cache trees. |
 | Bridge | `apply_patch` | The pinned App Server exposes byte-level filesystem mutations but no deterministic patch semantic RPC. Connect owns patch parsing/preflight/rollback semantics. |
-| Bridge | `status` | Operator/runtime health, content-addressed build identity, global Codex configuration provenance, and App Server launch context are Connect deployment concerns, not Codex thread state. |
+| Bridge | `status` | Operator/runtime health, content-addressed build identity, global Codex configuration provenance, App Server launch context, and the compact operator-contract marker are Connect deployment concerns, not Codex thread state. |
 
 `codex.*` is the public namespace for interacting with the Codex CLI/App Server agent domain. `codex-connect` remains the implementation/product identity of the bridge, while host/operator operations such as `status`, `inspect`, `apply_patch`, `view_image`, and `command.*` speak for the connector environment directly.
 
@@ -73,27 +72,26 @@ sequenceDiagram
     participant X as Codex Connect
     participant A as Codex App Server
 
-    C->>X: codex.work.start(task, sandboxPolicy)
+    C->>X: codex.start(mode=work, task, sandboxPolicy)
     X->>A: thread/start or thread/resume
     X->>A: turn/start
     A-->>X: official notifications
     X-->>C: threadId + turnId + cursor
-    C->>X: codex.work.wait(afterCursor)
+    C->>X: codex.wait(afterCursor)
     X-->>C: terminal / operator action / lease timeout
 ```
 
-`codex.work.wait` is a bounded quiet join, not a progress subscription. Routine item lifecycle notifications, tool activity, file changes, and agent commentary continue to enter the bounded event journal but do not resolve the wait. The wait returns early only when the selected turn becomes terminal or operator action/input is required; otherwise it returns when its lease expires. A zero-duration wait can be used to pull the accumulated journal without blocking. The relay treats the official `turn/start` / `review/start` response as immediately valid live state, then reconciles against paginated `thread/turns/list` history with turn items omitted during scans. Only the selected turn is hydrated through filtered `thread/items/list` pages. Metadata checks use `thread/read(includeTurns=false)`; full-history hydration is deliberately avoided on the wait path.
+`codex.wait` is a bounded quiet join, not a progress subscription. Routine item lifecycle notifications, tool activity, file changes, and agent commentary continue to enter the bounded event journal but do not resolve the wait. The wait returns early only when the selected turn becomes terminal or operator action/input is required; otherwise it returns when its lease expires. A zero-duration wait is the authoritative snapshot path and replaces a separate read tool. The relay treats the official `turn/start` / `review/start` response as immediately valid live state, then reconciles against paginated `thread/turns/list` history with turn items omitted during scans. Only the selected turn is hydrated through filtered `thread/items/list` pages. Metadata checks use `thread/read(includeTurns=false)`; full-history hydration is deliberately avoided on the wait path.
 
 ## Typed action loop
 
-Operator-actionable server requests are normalized into four categories:
+Public operator-actionable server requests are normalized into three categories and resolved through `codex.action.respond`:
 
-- command/file approvals → `codex.approval.respond`
-- permission grants → `codex.permissions.respond`
-- MCP elicitation → `codex.elicitation.respond`
-- Codex semantic questions → `codex.userInput.respond`
+- command/file approvals → `type=approval`
+- permission grants → `type=permissions`
+- Codex semantic questions → `type=userInput`
 
-The pending registry preserves the exact official request ID, method, params, and correlated thread ID. Responders validate the action category and translate the compact public decision into the pinned official response shape. Unsupported server requests fail closed.
+The pending registry preserves the exact official request ID, method, params, and correlated thread ID. `codex.wait` returns those pending actions directly, eliminating a separate list tool. The responder validates the action category against the authoritative request kind and translates the compact public decision into the pinned official response shape. MCP elicitation remains recognized by the transport so an unexpected request is observable and can fail closed, but Codex Connect does not advertise the `openai/form` extension and exposes no elicitation response operation.
 
 `item/tool/requestUserInput` is the one deliberate experimental exception. It is exposed because semantic worker questions materially improve operator collaboration; all other experimental App Server methods remain private and unavailable unless separately designed into the public surface.
 
@@ -119,23 +117,23 @@ The public `inspect` output schema preserves that operation type information ins
 
 ## Command boundary
 
-`command.exec` is reserved for a known deterministic command that should finish synchronously. It is also the intended composition escape hatch for repository/tool queries that are naturally expressed as one bounded command (for example, several related `git`, `rg`, or build-system reads in one shell invocation) rather than a chain of tiny MCP calls. The default process timeout is 30 seconds, callers may extend it to 60 minutes, and captured stdout/stderr remains capped rather than allowing unbounded buffering. `timeoutMs` is an App Server process deadline, not an end-to-end MCP latency SLA: Codex Connect gives final response delivery a small finite allowance after that deadline. The pinned App Server buffered response contains `exitCode`, `stdout`, and `stderr` but no truncation flag. Connect therefore adds byte counts plus conservative `stdoutMayBeTruncated` / `stderrMayBeTruncated` flags when a stream exactly reaches `outputBytesCap`; those flags mean the cap may have been reached, not that truncation is proven. `durationMs` is Connect-observed wall time for the App Server command request.
+`command.exec` is reserved for a known deterministic command that should finish synchronously. It is also the intended composition escape hatch for repository/tool queries that are naturally expressed as one bounded command (for example, several related `git`, `rg`, or build-system reads in one shell invocation) rather than a chain of tiny MCP calls. The default process timeout is 60 seconds, callers may extend it to 60 minutes, and captured stdout/stderr remains capped rather than allowing unbounded buffering. `timeoutMs` is an App Server process deadline, not an end-to-end MCP latency SLA: Codex Connect gives final response delivery a small finite allowance after that deadline. The pinned App Server buffered response contains `exitCode`, `stdout`, and `stderr` but no truncation flag. Connect therefore adds byte counts plus conservative `stdoutMayBeTruncated` / `stderrMayBeTruncated` flags when a stream exactly reaches `outputBytesCap`; those flags mean the cap may have been reached, not that truncation is proven. `durationMs` is Connect-observed wall time for the App Server command request.
 
 ### Host sandbox inheritance invariant
 
 > **Invariant:** when a host `command.exec` or `command.start` call omits `sandboxPolicy`, Codex Connect MUST send **no synthetic sandbox policy** to App Server. The `sandboxPolicy` field stays absent from the official `command/exec` request, and App Server applies the effective upstream Codex configuration it already loaded from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`).
 
-This makes upstream Codex configuration the single source of truth for host-command defaults. Codex Connect must not parse, copy, persist, materialize, or otherwise mirror `sandbox_mode` or `sandbox_workspace_write.network_access` as its own defaults. An explicit per-command `sandboxPolicy` is an override only and is scope-normalized before being sent upstream.
+This makes upstream Codex configuration the single source of truth for host-command defaults. Codex Connect must not parse, copy, persist, materialize, or otherwise mirror `sandbox_mode` or `sandbox_workspace_write.network_access` as its own defaults. An explicit per-command `sandboxPolicy` is an override only and is scope-normalized before being sent upstream. The public host-command schema exposes only `workspaceWrite` and `dangerFullAccess`; `readOnly` is deliberately reserved for delegated Codex work, and hand-crafted host-command attempts to select it are rejected server-side.
 
-Persistent deterministic commands use a separate `command.start` / `command.read` / `command.write` / `command.resize` / `command.terminate` surface backed by the official sandboxed `command/exec` streaming session contract. `command.start` supplies a client-generated, connection-scoped `processId`, enables streamed stdout/stderr and stdin control, and runs the still-pending `command/exec` RPC in a relay task until the App Server returns its authoritative final response. PTY mode is explicit; non-PTY sessions still support streaming output and stdin. `command.read` uses a bounded per-session cursor journal and wakes on new output, terminal state, or lease expiry. Process lifecycle and journal consumption are independent: a read can report `state:"exited"` or `state:"failed"` while newer retained chunks remain unread because each MCP response is separately bounded. `hasMoreOutput:true` states that a newer retained chunk was withheld by that response bound. `drained:true` states that the process is terminal and the current read consumed all retained output, so no cursor-stability inference is required. Output retention is separately bounded; `historyLost:true` still means older journal data is no longer recoverable even when `drained:true`.
+Persistent deterministic commands use `command.start` / `command.read` / `command.control`, backed by the official sandboxed `command/exec` streaming session contract. `command.start` supplies a client-generated, connection-scoped `processId`, enables streamed stdout/stderr and stdin control, and runs the still-pending `command/exec` RPC in a relay task until the App Server returns its authoritative final response. `command.control` discriminates write, resize, and terminate mutations against that same session. PTY mode is explicit; non-PTY sessions still support streaming output and stdin. `command.read` uses a bounded per-session cursor journal and wakes on new output, terminal state, or lease expiry. Process lifecycle and journal consumption are independent: a read can report `state:"exited"` or `state:"failed"` while newer retained chunks remain unread because each MCP response is separately bounded. `hasMoreOutput:true` states that a newer retained chunk was withheld by that response bound. `drained:true` states that the process is terminal and the current read consumed all retained output, so no cursor-stability inference is required. Output retention is separately bounded; `historyLost:true` still means older journal data is no longer recoverable even when `drained:true`.
 
-`command.terminate` forwards the official App Server stop request and does not add a graceful-shutdown contract. Runtime/platform termination may prevent shell traps or other cleanup handlers from running; callers must not depend on them and must use `command.read` for the authoritative final state and any retained output.
+`command.control(action=terminate)` forwards the official App Server stop request and does not add a graceful-shutdown contract. Runtime/platform termination may prevent shell traps or other cleanup handlers from running; callers must not depend on them and must use `command.read` for the authoritative final state and any retained output.
 
 App Server owns the actual process lifecycle. Codex Connect owns only the bounded client-side projection required to expose that long-running RPC asynchronously over MCP. There is deliberately no `command.list`: the pinned App Server has no authoritative standalone command-session enumeration RPC, so exposing relay bookkeeping as a list would imply authority it does not have. Command-session handles do not survive backend/App Server restart. The pinned protocol states that streaming command sessions are connection-scoped and are terminated if the originating connection closes; after restart an old `processId` is therefore stale and rejected.
 
-The separate experimental App Server `process/*` API is not used for this surface because current upstream semantics place it outside Codex sandbox execution, while the operator contract here requires the existing sandbox/network controls. Autonomous investigation or coding still belongs in `codex.work.start`, where Codex owns its normal command/file lifecycle and reasoning loop. Every public `codex.work.start` call requires `sandboxPolicy`; Codex Connect roots workspace-write paths and always sends that operator-selected policy on the corresponding official `turn/start`. The lower-level App Server protocol keeps the field optional because that is the pinned upstream wire contract, but the public operator surface intentionally does not inherit it.
+The separate experimental App Server `process/*` API is not used for this surface because current upstream semantics place it outside Codex sandbox execution, while the operator contract here requires the existing sandbox/network controls. Autonomous investigation or coding belongs in `codex.start(mode=work)` only when delegation materially improves the critical path or quality; Codex owns the delegated command/file lifecycle and reasoning loop. Every work-mode start requires `sandboxPolicy`; Codex Connect roots workspace-write paths and always sends that operator-selected policy on the corresponding official `turn/start`. The lower-level App Server protocol keeps the field optional because that is the pinned upstream wire contract, but the public operator surface intentionally does not inherit it. Delegated workers do not inherit the calling ChatGPT conversation, so the task payload is the complete collaboration boundary.
 
-Workspace-write `writableRoots` must be absolute paths inside the durable scope. They are additional writable roots in the upstream workspace-write policy, not an exclusive allowlist, and they do not narrow App Server's base workspace. Codex Connect launches its dedicated App Server with the durable `scopeRoot` as `working_directory`; for host `command.exec` / `command.start`, `workspaceWrite` therefore leaves `scopeRoot` writable even when `writableRoots` is empty. A per-command `cwd` only chooses the child process working directory and does not reduce that write authority. Callers that require read-only behavior must select `readOnly` rather than trying to narrow `workspaceWrite`. For an explicitly supplied policy, the upstream `networkAccess` boolean is passed through deliberately: `false` can prohibit socket creation, including localhost-based tests, while `true` is broader network access rather than a loopback-only grant. Codex Connect does not silently retry with broader permissions.
+Workspace-write `writableRoots` must be absolute paths inside the durable scope. They are additional writable roots in the upstream workspace-write policy, not an exclusive allowlist, and they do not narrow App Server's base workspace. Codex Connect launches its dedicated App Server with the durable `scopeRoot` as `working_directory`; for host `command.exec` / `command.start`, `workspaceWrite` therefore leaves `scopeRoot` writable even when `writableRoots` is empty. A per-command `cwd` only chooses the child process working directory and does not reduce that write authority. Read-only host exploration belongs in `inspect`; delegated work may explicitly select `readOnly` through `codex.start(mode=work)`. For an explicitly supplied policy, the upstream `networkAccess` boolean is passed through deliberately: `false` can prohibit socket creation, including localhost-based tests, while `true` is broader network access rather than a loopback-only grant. Codex Connect does not silently retry with broader permissions.
 
 Setup sanitizes its execution `PATH` to absolute, non-empty directories and embeds that PATH in the persistent user-systemd backend unit. This gives App Server commands and workers the operator toolchain environment without wrapping commands in login shells or adding executable-specific lookup fallbacks.
 
@@ -146,14 +144,14 @@ The App Server handshake explicitly sets:
 ```text
 experimentalApi = true
 requestAttestation = false
-extensions["openai/form"] = {}
+extensions = {}
 ```
 
 The dedicated pinned App Server process is launched with `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` enabled. Codex Connect owns these process-local requirements rather than depending on a user's global Codex feature configuration.
 
-Because `openai/form` is advertised during initialization, the elicitation responder accepts both standard `form` payloads and the `openai/form` / legacy `openaiForm` variants. URL-mode elicitation remains content-free on acceptance.
+Codex Connect intentionally does not advertise `openai/form` because the minimized public surface has no elicitation response operation. The transport still recognizes `mcpServer/elicitation/request` so unexpected requests are visible and fail closed rather than corrupting the connection.
 
-`codex.usage` preserves the pinned App Server account usage payload rather than projecting only percentages. This includes `ordinaryUsageAllowed`, reset-credit summary state, per-limit snapshots, and other top-level fields supplied by `account/rateLimits/read`, so the operator does not infer availability from percentages or reset timestamps.
+`codex.info(type=usage)` preserves the pinned App Server account usage payload rather than projecting only percentages. This includes `ordinaryUsageAllowed`, reset-credit summary state, per-limit snapshots, and other top-level fields supplied by `account/rateLimits/read`, so the operator does not infer availability from percentages or reset timestamps.
 
 The generated schema artifact contains only the internal requests and server-response contracts needed by the adapter, including the explicitly selected user-input request contract. Upstream App Server schema identifiers are preserved verbatim and do not define generations of the Codex Connect MCP surface. Adding an App Server method to that artifact does not make it a public MCP tool; public tools are deliberately designed around ChatGPT goals.
 

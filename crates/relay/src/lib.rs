@@ -4,7 +4,7 @@ mod actions;
 mod command_sessions;
 mod event_journal;
 
-pub use actions::{ApprovalDecision, ElicitationAction, PermissionGrant, PermissionScope};
+pub use actions::{ApprovalDecision, PermissionGrant, PermissionScope};
 use base64::Engine;
 pub use codex_connect_app_server::protocol::{
     ApprovalPolicy, CommandExec, CommandExecTerminalSize, ModelList, ReviewTarget, RpcId,
@@ -38,7 +38,7 @@ const WAIT_RECONCILE_MS: u64 = 1_000;
 const MAX_LIVE_TURNS: usize = 256;
 const TURN_PAGE_SIZE: u32 = 50;
 const ITEM_PAGE_SIZE: u32 = 100;
-pub const DEFAULT_COMMAND_MS: u64 = 30_000;
+pub const DEFAULT_COMMAND_MS: u64 = 60_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMAND_MS: u64 = 60 * 60 * 1_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
@@ -517,12 +517,12 @@ impl Relay {
         let input = input.unwrap_or_default();
         if input.is_empty() && !close_stdin {
             return Err(RelayError::Invalid(
-                "command.write requires non-empty input or closeStdin: true".into(),
+                "command.control action=write requires non-empty input or closeStdin: true".into(),
             ));
         }
         if input.len() > MAX_COMMAND_WRITE_BYTES {
             return Err(RelayError::Invalid(format!(
-                "command.write input must be at most {MAX_COMMAND_WRITE_BYTES} UTF-8 bytes"
+                "command.control action=write input must be at most {MAX_COMMAND_WRITE_BYTES} UTF-8 bytes"
             )));
         }
         let delta_base64 = (!input.is_empty())

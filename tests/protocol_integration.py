@@ -22,12 +22,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONTRACT = json.loads((ROOT / "config/app-server-tool-schemas.json").read_text())
 EXPECTED = {
     "status", "inspect", "apply_patch", "view_image", "command.exec",
-    "command.start", "command.read", "command.write", "command.resize", "command.terminate",
-    "codex.work.start", "codex.work.read", "codex.work.wait",
-    "codex.work.steer", "codex.work.interrupt", "codex.pendingActions.list",
-    "codex.approval.respond", "codex.permissions.respond",
-    "codex.elicitation.respond", "codex.userInput.respond",
-    "codex.review", "codex.model.list", "codex.skills.list", "codex.usage",
+    "command.start", "command.read", "command.control",
+    "codex.start", "codex.wait", "codex.control", "codex.action.respond", "codex.info",
 }
 
 
@@ -94,31 +90,40 @@ class OperatorProtocolTests(unittest.TestCase):
             "sandboxPolicy",
             {"type": "workspaceWrite", "networkAccess": True},
         )
-        return self.client.call("codex.work.start", {"task": scenario, **arguments})
+        return self.client.call("codex.start", {"mode": "work", "task": scenario, **arguments})
 
     def wait(self, work, timeout=1000, **arguments):
-        return self.client.call("codex.work.wait", {
+        return self.client.call("codex.wait", {
             "threadId": work["threadId"], "turnId": work["turnId"], "afterCursor": work["cursor"],
             "timeoutMs": timeout, **arguments,
         })
 
     def test_catalog_and_status_are_canonical(self):
-        self.assertEqual(len(self.client.catalog), 24)
+        self.assertEqual(len(self.client.catalog), 13)
         self.assertEqual(set(self.client.tools), EXPECTED)
-        wait_timeout = self.client.tools["codex.work.wait"]["inputSchema"]["properties"]["timeoutMs"]
+        wait_timeout = self.client.tools["codex.wait"]["inputSchema"]["properties"]["timeoutMs"]
         self.assertEqual(wait_timeout["default"], 60000)
         self.assertEqual(wait_timeout["maximum"], 120000)
+        exec_timeout = self.client.tools["command.exec"]["inputSchema"]["properties"]["timeoutMs"]
+        self.assertEqual(exec_timeout["default"], 60000)
+        self.assertEqual(exec_timeout["maximum"], 60 * 60 * 1000)
         start_size = self.client.tools["command.start"]["inputSchema"]["properties"]["size"]["anyOf"][0]
-        resize = self.client.tools["command.resize"]["inputSchema"]["properties"]
+        resize = self.client.tools["command.control"]["inputSchema"]["oneOf"][1]["properties"]
         self.assertEqual(start_size["properties"]["rows"]["minimum"], 1)
         self.assertEqual(start_size["properties"]["cols"]["minimum"], 1)
         self.assertEqual(resize["rows"]["minimum"], 1)
         self.assertEqual(resize["cols"]["minimum"], 1)
-        work_start = self.client.tools["codex.work.start"]["inputSchema"]
+        work_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][0]
         self.assertIn("sandboxPolicy", work_start["required"])
+        self.assertIn('"readOnly"', json.dumps(work_start["properties"]["sandboxPolicy"]))
+        for host_tool in ("command.exec", "command.start"):
+            sandbox = self.client.tools[host_tool]["inputSchema"]["properties"]["sandboxPolicy"]
+            self.assertNotIn('"readOnly"', json.dumps(sandbox))
+            self.assertIn('"workspaceWrite"', json.dumps(sandbox))
+            self.assertIn('"dangerFullAccess"', json.dumps(sandbox))
         self.client.call(
-            "codex.work.start",
-            {"task": "no_event"},
+            "codex.start",
+            {"mode": "work", "task": "no_event"},
             error=True,
             validate_input=False,
         )
@@ -126,8 +131,16 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertTrue(status["healthy"])
         self.assertTrue(status["experimentalApi"])
         self.assertEqual(set(status), {
-            "healthy", "scopeRoot", "endpoint", "buildId", "binarySha256",
+            "healthy", "operatorContract", "scopeRoot", "endpoint", "buildId", "binarySha256",
             "executable", "appServerTransport", "experimentalApi", "codex", "appServer",
+        })
+        self.assertEqual(status["operatorContract"], {
+            "version": 2,
+            "controlPlane": "codex-connect",
+            "codexAccess": "mcp",
+            "workerContext": "isolated",
+            "commandDefaultTimeoutMs": 60000,
+            "commandMaxTimeoutMs": 60 * 60 * 1000,
         })
         self.assertEqual(set(status["codex"]), {
             "binary", "release", "home", "homeSource", "globalConfig",
@@ -243,7 +256,7 @@ class OperatorProtocolTests(unittest.TestCase):
         schema = self.client.tools["command.exec"]["inputSchema"]["properties"]
         self.assertNotIn("disableTimeout", schema)
         self.assertNotIn("disableOutputCap", schema)
-        self.assertEqual(schema["timeoutMs"]["default"], 30000)
+        self.assertEqual(schema["timeoutMs"]["default"], 60000)
         self.assertEqual(schema["timeoutMs"]["maximum"], 3600000)
         self.assertEqual(schema["outputBytesCap"]["default"], 65536)
         inherited = self.client.call("command.exec", {"command":["fixture-policy"]})
@@ -296,10 +309,10 @@ class OperatorProtocolTests(unittest.TestCase):
                 break
         self.assertEqual(stdout, "ready\n")
         self.assertEqual(stderr, "warning\n")
-        self.client.call("command.resize", {
-            "processId": started["processId"], "rows": 24, "cols": 80,
+        self.client.call("command.control", {
+            "action": "resize", "processId": started["processId"], "rows": 24, "cols": 80,
         }, error=True)
-        self.client.call("command.terminate", {"processId": started["processId"]})
+        self.client.call("command.control", {"action": "terminate", "processId": started["processId"]})
         exited = self.client.call("command.read", {
             "processId": started["processId"], "afterCursor": cursor, "timeoutMs": 1000,
         })
@@ -307,16 +320,10 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(exited["wakeReason"], "exit")
         self.assertEqual(exited["exitCode"], 143)
 
-        sandboxed = self.client.call("command.start", {
+        self.client.call("command.start", {
             "command": ["fixture-sandbox"],
             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
-        })
-        sandbox_output = self.client.call("command.read", {
-            "processId": sandboxed["processId"], "timeoutMs": 1000,
-        })
-        self.assertIn('"type": "readOnly"', sandbox_output["stdout"])
-        self.assertIn('"networkAccess": false', sandbox_output["stdout"])
-        self.client.call("command.terminate", {"processId": sandboxed["processId"]})
+        }, error=True, validate_input=False)
 
         context = self.client.call("command.start", {
             "command": ["fixture-context"],
@@ -330,7 +337,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(decoded["cwd"], str(self.project))
         self.assertEqual(decoded["env"], {"CC_TEST": "yes", "CC_UNSET": None})
         self.assertIsNone(decoded["sandboxPolicy"])
-        self.client.call("command.terminate", {"processId": context["processId"]})
+        self.client.call("command.control", {"action": "terminate", "processId": context["processId"]})
 
     def test_persistent_pty_round_trip_resize_and_close(self):
         early = self.client.call("command.start", {
@@ -338,10 +345,10 @@ class OperatorProtocolTests(unittest.TestCase):
             "tty": True,
             "size": {"rows": 24, "cols": 80},
         })
-        self.client.call("command.resize", {
-            "processId": early["processId"], "rows": 33, "cols": 99,
+        self.client.call("command.control", {
+            "action": "resize", "processId": early["processId"], "rows": 33, "cols": 99,
         })
-        self.client.call("command.terminate", {"processId": early["processId"]})
+        self.client.call("command.control", {"action": "terminate", "processId": early["processId"]})
 
         started = self.client.call("command.start", {
             "command": ["fixture-repl"],
@@ -353,30 +360,30 @@ class OperatorProtocolTests(unittest.TestCase):
         })
         self.assertEqual(prompt["stdout"], ">>> ")
         self.assertEqual(prompt["stderr"], "")
-        self.client.call("command.resize", {
-            "processId": started["processId"], "rows": 40, "cols": 120,
+        self.client.call("command.control", {
+            "action": "resize", "processId": started["processId"], "rows": 40, "cols": 120,
         })
-        self.client.call("command.write", {
-            "processId": started["processId"], "input": "2+2\n",
+        self.client.call("command.control", {
+            "action": "write", "processId": started["processId"], "input": "2+2\n",
         })
         answer = self.client.call("command.read", {
             "processId": started["processId"], "afterCursor": prompt["cursor"], "timeoutMs": 1000,
         })
         self.assertEqual(answer["stdout"], "4\n>>> ")
-        self.client.call("command.write", {
-            "processId": started["processId"], "closeStdin": True,
+        self.client.call("command.control", {
+            "action": "write", "processId": started["processId"], "closeStdin": True,
         })
         exited = self.client.call("command.read", {
             "processId": started["processId"], "afterCursor": answer["cursor"], "timeoutMs": 1000,
         })
         self.assertEqual(exited["state"], "exited")
         self.assertEqual(exited["exitCode"], 0)
-        for tool, args in [
-            ("command.write", {"processId": started["processId"], "input": "x"}),
-            ("command.resize", {"processId": started["processId"], "rows": 1, "cols": 1}),
-            ("command.terminate", {"processId": started["processId"]}),
+        for args in [
+            {"action": "write", "processId": started["processId"], "input": "x"},
+            {"action": "resize", "processId": started["processId"], "rows": 1, "cols": 1},
+            {"action": "terminate", "processId": started["processId"]},
         ]:
-            self.client.call(tool, args, error=True)
+            self.client.call("command.control", args, error=True)
 
     def test_persistent_read_timeout_exit_and_invalid_handle(self):
         quiet = self.client.call("command.start", {"command": ["fixture-quiet"]})
@@ -386,7 +393,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(timeout["state"], "running")
         self.assertEqual(timeout["wakeReason"], "timeout")
         self.assertEqual(timeout["stdout"], "")
-        self.client.call("command.terminate", {"processId": quiet["processId"]})
+        self.client.call("command.control", {"action": "terminate", "processId": quiet["processId"]})
 
         delayed = self.client.call("command.start", {"command": ["fixture-delayed-exit"]})
         exited = self.client.call("command.read", {
@@ -431,12 +438,12 @@ class OperatorProtocolTests(unittest.TestCase):
             "processId": started["processId"], "afterCursor": 1, "timeoutMs": 0,
         })
         self.assertTrue(stale["historyLost"])
-        self.client.call("command.terminate", {"processId": started["processId"]})
+        self.client.call("command.control", {"action": "terminate", "processId": started["processId"]})
 
     def test_persistent_terminal_state_does_not_imply_output_is_drained(self):
         started = self.client.call("command.start", {"command": ["fixture-drain"]})
-        self.client.call("command.write", {
-            "processId": started["processId"], "input": "produce\n",
+        self.client.call("command.control", {
+            "action": "write", "processId": started["processId"], "input": "produce\n",
         })
 
         cursor = 0
@@ -453,8 +460,8 @@ class OperatorProtocolTests(unittest.TestCase):
                 break
         self.assertEqual(len(output.encode()), (128 * 1024) + 20000)
 
-        self.client.call("command.write", {
-            "processId": started["processId"], "closeStdin": True,
+        self.client.call("command.control", {
+            "action": "write", "processId": started["processId"], "closeStdin": True,
         })
         terminal = self.client.call("command.read", {
             "processId": started["processId"], "afterCursor": cursor, "timeoutMs": 1000,
@@ -515,16 +522,16 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(second["stdout"], first["stdout"])
         self.assertEqual(second["stderr"], first["stderr"])
 
-        self.client.call("command.write", {
-            "processId": started["processId"], "input": None, "closeStdin": False,
+        self.client.call("command.control", {
+            "action": "write", "processId": started["processId"], "input": None, "closeStdin": False,
         }, error=True)
-        self.client.call("command.write", {
-            "processId": started["processId"], "input": "x" * (64 * 1024 + 1),
+        self.client.call("command.control", {
+            "action": "write", "processId": started["processId"], "input": "x" * (64 * 1024 + 1),
         }, error=True, validate_input=False)
-        self.client.call("command.resize", {
-            "processId": started["processId"], "rows": 0, "cols": 80,
+        self.client.call("command.control", {
+            "action": "resize", "processId": started["processId"], "rows": 0, "cols": 80,
         }, error=True, validate_input=False)
-        self.client.call("command.terminate", {"processId": started["processId"]})
+        self.client.call("command.control", {"action": "terminate", "processId": started["processId"]})
 
     def test_authoritative_completion_without_events_and_unknown_turn(self):
         work = self.start("no_event")
@@ -532,14 +539,14 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"],"terminal")
         self.assertEqual(result["wakeReason"],"terminal")
         self.assertEqual(result["turn"]["output"][0]["text"],"fixture complete")
-        self.client.call("codex.work.wait",{"threadId":work["threadId"],"turnId":"missing","timeoutMs":0},error=True)
+        self.client.call("codex.wait",{"threadId":work["threadId"],"turnId":"missing","timeoutMs":0},error=True)
         next_work = self.start("idle",threadId=work["threadId"])
         self.assertFalse(next_work["createdThread"])
         idle = self.wait(next_work,timeout=0)
         self.assertEqual(idle["state"],"active")
         self.assertEqual(idle["wakeReason"],"timeout")
-        read = self.client.call("codex.work.read",{"threadId":work["threadId"]})
-        self.assertEqual(read["latestTurn"]["id"], next_work["turnId"])
+        snapshot = self.client.call("codex.wait",{"threadId":work["threadId"],"timeoutMs":0})
+        self.assertEqual(snapshot["turn"]["id"], next_work["turnId"])
 
     def test_wait_uses_paginated_turn_lookup(self):
         work = self.start("inflate_history")
@@ -558,8 +565,8 @@ class OperatorProtocolTests(unittest.TestCase):
                 self.assertIn("item/agentMessage/delta", [event["method"] for event in result["events"]])
             if scenario == "oversized":
                 self.assertTrue(any(event["truncated"] for event in result["events"]))
-            self.client.call("codex.work.steer",{"threadId":work["threadId"],"expectedTurnId":work["turnId"],"instruction":"continue"})
-            self.client.call("codex.work.interrupt",{"threadId":work["threadId"],"turnId":work["turnId"]})
+            self.client.call("codex.control",{"action":"steer","threadId":work["threadId"],"expectedTurnId":work["turnId"],"instruction":"continue"})
+            self.client.call("codex.control",{"action":"interrupt","threadId":work["threadId"],"turnId":work["turnId"]})
             interrupted = self.wait(work)
             self.assertEqual(interrupted["state"],"terminal")
             self.assertEqual(interrupted["wakeReason"],"terminal")
@@ -595,15 +602,14 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(pending["params"]["questions"][0]["id"],"format")
         self.assertTrue(pending["isBlocking"])
         request_id = pending["requestId"]
-        self.client.call("codex.approval.respond",{"requestId":request_id,"decision":"approve"},error=True)
-        self.client.call("codex.userInput.respond",{"requestId":request_id,"answers":{"wrong":["JSON"]}},error=True)
-        self.client.call("codex.userInput.respond",{"requestId":request_id,"answers":{"format":["JSON"]}})
+        self.client.call("codex.action.respond",{"type":"approval","requestId":request_id,"decision":"approve"},error=True)
+        self.client.call("codex.action.respond",{"type":"userInput","requestId":request_id,"answers":{"wrong":["JSON"]}},error=True)
+        self.client.call("codex.action.respond",{"type":"userInput","requestId":request_id,"answers":{"format":["JSON"]}})
         completed = self.wait(work)
         self.assertEqual(completed["state"],"terminal")
         self.assertEqual(completed["wakeReason"],"terminal")
-        self.client.call("codex.userInput.respond",{"requestId":request_id,"answers":{"format":["JSON"]}},error=True)
-        actions = self.client.call("codex.pendingActions.list",{"threadId":work["threadId"]})["actions"]
-        self.assertEqual(actions,[])
+        self.client.call("codex.action.respond",{"type":"userInput","requestId":request_id,"answers":{"format":["JSON"]}},error=True)
+        self.assertEqual(self.client.call("codex.wait",{"threadId":work["threadId"],"timeoutMs":0})["pendingActions"],[])
 
     def test_nonblocking_question_does_not_wake_join_and_interrupt_cleans_up(self):
         work = self.start("nonblocking")
@@ -611,37 +617,48 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"],"active")
         self.assertEqual(result["wakeReason"],"timeout")
         self.assertFalse(result["pendingActions"][0]["isBlocking"])
-        self.client.call("codex.work.interrupt",{"threadId":work["threadId"],"turnId":work["turnId"]})
-        self.assertEqual(self.client.call("codex.pendingActions.list",{"threadId":work["threadId"]})["actions"],[])
+        self.client.call("codex.control",{"action":"interrupt","threadId":work["threadId"],"turnId":work["turnId"]})
+        self.assertEqual(self.client.call("codex.wait",{"threadId":work["threadId"],"timeoutMs":0})["pendingActions"],[])
 
-    def test_typed_approval_permission_and_elicitation_wire_responses(self):
+    def test_typed_approval_permission_and_unexposed_elicitation_paths(self):
         cases = [
-            ("approval","codex.approval.respond",{"decision":"approve"}),
-            ("file","codex.approval.respond",{"decision":"decline"}),
-            ("permissions","codex.permissions.respond",{"permissions":{"network":{"enabled":True}},"scope":"turn"}),
-            ("form","codex.elicitation.respond",{"action":"accept","content":{"name":"Ada"}}),
-            ("openai_form","codex.elicitation.respond",{"action":"accept","content":{"name":"Ada"}}),
-            ("url","codex.elicitation.respond",{"action":"accept"}),
+            ("approval",{"type":"approval","decision":"approve"}),
+            ("file",{"type":"approval","decision":"decline"}),
+            ("permissions",{"type":"permissions","permissions":{"network":{"enabled":True}},"scope":"turn"}),
         ]
-        for scenario, responder, answer in cases:
+        for scenario, answer in cases:
             with self.subTest(scenario=scenario):
                 work = self.start(scenario)
                 result = self.wait(work)
                 self.assertEqual(result["state"],"active")
                 self.assertEqual(result["wakeReason"],"actionRequired")
                 request_id = result["pendingActions"][0]["requestId"]
-                self.client.call(responder,{"requestId":request_id,**answer})
+                self.client.call("codex.action.respond",{"requestId":request_id,**answer})
                 completed = self.wait(work)
                 self.assertEqual(completed["state"],"terminal")
                 self.assertEqual(completed["wakeReason"],"terminal")
+
+        for scenario in ("form", "openai_form", "url"):
+            with self.subTest(scenario=scenario):
+                work = self.start(scenario)
+                result = self.wait(work)
+                pending = result["pendingActions"][0]
+                self.assertEqual(pending["kind"], "elicitation")
+                self.client.call("codex.action.respond", {
+                    "type": "approval", "requestId": pending["requestId"], "decision": "cancel",
+                }, error=True)
+                self.client.call("codex.control", {
+                    "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
+                })
+                self.assertEqual(self.wait(work)["state"], "terminal")
 
     def test_review_and_discovery(self):
         source = self.start("complete")
         source_result = self.wait(source)
         self.assertEqual(source_result["state"],"terminal")
         self.assertEqual(source_result["wakeReason"],"terminal")
-        review = self.client.call("codex.review",{
-            "threadId": source["threadId"], "target":{"type":"uncommittedChanges"},
+        review = self.client.call("codex.start",{
+            "mode":"review", "threadId": source["threadId"], "target":{"type":"uncommittedChanges"},
         })
         self.assertFalse(review["createdThread"])
         self.assertEqual(review["threadId"], source["threadId"])
@@ -650,18 +667,27 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["wakeReason"],"terminal")
         self.assertEqual(result["threadId"], source["threadId"])
         self.assertEqual(result["turnId"], review["turnId"])
-        self.client.call("codex.model.list")
-        self.client.call("codex.skills.list")
-        usage = self.client.call("codex.usage")
+        info = self.client.call("codex.info", {"queries":[
+            {"type":"models"}, {"type":"skills"}, {"type":"usage"},
+        ]})
+        self.assertEqual([entry["type"] for entry in info["results"]], ["models", "skills", "usage"])
+        usage = info["results"][2]["result"]
         self.assertFalse(usage["ordinaryUsageAllowed"])
         self.assertEqual(usage["rateLimitResetCredits"]["availableCount"], 2)
         self.assertEqual(usage["accountId"], "fixture-account")
+        self.client.call("codex.info", {"queries": []}, error=True, validate_input=False)
+        self.client.call(
+            "codex.info",
+            {"queries": [{"type": "usage"}] * 11},
+            error=True,
+            validate_input=False,
+        )
 
     def test_wait_tracks_review_turn_before_thread_history_catches_up(self):
         source = self.start("complete")
         self.assertEqual(self.wait(source)["state"], "terminal")
-        review = self.client.call("codex.review", {
-            "threadId": source["threadId"],
+        review = self.client.call("codex.start", {
+            "mode": "review", "threadId": source["threadId"],
             "target": {"type": "custom", "instructions": "delayed_visibility"},
         })
         result = self.wait(review, timeout=1000)
@@ -681,21 +707,21 @@ class OperatorProtocolTests(unittest.TestCase):
 
         source = self.start("complete")
         self.assertEqual(self.wait(source)["state"], "terminal")
-        self.client.call("codex.work.read", {"threadId": source["threadId"]})
+        self.client.call("codex.wait", {"threadId": source["threadId"], "timeoutMs": 0})
 
         resumed = self.start("idle", threadId=source["threadId"])
-        self.client.call("codex.work.steer", {
-            "threadId": resumed["threadId"],
+        self.client.call("codex.control", {
+            "action": "steer", "threadId": resumed["threadId"],
             "expectedTurnId": resumed["turnId"],
             "instruction": "continue",
         })
-        self.client.call("codex.work.interrupt", {
-            "threadId": resumed["threadId"], "turnId": resumed["turnId"],
+        self.client.call("codex.control", {
+            "action": "interrupt", "threadId": resumed["threadId"], "turnId": resumed["turnId"],
         })
         self.assertEqual(self.wait(resumed)["state"], "terminal")
 
-        review = self.client.call("codex.review", {
-            "threadId": source["threadId"], "target": {"type": "uncommittedChanges"},
+        review = self.client.call("codex.start", {
+            "mode": "review", "threadId": source["threadId"], "target": {"type": "uncommittedChanges"},
         })
         self.assertEqual(self.wait(review)["state"], "terminal")
 
@@ -704,30 +730,37 @@ class OperatorProtocolTests(unittest.TestCase):
             "command": ["fixture-repl"], "tty": True, "size": {"rows": 24, "cols": 80},
         })
         self.client.call("command.read", {"processId": repl["processId"], "timeoutMs": 1000})
-        self.client.call("command.resize", {"processId": repl["processId"], "rows": 30, "cols": 100})
-        self.client.call("command.write", {
-            "processId": repl["processId"], "input": "2+2\n", "closeStdin": True,
+        self.client.call("command.control", {"action": "resize", "processId": repl["processId"], "rows": 30, "cols": 100})
+        self.client.call("command.control", {
+            "action": "write", "processId": repl["processId"], "input": "2+2\n", "closeStdin": True,
         })
         self.client.call("command.read", {"processId": repl["processId"], "timeoutMs": 1000})
         quiet = self.client.call("command.start", {"command": ["fixture-quiet"]})
-        self.client.call("command.terminate", {"processId": quiet["processId"]})
+        self.client.call("command.control", {"action": "terminate", "processId": quiet["processId"]})
         self.client.call("command.read", {"processId": quiet["processId"], "timeoutMs": 1000})
 
-        for scenario, responder, answer in [
-            ("approval", "codex.approval.respond", {"decision": "approve"}),
-            ("file", "codex.approval.respond", {"decision": "decline"}),
-            ("permissions", "codex.permissions.respond", {"permissions": {"network": {"enabled": True}}, "scope": "turn"}),
-            ("form", "codex.elicitation.respond", {"action": "accept", "content": {"name": "Ada"}}),
-            ("question", "codex.userInput.respond", {"answers": {"format": ["JSON"]}}),
+        for scenario, answer in [
+            ("approval", {"type": "approval", "decision": "approve"}),
+            ("file", {"type": "approval", "decision": "decline"}),
+            ("permissions", {"type": "permissions", "permissions": {"network": {"enabled": True}}, "scope": "turn"}),
+            ("question", {"type": "userInput", "answers": {"format": ["JSON"]}}),
         ]:
             work = self.start(scenario)
             pending = self.wait(work)["pendingActions"][0]
-            self.client.call(responder, {"requestId": pending["requestId"], **answer})
+            self.client.call("codex.action.respond", {"requestId": pending["requestId"], **answer})
             self.assertEqual(self.wait(work)["state"], "terminal")
 
-        self.client.call("codex.model.list")
-        self.client.call("codex.skills.list")
-        self.client.call("codex.usage")
+        elicitation = self.start("form")
+        pending = self.wait(elicitation)["pendingActions"][0]
+        self.assertEqual(pending["kind"], "elicitation")
+        self.client.call("codex.control", {
+            "action": "interrupt", "threadId": elicitation["threadId"], "turnId": elicitation["turnId"],
+        })
+        self.assertEqual(self.wait(elicitation)["state"], "terminal")
+
+        self.client.call("codex.info", {"queries":[
+            {"type":"models"}, {"type":"skills"}, {"type":"usage"},
+        ]})
 
         observed = {"method": set(), "serverRequest": set(), "notification": set()}
         for line in self.coverage_path.read_text().splitlines():

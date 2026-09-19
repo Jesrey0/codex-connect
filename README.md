@@ -51,48 +51,50 @@ For persistent or interactive deterministic commands:
 ```text
 command.start
     ↓
-command.read ↔ command.write
-       ↘ command.resize   (PTY only)
-        ↘ command.terminate
+command.read ↔ command.control
+               ├─ write
+               ├─ resize   (PTY only)
+               └─ terminate
 ```
 
 For autonomous Codex work:
 
 ```text
-codex.work.start
+codex.start(mode=work|review)
         ↓
-codex.work.wait
+codex.wait
         ↓
-[pending typed action, if any]
+[pending approval / permissions / userInput, if any]
         ↓
-codex.approval.respond / codex.permissions.respond /
-codex.elicitation.respond / codex.userInput.respond
+codex.action.respond
         ↓
-codex.work.wait
+codex.wait
 ```
 
-Use `inspect` for structured read-only host exploration, and batch independent inspection operations in one call. Use `command.exec` when the answer is naturally produced by one bounded deterministic host command; compose related repository/tool reads into that single command rather than chaining tiny calls. Use `command.start` when the host command is still deterministic but must remain running or interactive. Use `codex.work.start` when the Codex CLI/agent should investigate, reason, edit, test, or iterate autonomously.
+Use `inspect` for structured read-only host exploration, and batch independent inspection operations in one call. Use `command.exec` when the answer is naturally produced by one bounded deterministic host command; compose related repository/tool reads into that single command rather than chaining tiny calls. Use `command.start` when the host command is still deterministic but must remain running or interactive. Use `codex.start(mode=work)` only when delegated autonomous reasoning or iteration materially improves the critical path or quality; delegation is an optimization, not the default.
 
-**Host sandbox invariant:** when `command.exec` or `command.start` omits `sandboxPolicy`, Codex Connect sends **no synthetic policy**. The field remains absent on the App Server request, so App Server uses the effective upstream Codex configuration from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Codex Connect must not mirror those defaults locally. Callers may still supply an explicit per-command override, including `dangerFullAccess`. By contrast, `codex.work.start` requires an explicit `sandboxPolicy` on every delegated turn so operator-selected authority is never inherited implicitly.
+**Control-plane invariant:** ChatGPT operates the host and Codex through Codex Connect. When a Codex semantic operation is available through `codex.*`, host command tools must not be used to invoke the Codex CLI as an alternate control plane. Codex workers are isolated from the calling ChatGPT conversation: every delegated work task must include its own relevant context, constraints, paths, decisions, and acceptance criteria. Prefer batching and deterministic local work over unnecessary delegated turns because model usage is a constrained resource.
 
-**Command edge semantics:** `workspaceWrite.writableRoots` adds writable roots; it is not an exclusive allowlist and does not narrow App Server's base workspace. Codex Connect launches its dedicated App Server with `scopeRoot` as the working directory, so host `command.exec` / `command.start` with `workspaceWrite` leave `scopeRoot` writable even when `writableRoots` is empty. A per-command `cwd` only selects the process working directory; it does **not** confine write authority to that directory. `command.exec.timeoutMs` is a process deadline rather than an end-to-end MCP latency ceiling, and a buffered stdout/stderr stream exactly equal to `outputBytesCap` may have been truncated because the pinned App Server response has no truncation flag. For persistent commands, keep calling `command.read` with the returned cursor even after `state:"exited"`/`"failed"` until the cursor stops advancing and both output streams are empty; honor `historyLost:true` as unrecoverable earlier output. `command.terminate` is a stop request, not a graceful-cleanup guarantee. Relative scoped paths reject `..` components lexically; use an absolute in-scope path when intentionally reaching outside a request-local `cwd`.
+**Host sandbox invariant:** when `command.exec` or `command.start` omits `sandboxPolicy`, Codex Connect sends **no synthetic policy**. The field remains absent on the App Server request, so App Server uses the effective upstream Codex configuration from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Codex Connect must not mirror those defaults locally. The public host-command override surface intentionally exposes only `workspaceWrite` and `dangerFullAccess`; read-only host exploration belongs in `inspect`. By contrast, `codex.start(mode=work)` requires an explicit `sandboxPolicy` and still exposes `readOnly`, `workspaceWrite`, and `dangerFullAccess` so delegated authority is selected explicitly for each turn.
+
+**Command edge semantics:** `workspaceWrite.writableRoots` adds writable roots; it is not an exclusive allowlist and does not narrow App Server's base workspace. Codex Connect launches its dedicated App Server with `scopeRoot` as the working directory, so host `command.exec` / `command.start` with `workspaceWrite` leave `scopeRoot` writable even when `writableRoots` is empty. A per-command `cwd` only selects the process working directory; it does **not** confine write authority to that directory. `command.exec.timeoutMs` defaults to 60 seconds, has a 60-minute maximum, and is a process deadline rather than an end-to-end MCP latency ceiling. A buffered stdout/stderr stream exactly equal to `outputBytesCap` may have been truncated because the pinned App Server response has no truncation flag. For persistent commands, keep calling `command.read` with the returned cursor even after `state:"exited"`/`"failed"` until `drained:true`; honor `historyLost:true` as unrecoverable earlier output. `command.control(action=terminate)` is a stop request, not a graceful-cleanup guarantee. Relative scoped paths reject `..` components lexically; use an absolute in-scope path when intentionally reaching outside a request-local `cwd`.
 
 ## Public MCP surface
 
-The canonical MCP surface contains 24 tools:
+The canonical MCP surface contains 13 tools:
 
 | Area | Tools |
 | --- | --- |
 | Host orientation | `status` (health, build identity, global Codex config provenance, App Server launch context) |
 | Read-only host inspection | `inspect`, `view_image` |
-| Deterministic mutation/execution | `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.write`, `command.resize`, `command.terminate` |
-| Codex work | `codex.work.start`, `codex.work.read`, `codex.work.wait`, `codex.work.steer`, `codex.work.interrupt` |
-| Codex operator/action loop | `codex.pendingActions.list`, `codex.approval.respond`, `codex.permissions.respond`, `codex.elicitation.respond`, `codex.userInput.respond` |
-| Codex review/discovery/usage | `codex.review`, `codex.model.list`, `codex.skills.list`, `codex.usage` |
+| Deterministic mutation/execution | `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control` |
+| Codex work/review | `codex.start`, `codex.wait`, `codex.control` |
+| Codex collaboration | `codex.action.respond` |
+| Codex discovery/account | `codex.info` |
 
 `codex.*` is the public namespace for interacting with the Codex CLI/App Server agent domain. `codex-connect` and `@codexConnect` remain the implementation and connector/product identities of the bridge; host/operator tools remain un-namespaced or under `command.*`.
 
-The App Server is initialized with `experimentalApi: true` and advertises `extensions["openai/form"]` for the official structured collaboration paths Codex Connect exposes. Its dedicated App Server process also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` feature flags so those catalog responders can be exercised without relying on a user's global Codex configuration.
+The App Server is initialized with `experimentalApi: true` but advertises no form/elicitation extension because the minimized public MCP surface has no elicitation response operation. Elicitation remains transport-recognized for observability and fail-closed handling. The dedicated App Server process also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` feature flags so the public `codex.action.respond` collaboration paths can be exercised without relying on a user's global Codex configuration.
 
 The configured host scope is a general filesystem workspace, not implicitly a Git repository. Version control is optional. Codex Connect and its agents must not initialize repositories, create branches, commits, or tags, or use Git as a workflow/checkpoint mechanism unless the user explicitly requests version-control work.
 

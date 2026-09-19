@@ -27,7 +27,7 @@ mod initialize_tests {
             json!({
                 "experimentalApi": true,
                 "requestAttestation": false,
-                "extensions": {"openai/form": {}}
+                "extensions": {}
             })
         );
     }
@@ -63,10 +63,7 @@ impl Initialize {
             capabilities: InitializeCapabilities {
                 experimental_api: true,
                 request_attestation: false,
-                extensions: BTreeMap::from([(
-                    "openai/form".to_string(),
-                    Value::Object(Default::default()),
-                )]),
+                extensions: BTreeMap::new(),
             },
         }
     }

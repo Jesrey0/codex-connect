@@ -180,7 +180,7 @@ for line in sys.stdin:
         assert params["capabilities"] == {
             "experimentalApi": True,
             "requestAttestation": False,
-            "extensions": {"openai/form": {}},
+            "extensions": {},
         }
         handshake = True
         respond(message, result)

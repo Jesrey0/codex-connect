@@ -138,7 +138,7 @@ sandbox_mode = "workspace-write"
 network_access = true
 ```
 
-`codex.work.start` is different by design: its public MCP contract requires an explicit `sandboxPolicy` for every turn, so delegated agent authority is selected by the operator at task start rather than inherited from that host default.
+The public host-command schema exposes only `workspaceWrite` and `dangerFullAccess`; read-only host exploration belongs in `inspect`. `codex.start(mode=work)` is different by design: its public MCP contract requires an explicit `sandboxPolicy` for every delegated turn and still offers `readOnly`, `workspaceWrite`, and `dangerFullAccess`, so agent authority is selected at task start rather than inherited from the host default.
 
 ## Deployment boundary
 

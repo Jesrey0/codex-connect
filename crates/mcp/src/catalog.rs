@@ -52,7 +52,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "apply_patch",
                 "Apply Patch",
-                "Use when the exact textual file change is already known. Relative patch paths resolve against request cwd (default: scopeRoot), within the configured scope. Parent (..) components are rejected lexically; use an absolute in-scope path instead of parent traversal. For autonomous multi-step coding, use codex.work.start instead.",
+                "Use when the exact textual file change is already known. Relative patch paths resolve against request cwd (default: scopeRoot), within the configured scope. Parent (..) components are rejected lexically; use an absolute in-scope path instead of parent traversal. For delegated autonomous multi-step coding, use codex.start instead.",
                 false,
                 true,
                 false,
@@ -71,7 +71,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.start",
                 "Start Persistent Command",
-                "Use for a deterministic command that must remain running or interactive: dev servers, watchers, REPLs, debuggers, installers, prompts, or interactive CLIs. Returns a connection-scoped processId immediately after the official App Server command request is flushed; follow with command.read/write/resize/terminate. Set tty=true only when terminal semantics are needed. sandboxPolicy is an optional per-call override; omit it to inherit the effective sandbox configuration loaded by Codex App Server.",
+                "Use for a deterministic command that must remain running or interactive: dev servers, watchers, REPLs, debuggers, installers, prompts, or interactive CLIs. Returns a connection-scoped processId immediately after the official App Server command request is flushed; follow with command.read for observation and command.control for stdin, PTY resize, or termination. Set tty=true only when terminal semantics are needed. sandboxPolicy is an optional per-call override; omit it to inherit the effective sandbox configuration loaded by Codex App Server.",
                 false,
                 true,
                 true,
@@ -95,54 +95,16 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "command.write",
-                "Write Persistent Command",
-                "Write exact UTF-8 stdin bytes to a running command.start session, optionally closing stdin after the write. No newline is added automatically.",
+                "command.control",
+                "Control Persistent Command",
+                "Mutate a running command.start session. Use action=write for exact UTF-8 stdin bytes or stdin closure, action=resize for a PTY-backed session, and action=terminate to request process termination. Termination is not a graceful-shutdown guarantee; follow with command.read to observe final state and drain retained output.",
                 false,
                 true,
                 false,
                 false,
             ),
-            command_write_schema(),
-            Some(object_schema(
-                json!({"processId":{"type":"string"},"written":{"const":true},"stdinClosed":{"type":"boolean"}}),
-                &["processId", "written", "stdinClosed"],
-            )),
-        ),
-        tool(
-            meta(
-                "command.resize",
-                "Resize Command PTY",
-                "Resize a running PTY-backed command.start session. Valid only for sessions started with tty=true.",
-                false,
-                true,
-                false,
-                true,
-            ),
-            command_resize_schema(),
-            Some(object_schema(
-                json!({"processId":{"type":"string"},"resized":{"const":true}}),
-                &["processId", "resized"],
-            )),
-        ),
-        tool(
-            meta(
-                "command.terminate",
-                "Terminate Persistent Command",
-                "Request termination of a running command.start session through the official App Server. This is a stop request, not a graceful-shutdown guarantee; do not rely on signal traps or cleanup handlers running. Follow with command.read to observe the authoritative final exit state and drain retained output.",
-                false,
-                true,
-                false,
-                true,
-            ),
-            object_schema(
-                json!({"processId":{"type":"string","minLength":1}}),
-                &["processId"],
-            ),
-            Some(object_schema(
-                json!({"processId":{"type":"string"},"terminationRequested":{"const":true}}),
-                &["processId", "terminationRequested"],
-            )),
+            command_control_schema(),
+            Some(command_control_output_schema()),
         ),
         tool(
             meta(
@@ -167,7 +129,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for one known bounded deterministic command, including a shell command that composes several related read-only repository/tool queries into one result. This is the App Server command/exec path, not a separate executor. Non-interactive, with a 30-second default process timeout (60-minute maximum) and 64 KiB per-stream default output cap (256 KiB maximum). timeoutMs is not an end-to-end API latency ceiling because final App Server response delivery gets a finite allowance. stdoutMayBeTruncated/stderrMayBeTruncated conservatively report when the returned byte count exactly reached outputBytesCap; the upstream buffered response does not prove whether additional bytes existed. durationMs is Connect-observed App Server request wall time. Omit sandboxPolicy to inherit App Server policy. For long-running or interactive commands use command.start; for autonomous investigation/coding use codex.work.start.",
+                "Use for one known bounded deterministic command, including a shell command that composes several related read-only repository/tool queries into one result. This is the App Server command/exec path, not a separate executor. Non-interactive, with a 60-second default process timeout (60-minute maximum) and 64 KiB per-stream default output cap (256 KiB maximum). timeoutMs is not an end-to-end API latency ceiling because final App Server response delivery gets a finite allowance. stdoutMayBeTruncated/stderrMayBeTruncated conservatively report when the returned byte count exactly reached outputBytesCap; the upstream buffered response does not prove whether additional bytes existed. durationMs is Connect-observed App Server request wall time. Omit sandboxPolicy to inherit App Server policy. For long-running or interactive commands use command.start; for delegated autonomous investigation/coding use codex.start.",
                 false,
                 true,
                 true,
@@ -199,241 +161,68 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codex.work.start",
-                "Start Codex Work",
-                "Use for autonomous multi-step engineering work. Creates or resumes an official Codex thread and starts one official turn; follow with codex.work.wait. sandboxPolicy is required on every call so the operator explicitly selects the sandbox/network policy for each delegated turn instead of inheriting a hidden default.",
+                "codex.start",
+                "Start Codex Turn",
+                "Start delegated Codex work or an official Codex review. Use mode=work only when autonomous reasoning or iteration materially improves the critical path or quality; Codex workers do not inherit the ChatGPT conversation, so task must be self-contained with relevant context, constraints, paths, decisions, and acceptance criteria. Work mode requires an explicit sandboxPolicy. Use mode=review for the official review/start lifecycle. Follow with codex.wait.",
                 false,
                 true,
                 true,
                 false,
             ),
-            work_start_schema(),
+            codex_start_schema(),
             Some(work_started_schema()),
         ),
         tool(
             meta(
-                "codex.work.read",
-                "Read Codex Work",
-                "Use for a compact authoritative snapshot of an official Codex thread. Use codex.work.wait to quietly join Codex work until completion, required operator action, or the wait lease expires.",
+                "codex.wait",
+                "Read or Wait for Codex Turn",
+                "Read or quietly join a delegated Codex turn. timeoutMs=0 is a non-blocking authoritative snapshot; positive values wait up to 120 seconds. Routine tool calls, file changes, and worker commentary remain journaled but do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required; pendingActions are returned directly for codex.action.respond.",
                 true,
                 false,
                 false,
                 true,
             ),
-            id_schema(),
-            Some(work_read_schema()),
-        ),
-        tool(
-            meta(
-                "codex.work.wait",
-                "Wait for Codex Work",
-                "Quietly join delegated Codex work for up to 120 seconds. Routine tool calls, file changes, and worker commentary remain journaled but do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required; otherwise returns when the wait lease expires.",
-                true,
-                false,
-                false,
-                true,
-            ),
-            work_wait_schema(),
+            codex_wait_schema(),
             Some(work_wait_output_schema()),
         ),
         tool(
             meta(
-                "codex.work.steer",
-                "Steer Active Codex Work",
-                "Use to add instructions to the currently steerable official turn without creating a new thread.",
+                "codex.control",
+                "Control Active Codex Turn",
+                "Mutate an active official Codex turn. Use action=steer to add self-contained instructions to the currently steerable turn without creating a new thread, or action=interrupt to stop the selected turn.",
                 false,
                 true,
                 true,
                 false,
             ),
-            object_schema(
-                json!({"threadId":{"type":"string"},"expectedTurnId":{"type":"string"},"instruction":{"type":"string","minLength":1}}),
-                &["threadId", "expectedTurnId", "instruction"],
-            ),
-            Some(object_schema(
-                json!({"turnId":{"type":"string"}}),
-                &["turnId"],
-            )),
+            codex_control_schema(),
+            Some(codex_control_output_schema()),
         ),
         tool(
             meta(
-                "codex.work.interrupt",
-                "Interrupt Codex Work",
-                "Use to stop an active official Codex turn.",
-                false,
-                true,
-                false,
-                true,
-            ),
-            object_schema(
-                json!({"threadId":{"type":"string"},"turnId":{"type":"string"}}),
-                &["threadId", "turnId"],
-            ),
-            Some(object_schema(
-                json!({"turnId":{"type":"string"},"interrupted":{"const":true}}),
-                &["turnId", "interrupted"],
-            )),
-        ),
-        tool(
-            meta(
-                "codex.pendingActions.list",
-                "List Pending Codex Actions",
-                "Use when codex.work.wait returns wakeReason=actionRequired or inputRequired, or to inspect outstanding approvals, permissions, elicitations, and semantic questions. Check isBlocking before treating a question as a blocked turn.",
-                true,
-                false,
-                false,
-                true,
-            ),
-            object_schema(json!({"threadId":{"type":["string","null"]}}), &[]),
-            Some(object_schema(
-                json!({"actions":{"type":"array","items":pending_schema()}}),
-                &["actions"],
-            )),
-        ),
-        tool(
-            meta(
-                "codex.approval.respond",
-                "Respond to Codex Approval",
-                "Use only for a pending command or file-change approval returned by codex.pendingActions.list. Decisions are normalized and translated to the pinned official response shape.",
+                "codex.action.respond",
+                "Respond to Pending Codex Action",
+                "Resolve a pending Codex approval, permission request, or semantic user-input question returned by codex.wait. The response type must match the authoritative pending action associated with requestId. MCP elicitation remains transport-recognized but is intentionally not exposed as a public response capability.",
                 false,
                 true,
                 true,
                 false,
             ),
-            object_schema(
-                json!({"requestId":rpc_id_schema(),"decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"]}}),
-                &["requestId", "decision"],
-            ),
+            codex_action_respond_schema(),
             Some(action_response_schema()),
         ),
         tool(
             meta(
-                "codex.permissions.respond",
-                "Respond to Permission Request",
-                "Use only for a pending Codex permission request. Grants the explicit official permission profile for this turn or session.",
-                false,
-                true,
-                true,
-                false,
-            ),
-            object_schema(
-                json!({"requestId":rpc_id_schema(),"permissions":permissions_schema(),"scope":{"type":"string","enum":["turn","session"]}}),
-                &["requestId", "permissions"],
-            ),
-            Some(action_response_schema()),
-        ),
-        tool(
-            meta(
-                "codex.elicitation.respond",
-                "Respond to MCP Elicitation",
-                "Use only for pending MCP elicitation. Accept form/openai-form flows with their returned object content; accept a completed URL flow without content. Decline/cancel carry no content.",
-                false,
-                true,
-                true,
-                false,
-            ),
-            object_schema(
-                json!({"requestId":rpc_id_schema(),"action":{"type":"string","enum":["accept","decline","cancel"]},"content":{"type":["object","null"],"description":"Fields requested by the pending form schema; omit for URL acceptance or decline/cancel."}}),
-                &["requestId", "action"],
-            ),
-            Some(action_response_schema()),
-        ),
-        tool(
-            meta(
-                "codex.userInput.respond",
-                "Answer Codex Question",
-                "Use only for a pending Codex user-input question returned by codex.work.wait or codex.pendingActions.list. Map every official question id to selected or free-form strings; an empty array skips that question. This is the single deliberate experimental App Server capability exposed by Codex Connect.",
-                false,
-                true,
-                true,
-                false,
-            ),
-            object_schema(
-                json!({
-                    "requestId":rpc_id_schema(),
-                    "answers":{
-                        "type":"object",
-                        "minProperties":1,
-                        "additionalProperties":{
-                            "type":"array",
-                            "items":{"type":"string"}
-                        }
-                    }
-                }),
-                &["requestId", "answers"],
-            ),
-            Some(action_response_schema()),
-        ),
-        tool(
-            meta(
-                "codex.review",
-                "Start Code Review",
-                "Use when the user explicitly requests an official Codex review. Custom review instructions work without version control; uncommitted-change, branch, and commit targets require an existing VCS context. Follow with codex.work.wait for the result.",
-                false,
-                true,
-                true,
-                false,
-            ),
-            review_schema(),
-            Some(work_started_schema()),
-        ),
-        tool(
-            meta(
-                "codex.model.list",
-                "List Codex Models",
-                "Use when model choice or supported reasoning effort must be discovered before starting Codex work.",
+                "codex.info",
+                "Read Codex Information",
+                "Batch read-only Codex discovery/account queries in one call. Use type=models for model and reasoning-effort discovery, type=skills for skills available to scope-fenced working directories, and type=usage for authoritative account usage/rate-limit telemetry. Independent query failures are returned per result without discarding successful siblings.",
                 true,
                 false,
                 true,
                 true,
             ),
-            model_list_schema(),
-            Some(object_schema(
-                json!({"data":{"type":"array","items":{"type":"object"}},"nextCursor":{"type":["string","null"]}}),
-                &["data"],
-            )),
-        ),
-        tool(
-            meta(
-                "codex.skills.list",
-                "List Codex Skills",
-                "Use to discover Codex skills available for one or more scope-fenced working directories.",
-                true,
-                false,
-                false,
-                true,
-            ),
-            object_schema(
-                json!({"cwds":{"type":"array","items":{"type":"string"}},"forceReload":{"type":"boolean"}}),
-                &[],
-            ),
-            Some(object_schema(
-                json!({"data":{"type":"array","items":{"type":"object"}}}),
-                &["data"],
-            )),
-        ),
-        tool(
-            meta(
-                "codex.usage",
-                "Read Codex Usage",
-                "Use for the authoritative Codex account usage/rate-limit snapshot, including ordinary-usage permission and reset-credit state when supplied. This is remote account telemetry and is not workspace state.",
-                true,
-                false,
-                true,
-                true,
-            ),
-            empty_schema(),
-            Some(object_schema(
-                json!({
-                    "accountId":{"type":["string","null"]},
-                    "ordinaryUsageAllowed":{"type":["boolean","null"]},
-                    "rateLimitResetCredits":{"type":["object","null"]},
-                    "rateLimitUpsell":{},
-                    "rateLimits":{"type":["object","null"]},
-                    "rateLimitsByLimitId":{"type":["object","null"],"additionalProperties":{"type":"object"}}
-                }),
-                &["rateLimits"],
-            )),
+            codex_info_schema(),
+            Some(codex_info_output_schema()),
         ),
     ]
 }
@@ -580,6 +369,14 @@ fn status_schema() -> Value {
     object_schema(
         json!({
             "healthy":{"type":"boolean"},
+            "operatorContract":object_schema(json!({
+                "version":{"const":2},
+                "controlPlane":{"const":"codex-connect"},
+                "codexAccess":{"const":"mcp"},
+                "workerContext":{"const":"isolated"},
+                "commandDefaultTimeoutMs":{"type":"integer","minimum":1},
+                "commandMaxTimeoutMs":{"type":"integer","minimum":1}
+            }), &["version","controlPlane","codexAccess","workerContext","commandDefaultTimeoutMs","commandMaxTimeoutMs"]),
             "scopeRoot":{"type":"string"},
             "endpoint":{"type":"string"},
             "buildId":{"type":"string"},
@@ -614,6 +411,7 @@ fn status_schema() -> Value {
         }),
         &[
             "healthy",
+            "operatorContract",
             "scopeRoot",
             "endpoint",
             "buildId",
@@ -626,19 +424,10 @@ fn status_schema() -> Value {
         ],
     )
 }
-fn id_schema() -> Value {
-    object_schema(json!({"threadId":{"type":"string"}}), &["threadId"])
-}
 fn work_started_schema() -> Value {
     object_schema(
         json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"createdThread":{"type":"boolean"},"cursor":{"type":"integer","minimum":0}}),
         &["threadId", "turnId", "cursor"],
-    )
-}
-fn work_read_schema() -> Value {
-    object_schema(
-        json!({"threadId":{"type":"string"},"latestTurn":nullable(turn_schema()),"cursor":{"type":"integer"}}),
-        &["threadId", "cursor"],
     )
 }
 fn work_wait_output_schema() -> Value {
@@ -670,14 +459,36 @@ fn cwd_schema() -> Value {
     json!({"type":["string","null"],"description":"Request working directory within scopeRoot. Relative cwd is resolved from scopeRoot; omitted or null cwd selects scopeRoot. Relative operation paths resolve from cwd, with no alternate-root retries. Parent (..) components are rejected lexically even when normalization would remain inside scopeRoot; use an absolute in-scope path when that traversal is intentional."})
 }
 fn network_access_schema() -> Value {
-    json!({"type":"boolean","default":false,"description":"Network access for an explicitly supplied sandbox policy. false may block sockets, including socket-based localhost tests. true enables broader network access, not only loopback. This default does not apply when the entire sandboxPolicy is omitted; host commands then inherit Codex App Server's effective configuration. No automatic escalation or retry."})
+    json!({"type":"boolean","default":false,"description":"Network access for an explicitly supplied sandbox policy. false may block sockets, including socket-based localhost tests. true enables broader network access, not only loopback. No automatic escalation or retry."})
 }
-fn sandbox_schema() -> Value {
-    json!({"oneOf":[{"type":"object","properties":{"type":{"const":"readOnly"},"networkAccess":network_access_schema()},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"workspaceWrite"},"writableRoots":{"type":"array","description":"Additional absolute writable directory paths within scopeRoot, as required by the pinned upstream contract. They are not an exclusive allowlist and do not narrow App Server's base workspace. For host command.exec/command.start, Codex Connect launches App Server with scopeRoot as its working directory, so workspaceWrite leaves scopeRoot writable even when this list is empty; per-command cwd only selects the process working directory and does not narrow write authority.","items":{"type":"string","pattern":"^/"}},"networkAccess":network_access_schema(),"excludeSlashTmp":{"type":"boolean"},"excludeTmpdirEnvVar":{"type":"boolean"}},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"dangerFullAccess"}},"required":["type"],"additionalProperties":false}]})
+fn workspace_write_policy_schema() -> Value {
+    object_schema(
+        json!({
+            "type":{"const":"workspaceWrite"},
+            "writableRoots":{"type":"array","description":"Additional absolute writable directory paths within scopeRoot, as required by the pinned upstream contract. They are not an exclusive allowlist and do not narrow App Server's base workspace. Codex Connect launches its dedicated App Server with scopeRoot as its working directory, so workspaceWrite leaves scopeRoot writable even when this list is empty; request cwd only selects the process working directory and does not narrow write authority.","items":{"type":"string","pattern":"^/"}},
+            "networkAccess":network_access_schema(),
+            "excludeSlashTmp":{"type":"boolean"},
+            "excludeTmpdirEnvVar":{"type":"boolean"}
+        }),
+        &["type"],
+    )
+}
+fn danger_full_access_schema() -> Value {
+    object_schema(json!({"type":{"const":"dangerFullAccess"}}), &["type"])
+}
+fn host_sandbox_schema() -> Value {
+    json!({"oneOf":[workspace_write_policy_schema(),danger_full_access_schema()]})
+}
+fn work_sandbox_schema() -> Value {
+    json!({"oneOf":[
+        object_schema(json!({"type":{"const":"readOnly"},"networkAccess":network_access_schema()}), &["type"]),
+        workspace_write_policy_schema(),
+        danger_full_access_schema()
+    ]})
 }
 fn command_schema() -> Value {
     object_schema(
-        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Process execution timeout in milliseconds. App Server enforces the process timeout; the MCP call may complete later while the final response is delivered."},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Per-stream stdout/stderr capture cap in bytes. The pinned App Server buffered response has no truncation flag; if a returned stream is exactly this many bytes, treat it as potentially incomplete."},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},"sandboxPolicy":sandbox_schema()}),
+        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Process execution timeout in milliseconds. App Server enforces the process timeout; the MCP call may complete later while the final response is delivered."},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Per-stream stdout/stderr capture cap in bytes. The pinned App Server buffered response has no truncation flag; if a returned stream is exactly this many bytes, treat it as potentially incomplete."},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},"sandboxPolicy":host_sandbox_schema()}),
         &["command"],
     )
 }
@@ -696,7 +507,7 @@ fn command_start_schema() -> Value {
             "command":{"type":"array","minItems":1,"items":{"type":"string"}},
             "cwd":{"type":["string","null"]},
             "env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},
-            "sandboxPolicy":sandbox_schema(),
+            "sandboxPolicy":host_sandbox_schema(),
             "tty":{"type":"boolean","default":false},
             "size":nullable(terminal_size_schema())
         }),
@@ -758,53 +569,155 @@ fn command_read_output_schema() -> Value {
         ],
     )
 }
-fn command_write_schema() -> Value {
-    object_schema(
-        json!({
+fn command_control_schema() -> Value {
+    json!({"oneOf":[
+        object_schema(json!({
+            "action":{"const":"write"},
             "processId":{"type":"string","minLength":1},
             "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES},
             "closeStdin":{"type":"boolean","default":false}
-        }),
-        &["processId"],
-    )
-}
-fn command_resize_schema() -> Value {
-    object_schema(
-        json!({
+        }), &["action","processId"]),
+        object_schema(json!({
+            "action":{"const":"resize"},
             "processId":{"type":"string","minLength":1},
             "rows":{"type":"integer","minimum":1,"maximum":65535},
             "cols":{"type":"integer","minimum":1,"maximum":65535}
-        }),
-        &["processId", "rows", "cols"],
-    )
+        }), &["action","processId","rows","cols"]),
+        object_schema(json!({
+            "action":{"const":"terminate"},
+            "processId":{"type":"string","minLength":1}
+        }), &["action","processId"])
+    ]})
 }
-fn work_start_schema() -> Value {
-    object_schema(
-        json!({"task":{"type":"string","minLength":1},"cwd":{"type":"string"},"threadId":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string"},"serviceTier":{"type":"string"},"approvalPolicy":approval_policy_schema(),"sandboxPolicy":sandbox_schema()}),
-        &["task", "sandboxPolicy"],
-    )
+fn command_control_output_schema() -> Value {
+    json!({"oneOf":[
+        object_schema(json!({"processId":{"type":"string"},"written":{"const":true},"stdinClosed":{"type":"boolean"}}), &["processId","written","stdinClosed"]),
+        object_schema(json!({"processId":{"type":"string"},"resized":{"const":true}}), &["processId","resized"]),
+        object_schema(json!({"processId":{"type":"string"},"terminationRequested":{"const":true}}), &["processId","terminationRequested"])
+    ]})
 }
-fn work_wait_schema() -> Value {
+fn review_target_schema() -> Value {
+    json!({"oneOf":[
+        object_schema(json!({"type":{"const":"uncommittedChanges"}}), &["type"]),
+        object_schema(json!({"type":{"const":"baseBranch"},"branch":{"type":"string"}}), &["type","branch"]),
+        object_schema(json!({"type":{"const":"commit"},"sha":{"type":"string"},"title":{"type":["string","null"]}}), &["type","sha"]),
+        object_schema(json!({"type":{"const":"custom"},"instructions":{"type":"string"}}), &["type","instructions"])
+    ]})
+}
+fn codex_start_schema() -> Value {
+    json!({"oneOf":[
+        object_schema(
+            json!({
+                "mode":{"const":"work"},
+                "task":{"type":"string","minLength":1},
+                "cwd":{"type":"string"},
+                "threadId":{"type":"string"},
+                "model":{"type":"string"},
+                "effort":{"type":"string"},
+                "serviceTier":{"type":"string"},
+                "approvalPolicy":approval_policy_schema(),
+                "sandboxPolicy":work_sandbox_schema()
+            }),
+            &["mode","task","sandboxPolicy"],
+        ),
+        object_schema(
+            json!({
+                "mode":{"const":"review"},
+                "cwd":{"type":"string"},
+                "threadId":{"type":"string"},
+                "target":review_target_schema()
+            }),
+            &["mode","target"],
+        )
+    ]})
+}
+fn codex_wait_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by codex.work.start/codex.work.wait. Matching events after this cursor are returned when the quiet join ends but do not wake it by themselves."},"timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet-join lease in milliseconds. Set to 0 for a non-blocking state/journal pull."}}),
+        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by codex.start/codex.wait. Matching events after this cursor are returned when the quiet join ends but do not wake it by themselves."},"timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet-join lease in milliseconds. Set to 0 for a non-blocking state/journal pull."}}),
         &["threadId"],
     )
 }
-fn model_list_schema() -> Value {
+fn codex_control_schema() -> Value {
+    json!({"oneOf":[
+        object_schema(json!({
+            "action":{"const":"steer"},
+            "threadId":{"type":"string"},
+            "expectedTurnId":{"type":"string"},
+            "instruction":{"type":"string","minLength":1}
+        }), &["action","threadId","expectedTurnId","instruction"]),
+        object_schema(json!({
+            "action":{"const":"interrupt"},
+            "threadId":{"type":"string"},
+            "turnId":{"type":"string"}
+        }), &["action","threadId","turnId"])
+    ]})
+}
+fn codex_control_output_schema() -> Value {
+    json!({"oneOf":[
+        object_schema(json!({"turnId":{"type":"string"}}), &["turnId"]),
+        object_schema(json!({"turnId":{"type":"string"},"interrupted":{"const":true}}), &["turnId","interrupted"])
+    ]})
+}
+fn codex_action_respond_schema() -> Value {
+    json!({"oneOf":[
+        object_schema(json!({
+            "type":{"const":"approval"},
+            "requestId":rpc_id_schema(),
+            "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"]}
+        }), &["type","requestId","decision"]),
+        object_schema(json!({
+            "type":{"const":"permissions"},
+            "requestId":rpc_id_schema(),
+            "permissions":permissions_schema(),
+            "scope":{"type":"string","enum":["turn","session"]}
+        }), &["type","requestId","permissions"]),
+        object_schema(json!({
+            "type":{"const":"userInput"},
+            "requestId":rpc_id_schema(),
+            "answers":{"type":"object","minProperties":1,"additionalProperties":{"type":"array","items":{"type":"string"}}}
+        }), &["type","requestId","answers"])
+    ]})
+}
+fn codex_info_schema() -> Value {
+    let query = json!({"oneOf":[
+        object_schema(json!({
+            "type":{"const":"models"},
+            "cursor":{"type":["string","null"]},
+            "includeHidden":{"type":["boolean","null"]},
+            "limit":{"type":["integer","null"],"minimum":0}
+        }), &["type"]),
+        object_schema(json!({
+            "type":{"const":"skills"},
+            "cwds":{"type":"array","items":{"type":"string"}},
+            "forceReload":{"type":"boolean","default":false}
+        }), &["type"]),
+        object_schema(json!({"type":{"const":"usage"}}), &["type"])
+    ]});
     object_schema(
-        json!({"cursor":{"type":["string","null"]},"includeHidden":{"type":["boolean","null"]},"limit":{"type":["integer","null"],"minimum":0}}),
-        &[],
+        json!({"queries":{"type":"array","minItems":1,"maxItems":10,"items":query}}),
+        &["queries"],
     )
 }
-fn review_schema() -> Value {
+fn codex_info_output_schema() -> Value {
+    let success = object_schema(
+        json!({
+            "index":{"type":"integer","minimum":0},
+            "type":{"enum":["models","skills","usage"]},
+            "result":{"type":"object"}
+        }),
+        &["index", "type", "result"],
+    );
+    let error = object_schema(
+        json!({
+            "index":{"type":"integer","minimum":0},
+            "type":{"enum":["models","skills","usage"]},
+            "error":{"type":"string"}
+        }),
+        &["index", "type", "error"],
+    );
     object_schema(
-        json!({"cwd":{"type":"string"},"threadId":{"type":"string"},"target":{"oneOf":[
-            object_schema(json!({"type":{"const":"uncommittedChanges"}}), &["type"]),
-            object_schema(json!({"type":{"const":"baseBranch"},"branch":{"type":"string"}}), &["type","branch"]),
-            object_schema(json!({"type":{"const":"commit"},"sha":{"type":"string"},"title":{"type":["string","null"]}}), &["type","sha"]),
-            object_schema(json!({"type":{"const":"custom"},"instructions":{"type":"string"}}), &["type","instructions"])
-        ]}}),
-        &["target"],
+        json!({"results":{"type":"array","items":{"oneOf":[success,error]}}}),
+        &["results"],
     )
 }
 
@@ -903,6 +816,15 @@ mod tests {
     fn status_schema_exposes_codex_provenance_and_app_server_launch_context() {
         let schema = status_schema();
         let properties = &schema["properties"];
+        assert_eq!(properties["operatorContract"]["type"], "object");
+        assert_eq!(
+            properties["operatorContract"]["properties"]["controlPlane"]["const"],
+            "codex-connect"
+        );
+        assert_eq!(
+            properties["operatorContract"]["properties"]["workerContext"]["const"],
+            "isolated"
+        );
         assert_eq!(properties["codex"]["type"], "object");
         assert_eq!(properties["appServer"]["type"], "object");
         assert_eq!(properties["endpoint"]["type"], "string");
@@ -957,34 +879,41 @@ mod tests {
                 .contains("potentially incomplete")
         );
         assert_eq!(schema["additionalProperties"], false);
-        let sandbox = sandbox_schema();
-        for variant in &sandbox["oneOf"].as_array().unwrap()[..2] {
-            let network = &variant["properties"]["networkAccess"];
-            assert_eq!(network["default"], false);
-            let description = network["description"].as_str().unwrap();
-            assert!(description.contains("localhost"));
-            assert!(description.contains("broader network access"));
-            assert_eq!(variant["additionalProperties"], false);
-        }
-        assert!(!sandbox.to_string().contains("allowLoopback"));
+        let host_sandbox = host_sandbox_schema();
+        let host_variants = host_sandbox["oneOf"].as_array().unwrap();
+        assert_eq!(host_variants.len(), 2);
+        assert!(!host_sandbox.to_string().contains("readOnly"));
+        assert!(host_sandbox.to_string().contains("workspaceWrite"));
+        assert!(host_sandbox.to_string().contains("dangerFullAccess"));
+        let network = &host_variants[0]["properties"]["networkAccess"];
+        assert_eq!(network["default"], false);
+        let description = network["description"].as_str().unwrap();
+        assert!(description.contains("localhost"));
+        assert!(description.contains("broader network access"));
+        assert!(!host_sandbox.to_string().contains("allowLoopback"));
         assert_eq!(
-            sandbox["oneOf"][1]["properties"]["writableRoots"]["items"]["pattern"],
+            host_variants[0]["properties"]["writableRoots"]["items"]["pattern"],
             "^/"
         );
         let writable_roots_description =
-            sandbox["oneOf"][1]["properties"]["writableRoots"]["description"]
+            host_variants[0]["properties"]["writableRoots"]["description"]
                 .as_str()
                 .unwrap();
         assert!(writable_roots_description.contains("not an exclusive allowlist"));
         assert!(writable_roots_description.contains("scopeRoot writable"));
         assert!(writable_roots_description.contains("does not narrow write authority"));
         assert_eq!(
-            sandbox["oneOf"][2]["properties"],
+            host_variants[1]["properties"],
             json!({"type":{"const":"dangerFullAccess"}})
         );
-        for schema in [command_schema(), work_start_schema()] {
-            assert_eq!(schema["properties"]["sandboxPolicy"], sandbox);
-        }
+        assert_eq!(
+            command_schema()["properties"]["sandboxPolicy"],
+            host_sandbox
+        );
+        assert_eq!(
+            command_start_schema()["properties"]["sandboxPolicy"],
+            host_sandbox_schema()
+        );
         assert!(
             !command_schema()["required"]
                 .as_array()
@@ -992,13 +921,23 @@ mod tests {
                 .iter()
                 .any(|value| value == "sandboxPolicy")
         );
+        let start = codex_start_schema();
+        let work = &start["oneOf"][0];
+        let review = &start["oneOf"][1];
+        assert_eq!(work["properties"]["sandboxPolicy"], work_sandbox_schema());
         assert!(
-            work_start_schema()["required"]
+            work["properties"]["sandboxPolicy"]
+                .to_string()
+                .contains("readOnly")
+        );
+        assert!(
+            work["required"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|value| value == "sandboxPolicy")
         );
+        assert!(review["properties"].get("sandboxPolicy").is_none());
     }
 
     #[test]
@@ -1028,12 +967,12 @@ mod tests {
                 .any(|value| value == "drained")
         );
 
-        let terminate = tools
+        let control = tools
             .iter()
-            .find(|tool| tool.name.as_ref() == "command.terminate")
+            .find(|tool| tool.name.as_ref() == "command.control")
             .unwrap();
-        let terminate_description = terminate.description.as_deref().unwrap();
-        assert!(terminate_description.contains("not a graceful-shutdown guarantee"));
+        let control_description = control.description.as_deref().unwrap();
+        assert!(control_description.contains("not a graceful-shutdown guarantee"));
 
         let exec = tools
             .iter()
@@ -1056,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn work_wait_schema_models_a_quiet_join() {
+    fn codex_wait_schema_models_a_quiet_join() {
         let output = work_wait_output_schema();
         assert_eq!(
             output["properties"]["state"]["enum"],
@@ -1068,7 +1007,7 @@ mod tests {
         );
         assert!(!output.to_string().contains("progress"));
 
-        let input = work_wait_schema();
+        let input = codex_wait_schema();
         assert_eq!(input["properties"]["timeoutMs"]["minimum"], 0);
         assert!(
             input["properties"]["timeoutMs"]["description"]
@@ -1086,26 +1025,15 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let expected = [
             "apply_patch",
-            "codex.approval.respond",
-            "codex.elicitation.respond",
-            "codex.model.list",
-            "codex.pendingActions.list",
-            "codex.permissions.respond",
-            "codex.review",
-            "codex.skills.list",
-            "codex.usage",
-            "codex.userInput.respond",
-            "codex.work.interrupt",
-            "codex.work.read",
-            "codex.work.start",
-            "codex.work.steer",
-            "codex.work.wait",
+            "codex.action.respond",
+            "codex.control",
+            "codex.info",
+            "codex.start",
+            "codex.wait",
+            "command.control",
             "command.exec",
             "command.read",
-            "command.resize",
             "command.start",
-            "command.terminate",
-            "command.write",
             "inspect",
             "status",
             "view_image",
@@ -1212,26 +1140,24 @@ mod tests {
                 "read the new output from the dev server",
                 Some("command.read"),
             ),
-            ("send `continue` to the debugger", Some("command.write")),
-            ("resize the debugger terminal", Some("command.resize")),
-            ("stop the running dev server", Some("command.terminate")),
+            ("send `continue` to the debugger", Some("command.control")),
+            ("resize the debugger terminal", Some("command.control")),
+            ("stop the running dev server", Some("command.control")),
             (
                 "investigate these test failures and fix them",
-                Some("codex.work.start"),
+                Some("codex.start"),
             ),
-            (
-                "wait for the coding agent to finish",
-                Some("codex.work.wait"),
-            ),
-            ("review my uncommitted changes", Some("codex.review")),
+            ("wait for the coding agent to finish", Some("codex.wait")),
+            ("review my uncommitted changes", Some("codex.start")),
             ("show me this png", Some("view_image")),
             (
                 "answer the coding agent's question",
-                Some("codex.userInput.respond"),
+                Some("codex.action.respond"),
             ),
+            ("show models, skills, and usage", Some("codex.info")),
             ("what is the weather", None),
         ];
-        assert_eq!(cases.len(), 14);
+        assert_eq!(cases.len(), 15);
         assert!(cases.iter().all(|(_, tool)| {
             tool.is_none_or(|name| tool_catalog().iter().any(|t| t.name.as_ref() == name))
         }));

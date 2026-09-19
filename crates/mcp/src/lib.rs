@@ -7,8 +7,8 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::response::Json;
 use codex_connect_relay::{
-    ApprovalDecision, ApprovalPolicy, CommandExecTerminalSize, ElicitationAction, MAX_WAIT_MS,
-    ModelList, PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
+    ApprovalDecision, ApprovalPolicy, CommandExec, CommandExecTerminalSize, MAX_WAIT_MS, ModelList,
+    PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
 };
 use codex_connect_scope::Scope;
 use rmcp::ErrorData as McpError;
@@ -30,6 +30,7 @@ use tokio::net::TcpListener;
 const DEFAULT_WAIT_MS: u64 = 60_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
+const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Use this MCP surface for host workspace operations and use codex.* for Codex threads, turns, reviews, discovery, usage, approvals, permissions, and user input; do not invoke the Codex CLI through host command tools as an alternate control plane when the semantic operation is available here. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. Prefer inspect for batched read-only exploration, command.exec for bounded deterministic host commands, command.start/read/control for persistent or interactive deterministic commands, and apply_patch for exact known text edits. Use codex.start followed by codex.wait only when delegated autonomous reasoning or iteration materially improves the critical path or quality; delegation is an optimization, not the default. Codex workers do not inherit the ChatGPT conversation, so every delegated task must include its own relevant context, constraints, paths, decisions, and acceptance criteria. Minimize unnecessary Codex turns and discovery calls because model usage is constrained; batch independent discovery with codex.info. Preserve ownership boundaries: Codex CLI/App Server and tunnel-client are independently owned upstream dependencies, and Codex Connect must not install, relocate, duplicate, upgrade, delete, or supervise their owned state. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect scopes, batches, and projects those capabilities rather than reimplementing them.";
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +46,17 @@ pub struct RuntimeIdentity {
     pub codex_global_config: CodexGlobalConfigSummary,
     pub app_server_working_directory: String,
     pub app_server_launch_overrides: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorContract {
+    pub version: u32,
+    pub control_plane: String,
+    pub codex_access: String,
+    pub worker_context: String,
+    pub command_default_timeout_ms: u64,
+    pub command_max_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
@@ -107,27 +119,37 @@ fn default_command_read_ms() -> u64 {
     codex_connect_relay::DEFAULT_COMMAND_READ_MS
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CommandWriteArgs {
-    process_id: String,
-    input: Option<String>,
-    #[serde(default)]
-    close_stdin: bool,
+fn validate_host_sandbox(policy: Option<&SandboxPolicy>) -> anyhow::Result<()> {
+    if matches!(policy, Some(SandboxPolicy::ReadOnly { .. })) {
+        anyhow::bail!(
+            "readOnly is not a public host-command policy; omit sandboxPolicy to inherit upstream configuration or use workspaceWrite/dangerFullAccess"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CommandResizeArgs {
-    process_id: String,
-    rows: u16,
-    cols: u16,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CommandTerminateArgs {
-    process_id: String,
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum CommandControlArgs {
+    Write {
+        process_id: String,
+        input: Option<String>,
+        #[serde(default)]
+        close_stdin: bool,
+    },
+    Resize {
+        process_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    Terminate {
+        process_id: String,
+    },
 }
 
 pub fn router(relay: Relay, scope: Scope, runtime: RuntimeIdentity) -> Router {
@@ -176,6 +198,7 @@ struct McpHandler {
 #[serde(rename_all = "camelCase")]
 pub struct OperatorStatus {
     pub healthy: bool,
+    pub operator_contract: OperatorContract,
     pub scope_root: String,
     pub endpoint: String,
     pub build_id: String,
@@ -191,6 +214,14 @@ impl OperatorStatus {
     fn read(relay: &Relay, runtime: &RuntimeIdentity) -> Self {
         Self {
             healthy: relay.worker_available(),
+            operator_contract: OperatorContract {
+                version: 2,
+                control_plane: "codex-connect".into(),
+                codex_access: "mcp".into(),
+                worker_context: "isolated".into(),
+                command_default_timeout_ms: codex_connect_relay::DEFAULT_COMMAND_MS,
+                command_max_timeout_ms: codex_connect_relay::MAX_COMMAND_MS,
+            },
             scope_root: relay.scope_root(),
             endpoint: runtime.endpoint.clone(),
             build_id: runtime.build_id.clone(),
@@ -229,9 +260,7 @@ impl ServerHandler for McpHandler {
                 "codex-connect",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(
-                "Codex Connect connects ChatGPT to the host workspace and Codex CLI through the official Codex App Server. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. Use inspect for structured read-only host exploration, batching independent reads and searches when possible. Use command.exec for bounded deterministic host commands and command.start plus command.read/write/resize/terminate only for persistent or interactive deterministic commands. Use codex.work.start followed by codex.work.wait for autonomous Codex CLI/agent work, and codex.review for official Codex review. The codex.* namespace represents the Codex CLI/App Server agent domain; un-namespaced host tools and command.* represent connector/operator facilities. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect scopes, batches, and projects those capabilities rather than reimplementing them.",
-            )
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 
     async fn list_tools(
@@ -328,27 +357,33 @@ struct ViewImageArgs {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkStartArgs {
-    task: String,
-    cwd: Option<String>,
-    thread_id: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
-    service_tier: Option<String>,
-    approval_policy: Option<ApprovalPolicy>,
-    sandbox_policy: SandboxPolicy,
+#[serde(
+    tag = "mode",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum CodexStartArgs {
+    Work {
+        task: String,
+        cwd: Option<String>,
+        thread_id: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        service_tier: Option<String>,
+        approval_policy: Option<ApprovalPolicy>,
+        sandbox_policy: SandboxPolicy,
+    },
+    Review {
+        cwd: Option<String>,
+        thread_id: Option<String>,
+        target: ReviewTarget,
+    },
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkReadArgs {
-    thread_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkWaitArgs {
+struct CodexWaitArgs {
     thread_id: String,
     turn_id: Option<String>,
     #[serde(default)]
@@ -361,71 +396,73 @@ fn default_wait_ms() -> u64 {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkSteerArgs {
-    thread_id: String,
-    expected_turn_id: String,
-    instruction: String,
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum CodexControlArgs {
+    Steer {
+        thread_id: String,
+        expected_turn_id: String,
+        instruction: String,
+    },
+    Interrupt {
+        thread_id: String,
+        turn_id: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum CodexActionRespondArgs {
+    Approval {
+        request_id: RpcId,
+        decision: ApprovalDecision,
+    },
+    Permissions {
+        request_id: RpcId,
+        permissions: PermissionGrant,
+        scope: Option<PermissionScope>,
+    },
+    UserInput {
+        request_id: RpcId,
+        answers: std::collections::BTreeMap<String, Vec<String>>,
+    },
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkInterruptArgs {
-    thread_id: String,
-    turn_id: String,
+struct CodexInfoArgs {
+    queries: Vec<CodexInfoQuery>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PendingActionsArgs {
-    thread_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ApprovalRespondArgs {
-    request_id: RpcId,
-    decision: ApprovalDecision,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PermissionsRespondArgs {
-    request_id: RpcId,
-    permissions: PermissionGrant,
-    scope: Option<PermissionScope>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ElicitationRespondArgs {
-    request_id: RpcId,
-    action: ElicitationAction,
-    content: Option<Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UserInputRespondArgs {
-    request_id: RpcId,
-    answers: std::collections::BTreeMap<String, Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ReviewArgs {
-    cwd: Option<String>,
-    thread_id: Option<String>,
-    target: ReviewTarget,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SkillsArgs {
-    #[serde(default)]
-    cwds: Vec<String>,
-    #[serde(default)]
-    force_reload: bool,
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum CodexInfoQuery {
+    Models {
+        cursor: Option<String>,
+        include_hidden: Option<bool>,
+        limit: Option<u32>,
+    },
+    Skills {
+        #[serde(default)]
+        cwds: Vec<String>,
+        #[serde(default)]
+        force_reload: bool,
+    },
+    Usage,
 }
 
 async fn dispatch(
@@ -446,13 +483,18 @@ async fn dispatch(
             let args: PatchArgs = parse(arguments)?;
             Ok(json!({"applied": scope.apply_patch(&args.patch, args.cwd.as_deref())?}))
         }
-        "command.exec" => relay
-            .command_exec(parse(arguments)?)
-            .await
-            .map(|v| serde_json::to_value(v).unwrap())
-            .map_err(Into::into),
+        "command.exec" => {
+            let a: CommandExec = parse(arguments)?;
+            validate_host_sandbox(a.sandbox_policy.as_ref())?;
+            relay
+                .command_exec(a)
+                .await
+                .map(|v| serde_json::to_value(v).unwrap())
+                .map_err(Into::into)
+        }
         "command.start" => {
             let a: CommandStartArgs = parse(arguments)?;
+            validate_host_sandbox(a.sandbox_policy.as_ref())?;
             relay
                 .command_start(a.command, a.cwd, a.env, a.sandbox_policy, a.tty, a.size)
                 .await
@@ -465,127 +507,149 @@ async fn dispatch(
                 .await
                 .map_err(Into::into)
         }
-        "command.write" => {
-            let a: CommandWriteArgs = parse(arguments)?;
-            relay
-                .command_write(a.process_id, a.input, a.close_stdin)
+        "command.control" => match parse(arguments)? {
+            CommandControlArgs::Write {
+                process_id,
+                input,
+                close_stdin,
+            } => relay
+                .command_write(process_id, input, close_stdin)
                 .await
-                .map_err(Into::into)
-        }
-        "command.resize" => {
-            let a: CommandResizeArgs = parse(arguments)?;
-            relay
-                .command_resize(
-                    a.process_id,
-                    CommandExecTerminalSize {
-                        rows: a.rows,
-                        cols: a.cols,
-                    },
-                )
+                .map_err(Into::into),
+            CommandControlArgs::Resize {
+                process_id,
+                rows,
+                cols,
+            } => relay
+                .command_resize(process_id, CommandExecTerminalSize { rows, cols })
                 .await
-                .map_err(Into::into)
-        }
-        "command.terminate" => {
-            let a: CommandTerminateArgs = parse(arguments)?;
-            relay
-                .command_terminate(a.process_id)
+                .map_err(Into::into),
+            CommandControlArgs::Terminate { process_id } => relay
+                .command_terminate(process_id)
                 .await
-                .map_err(Into::into)
-        }
-        "codex.work.start" => {
-            let a: WorkStartArgs = parse(arguments)?;
-            relay
+                .map_err(Into::into),
+        },
+        "codex.start" => match parse(arguments)? {
+            CodexStartArgs::Work {
+                task,
+                cwd,
+                thread_id,
+                model,
+                effort,
+                service_tier,
+                approval_policy,
+                sandbox_policy,
+            } => relay
                 .work_start(
-                    a.task,
-                    a.cwd,
-                    a.thread_id,
-                    a.model,
-                    a.effort,
-                    a.service_tier,
-                    a.approval_policy,
-                    a.sandbox_policy,
+                    task,
+                    cwd,
+                    thread_id,
+                    model,
+                    effort,
+                    service_tier,
+                    approval_policy,
+                    sandbox_policy,
                 )
                 .await
-                .map_err(Into::into)
-        }
-        "codex.work.read" => {
-            let a: WorkReadArgs = parse(arguments)?;
-            relay.work_read(a.thread_id).await.map_err(Into::into)
-        }
-        "codex.work.wait" => {
-            let a: WorkWaitArgs = parse(arguments)?;
+                .map_err(Into::into),
+            CodexStartArgs::Review {
+                cwd,
+                thread_id,
+                target,
+            } => relay
+                .review(cwd, thread_id, target)
+                .await
+                .map_err(Into::into),
+        },
+        "codex.wait" => {
+            let a: CodexWaitArgs = parse(arguments)?;
             relay
                 .work_wait(a.thread_id, a.turn_id, a.after_cursor, a.timeout_ms)
                 .await
                 .map_err(Into::into)
         }
-        "codex.work.steer" => {
-            let a: WorkSteerArgs = parse(arguments)?;
-            relay
-                .work_steer(a.thread_id, a.expected_turn_id, a.instruction)
+        "codex.control" => match parse(arguments)? {
+            CodexControlArgs::Steer {
+                thread_id,
+                expected_turn_id,
+                instruction,
+            } => relay
+                .work_steer(thread_id, expected_turn_id, instruction)
                 .await
-                .map_err(Into::into)
-        }
-        "codex.work.interrupt" => {
-            let a: WorkInterruptArgs = parse(arguments)?;
-            relay
-                .work_interrupt(a.thread_id, a.turn_id)
+                .map_err(Into::into),
+            CodexControlArgs::Interrupt { thread_id, turn_id } => relay
+                .work_interrupt(thread_id, turn_id)
                 .await
-                .map_err(Into::into)
-        }
-        "codex.pendingActions.list" => {
-            let a: PendingActionsArgs = parse(arguments)?;
-            Ok(json!({"actions":relay.pending_actions(a.thread_id.as_deref()).await}))
-        }
-        "codex.approval.respond" => {
-            let a: ApprovalRespondArgs = parse(arguments)?;
-            relay
-                .respond_approval(a.request_id, a.decision)
+                .map_err(Into::into),
+        },
+        "codex.action.respond" => match parse(arguments)? {
+            CodexActionRespondArgs::Approval {
+                request_id,
+                decision,
+            } => relay
+                .respond_approval(request_id, decision)
                 .await
-                .map_err(Into::into)
-        }
-        "codex.permissions.respond" => {
-            let a: PermissionsRespondArgs = parse(arguments)?;
-            relay
-                .respond_permissions(a.request_id, a.permissions, a.scope)
+                .map_err(Into::into),
+            CodexActionRespondArgs::Permissions {
+                request_id,
+                permissions,
+                scope,
+            } => relay
+                .respond_permissions(request_id, permissions, scope)
                 .await
-                .map_err(Into::into)
-        }
-        "codex.elicitation.respond" => {
-            let a: ElicitationRespondArgs = parse(arguments)?;
-            relay
-                .respond_elicitation(a.request_id, a.action, a.content)
+                .map_err(Into::into),
+            CodexActionRespondArgs::UserInput {
+                request_id,
+                answers,
+            } => relay
+                .respond_user_input(request_id, answers)
                 .await
-                .map_err(Into::into)
-        }
-        "codex.userInput.respond" => {
-            let a: UserInputRespondArgs = parse(arguments)?;
-            relay
-                .respond_user_input(a.request_id, a.answers)
-                .await
-                .map_err(Into::into)
-        }
-        "codex.review" => {
-            let a: ReviewArgs = parse(arguments)?;
-            relay
-                .review(a.cwd, a.thread_id, a.target)
-                .await
-                .map_err(Into::into)
-        }
-        "codex.model.list" => {
-            let a: ModelList = parse(arguments)?;
-            relay.model_list(a).await.map_err(Into::into)
-        }
-        "codex.skills.list" => {
-            let a: SkillsArgs = parse(arguments)?;
-            relay
-                .skills_list(a.cwds, a.force_reload)
-                .await
-                .map_err(Into::into)
-        }
-        "codex.usage" => {
-            ensure_empty(arguments)?;
-            relay.usage().await.map_err(Into::into)
+                .map_err(Into::into),
+        },
+        "codex.info" => {
+            let a: CodexInfoArgs = parse(arguments)?;
+            if a.queries.is_empty() || a.queries.len() > 10 {
+                anyhow::bail!("codex.info queries must contain 1..=10 items");
+            }
+            let query_count = a.queries.len();
+            let mut pending = tokio::task::JoinSet::new();
+            for (index, query) in a.queries.into_iter().enumerate() {
+                let relay = relay.clone();
+                pending.spawn(async move {
+                    let (kind, result) = match query {
+                        CodexInfoQuery::Models {
+                            cursor,
+                            include_hidden,
+                            limit,
+                        } => (
+                            "models",
+                            relay
+                                .model_list(ModelList {
+                                    include_hidden,
+                                    cursor,
+                                    limit,
+                                })
+                                .await,
+                        ),
+                        CodexInfoQuery::Skills { cwds, force_reload } => {
+                            ("skills", relay.skills_list(cwds, force_reload).await)
+                        }
+                        CodexInfoQuery::Usage => ("usage", relay.usage().await),
+                    };
+                    let entry = match result {
+                        Ok(value) => json!({"index":index,"type":kind,"result":value}),
+                        Err(error) => json!({"index":index,"type":kind,"error":error.to_string()}),
+                    };
+                    (index, entry)
+                });
+            }
+            let mut results = vec![Value::Null; query_count];
+            while let Some(joined) = pending.join_next().await {
+                let (index, entry) = joined
+                    .map_err(|error| anyhow::anyhow!("codex.info query task failed: {error}"))?;
+                results[index] = entry;
+            }
+            Ok(json!({"results":results}))
         }
         _ => anyhow::bail!("unknown tool `{name}`"),
     }
@@ -723,17 +787,33 @@ fn summary_for(name: &str, value: &Value) -> String {
                 "Persistent command state: {state}; drained={drained}; hasMoreOutput={has_more}."
             )
         }
-        "codex.work.start" => "Codex work started.".into(),
-        "codex.work.wait" => format!(
+        "codex.start" => "Codex turn started.".into(),
+        "codex.wait" => format!(
             "Codex work state: {}.",
             value
                 .get("state")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
         ),
-        "codex.review" => "Codex review started.".into(),
         "inspect" => "Inspection completed.".into(),
         _ => "Operation completed.".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SERVER_INSTRUCTIONS;
+
+    #[test]
+    fn server_instructions_calibrate_control_plane_and_delegation() {
+        assert!(SERVER_INSTRUCTIONS.contains("primary host and Codex control plane"));
+        assert!(
+            SERVER_INSTRUCTIONS.contains("do not invoke the Codex CLI through host command tools")
+        );
+        assert!(SERVER_INSTRUCTIONS.contains("do not inherit the ChatGPT conversation"));
+        assert!(SERVER_INSTRUCTIONS.contains("delegation is an optimization, not the default"));
+        assert!(SERVER_INSTRUCTIONS.contains("model usage is constrained"));
+        assert!(SERVER_INSTRUCTIONS.contains("batch independent discovery with codex.info"));
     }
 }
 

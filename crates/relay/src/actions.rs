@@ -1,4 +1,4 @@
-//! Operator decisions translated to the five selected official server-response contracts.
+//! Operator decisions translated to the three public server-response contracts.
 
 use crate::{PendingActionKind, PendingServerRequest, Relay, RelayError, RpcId};
 use serde::{Deserialize, Serialize};
@@ -20,14 +20,6 @@ pub enum ApprovalDecision {
 pub enum PermissionScope {
     Turn,
     Session,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub enum ElicitationAction {
-    Accept,
-    Decline,
-    Cancel,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -165,17 +157,6 @@ impl Relay {
         .await
     }
 
-    pub async fn respond_elicitation(
-        &self,
-        id: RpcId,
-        action: ElicitationAction,
-        content: Option<Value>,
-    ) -> Result<Value, RelayError> {
-        let request = self.pending(&id, PendingActionKind::Elicitation)?;
-        let result = elicitation_response(&request, action, content)?;
-        self.answer(request, result).await
-    }
-
     pub async fn respond_user_input(
         &self,
         id: RpcId,
@@ -208,54 +189,6 @@ fn approval_response(
         ));
     }
     Ok(json!({"decision":decision}))
-}
-
-fn elicitation_response(
-    request: &PendingServerRequest,
-    action: ElicitationAction,
-    content: Option<Value>,
-) -> Result<Value, RelayError> {
-    let content = if action == ElicitationAction::Accept {
-        match request.params.get("mode").and_then(Value::as_str) {
-            Some("url") => {
-                if content.as_ref().is_some_and(|v| !v.is_null()) {
-                    return Err(RelayError::Invalid(
-                        "URL elicitation accepts no form content".into(),
-                    ));
-                }
-                Value::Null
-            }
-            Some("form" | "openai/form" | "openaiForm") => {
-                let content = content.filter(Value::is_object).ok_or_else(|| {
-                    RelayError::Invalid("accepted form elicitation requires object content".into())
-                })?;
-                if request.params.get("mode").and_then(Value::as_str) == Some("form")
-                    && let Some(required) = request
-                        .params
-                        .pointer("/requestedSchema/required")
-                        .and_then(Value::as_array)
-                {
-                    for key in required.iter().filter_map(Value::as_str) {
-                        if content.get(key).is_none() {
-                            return Err(RelayError::Invalid(format!(
-                                "elicitation content omitted {key}"
-                            )));
-                        }
-                    }
-                }
-                content
-            }
-            _ => return Err(RelayError::Invalid("unsupported elicitation mode".into())),
-        }
-    } else {
-        if content.as_ref().is_some_and(|v| !v.is_null()) {
-            return Err(RelayError::Invalid(
-                "decline/cancel must not include content".into(),
-            ));
-        }
-        Value::Null
-    };
-    Ok(json!({"action":action,"content":content}))
 }
 
 fn user_input_response(
@@ -341,44 +274,6 @@ mod tests {
         }
         request.params = json!({"availableDecisions":["decline","cancel"]});
         assert!(approval_response(&request, ApprovalDecision::Approve).is_err());
-    }
-
-    #[test]
-    fn url_and_form_elicitation_have_distinct_acceptance_payloads() {
-        let url = request(PendingActionKind::Elicitation, json!({"mode":"url"}));
-        assert_eq!(
-            elicitation_response(&url, ElicitationAction::Accept, None).unwrap(),
-            json!({"action":"accept","content":null})
-        );
-        let form = request(
-            PendingActionKind::Elicitation,
-            json!({"mode":"form","requestedSchema":{"required":["name"]}}),
-        );
-        assert!(elicitation_response(&form, ElicitationAction::Accept, Some(json!({}))).is_err());
-        assert_eq!(
-            elicitation_response(&form, ElicitationAction::Accept, Some(json!({"name":"A"})))
-                .unwrap()["content"],
-            json!({"name":"A"})
-        );
-        assert!(
-            elicitation_response(&form, ElicitationAction::Cancel, Some(json!({"name":"A"})))
-                .is_err()
-        );
-        for mode in ["openai/form", "openaiForm"] {
-            let openai_form = request(
-                PendingActionKind::Elicitation,
-                json!({"mode":mode,"requestedSchema":{"opaque":true}}),
-            );
-            assert_eq!(
-                elicitation_response(
-                    &openai_form,
-                    ElicitationAction::Accept,
-                    Some(json!({"name":"Ada"})),
-                )
-                .unwrap()["content"],
-                json!({"name":"Ada"})
-            );
-        }
     }
 
     #[test]

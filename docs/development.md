@@ -102,7 +102,7 @@ When adding event handling:
 
 Server-request response shapes must come from the pinned generated schemas. Public responders should normalize only the operator decision and translate it to the official shape. Never reintroduce a generic `result: any` public responder.
 
-`experimentalApi` is enabled because Codex Connect intentionally supports `item/tool/requestUserInput`. The dedicated App Server launch also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` flags, while initialize advertises the `openai/form` extension. These are explicit integration requirements, not blanket permission to expose unrelated experimental methods.
+`experimentalApi` is enabled because Codex Connect intentionally supports `item/tool/requestUserInput`. The dedicated App Server launch also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` flags. Initialize deliberately advertises no form/elicitation extension because the minimized public MCP surface has no elicitation response operation; unexpected elicitation requests are still parsed and surfaced fail-closed. These are explicit integration requirements, not blanket permission to expose unrelated experimental methods.
 
 ## App Server reuse gate
 
@@ -120,7 +120,9 @@ A bridge needs an explicit architectural justification and should be reconsidere
 
 Host `command.exec` / `command.start` must preserve an omitted `sandboxPolicy` all the way to App Server. **Absence is semantic:** Codex Connect sends no synthetic policy, so App Server uses the effective upstream Codex configuration from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Do not replace omission with an equivalent-looking `workspaceWrite` object, because doing so would duplicate upstream defaults and create configuration drift.
 
-`codex.work.start` has the opposite contract: it must reject omission and always send the operator-supplied `sandboxPolicy` on `turn/start`. Do not add Codex Connect configuration fields for `sandbox_mode` or `sandbox_workspace_write.network_access`.
+Host command schemas intentionally expose only `workspaceWrite` and `dangerFullAccess`; read-only host exploration belongs in `inspect`, and hand-crafted `readOnly` host-command requests are rejected server-side. `codex.start(mode=work)` has the opposite contract: it must reject sandbox omission and still expose `readOnly`, `workspaceWrite`, and `dangerFullAccess`, always sending the operator-supplied `sandboxPolicy` on `turn/start`. Do not add Codex Connect configuration fields for `sandbox_mode` or `sandbox_workspace_write.network_access`.
+
+Codex Connect is the primary control plane for ChatGPT. When a Codex semantic operation is public under `codex.*`, do not invoke the Codex CLI through host command tools as an alternate control plane. Delegated Codex workers do not inherit the calling ChatGPT conversation; every work task must therefore be self-contained. Prefer direct inspection, deterministic commands, and exact patches when they are sufficient, and delegate only when autonomous iteration or parallel reasoning materially improves the critical path or quality.
 
 The MCP tests contain deterministic golden examples such as:
 
@@ -129,12 +131,14 @@ The MCP tests contain deterministic golden examples such as:
 - “run cargo test” → `command.exec`
 - “start the dev server and keep it running” → `command.start`
 - “read the new output from the dev server” → `command.read`
-- “send input to the debugger” → `command.write`
-- “resize the debugger terminal” → `command.resize`
-- “stop the running dev server” → `command.terminate`
-- “investigate these failures and fix them” → `codex.work.start`
-- “wait for the coding agent” → `codex.work.wait`
-- “review uncommitted changes” → `codex.review`
+- “send input to the debugger” → `command.control(action=write)`
+- “resize the debugger terminal” → `command.control(action=resize)`
+- “stop the running dev server” → `command.control(action=terminate)`
+- “investigate these failures and fix them” → `codex.start(mode=work)`
+- “wait for the coding agent” → `codex.wait`
+- “review uncommitted changes” → `codex.start(mode=review)`
+- “answer the coding agent's question” → `codex.action.respond`
+- “show models, skills, and usage” → one batched `codex.info` call
 - unrelated prompts → no Codex Connect tool
 
 Extend this fixture when adding or materially changing tool metadata.
