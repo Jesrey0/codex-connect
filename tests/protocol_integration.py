@@ -592,6 +592,36 @@ class OperatorProtocolTests(unittest.TestCase):
         snapshot = self.client.call("codex.wait",{"threadId":work["threadId"],"timeoutMs":0})
         self.assertEqual(snapshot["turn"]["id"], next_work["turnId"])
 
+    def test_observer_does_not_regress_early_completed_turn_to_in_progress(self):
+        work = self.start(
+            "early_complete",
+            model="gpt-6-astra",
+            effort="high",
+        )
+        with urllib.request.urlopen(self.url + "/observe") as response:
+            observer = json.load(response)
+        self.assertNotIn(
+            work["turnId"],
+            [turn["turnId"] for turn in observer["projection"]["activeTurns"]],
+        )
+        result = self.wait(work)
+        self.assertEqual(result["state"], "terminal")
+        self.assertEqual(result["turn"]["status"], "completed")
+
+    def test_observer_hides_unannotated_review_auxiliary_turn(self):
+        review = self.client.call("codex.start", {
+            "mode": "review",
+            "target": {"type": "uncommittedChanges"},
+            "model": "gpt-6-astra",
+        })
+        self.assertEqual(self.wait(review)["state"], "terminal")
+        with urllib.request.urlopen(self.url + "/observe") as response:
+            observer = json.load(response)
+        self.assertNotIn(
+            f"{review['threadId']}-review-auxiliary",
+            [turn["turnId"] for turn in observer["projection"]["activeTurns"]],
+        )
+
     def test_wait_uses_paginated_turn_lookup(self):
         work = self.start("inflate_history")
         result = self.wait(work, timeout=1000)

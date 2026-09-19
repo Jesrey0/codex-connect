@@ -252,7 +252,7 @@ fn render_snapshot(lines: &mut Vec<String>, snapshot: &Value, width: usize) {
 }
 
 fn worker_row(turn: &Value, width: usize) -> String {
-    let mode = text(&turn["mode"], "work");
+    let mode = text(&turn["mode"], "unknown");
     let model = turn["model"].as_str().unwrap_or("default/inherited");
     let effort = turn["effort"].as_str().unwrap_or("default/inherited");
     let state = text(&turn["status"], "unknown");

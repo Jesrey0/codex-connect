@@ -149,6 +149,12 @@ impl LiveTurns {
     fn insert(&mut self, thread_id: &str, turn: codex_connect_app_server::protocol::Turn) {
         let key = (thread_id.to_string(), turn.id.clone());
         if let Some(existing) = self.turns.get_mut(&key) {
+            // App Server notifications can race ahead of the turn/start response. Once a
+            // terminal lifecycle event has been observed, a later stale inProgress response
+            // must not regress the local projection back to active forever.
+            if existing.turn.status.is_terminal() && !turn.status.is_terminal() {
+                return;
+            }
             existing.turn = turn;
             return;
         }
@@ -1128,7 +1134,7 @@ impl Relay {
                 .iter()
                 .filter_map(|(thread_id, turn_id)| {
                     let observed = live.turns.get(&(thread_id.clone(), turn_id.clone()))?;
-                    (!observed.turn.status.is_terminal()).then(|| {
+                    (!observed.turn.status.is_terminal() && observed.mode.is_some()).then(|| {
                         json!({
                             "threadId": thread_id,
                             "turnId": observed.turn.id,

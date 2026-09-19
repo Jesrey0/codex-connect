@@ -242,6 +242,12 @@ for line in sys.stdin:
         turn.update(id=turn_id, status="inProgress", items=[], error=None)
         thread["turns"].append(turn)
         scenario = params["input"][0]["text"]
+        if scenario == "early_complete":
+            stale_result = copy.deepcopy(result)
+            notify("turn/started", {"threadId": thread_id, "turn": turn})
+            complete(thread_id, turn_id)
+            respond(message, stale_result)
+            continue
         respond(message, result)
         notify("turn/started", {"threadId": thread_id, "turn": turn})
         if scenario == "no_event":
@@ -298,6 +304,13 @@ for line in sys.stdin:
 
         result["reviewThreadId"] = review_thread_id
         respond(message, result)
+        # The pinned App Server may emit an auxiliary source-thread lifecycle turn while an
+        # inline review is running without a matching terminal notification on that same
+        # lifecycle stream. It is not a Codex Connect work/review turn and must not appear as
+        # an active operator-visible worker.
+        auxiliary_turn = copy.deepcopy(turn)
+        auxiliary_turn.update(id=f"{thread_id}-review-auxiliary", status="inProgress", items=[])
+        notify("turn/started", {"threadId": thread_id, "turn": auxiliary_turn})
         if delayed_visibility:
             completed_turn = copy.deepcopy(turn)
             completed_turn.update(
