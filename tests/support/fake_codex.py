@@ -286,7 +286,7 @@ for line in sys.stdin:
         if not delayed_visibility:
             thread["turns"].append(turn)
 
-        # Mirror live 0.154.0: reviewThreadId can identify the internal reviewer while the
+        # Mirror the pinned App Server: reviewThreadId can identify the internal reviewer while the
         # response turn itself belongs to the source thread.
         review_thread_id = f"review-thread-{thread_id}-{len(thread['turns'])}"
         review_thread = copy.deepcopy(thread)

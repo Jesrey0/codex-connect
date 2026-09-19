@@ -1055,7 +1055,7 @@ impl Relay {
             None,
         )
         .await;
-        // Live App Server 0.154.0 returns the inline review turn on the source thread even
+        // The pinned App Server returns the inline review turn on the source thread even
         // when reviewThreadId names the internal reviewer thread. work.wait needs that pair.
         Ok(
             json!({"threadId":thread_id,"turnId":response.turn.id,"createdThread":created,"cursor":cursor}),

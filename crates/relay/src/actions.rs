@@ -44,7 +44,7 @@ pub struct FileSystemGrant {
     pub entries: Option<Vec<FileSystemEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub glob_scan_max_depth: Option<u32>,
-    // These are official 0.154.0 permission fields, also emitted by its built-in tool.
+    // These are official pinned App Server permission fields, also emitted by its built-in tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
