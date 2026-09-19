@@ -370,13 +370,12 @@ fn status_schema() -> Value {
         json!({
             "healthy":{"type":"boolean"},
             "operatorContract":object_schema(json!({
-                "version":{"const":2},
                 "controlPlane":{"const":"codex-connect"},
                 "codexAccess":{"const":"mcp"},
                 "workerContext":{"const":"isolated"},
                 "commandDefaultTimeoutMs":{"type":"integer","minimum":1},
                 "commandMaxTimeoutMs":{"type":"integer","minimum":1}
-            }), &["version","controlPlane","codexAccess","workerContext","commandDefaultTimeoutMs","commandMaxTimeoutMs"]),
+            }), &["controlPlane","codexAccess","workerContext","commandDefaultTimeoutMs","commandMaxTimeoutMs"]),
             "scopeRoot":{"type":"string"},
             "endpoint":{"type":"string"},
             "buildId":{"type":"string"},

@@ -135,7 +135,6 @@ class OperatorProtocolTests(unittest.TestCase):
             "executable", "appServerTransport", "experimentalApi", "codex", "appServer",
         })
         self.assertEqual(status["operatorContract"], {
-            "version": 2,
             "controlPlane": "codex-connect",
             "codexAccess": "mcp",
             "workerContext": "isolated",

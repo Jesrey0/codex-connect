@@ -51,7 +51,6 @@ pub struct RuntimeIdentity {
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperatorContract {
-    pub version: u32,
     pub control_plane: String,
     pub codex_access: String,
     pub worker_context: String,
@@ -215,7 +214,6 @@ impl OperatorStatus {
         Self {
             healthy: relay.worker_available(),
             operator_contract: OperatorContract {
-                version: 2,
                 control_plane: "codex-connect".into(),
                 codex_access: "mcp".into(),
                 worker_context: "isolated".into(),
