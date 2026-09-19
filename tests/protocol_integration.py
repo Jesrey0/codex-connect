@@ -156,6 +156,18 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(status["appServerTransport"], status["appServer"]["transport"])
         with urllib.request.urlopen(self.url + "/status") as response:
             self.assertEqual(status, json.load(response))
+        with urllib.request.urlopen(self.url + "/observe") as response:
+            observer = json.load(response)
+        self.assertEqual(observer["status"], status)
+        projection = observer["projection"]
+        self.assertEqual(set(projection), {
+            "workerAvailable", "scopeRoot", "usage", "usageRefreshMs", "activeTurns",
+            "pendingActions", "cursor", "historyLost", "events",
+        })
+        self.assertTrue(projection["workerAvailable"])
+        self.assertEqual(projection["scopeRoot"], str(self.scope))
+        self.assertEqual(projection["usageRefreshMs"], 5000)
+        self.assertIn("rateLimits", projection["usage"])
         with self.assertRaises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(self.url + "/scope-info")
         self.assertEqual(error.exception.code, 404)

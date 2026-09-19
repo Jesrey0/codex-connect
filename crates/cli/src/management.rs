@@ -896,6 +896,16 @@ async fn backend_status_once(config: &BackendConfig) -> Result<OperatorStatus> {
     }
     Ok(serde_json::from_slice(&body)?)
 }
+
+pub(crate) async fn backend_observer_once(config: &BackendConfig) -> Result<serde_json::Value> {
+    let addr = config.listen_addr()?;
+    let (status, body) = http_get(addr, "/observe").await?;
+    if status != 200 {
+        bail!("observer endpoint returned HTTP {status}");
+    }
+    Ok(serde_json::from_slice(&body)?)
+}
+
 async fn http_get(addr: SocketAddr, path: &str) -> Result<(u16, Vec<u8>)> {
     let mut stream = timeout(HEALTH_TIMEOUT, TcpStream::connect(addr)).await??;
     let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");

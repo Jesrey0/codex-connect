@@ -126,6 +126,28 @@ impl EventJournal {
         batch.cursor = state.cursor;
         Ok(batch)
     }
+
+    pub async fn tail(&self, max_events: usize) -> JournalBatch {
+        let state = self.state.lock().await;
+        let mut events = Vec::new();
+        let mut bytes = 0usize;
+        for (event, size) in state.events.iter().rev() {
+            if events.len() >= max_events {
+                break;
+            }
+            if !events.is_empty() && bytes + size > MAX_BATCH_BYTES {
+                break;
+            }
+            bytes += size;
+            events.push(event.clone());
+        }
+        events.reverse();
+        JournalBatch {
+            events,
+            cursor: state.cursor,
+            history_lost: state.dropped_through > 0,
+        }
+    }
 }
 
 fn string(value: &Value, key: &str) -> Option<String> {
@@ -218,5 +240,20 @@ mod tests {
         }
         assert_eq!(count, 10);
         assert!(journal.read_after(cursor + 1, "a", None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn tail_returns_the_newest_events_in_order() {
+        let journal = EventJournal::default();
+        for n in 0..5 {
+            journal
+                .push("item/completed", &json!({"threadId":"a","n":n}))
+                .await;
+        }
+        let batch = journal.tail(3).await;
+        assert_eq!(batch.cursor, 5);
+        assert_eq!(batch.events.len(), 3);
+        assert_eq!(batch.events[0].params["n"], 2);
+        assert_eq!(batch.events[2].params["n"], 4);
     }
 }

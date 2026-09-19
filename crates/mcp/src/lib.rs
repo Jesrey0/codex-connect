@@ -158,6 +158,7 @@ pub fn router(relay: Relay, scope: Scope, runtime: RuntimeIdentity) -> Router {
         runtime,
     };
     let operator_status = handler.clone();
+    let observer = handler.clone();
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -173,6 +174,25 @@ pub fn router(relay: Relay, scope: Scope, runtime: RuntimeIdentity) -> Router {
             axum::routing::get(move || {
                 let handler = operator_status.clone();
                 async move { Json(handler.status_value()) }
+            }),
+        )
+        .route(
+            "/observe",
+            axum::routing::get(move || {
+                let handler = observer.clone();
+                async move {
+                    handler
+                        .relay
+                        .observer_snapshot()
+                        .await
+                        .map(|projection| {
+                            Json(json!({
+                                "status": handler.status_value(),
+                                "projection": projection,
+                            }))
+                        })
+                        .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))
+                }
             }),
         )
 }

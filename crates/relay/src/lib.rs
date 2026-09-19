@@ -35,6 +35,7 @@ use tokio::time::{Duration, Instant};
 
 pub const MAX_WAIT_MS: u64 = 120_000;
 const WAIT_RECONCILE_MS: u64 = 1_000;
+const OBSERVER_USAGE_REFRESH_MS: u64 = 5_000;
 const MAX_LIVE_TURNS: usize = 256;
 const TURN_PAGE_SIZE: u32 = 50;
 const ITEM_PAGE_SIZE: u32 = 100;
@@ -115,6 +116,7 @@ pub struct Relay {
     scope: Scope,
     journal: event_journal::EventJournal,
     live_turns: Arc<Mutex<LiveTurns>>,
+    observer_usage: Arc<Mutex<Option<(Instant, Value)>>>,
     command_sessions: command_sessions::CommandSessions,
     next_command_id: Arc<AtomicU64>,
 }
@@ -183,6 +185,7 @@ impl Relay {
             scope,
             journal: event_journal::EventJournal::default(),
             live_turns: Arc::new(Mutex::new(LiveTurns::default())),
+            observer_usage: Arc::new(Mutex::new(None)),
             command_sessions: command_sessions::CommandSessions::default(),
             next_command_id: Arc::new(AtomicU64::new(1)),
         };
@@ -972,6 +975,55 @@ impl Relay {
                 exclude_reset_credit_details: true,
             })
             .await?)
+    }
+
+    pub async fn observer_snapshot(&self) -> Result<Value, RelayError> {
+        let usage = {
+            let cached = self.observer_usage.lock().await;
+            cached
+                .as_ref()
+                .filter(|(sampled, _)| {
+                    sampled.elapsed() < Duration::from_millis(OBSERVER_USAGE_REFRESH_MS)
+                })
+                .map(|(_, value)| value.clone())
+        };
+        let usage = match usage {
+            Some(value) => value,
+            None => {
+                let value = self.usage().await?;
+                *self.observer_usage.lock().await = Some((Instant::now(), value.clone()));
+                value
+            }
+        };
+        let active_turns = {
+            let live = self.live_turns.lock().await;
+            live.order
+                .iter()
+                .filter_map(|(thread_id, turn_id)| {
+                    let turn = live.turns.get(&(thread_id.clone(), turn_id.clone()))?;
+                    (!turn.status.is_terminal()).then(|| {
+                        json!({
+                            "threadId": thread_id,
+                            "turnId": turn.id,
+                            "status": turn.status,
+                        })
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let pending_actions = self.pending_actions(None).await;
+        let recent = self.journal.tail(64).await;
+        Ok(json!({
+            "workerAvailable": self.worker_available(),
+            "scopeRoot": self.scope_root(),
+            "usage": usage,
+            "usageRefreshMs": OBSERVER_USAGE_REFRESH_MS,
+            "activeTurns": active_turns,
+            "pendingActions": pending_actions,
+            "cursor": recent.cursor,
+            "historyLost": recent.history_lost,
+            "events": recent.events,
+        }))
     }
 
     fn start_event_loop(&self) {

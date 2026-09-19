@@ -40,6 +40,8 @@ Codex Connect does **not** define another agent/session model.
 
 Connect-owned state is observational or transport-specific only: the bounded event journal, pending server-request registry, and bounded live-turn cache seeded from official turn-start responses/lifecycle events. None is authoritative Codex state; persisted thread history remains App Server-owned.
 
+The backend also exposes a loopback-only `GET /observe` endpoint for the local `codex-connect tui`. This is deliberately outside the public MCP tool catalog and contains no mutation operations. It projects backend/runtime status, briefly cached `account/rateLimits/read` telemetry, currently active entries from the bounded live-turn cache, pending-action metadata, and the newest bounded journal events. The projection resets with the backend process and must not be interpreted as global Codex thread enumeration.
+
 ## App Server reuse invariant
 
 Before adding or retaining a Codex Connect capability, inspect the generated schema from the pinned Codex CLI. If App Server already owns the semantic operation, Connect must project or adapt that method instead of implementing a parallel host primitive. A Connect-only bridge is justified only when the pinned App Server has no equivalent semantic operation required by ChatGPT.
@@ -57,6 +59,8 @@ The public surface therefore falls into three implementation classes:
 | Bridge | `inspect.searchContent` | The pinned App Server has no workspace-content-search RPC. The bridge is bounded, scope-fenced, cancellation-aware, and skips known build/cache trees. |
 | Bridge | `apply_patch` | The pinned App Server exposes byte-level filesystem mutations but no deterministic patch semantic RPC. Connect owns patch parsing/preflight/rollback semantics. |
 | Bridge | `status` | Operator/runtime health, content-addressed build identity, global Codex configuration provenance, App Server launch context, and the compact operator-contract marker are Connect deployment concerns, not Codex thread state. |
+
+The local observer endpoint and TUI do not add an MCP tool or a second control plane. They are a presentation-only projection over the same relay process; approval, permission, user-input, delegation, steering, and interruption authority remain on the existing ChatGPT-facing MCP path.
 
 `codex.*` is the public namespace for interacting with the Codex CLI/App Server agent domain. `codex-connect` remains the implementation/product identity of the bridge, while host/operator operations such as `status`, `inspect`, `apply_patch`, `view_image`, and `command.*` speak for the connector environment directly.
 
