@@ -117,7 +117,7 @@ fn render_snapshot(lines: &mut Vec<String>, snapshot: &Value, width: usize) {
         width,
     ));
     lines.push(row(
-        &format!(" scope {}", text(&projection["scopeRoot"], "unknown")),
+        &format!(" cwd {}", text(&projection["defaultCwd"], "unknown")),
         width,
     ));
 

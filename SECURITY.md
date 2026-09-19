@@ -18,13 +18,13 @@ This trust model is intended for a single-user host. Any local process that can 
 
 The native `tunnel-client` owns its control-plane credentials and runtime state. Keep its runtime API key private and grant only the tunnel permissions required for operation. The ChatGPT custom app/connector uses **no authentication**; remote reachability is mediated by the OpenAI tunnel/control-plane configuration rather than a second credential layer in Codex Connect.
 
-The durable host scope root fences direct file tools and official `cwd` / writable-root fields. It is not a system-wide sandbox: commands, `danger-full-access` turns, network access, and `sudo` remain subject to Codex sandbox policy and the machine user's normal OS permissions. The backend intentionally does not apply `NoNewPrivileges=true`; do not use a host account whose sudo policy is broader than the intended remote-operator trust.
+The primary operator plane intentionally has the host user's filesystem/process authority. Direct host tools accept absolute paths, and the dedicated App Server is launched with a process-local `danger-full-access` sandbox default; the configured default workspace is navigation only, not an authorization fence. Delegated Codex work remains separately policy-bounded per turn, and new official review threads are read-only. The backend intentionally does not apply `NoNewPrivileges=true`; do not use a host account whose sudo policy is broader than the intended remote-operator trust.
 
 ## Operational guidance
 
 - Keep the MCP backend bound to loopback.
 - Use OpenAI Secure MCP Tunnel rather than exposing the backend through an ad-hoc public tunnel.
 - Keep tunnel runtime credentials out of project files, logs, bug reports, and ChatGPT connector configuration.
-- Review the effective Codex sandbox configuration before allowing host command execution.
-- Run `codex-connect doctor` after installation or upgrades and treat unexpected scope/build identity as a failure.
+- Treat connector/tunnel access as equivalent to high-trust host-operator access and keep the backend loopback-only.
+- Run `codex-connect doctor` after installation or upgrades and treat unexpected default-workspace/build identity as a failure.
 - Use `codex-connect uninstall` when removing the backend; tunnel-client state remains independently managed and must be removed separately if no longer needed.

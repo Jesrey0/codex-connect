@@ -59,6 +59,8 @@ mod launch_tests {
             [
                 "app-server",
                 "-c",
+                "sandbox_mode=\"danger-full-access\"",
+                "-c",
                 "features.default_mode_request_user_input=true",
                 "-c",
                 "features.request_permissions_tool=true",
@@ -71,7 +73,8 @@ mod launch_tests {
     }
 }
 
-pub const APP_SERVER_FEATURE_OVERRIDES: &[&str] = &[
+pub const APP_SERVER_LAUNCH_OVERRIDES: &[&str] = &[
+    "sandbox_mode=\"danger-full-access\"",
     "features.default_mode_request_user_input=true",
     "features.request_permissions_tool=true",
     "features.exec_permission_approvals=true",
@@ -79,6 +82,8 @@ pub const APP_SERVER_FEATURE_OVERRIDES: &[&str] = &[
 
 const APP_SERVER_ARGS: &[&str] = &[
     "app-server",
+    "-c",
+    "sandbox_mode=\"danger-full-access\"",
     "-c",
     "features.default_mode_request_user_input=true",
     "-c",

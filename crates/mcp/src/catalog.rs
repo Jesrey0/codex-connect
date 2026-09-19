@@ -39,7 +39,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "inspect",
                 "Inspect Workspace",
-                "Use for structured read-only workspace exploration. Batch independent text reads, directory listings, metadata checks, content searches, and ranked App Server fuzzy file searches in one call whenever possible. The workspace need not use version control. Relative paths resolve against request cwd (default: scopeRoot); omitted search paths mean cwd. Relative paths containing parent (..) components are rejected lexically even when normalization would remain in scope; use an absolute in-scope path when intentionally reaching outside request cwd. Each operation returns an indexed result or error without discarding successful siblings. Use command.exec instead when the answer is naturally produced by one deterministic repository/tool command.",
+                "Use for structured read-only host exploration. Batch independent text reads, directory listings, metadata checks, content searches, and ranked App Server fuzzy file searches in one call whenever possible. Absolute host paths are accepted; relative paths resolve against request cwd, which defaults to defaultCwd. Each operation returns an indexed result or error without discarding successful siblings. Use command.exec instead when the answer is naturally produced by one deterministic repository/tool command.",
                 true,
                 false,
                 false,
@@ -52,7 +52,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "apply_patch",
                 "Apply Patch",
-                "Use when the exact textual file change is already known. Relative patch paths resolve against request cwd (default: scopeRoot), within the configured scope. Parent (..) components are rejected lexically; use an absolute in-scope path instead of parent traversal. For delegated autonomous multi-step coding, use codex.start instead.",
+                "Use when the exact textual file change is already known. Absolute host paths are accepted; relative patch paths resolve against request cwd, which defaults to defaultCwd. Patch transaction, regular-file, and symlink-mutation protections remain enforced. For delegated autonomous multi-step coding, use codex.start instead.",
                 false,
                 true,
                 false,
@@ -71,7 +71,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.start",
                 "Start Persistent Command",
-                "Use for a deterministic command that must remain running or interactive: dev servers, watchers, REPLs, debuggers, installers, prompts, or interactive CLIs. Returns a connection-scoped processId immediately after the official App Server command request is flushed; follow with command.read for observation and command.control for stdin, PTY resize, or termination. Set tty=true only when terminal semantics are needed. sandboxPolicy is an optional per-call override; omit it to inherit the effective sandbox configuration loaded by Codex App Server.",
+                "Use for a deterministic host command that must remain running or interactive: dev servers, watchers, REPLs, debuggers, installers, prompts, or interactive CLIs. Host commands run through Codex Connect's dedicated App Server, which is launched with danger-full-access for the primary operator plane. Returns a connection-scoped processId immediately after the official App Server command request is flushed; follow with command.read for observation and command.control for stdin, PTY resize, or termination. Set tty=true only when terminal semantics are needed.",
                 false,
                 true,
                 true,
@@ -110,7 +110,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "view_image",
                 "View Image",
-                "Use to inspect an image file inside the configured host scope. Relative paths resolve against request cwd (default: scopeRoot). Parent (..) components are rejected lexically; use an absolute in-scope path instead of parent traversal.",
+                "Use to inspect an image file on the host. Absolute host paths are accepted; relative paths resolve against request cwd, which defaults to defaultCwd.",
                 true,
                 false,
                 false,
@@ -129,7 +129,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for one known bounded deterministic command, including a shell command that composes several related read-only repository/tool queries into one result. This is the App Server command/exec path, not a separate executor. Non-interactive, with a 60-second default process timeout (60-minute maximum) and 64 KiB per-stream default output cap (256 KiB maximum). timeoutMs is not an end-to-end API latency ceiling because final App Server response delivery gets a finite allowance. stdoutMayBeTruncated/stderrMayBeTruncated conservatively report when the returned byte count exactly reached outputBytesCap; the upstream buffered response does not prove whether additional bytes existed. durationMs is Connect-observed App Server request wall time. Omit sandboxPolicy to inherit App Server policy. For long-running or interactive commands use command.start; for delegated autonomous investigation/coding use codex.start.",
+                "Use for one known bounded deterministic host command, including a shell command that composes several related repository/tool queries into one result. This is the App Server command/exec path, not a separate executor; Codex Connect's dedicated App Server is launched with danger-full-access for the primary operator plane. Non-interactive, with a 60-second default process timeout (60-minute maximum) and 64 KiB per-stream default output cap (256 KiB maximum). timeoutMs is not an end-to-end API latency ceiling because final App Server response delivery gets a finite allowance. stdoutMayBeTruncated/stderrMayBeTruncated conservatively report when the returned byte count exactly reached outputBytesCap; the upstream buffered response does not prove whether additional bytes existed. durationMs is Connect-observed App Server request wall time. For long-running or interactive commands use command.start; for delegated autonomous investigation/coding use codex.start.",
                 false,
                 true,
                 true,
@@ -163,7 +163,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Start delegated Codex work or an official Codex review. Use mode=work only when autonomous reasoning or iteration materially improves the critical path or quality; Codex workers do not inherit the ChatGPT conversation, so task must be self-contained with relevant context, constraints, paths, decisions, and acceptance criteria. Work mode requires an explicit sandboxPolicy. Use mode=review for the official review/start lifecycle. Follow with codex.wait.",
+                "Start delegated Codex work or an official Codex review. Use mode=work only when autonomous reasoning or iteration materially improves the critical path or quality; Codex workers do not inherit the ChatGPT conversation, so task must be self-contained with relevant context, constraints, paths, decisions, and acceptance criteria. Work mode requires an explicit sandboxPolicy selected per task. New review threads are read-only and may select a model; existing review threads keep their established settings. Use mode=review for the official review/start lifecycle. Follow with codex.wait.",
                 false,
                 true,
                 true,
@@ -373,10 +373,13 @@ fn status_schema() -> Value {
                 "controlPlane":{"const":"codex-connect"},
                 "codexAccess":{"const":"mcp"},
                 "workerContext":{"const":"isolated"},
+                "hostAccess":{"const":"dangerFullAccess"},
+                "codexPolicy":{"const":"perCall"},
+                "reviewPolicy":{"const":"readOnlyNewThread"},
                 "commandDefaultTimeoutMs":{"type":"integer","minimum":1},
                 "commandMaxTimeoutMs":{"type":"integer","minimum":1}
-            }), &["controlPlane","codexAccess","workerContext","commandDefaultTimeoutMs","commandMaxTimeoutMs"]),
-            "scopeRoot":{"type":"string"},
+            }), &["controlPlane","codexAccess","workerContext","hostAccess","codexPolicy","reviewPolicy","commandDefaultTimeoutMs","commandMaxTimeoutMs"]),
+            "defaultCwd":{"type":"string"},
             "endpoint":{"type":"string"},
             "buildId":{"type":"string"},
             "binarySha256":{"type":"string"},
@@ -411,7 +414,7 @@ fn status_schema() -> Value {
         &[
             "healthy",
             "operatorContract",
-            "scopeRoot",
+            "defaultCwd",
             "endpoint",
             "buildId",
             "binarySha256",
@@ -455,7 +458,7 @@ fn inspect_schema() -> Value {
     )
 }
 fn cwd_schema() -> Value {
-    json!({"type":["string","null"],"description":"Request working directory within scopeRoot. Relative cwd is resolved from scopeRoot; omitted or null cwd selects scopeRoot. Relative operation paths resolve from cwd, with no alternate-root retries. Parent (..) components are rejected lexically even when normalization would remain inside scopeRoot; use an absolute in-scope path when that traversal is intentional."})
+    json!({"type":["string","null"],"description":"Request working directory on the host. Absolute paths are accepted. Relative cwd is resolved from defaultCwd; omitted or null cwd selects defaultCwd. Relative operation paths resolve from the selected cwd."})
 }
 fn network_access_schema() -> Value {
     json!({"type":"boolean","default":false,"description":"Network access for an explicitly supplied sandbox policy. false may block sockets, including socket-based localhost tests. true enables broader network access, not only loopback. No automatic escalation or retry."})
@@ -464,7 +467,7 @@ fn workspace_write_policy_schema() -> Value {
     object_schema(
         json!({
             "type":{"const":"workspaceWrite"},
-            "writableRoots":{"type":"array","description":"Additional absolute writable directory paths within scopeRoot, as required by the pinned upstream contract. They are not an exclusive allowlist and do not narrow App Server's base workspace. Codex Connect launches its dedicated App Server with scopeRoot as its working directory, so workspaceWrite leaves scopeRoot writable even when this list is empty; request cwd only selects the process working directory and does not narrow write authority.","items":{"type":"string","pattern":"^/"}},
+            "writableRoots":{"type":"array","description":"Additional absolute writable directory paths for the delegated Codex workspace-write policy, as required by the pinned upstream contract. They are not an exclusive allowlist. The requested task sandbox remains explicit even though the primary host-operator plane runs with danger-full-access.","items":{"type":"string","pattern":"^/"}},
             "networkAccess":network_access_schema(),
             "excludeSlashTmp":{"type":"boolean"},
             "excludeTmpdirEnvVar":{"type":"boolean"}
@@ -475,9 +478,6 @@ fn workspace_write_policy_schema() -> Value {
 fn danger_full_access_schema() -> Value {
     object_schema(json!({"type":{"const":"dangerFullAccess"}}), &["type"])
 }
-fn host_sandbox_schema() -> Value {
-    json!({"oneOf":[workspace_write_policy_schema(),danger_full_access_schema()]})
-}
 fn work_sandbox_schema() -> Value {
     json!({"oneOf":[
         object_schema(json!({"type":{"const":"readOnly"},"networkAccess":network_access_schema()}), &["type"]),
@@ -487,7 +487,7 @@ fn work_sandbox_schema() -> Value {
 }
 fn command_schema() -> Value {
     object_schema(
-        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Process execution timeout in milliseconds. App Server enforces the process timeout; the MCP call may complete later while the final response is delivered."},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Per-stream stdout/stderr capture cap in bytes. The pinned App Server buffered response has no truncation flag; if a returned stream is exactly this many bytes, treat it as potentially incomplete."},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},"sandboxPolicy":host_sandbox_schema()}),
+        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Process execution timeout in milliseconds. App Server enforces the process timeout; the MCP call may complete later while the final response is delivered."},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Per-stream stdout/stderr capture cap in bytes. The pinned App Server buffered response has no truncation flag; if a returned stream is exactly this many bytes, treat it as potentially incomplete."},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}}}),
         &["command"],
     )
 }
@@ -506,7 +506,6 @@ fn command_start_schema() -> Value {
             "command":{"type":"array","minItems":1,"items":{"type":"string"}},
             "cwd":{"type":["string","null"]},
             "env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},
-            "sandboxPolicy":host_sandbox_schema(),
             "tty":{"type":"boolean","default":false},
             "size":nullable(terminal_size_schema())
         }),
@@ -624,7 +623,8 @@ fn codex_start_schema() -> Value {
                 "mode":{"const":"review"},
                 "cwd":{"type":"string"},
                 "threadId":{"type":"string"},
-                "target":review_target_schema()
+                "target":review_target_schema(),
+                "model":{"type":"string"}
             }),
             &["mode","target"],
         )
@@ -878,47 +878,15 @@ mod tests {
                 .contains("potentially incomplete")
         );
         assert_eq!(schema["additionalProperties"], false);
-        let host_sandbox = host_sandbox_schema();
-        let host_variants = host_sandbox["oneOf"].as_array().unwrap();
-        assert_eq!(host_variants.len(), 2);
-        assert!(!host_sandbox.to_string().contains("readOnly"));
-        assert!(host_sandbox.to_string().contains("workspaceWrite"));
-        assert!(host_sandbox.to_string().contains("dangerFullAccess"));
-        let network = &host_variants[0]["properties"]["networkAccess"];
-        assert_eq!(network["default"], false);
-        let description = network["description"].as_str().unwrap();
-        assert!(description.contains("localhost"));
-        assert!(description.contains("broader network access"));
-        assert!(!host_sandbox.to_string().contains("allowLoopback"));
-        assert_eq!(
-            host_variants[0]["properties"]["writableRoots"]["items"]["pattern"],
-            "^/"
-        );
-        let writable_roots_description =
-            host_variants[0]["properties"]["writableRoots"]["description"]
-                .as_str()
-                .unwrap();
-        assert!(writable_roots_description.contains("not an exclusive allowlist"));
-        assert!(writable_roots_description.contains("scopeRoot writable"));
-        assert!(writable_roots_description.contains("does not narrow write authority"));
-        assert_eq!(
-            host_variants[1]["properties"],
-            json!({"type":{"const":"dangerFullAccess"}})
-        );
-        assert_eq!(
-            command_schema()["properties"]["sandboxPolicy"],
-            host_sandbox
-        );
-        assert_eq!(
-            command_start_schema()["properties"]["sandboxPolicy"],
-            host_sandbox_schema()
+        assert!(
+            command_schema()["properties"]
+                .get("sandboxPolicy")
+                .is_none()
         );
         assert!(
-            !command_schema()["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "sandboxPolicy")
+            command_start_schema()["properties"]
+                .get("sandboxPolicy")
+                .is_none()
         );
         let start = codex_start_schema();
         let work = &start["oneOf"][0];
@@ -937,6 +905,9 @@ mod tests {
                 .any(|value| value == "sandboxPolicy")
         );
         assert!(review["properties"].get("sandboxPolicy").is_none());
+        assert!(review["properties"].get("effort").is_none());
+        assert!(review["properties"].get("serviceTier").is_none());
+        assert_eq!(review["properties"]["model"]["type"], "string");
     }
 
     #[test]

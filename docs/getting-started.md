@@ -10,7 +10,7 @@ The target success condition is simple:
 
 Codex Connect's managed setup currently targets **Linux with systemd user services**. The underlying Codex CLI and Secure MCP Tunnel support additional platforms, but `codex-connect setup` uses a systemd user service today.
 
-The pre-release installation layout is intentionally opinionated: `~/projects` is the default host scope, and the managed operator symlink/build store live under `~/projects/.local`. Configuration and deployment state default to `~/projects/.config` and `~/projects/.local/state` respectively, while honoring explicit `XDG_CONFIG_HOME` / `XDG_STATE_HOME`. You can change the configured host scope after setup; doing so does not relocate the managed operator/build store.
+The pre-release installation layout is intentionally opinionated: `~/projects` is the default workspace/cwd, and the managed operator symlink/build store live under `~/projects/.local`. Configuration and deployment state default to `~/projects/.config` and `~/projects/.local/state` respectively, while honoring explicit `XDG_CONFIG_HOME` / `XDG_STATE_HOME`. You can change the configured default workspace after setup; it is a navigation/startup default rather than a filesystem authorization boundary, and changing it does not relocate the managed operator/build store.
 
 ### ChatGPT plan scope
 
@@ -250,7 +250,7 @@ A working installation should return live data from `status`, including an avail
 Then test the useful boundary, not just connectivity:
 
 ```text
-@codexConnect show the configured host scope, create a disposable project under it,
+@codexConnect show the configured default workspace, create a disposable project under it,
 write a small file, read it back, and start a disposable Codex thread in that project.
 ```
 

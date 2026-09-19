@@ -98,6 +98,15 @@ class OperatorProtocolTests(unittest.TestCase):
             "timeoutMs": timeout, **arguments,
         })
 
+    def method_params(self, method):
+        return [
+            entry["params"]
+            for entry in (
+                json.loads(line) for line in self.coverage_path.read_text().splitlines()
+            )
+            if entry["kind"] == "method" and entry["name"] == method and "params" in entry
+        ]
+
     def test_catalog_and_status_are_canonical(self):
         self.assertEqual(len(self.client.catalog), 13)
         self.assertEqual(set(self.client.tools), EXPECTED)
@@ -114,13 +123,18 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(resize["rows"]["minimum"], 1)
         self.assertEqual(resize["cols"]["minimum"], 1)
         work_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][0]
+        review_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][1]
         self.assertIn("sandboxPolicy", work_start["required"])
         self.assertIn('"readOnly"', json.dumps(work_start["properties"]["sandboxPolicy"]))
         for host_tool in ("command.exec", "command.start"):
-            sandbox = self.client.tools[host_tool]["inputSchema"]["properties"]["sandboxPolicy"]
-            self.assertNotIn('"readOnly"', json.dumps(sandbox))
-            self.assertIn('"workspaceWrite"', json.dumps(sandbox))
-            self.assertIn('"dangerFullAccess"', json.dumps(sandbox))
+            self.assertNotIn(
+                "sandboxPolicy",
+                self.client.tools[host_tool]["inputSchema"]["properties"],
+            )
+        self.assertIn("model", review_start["properties"])
+        self.assertNotIn("sandboxPolicy", review_start["properties"])
+        self.assertNotIn("effort", review_start["properties"])
+        self.assertNotIn("serviceTier", review_start["properties"])
         self.client.call(
             "codex.start",
             {"mode": "work", "task": "no_event"},
@@ -131,16 +145,20 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertTrue(status["healthy"])
         self.assertTrue(status["experimentalApi"])
         self.assertEqual(set(status), {
-            "healthy", "operatorContract", "scopeRoot", "endpoint", "buildId", "binarySha256",
+            "healthy", "operatorContract", "defaultCwd", "endpoint", "buildId", "binarySha256",
             "executable", "appServerTransport", "experimentalApi", "codex", "appServer",
         })
         self.assertEqual(status["operatorContract"], {
             "controlPlane": "codex-connect",
             "codexAccess": "mcp",
             "workerContext": "isolated",
+            "hostAccess": "dangerFullAccess",
+            "codexPolicy": "perCall",
+            "reviewPolicy": "readOnlyNewThread",
             "commandDefaultTimeoutMs": 60000,
             "commandMaxTimeoutMs": 60 * 60 * 1000,
         })
+        self.assertEqual(status["defaultCwd"], str(self.scope))
         self.assertEqual(set(status["codex"]), {
             "binary", "release", "home", "homeSource", "globalConfig",
         })
@@ -153,6 +171,7 @@ class OperatorProtocolTests(unittest.TestCase):
         })
         self.assertEqual(status["appServer"]["transport"], "stdio")
         self.assertTrue(status["appServer"]["experimentalApi"])
+        self.assertIn('sandbox_mode="danger-full-access"', status["appServer"]["launchOverrides"])
         self.assertEqual(status["appServerTransport"], status["appServer"]["transport"])
         with urllib.request.urlopen(self.url + "/status") as response:
             self.assertEqual(status, json.load(response))
@@ -161,18 +180,18 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(observer["status"], status)
         projection = observer["projection"]
         self.assertEqual(set(projection), {
-            "workerAvailable", "scopeRoot", "usage", "usageRefreshMs", "activeTurns",
+            "workerAvailable", "defaultCwd", "usage", "usageRefreshMs", "activeTurns",
             "pendingActions", "cursor", "historyLost", "events",
         })
         self.assertTrue(projection["workerAvailable"])
-        self.assertEqual(projection["scopeRoot"], str(self.scope))
+        self.assertEqual(projection["defaultCwd"], str(self.scope))
         self.assertEqual(projection["usageRefreshMs"], 5000)
         self.assertIn("rateLimits", projection["usage"])
         with self.assertRaises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(self.url + "/scope-info")
         self.assertEqual(error.exception.code, 404)
 
-    def test_inspection_uses_advertised_camel_case_and_scope(self):
+    def test_inspection_uses_default_cwd_and_accepts_absolute_host_paths(self):
         result = self.client.call("inspect", {"operations": [
             {"type": "readText", "path": "sample.txt", "startLine": 2, "endLine": 2},
             {"type": "searchContent", "query": "two", "maxResults": 1},
@@ -222,16 +241,17 @@ class OperatorProtocolTests(unittest.TestCase):
             {"type":"readText","path":"sample.txt","startLine":3,"endLine":3},
         ]})
         self.assertEqual(partial["results"][0]["index"], 0)
-        self.assertIn("outside the configured scope root", partial["results"][0]["error"])
+        self.assertIn("root:", partial["results"][0]["result"]["text"])
         self.assertEqual(partial["results"][1]["index"], 1)
         self.assertEqual(partial["results"][1]["result"]["text"], "three")
         escaped_fuzzy = self.client.call("inspect", {"operations": [
-            {"type":"fuzzyFileSearch","query":"etc","path":"/etc"},
+            {"type":"fuzzyFileSearch","query":"passwd","path":"/etc"},
         ]})
-        self.assertIn("outside the configured scope root", escaped_fuzzy["results"][0]["error"])
-        self.client.call("inspect", {
+        self.assertEqual(escaped_fuzzy["results"][0]["result"]["files"][0]["root"], "/etc")
+        outside_cwd = self.client.call("inspect", {
             "cwd":"/etc", "operations":[{"type":"readDirectory","path":"."}],
-        }, error=True)
+        })
+        self.assertIn("passwd", {entry["fileName"] for entry in outside_cwd["results"][0]["result"]["entries"]})
 
     def test_request_cwd_applies_consistently_to_paths_patch_and_image(self):
         cwd = str(self.project)
@@ -240,28 +260,29 @@ class OperatorProtocolTests(unittest.TestCase):
             {"type":"searchContent","query":"project-local"},
         ]})
         self.assertEqual(inspected["results"][0]["result"]["text"], "project-local")
-        self.assertEqual(inspected["results"][1]["result"]["matches"][0]["path"], "project/local.txt")
+        self.assertEqual(inspected["results"][1]["result"]["matches"][0]["path"], "local.txt")
         self.client.call("apply_patch", {
             "cwd":cwd,
             "patch":"*** Begin Patch\n*** Add File: patch.txt\n+created\n*** End Patch",
         })
         self.assertEqual((self.project / "patch.txt").read_text(), "created\n")
         before_image_reads = sum(
-            json.loads(line) == {"kind": "method", "name": "fs/readFile"}
+            (entry := json.loads(line))["kind"] == "method" and entry["name"] == "fs/readFile"
             for line in self.coverage_path.read_text().splitlines()
         )
         image = self.client.call("view_image", {"cwd":cwd,"path":"pixel.png"})
         self.assertEqual(image["path"], "project/pixel.png")
         self.assertEqual(image["mimeType"], "image/png")
         after_image_reads = sum(
-            json.loads(line) == {"kind": "method", "name": "fs/readFile"}
+            (entry := json.loads(line))["kind"] == "method" and entry["name"] == "fs/readFile"
             for line in self.coverage_path.read_text().splitlines()
         )
         self.assertEqual(after_image_reads, before_image_reads + 1)
         self.client.call("apply_patch", {
             "cwd":cwd,
-            "patch":"*** Begin Patch\n*** Add File: ../escape.txt\n+nope\n*** End Patch",
-        }, error=True)
+            "patch":"*** Begin Patch\n*** Add File: ../escape.txt\n+outside-cwd\n*** End Patch",
+        })
+        self.assertEqual((self.scope / "escape.txt").read_text(), "outside-cwd\n")
 
     def test_command_boundaries(self):
         schema = self.client.tools["command.exec"]["inputSchema"]["properties"]
@@ -282,10 +303,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(self.client.call("command.exec", {
             "command":["echo","fixture"], "timeoutMs":3600000,
         })["exitCode"], 0)
-        absolute_root = str(self.project)
         self.assertEqual(self.client.call("command.exec", {
-            "command":["echo","fixture"],
-            "sandboxPolicy":{"type":"workspaceWrite","writableRoots":[absolute_root],"networkAccess":False},
+            "command":["echo","fixture"], "cwd":"/etc",
         })["exitCode"], 0)
         for arguments in [
             {"command":[]}, {"command":["echo"],"tty":True},
@@ -294,14 +313,12 @@ class OperatorProtocolTests(unittest.TestCase):
             {"command":["echo"],"timeoutMs":3600001},
             {"command":["echo"],"sandboxPolicy":{"type":"externalSandbox"}},
             {"command":["echo"],"sandboxPolicy":{"type":"workspaceWrite","writableRoots":["project"]}},
-            {"command":["echo"],"cwd":"/etc"},
         ]:
             self.client.call("command.exec",arguments,error=True,validate_input=False)
 
-    def test_persistent_nonpty_streaming_and_sandbox(self):
+    def test_persistent_nonpty_streaming_and_host_context(self):
         started = self.client.call("command.start", {
             "command": ["fixture-stream"],
-            "sandboxPolicy": {"type": "workspaceWrite", "writableRoots": [str(self.project)], "networkAccess": False},
         })
         self.assertEqual(started["state"], "running")
         self.assertFalse(started["tty"])
@@ -693,6 +710,72 @@ class OperatorProtocolTests(unittest.TestCase):
             error=True,
             validate_input=False,
         )
+
+    def test_new_thread_policy_projection_and_review_model_routing(self):
+        for policy, expected_mode in [
+            ({"type": "readOnly", "networkAccess": False}, "read-only"),
+            ({"type": "workspaceWrite", "networkAccess": True}, "workspace-write"),
+            ({"type": "dangerFullAccess"}, "danger-full-access"),
+        ]:
+            with self.subTest(policy=policy["type"]):
+                before = len(self.method_params("thread/start"))
+                work = self.start("complete", sandboxPolicy=policy)
+                self.assertEqual(self.wait(work)["state"], "terminal")
+                thread_start = self.method_params("thread/start")[before]
+                self.assertEqual(thread_start["sandbox"], expected_mode)
+                turn_start = self.method_params("turn/start")[-1]
+                self.assertEqual(turn_start["sandboxPolicy"]["type"], policy["type"])
+                if "networkAccess" in policy:
+                    self.assertEqual(
+                        turn_start["sandboxPolicy"]["networkAccess"],
+                        policy["networkAccess"],
+                    )
+
+        source = self.start("complete")
+        self.assertEqual(self.wait(source)["state"], "terminal")
+        resume_count = len(self.method_params("thread/resume"))
+        resumed = self.start(
+            "complete",
+            threadId=source["threadId"],
+            sandboxPolicy={"type": "dangerFullAccess"},
+        )
+        self.assertEqual(self.wait(resumed)["state"], "terminal")
+        self.assertEqual(len(self.method_params("thread/resume")), resume_count + 1)
+        self.assertNotIn("sandbox", self.method_params("thread/resume")[-1])
+
+        before_threads = len(self.method_params("thread/start"))
+        before_reviews = len(self.method_params("review/start"))
+        review = self.client.call("codex.start", {
+            "mode": "review",
+            "model": "gpt-6-astra",
+            "target": {"type": "uncommittedChanges"},
+        })
+        self.assertTrue(review["createdThread"])
+        self.assertEqual(self.wait(review)["state"], "terminal")
+        review_thread_start = self.method_params("thread/start")[before_threads]
+        self.assertEqual(review_thread_start["model"], "gpt-6-astra")
+        self.assertEqual(review_thread_start["sandbox"], "read-only")
+        review_start = self.method_params("review/start")[before_reviews]
+        self.assertEqual(set(review_start), {"threadId", "target", "delivery"})
+
+        before_threads = len(self.method_params("thread/start"))
+        model_less = self.client.call("codex.start", {
+            "mode": "review",
+            "target": {"type": "uncommittedChanges"},
+        })
+        self.assertEqual(self.wait(model_less)["state"], "terminal")
+        model_less_start = self.method_params("thread/start")[before_threads]
+        self.assertNotIn("model", model_less_start)
+        self.assertEqual(model_less_start["sandbox"], "read-only")
+
+        resumes_before_rejection = len(self.method_params("thread/resume"))
+        self.client.call("codex.start", {
+            "mode": "review",
+            "threadId": source["threadId"],
+            "model": "gpt-6-astra",
+            "target": {"type": "uncommittedChanges"},
+        }, error=True)
+        self.assertEqual(len(self.method_params("thread/resume")), resumes_before_rejection)
 
     def test_wait_tracks_review_turn_before_thread_history_catches_up(self):
         source = self.start("complete")

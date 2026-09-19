@@ -18,6 +18,15 @@ if "--version" in sys.argv:
     print(f"codex-cli {CONTRACT['codexPin']}")
     raise SystemExit
 
+assert sys.argv[1:] == [
+    "app-server",
+    "-c", 'sandbox_mode="danger-full-access"',
+    "-c", "features.default_mode_request_user_input=true",
+    "-c", "features.request_permissions_tool=true",
+    "-c", "features.exec_permission_approvals=true",
+    "--listen", "stdio://",
+]
+
 
 def resolve(schema):
     while "$ref" in schema:
@@ -66,12 +75,15 @@ handshake = False
 coverage_file = os.environ.get("CODEX_CONNECT_FAKE_COVERAGE_FILE")
 
 
-def record_coverage(kind, name):
+def record_coverage(kind, name, params=None):
     if not coverage_file:
         return
+    entry = {"kind": kind, "name": name}
+    if params is not None:
+        entry["params"] = copy.deepcopy(params)
     with lock:
         with open(coverage_file, "a", encoding="utf-8") as output:
-            output.write(json.dumps({"kind": kind, "name": name}) + "\n")
+            output.write(json.dumps(entry) + "\n")
 
 
 def send(message):
@@ -173,7 +185,7 @@ for line in sys.stdin:
         initialized = True
         continue
     validate(params, CONTRACT["methods"][method]["inputSchema"])
-    record_coverage("method", method)
+    record_coverage("method", method, params)
     result = sample(CONTRACT["methods"][method]["outputSchema"])
     if method == "initialize":
         assert not handshake
@@ -414,7 +426,12 @@ for line in sys.stdin:
         )
     elif method == "fuzzyFileSearch":
         root = pathlib.Path(params["roots"][0])
-        relative = "escape/external_secret.txt" if params["query"] == "external" else "sample.txt"
+        if params["query"] == "external":
+            relative = "escape/external_secret.txt"
+        elif params["query"] == "passwd" and root == pathlib.Path("/etc"):
+            relative = "passwd"
+        else:
+            relative = "sample.txt"
         candidate = root / relative
         result["files"] = [{
             "root": str(root),

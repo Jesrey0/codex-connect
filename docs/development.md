@@ -102,7 +102,7 @@ When adding event handling:
 
 Server-request response shapes must come from the pinned generated schemas. Public responders should normalize only the operator decision and translate it to the official shape. Never reintroduce a generic `result: any` public responder.
 
-`experimentalApi` is enabled because Codex Connect intentionally supports `item/tool/requestUserInput`. The dedicated App Server launch also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` flags. Initialize deliberately advertises no form/elicitation extension because the minimized public MCP surface has no elicitation response operation; unexpected elicitation requests are still parsed and surfaced fail-closed. These are explicit integration requirements, not blanket permission to expose unrelated experimental methods.
+`experimentalApi` is enabled because Codex Connect intentionally supports `item/tool/requestUserInput`. The dedicated App Server launch sets the host-plane `sandbox_mode="danger-full-access"` override and enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` flags. Initialize deliberately advertises no form/elicitation extension because the minimized public MCP surface has no elicitation response operation; unexpected elicitation requests are still parsed and surfaced fail-closed. These are explicit integration requirements, not blanket permission to expose unrelated experimental methods.
 
 ## App Server reuse gate
 
@@ -116,11 +116,11 @@ A bridge needs an explicit architectural justification and should be reconsidere
 
 ## Tool-selection calibration
 
-### Sandbox ownership invariant
+### Authority ownership invariant
 
-Host `command.exec` / `command.start` must preserve an omitted `sandboxPolicy` all the way to App Server. **Absence is semantic:** Codex Connect sends no synthetic policy, so App Server uses the effective upstream Codex configuration from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Do not replace omission with an equivalent-looking `workspaceWrite` object, because doing so would duplicate upstream defaults and create configuration drift.
+Host `command.exec` / `command.start` expose no `sandboxPolicy`. Codex Connect owns one process-local App Server launch override, `sandbox_mode="danger-full-access"`, for the deterministic primary-operator plane. Host paths are not fenced to the configured default workspace; that directory is only the base for relative paths. Do not move this host-plane authority into `~/.codex/config.toml`, because the user-global Codex configuration must remain generic.
 
-Host command schemas intentionally expose only `workspaceWrite` and `dangerFullAccess`; read-only host exploration belongs in `inspect`, and hand-crafted `readOnly` host-command requests are rejected server-side. `codex.start(mode=work)` has the opposite contract: it must reject sandbox omission and still expose `readOnly`, `workspaceWrite`, and `dangerFullAccess`, always sending the operator-supplied `sandboxPolicy` on `turn/start`. Do not add Codex Connect configuration fields for `sandbox_mode` or `sandbox_workspace_write.network_access`.
+`codex.start(mode=work)` has the opposite contract: it must reject sandbox omission and expose `readOnly`, `workspaceWrite`, and `dangerFullAccess`, always sending the operator-supplied exact `sandboxPolicy` on `turn/start`. On a new work thread, also project the corresponding coarse sandbox mode on `thread/start` so initialization cannot inherit the host-plane default. New `mode=review` threads are explicitly read-only; an optional review `model` is carried by `thread/start.model`, while `review/start` remains byte-for-byte upstream. A supplied `threadId` must not silently mutate model or sandbox state.
 
 Codex Connect is the primary control plane for ChatGPT. When a Codex semantic operation is public under `codex.*`, do not invoke the Codex CLI through host command tools as an alternate control plane. Delegated Codex workers do not inherit the calling ChatGPT conversation; every work task must therefore be self-contained. Prefer direct inspection, deterministic commands, and exact patches when they are sufficient, and delegate only when autonomous iteration or parallel reasoning materially improves the critical path or quality.
 

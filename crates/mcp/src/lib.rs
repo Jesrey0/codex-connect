@@ -1,4 +1,4 @@
-//! ChatGPT-native MCP surface over Codex App Server and a fenced host scope.
+//! ChatGPT-native MCP surface over Codex App Server and the operator host.
 
 mod catalog;
 use catalog::tool_catalog;
@@ -30,7 +30,7 @@ use tokio::net::TcpListener;
 const DEFAULT_WAIT_MS: u64 = 60_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Use this MCP surface for host workspace operations and use codex.* for Codex threads, turns, reviews, discovery, usage, approvals, permissions, and user input; do not invoke the Codex CLI through host command tools as an alternate control plane when the semantic operation is available here. Treat the configured host scope as a general filesystem workspace: version control is optional and must not be assumed. Prefer inspect for batched read-only exploration, command.exec for bounded deterministic host commands, command.start/read/control for persistent or interactive deterministic commands, and apply_patch for exact known text edits. Use codex.start followed by codex.wait only when delegated autonomous reasoning or iteration materially improves the critical path or quality; delegation is an optimization, not the default. Codex workers do not inherit the ChatGPT conversation, so every delegated task must include its own relevant context, constraints, paths, decisions, and acceptance criteria. Minimize unnecessary Codex turns and discovery calls because model usage is constrained; batch independent discovery with codex.info. Preserve ownership boundaries: Codex CLI/App Server and tunnel-client are independently owned upstream dependencies, and Codex Connect must not install, relocate, duplicate, upgrade, delete, or supervise their owned state. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect scopes, batches, and projects those capabilities rather than reimplementing them.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Deterministic host tools operate with the host user's authority through a dedicated App Server launched in danger-full-access; defaultCwd is only the navigation base for relative paths, not an authorization fence. Use codex.* for Codex threads, turns, reviews, discovery, usage, approvals, permissions, and user input; do not invoke the Codex CLI through host command tools as an alternate control plane when the semantic operation is available here. Prefer inspect for batched read-only host exploration, command.exec for bounded deterministic host commands, command.start/read/control for persistent or interactive deterministic commands, and apply_patch for exact known text edits. Delegated codex.start(mode=work) always requires an explicit per-task sandboxPolicy. New official review threads are read-only and may select a model; resumed threads keep their established settings. Use codex.start followed by codex.wait only when delegated autonomous reasoning or iteration materially improves the critical path or quality; delegation is an optimization, not the default. Codex workers do not inherit the ChatGPT conversation, so every delegated task must include its own relevant context, constraints, paths, decisions, and acceptance criteria. Minimize unnecessary Codex turns and discovery calls because model usage is constrained; batch independent discovery with codex.info. Preserve ownership boundaries: Codex CLI/App Server and tunnel-client are independently owned upstream dependencies, and Codex Connect must not install, relocate, duplicate, upgrade, delete, or supervise their owned state. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect projects those capabilities without inventing a second execution model.";
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +54,9 @@ pub struct OperatorContract {
     pub control_plane: String,
     pub codex_access: String,
     pub worker_context: String,
+    pub host_access: String,
+    pub codex_policy: String,
+    pub review_policy: String,
     pub command_default_timeout_ms: u64,
     pub command_max_timeout_ms: u64,
 }
@@ -98,10 +101,19 @@ struct CommandStartArgs {
     command: Vec<String>,
     cwd: Option<String>,
     env: Option<std::collections::BTreeMap<String, Option<String>>>,
-    sandbox_policy: Option<SandboxPolicy>,
     #[serde(default)]
     tty: bool,
     size: Option<CommandExecTerminalSize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostCommandExecArgs {
+    command: Vec<String>,
+    timeout_ms: Option<u64>,
+    output_bytes_cap: Option<usize>,
+    cwd: Option<String>,
+    env: Option<std::collections::BTreeMap<String, Option<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -116,15 +128,6 @@ struct CommandReadArgs {
 
 fn default_command_read_ms() -> u64 {
     codex_connect_relay::DEFAULT_COMMAND_READ_MS
-}
-
-fn validate_host_sandbox(policy: Option<&SandboxPolicy>) -> anyhow::Result<()> {
-    if matches!(policy, Some(SandboxPolicy::ReadOnly { .. })) {
-        anyhow::bail!(
-            "readOnly is not a public host-command policy; omit sandboxPolicy to inherit upstream configuration or use workspaceWrite/dangerFullAccess"
-        );
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -218,7 +221,7 @@ struct McpHandler {
 pub struct OperatorStatus {
     pub healthy: bool,
     pub operator_contract: OperatorContract,
-    pub scope_root: String,
+    pub default_cwd: String,
     pub endpoint: String,
     pub build_id: String,
     pub binary_sha256: String,
@@ -237,10 +240,13 @@ impl OperatorStatus {
                 control_plane: "codex-connect".into(),
                 codex_access: "mcp".into(),
                 worker_context: "isolated".into(),
+                host_access: "dangerFullAccess".into(),
+                codex_policy: "perCall".into(),
+                review_policy: "readOnlyNewThread".into(),
                 command_default_timeout_ms: codex_connect_relay::DEFAULT_COMMAND_MS,
                 command_max_timeout_ms: codex_connect_relay::MAX_COMMAND_MS,
             },
-            scope_root: relay.scope_root(),
+            default_cwd: relay.default_cwd(),
             endpoint: runtime.endpoint.clone(),
             build_id: runtime.build_id.clone(),
             binary_sha256: runtime.binary_sha256.clone(),
@@ -396,6 +402,7 @@ enum CodexStartArgs {
         cwd: Option<String>,
         thread_id: Option<String>,
         target: ReviewTarget,
+        model: Option<String>,
     },
 }
 
@@ -502,19 +509,24 @@ async fn dispatch(
             Ok(json!({"applied": scope.apply_patch(&args.patch, args.cwd.as_deref())?}))
         }
         "command.exec" => {
-            let a: CommandExec = parse(arguments)?;
-            validate_host_sandbox(a.sandbox_policy.as_ref())?;
+            let a: HostCommandExecArgs = parse(arguments)?;
             relay
-                .command_exec(a)
+                .command_exec(CommandExec {
+                    command: a.command,
+                    timeout_ms: a.timeout_ms,
+                    output_bytes_cap: a.output_bytes_cap,
+                    cwd: a.cwd,
+                    env: a.env,
+                    sandbox_policy: None,
+                })
                 .await
                 .map(|v| serde_json::to_value(v).unwrap())
                 .map_err(Into::into)
         }
         "command.start" => {
             let a: CommandStartArgs = parse(arguments)?;
-            validate_host_sandbox(a.sandbox_policy.as_ref())?;
             relay
-                .command_start(a.command, a.cwd, a.env, a.sandbox_policy, a.tty, a.size)
+                .command_start(a.command, a.cwd, a.env, a.tty, a.size)
                 .await
                 .map_err(Into::into)
         }
@@ -574,8 +586,9 @@ async fn dispatch(
                 cwd,
                 thread_id,
                 target,
+                model,
             } => relay
-                .review(cwd, thread_id, target)
+                .review(cwd, thread_id, target, model)
                 .await
                 .map_err(Into::into),
         },
@@ -719,6 +732,7 @@ async fn inspect(
                 } => serde_json::to_value(scope.search_with_cancel(
                     query,
                     Some(&path),
+                    Some(&cwd),
                     *max_results,
                     || context.ct.is_cancelled(),
                 )?),

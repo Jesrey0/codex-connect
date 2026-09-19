@@ -9,7 +9,7 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
-use codex_connect_app_server::APP_SERVER_FEATURE_OVERRIDES;
+use codex_connect_app_server::APP_SERVER_LAUNCH_OVERRIDES;
 use codex_connect_app_server::AppServerClient;
 use codex_connect_app_server::AppServerConfig;
 use codex_connect_app_server::DEFAULT_REQUEST_TIMEOUT;
@@ -30,7 +30,7 @@ use std::{env, fs};
 #[derive(Debug)]
 pub(crate) struct ServeConfig {
     pub(crate) codex_bin: PathBuf,
-    pub(crate) scope_root: PathBuf,
+    pub(crate) default_cwd: PathBuf,
     pub(crate) listen: std::net::SocketAddr,
 }
 
@@ -152,7 +152,7 @@ enum CommandName {
         #[arg(long, default_value = "codex")]
         codex_bin: PathBuf,
 
-        /// Durable host-scope root for file tools and official cwd fields.
+        /// Default working directory for relative host paths and App Server startup.
         #[arg(long, default_value = "~/projects")]
         scope_root: PathBuf,
 
@@ -215,7 +215,7 @@ async fn main() -> Result<()> {
         } => {
             serve_mcp(ServeConfig {
                 codex_bin,
-                scope_root,
+                default_cwd: scope_root,
                 listen,
             })
             .await
@@ -226,28 +226,29 @@ async fn main() -> Result<()> {
 async fn serve_mcp(config: ServeConfig) -> Result<()> {
     let ServeConfig {
         codex_bin,
-        scope_root,
+        default_cwd,
         listen,
     } = config;
     if !listen.ip().is_loopback() {
         anyhow::bail!("MCP must listen on loopback; found {listen}");
     }
-    let scope_root =
-        (if scope_root.to_string_lossy() == "~" || scope_root.to_string_lossy().starts_with("~/") {
-            config::expand_path(&scope_root.to_string_lossy())?
-        } else {
-            scope_root
-        })
-        .canonicalize()
-        .context("unable to access scope root")?;
+    let default_cwd = (if default_cwd.to_string_lossy() == "~"
+        || default_cwd.to_string_lossy().starts_with("~/")
+    {
+        config::expand_path(&default_cwd.to_string_lossy())?
+    } else {
+        default_cwd
+    })
+    .canonicalize()
+    .context("unable to access default cwd")?;
     let codex_binary = codex_bin.display().to_string();
     let relay = Relay::start(RelayConfig {
         codex_bin,
-        scope_root: scope_root.clone(),
+        default_cwd: default_cwd.clone(),
     })
     .await
     .context("unable to start Codex Connect relay")?;
-    let scope = Scope::open(&scope_root).context("unable to open host scope")?;
+    let scope = Scope::open(&default_cwd).context("unable to open default cwd")?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("unable to listen on {listen}"))?;
@@ -266,8 +267,8 @@ async fn serve_mcp(config: ServeConfig) -> Result<()> {
         codex_home: codex_home.display().to_string(),
         codex_home_source,
         codex_global_config,
-        app_server_working_directory: scope_root.display().to_string(),
-        app_server_launch_overrides: APP_SERVER_FEATURE_OVERRIDES
+        app_server_working_directory: default_cwd.display().to_string(),
+        app_server_launch_overrides: APP_SERVER_LAUNCH_OVERRIDES
             .iter()
             .map(|value| (*value).to_string())
             .collect(),
@@ -275,7 +276,7 @@ async fn serve_mcp(config: ServeConfig) -> Result<()> {
     let mut changes = relay.changes();
     let router = mcp_router(relay.clone(), scope, runtime);
     println!("Codex Connect MCP listening at http://{listen}/mcp");
-    println!("scope root: {}", scope_root.display());
+    println!("default cwd: {}", default_cwd.display());
     tokio::select! {
         result = serve_router(listener, router) => result,
         _ = async {

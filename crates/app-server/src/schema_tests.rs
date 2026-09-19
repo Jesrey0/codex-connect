@@ -7,6 +7,41 @@ fn artifact() -> Value {
 }
 
 #[test]
+fn thread_start_projects_model_and_coarse_sandbox_without_changing_review_start() {
+    assert_eq!(
+        serde_json::to_value(ThreadStart {
+            model: Some("gpt-6-astra".into()),
+            cwd: Some("/workspace".into()),
+            sandbox: Some(SandboxMode::ReadOnly),
+            service_name: Some("codex-connect".into()),
+            developer_instructions: Some("workspace policy".into()),
+            ..ThreadStart::default()
+        })
+        .unwrap(),
+        json!({
+            "model":"gpt-6-astra",
+            "cwd":"/workspace",
+            "sandbox":"read-only",
+            "serviceName":"codex-connect",
+            "developerInstructions":"workspace policy"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(ReviewStart {
+            thread_id: "thread-1".into(),
+            target: ReviewTarget::UncommittedChanges,
+            delivery: "inline",
+        })
+        .unwrap(),
+        json!({
+            "threadId":"thread-1",
+            "target":{"type":"uncommittedChanges"},
+            "delivery":"inline"
+        })
+    );
+}
+
+#[test]
 fn turn_pagination_matches_the_pinned_wire_shape() {
     assert_eq!(
         serde_json::to_value(ThreadItemsList {

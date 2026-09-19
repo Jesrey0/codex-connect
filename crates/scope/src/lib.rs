@@ -1,4 +1,4 @@
-//! Durable host-scope policy and Connect-only search, image, and patch operations.
+//! Host path resolution plus Connect-only search, image, and patch operations.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -8,10 +8,12 @@ use image::imageops::FilterType;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Cursor;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -36,15 +38,15 @@ const SKIPPED_DIRECTORIES: &[&str] = &[
 
 #[derive(Debug, Error)]
 pub enum ScopeError {
-    #[error("path is outside the configured scope root")]
-    OutsideRoot,
-    #[error("scope path is not valid UTF-8 for App Server")]
+    #[error("the configured default cwd is not a directory")]
+    InvalidDefaultCwd,
+    #[error("host path is not valid UTF-8 for App Server")]
     NonUtf8Path,
-    #[error("scope operation failed: {0}")]
+    #[error("host operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("search query must not be empty")]
     EmptyQuery,
-    #[error("scope search was cancelled")]
+    #[error("host search was cancelled")]
     Cancelled,
     #[error("patch command failed: {0}")]
     PatchFailed(String),
@@ -56,10 +58,8 @@ pub enum ScopeError {
     InvalidImageDetail,
     #[error("image exceeds the {MAX_IMAGE_BYTES}-byte limit")]
     LargeImage,
-    #[error("scope mutations do not allow symbolic links: {0}")]
+    #[error("host mutations do not allow symbolic links: {0}")]
     SymlinkMutation(String),
-    #[error("the configured scope root cannot be mutated")]
-    RootMutation,
 }
 
 #[derive(Clone, Debug)]
@@ -92,13 +92,13 @@ pub struct ImageFile {
     pub base64_data: String,
 }
 
-/// The single durable host trust boundary. Projects are selected per operation
-/// by official Codex `cwd` fields or paths, never by mutable backend state.
+/// The configured root is only the default working directory for relative paths.
+/// Absolute paths are host paths governed by the OS and the caller's execution policy.
 impl Scope {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ScopeError> {
         let root = root.into().canonicalize()?;
         if !root.is_dir() {
-            return Err(ScopeError::OutsideRoot);
+            return Err(ScopeError::InvalidDefaultCwd);
         }
         Ok(Self { root })
     }
@@ -107,12 +107,12 @@ impl Scope {
         &self.root
     }
 
-    /// Resolve a request-local cwd; omission selects the authorization root.
+    /// Resolve a request-local cwd; omission selects the configured default cwd.
     pub fn resolve_cwd(&self, cwd: Option<&str>) -> Result<String, ScopeError> {
         self.resolve_app_server_directory(cwd.unwrap_or("."))
     }
 
-    /// Join against an already resolved cwd. The consumer must still fence the path.
+    /// Join against an already resolved cwd.
     pub fn path_from_cwd(cwd: &str, requested: &str) -> Result<String, ScopeError> {
         Path::new(cwd)
             .join(requested)
@@ -122,11 +122,7 @@ impl Scope {
     }
 
     pub fn resolve_app_server_existing(&self, requested: &str) -> Result<String, ScopeError> {
-        let candidate = self.resolve_rooted_path(requested, true)?;
-        let canonical = candidate.canonicalize()?;
-        if !canonical.starts_with(&self.root) {
-            return Err(ScopeError::OutsideRoot);
-        }
+        let canonical = self.resolve_existing(requested)?;
         canonical
             .to_str()
             .map(str::to_owned)
@@ -137,7 +133,7 @@ impl Scope {
         let candidate = self.resolve_app_server_existing(requested)?;
         if !Path::new(&candidate).is_dir() {
             return Err(ScopeError::PatchFailed(format!(
-                "scope path is not a directory: {requested}"
+                "host path is not a directory: {requested}"
             )));
         }
         Ok(candidate)
@@ -147,6 +143,7 @@ impl Scope {
         &self,
         query: &str,
         requested: Option<&str>,
+        result_base: Option<&str>,
         max_results: Option<usize>,
         is_cancelled: impl Fn() -> bool,
     ) -> Result<SearchResults, ScopeError> {
@@ -157,10 +154,15 @@ impl Scope {
             Some(path) => self.resolve_existing(path)?,
             None => self.root.clone(),
         };
+        let result_base = match result_base {
+            Some(path) => self.resolve_existing(path)?,
+            None => self.root.clone(),
+        };
         let max_results = max_results.unwrap_or(MAX_SEARCH_RESULTS).clamp(1, 1_000);
         let mut matches = Vec::new();
         search_tree(
-            &self.root,
+            &root,
+            &result_base,
             &root,
             query,
             max_results + 1,
@@ -179,7 +181,7 @@ impl Scope {
         requested: Option<&str>,
         max_results: Option<usize>,
     ) -> Result<SearchResults, ScopeError> {
-        self.search_with_cancel(query, requested, max_results, || false)
+        self.search_with_cancel(query, requested, None, max_results, || false)
     }
 
     pub fn image_from_bytes(
@@ -345,48 +347,42 @@ impl Scope {
     }
 
     fn apply_patch_plan(&self, plan: PatchPlan) -> Result<Vec<String>, ScopeError> {
-        let transaction = tempfile::Builder::new()
-            .prefix(".codex-connect-patch-")
-            .tempdir_in(&self.root)?;
-        let mut staged = Vec::with_capacity(plan.actions.len());
-        for (index, action) in plan.actions.iter().enumerate() {
-            let stage = match action {
-                PatchAction::Write { content, .. } => {
-                    let stage = transaction.path().join(format!("write-{index}"));
-                    fs::write(&stage, content)?;
-                    Some(stage)
-                }
-                PatchAction::Delete { .. } => None,
-            };
-            staged.push(stage);
-        }
-
         let mut completed = Vec::with_capacity(plan.actions.len());
         let mut created_directories = Vec::new();
         let result = (|| -> Result<(), ScopeError> {
-            for (index, action) in plan.actions.iter().enumerate() {
+            for action in &plan.actions {
                 let path = action.path();
                 match action {
-                    PatchAction::Write { .. } => {
-                        created_directories
-                            .extend(create_missing_parent_directories(&self.root, path)?);
+                    PatchAction::Write { content, .. } => {
+                        created_directories.extend(create_missing_parent_directories(path)?);
+                        let stage = StagedPatchFile::new(path, content)?;
                         let backup = if path.exists() {
-                            let backup = transaction.path().join(format!("backup-{index}"));
-                            fs::rename(path, &backup)?;
+                            let backup = reserve_patch_backup(path)?;
+                            if let Err(error) = fs::rename(path, &backup) {
+                                let _ = fs::remove_file(&backup);
+                                return Err(error.into());
+                            }
                             Some(backup)
                         } else {
                             None
                         };
-                        let stage = staged[index].as_ref().expect("write actions are staged");
-                        fs::rename(stage, path)?;
+                        if let Err(error) = stage.install(path) {
+                            if let Some(backup) = &backup {
+                                let _ = fs::rename(backup, path);
+                            }
+                            return Err(error.into());
+                        }
                         completed.push(CompletedPatchAction::Write {
                             path: path.to_path_buf(),
                             backup,
                         });
                     }
                     PatchAction::Delete { .. } => {
-                        let backup = transaction.path().join(format!("backup-{index}"));
-                        fs::rename(path, &backup)?;
+                        let backup = reserve_patch_backup(path)?;
+                        if let Err(error) = fs::rename(path, &backup) {
+                            let _ = fs::remove_file(&backup);
+                            return Err(error.into());
+                        }
                         completed.push(CompletedPatchAction::Delete {
                             path: path.to_path_buf(),
                             backup,
@@ -401,6 +397,7 @@ impl Scope {
             remove_created_directories(&created_directories);
             return Err(error);
         }
+        cleanup_patch_backups(&completed);
         Ok(plan.applied)
     }
 
@@ -411,77 +408,89 @@ impl Scope {
         } else {
             self.root.join(requested)
         };
-        let candidate = candidate.canonicalize()?;
-        if candidate.starts_with(&self.root) {
-            Ok(candidate)
-        } else {
-            Err(ScopeError::OutsideRoot)
-        }
+        Ok(candidate.canonicalize()?)
     }
 
     fn relative(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .trim_start_matches('/')
-            .to_string()
-    }
-
-    fn resolve_rooted_path(
-        &self,
-        requested: &str,
-        allow_scope_root: bool,
-    ) -> Result<PathBuf, ScopeError> {
-        let requested = Path::new(requested);
-        let relative = if requested.is_absolute() {
-            requested
-                .strip_prefix(&self.root)
-                .map_err(|_| ScopeError::OutsideRoot)?
-        } else {
-            requested
-        };
-        let mut candidate = self.root.clone();
-        for component in relative.components() {
-            match component {
-                std::path::Component::Normal(component) => candidate.push(component),
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir
-                | std::path::Component::Prefix(_)
-                | std::path::Component::RootDir => return Err(ScopeError::OutsideRoot),
-            }
+        match path.strip_prefix(&self.root) {
+            Ok(relative) => relative.to_string_lossy().to_string(),
+            Err(_) => path.to_string_lossy().to_string(),
         }
-        if !allow_scope_root && candidate == self.root {
-            return Err(ScopeError::RootMutation);
-        }
-        Ok(candidate)
     }
 
     fn resolve_mutation_path(&self, requested: &str) -> Result<PathBuf, ScopeError> {
-        let candidate = self.resolve_rooted_path(requested, false)?;
-        let relative = candidate
-            .strip_prefix(&self.root)
-            .map_err(|_| ScopeError::OutsideRoot)?;
-        let mut current = self.root.clone();
-        for component in relative.components() {
-            let std::path::Component::Normal(component) = component else {
-                return Err(ScopeError::OutsideRoot);
-            };
-            current.push(component);
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(ScopeError::SymlinkMutation(self.relative(&current)));
+        #[derive(Clone, Copy)]
+        enum ComponentState {
+            ExistingDirectory,
+            ExistingNonDirectory,
+            Missing,
+        }
+
+        let requested = Path::new(requested);
+        let requested = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.root.join(requested)
+        };
+        let mut current = PathBuf::from("/");
+        let mut states = Vec::new();
+        for component in requested.components() {
+            match component {
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => match states.last().copied() {
+                    Some(ComponentState::ExistingDirectory) => {
+                        states.pop();
+                        current.pop();
+                    }
+                    Some(ComponentState::ExistingNonDirectory) => {
+                        return Err(ScopeError::PatchFailed(format!(
+                            "patch path traverses parent through a non-directory component: {}",
+                            current.display()
+                        )));
+                    }
+                    Some(ComponentState::Missing) => {
+                        return Err(ScopeError::PatchFailed(format!(
+                            "patch path traverses parent through a missing component: {}",
+                            current.display()
+                        )));
+                    }
+                    None => {
+                        return Err(ScopeError::PatchFailed(format!(
+                            "patch path traverses above the filesystem root: {}",
+                            requested.display()
+                        )));
+                    }
+                },
+                std::path::Component::Normal(component) => {
+                    current.push(component);
+                    let state = match fs::symlink_metadata(&current) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            return Err(ScopeError::SymlinkMutation(self.relative(&current)));
+                        }
+                        Ok(metadata) if metadata.is_dir() => ComponentState::ExistingDirectory,
+                        Ok(_) => ComponentState::ExistingNonDirectory,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            ComponentState::Missing
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    states.push(state);
                 }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(error) => return Err(error.into()),
+                std::path::Component::Prefix(_) => {
+                    return Err(ScopeError::PatchFailed(format!(
+                        "unsupported host mutation path: {}",
+                        requested.display()
+                    )));
+                }
             }
         }
-        Ok(candidate)
+        Ok(current)
     }
 }
 
 fn search_tree(
-    root: &Path,
+    search_root: &Path,
+    result_base: &Path,
     path: &Path,
     query: &str,
     max_results: usize,
@@ -499,13 +508,14 @@ fn search_tree(
         return Ok(());
     }
     if metadata.is_dir() {
-        if path != root && should_skip_directory(path) {
+        if path != search_root && should_skip_directory(path) {
             return Ok(());
         }
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             search_tree(
-                root,
+                search_root,
+                result_base,
                 &entry.path(),
                 query,
                 max_results,
@@ -538,7 +548,7 @@ fn search_tree(
         if line.contains(query) {
             matches.push(SearchMatch {
                 path: path
-                    .strip_prefix(root)
+                    .strip_prefix(result_base)
                     .unwrap_or(path)
                     .to_string_lossy()
                     .to_string(),
@@ -947,12 +957,22 @@ fn register_patch_path(touched: &mut HashSet<PathBuf>, path: &Path) -> Result<()
     }
 }
 
-fn create_missing_parent_directories(root: &Path, path: &Path) -> Result<Vec<PathBuf>, ScopeError> {
+fn create_missing_parent_directories(path: &Path) -> Result<Vec<PathBuf>, ScopeError> {
     let mut missing = Vec::new();
-    let mut current = path.parent().ok_or(ScopeError::OutsideRoot)?;
-    while current != root && !current.exists() {
+    let mut current = path.parent().ok_or_else(|| {
+        ScopeError::PatchFailed(format!(
+            "patch destination has no parent: {}",
+            path.display()
+        ))
+    })?;
+    while !current.exists() {
         missing.push(current.to_path_buf());
-        current = current.parent().ok_or(ScopeError::OutsideRoot)?;
+        current = current.parent().ok_or_else(|| {
+            ScopeError::PatchFailed(format!(
+                "unable to resolve patch destination parent: {}",
+                path.display()
+            ))
+        })?;
     }
     if !current.is_dir() {
         return Err(ScopeError::PatchFailed(format!(
@@ -966,6 +986,80 @@ fn create_missing_parent_directories(root: &Path, path: &Path) -> Result<Vec<Pat
         created.push(directory.clone());
     }
     Ok(created)
+}
+
+struct StagedPatchFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StagedPatchFile {
+    fn new(path: &Path, content: &[u8]) -> Result<Self, ScopeError> {
+        let parent = path.parent().ok_or_else(|| {
+            ScopeError::PatchFailed(format!(
+                "patch destination has no parent: {}",
+                path.display()
+            ))
+        })?;
+        let temporary = tempfile::Builder::new()
+            .prefix(".codex-connect-patch-stage-")
+            .tempfile_in(parent)?;
+        let stage = temporary.path().to_path_buf();
+        temporary.close()?;
+        let guard = Self {
+            path: stage,
+            armed: true,
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&guard.path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        Ok(guard)
+    }
+
+    fn install(mut self, destination: &Path) -> Result<(), std::io::Error> {
+        fs::rename(&self.path, destination)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for StagedPatchFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn reserve_patch_backup(path: &Path) -> Result<PathBuf, ScopeError> {
+    let parent = path.parent().ok_or_else(|| {
+        ScopeError::PatchFailed(format!("patch path has no parent: {}", path.display()))
+    })?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".codex-connect-patch-backup-")
+        .tempfile_in(parent)?;
+    let (file, backup) = temporary.keep().map_err(|error| error.error)?;
+    drop(file);
+    Ok(backup)
+}
+
+fn cleanup_patch_backups(completed: &[CompletedPatchAction]) {
+    for action in completed {
+        match action {
+            CompletedPatchAction::Write {
+                backup: Some(backup),
+                ..
+            }
+            | CompletedPatchAction::Delete { backup, .. } => {
+                let _ = fs::remove_file(backup);
+            }
+            CompletedPatchAction::Write { backup: None, .. } => {}
+        }
+    }
 }
 
 fn rollback_patch(completed: &[CompletedPatchAction]) {
@@ -994,14 +1088,16 @@ fn remove_created_directories(directories: &[PathBuf]) {
 mod tests {
     use super::Scope;
     use super::ScopeError;
+    use super::StagedPatchFile;
     use base64::Engine;
     use std::fs;
 
     #[test]
-    fn app_server_paths_are_rooted_to_the_configured_scope() {
+    fn app_server_paths_use_default_cwd_but_allow_absolute_host_paths() {
         let scope_dir = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
         fs::write(scope_dir.path().join("inside.txt"), "inside").unwrap();
+        fs::write(outside_dir.path().join("outside.txt"), "outside").unwrap();
         let scope = Scope::open(scope_dir.path()).unwrap();
 
         let resolved = scope.resolve_app_server_existing("inside.txt").unwrap();
@@ -1009,10 +1105,52 @@ mod tests {
             std::path::Path::new(&resolved).canonicalize().unwrap(),
             scope_dir.path().join("inside.txt").canonicalize().unwrap()
         );
-        assert!(matches!(
-            scope.resolve_app_server_existing(outside_dir.path().to_str().unwrap()),
-            Err(ScopeError::OutsideRoot)
-        ));
+        let outside = scope
+            .resolve_app_server_existing(outside_dir.path().join("outside.txt").to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            std::path::Path::new(&outside),
+            outside_dir
+                .path()
+                .join("outside.txt")
+                .canonicalize()
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_write_can_cross_filesystems() {
+        use std::os::unix::fs::MetadataExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let Ok(destination) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        if workspace.path().metadata().unwrap().dev()
+            == destination.path().metadata().unwrap().dev()
+        {
+            return;
+        }
+        let scope = Scope::open(workspace.path()).unwrap();
+        let target = destination.path().join("cross-device.txt");
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+cross-device\n*** End Patch\n",
+            target.display()
+        );
+        scope.apply_patch(&patch, None).unwrap();
+        assert_eq!(fs::read_to_string(target).unwrap(), "cross-device\n");
+    }
+
+    #[test]
+    fn abandoned_patch_stage_is_removed_by_guard() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("destination.txt");
+        let stage = StagedPatchFile::new(&destination, b"staged\n").unwrap();
+        let stage_path = stage.path.clone();
+        assert!(stage_path.is_file());
+        drop(stage);
+        assert!(!stage_path.exists());
     }
 
     #[cfg(unix)]
@@ -1066,6 +1204,10 @@ mod tests {
             scope.resolve_mutation_path("escape/new.txt"),
             Err(ScopeError::SymlinkMutation(_))
         ));
+        assert!(matches!(
+            scope.resolve_mutation_path("escape/../new.txt"),
+            Err(ScopeError::SymlinkMutation(_))
+        ));
     }
 
     #[test]
@@ -1078,6 +1220,27 @@ mod tests {
         let matches = scope.search("needle", None, None).unwrap();
         assert_eq!(matches.matches.len(), 1);
         assert_eq!(matches.matches[0].path, "visible.txt");
+    }
+
+    #[test]
+    fn single_file_search_keeps_a_usable_result_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("needle.txt"), "find me\n").unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+        let matches = scope.search("find me", Some("needle.txt"), None).unwrap();
+        assert_eq!(matches.matches.len(), 1);
+        assert_eq!(matches.matches[0].path, "needle.txt");
+    }
+
+    #[test]
+    fn subdirectory_search_results_stay_relative_to_request_cwd() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("src")).unwrap();
+        fs::write(temporary.path().join("src/lib.rs"), "find me\n").unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+        let matches = scope.search("find me", Some("src"), None).unwrap();
+        assert_eq!(matches.matches.len(), 1);
+        assert_eq!(matches.matches[0].path, "src/lib.rs");
     }
 
     #[test]
@@ -1096,7 +1259,7 @@ mod tests {
         fs::write(temporary.path().join("visible.txt"), "needle").unwrap();
         let scope = Scope::open(temporary.path()).unwrap();
         assert!(matches!(
-            scope.search_with_cancel("needle", None, None, || true),
+            scope.search_with_cancel("needle", None, None, None, || true),
             Err(ScopeError::Cancelled)
         ));
     }
@@ -1315,16 +1478,21 @@ mod tests {
     }
 
     #[test]
-    fn patch_paths_cannot_escape_and_new_parents_are_created_inside_root() {
+    fn patch_paths_may_leave_default_cwd_and_new_parents_are_created() {
         let temporary = tempfile::tempdir().unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let error = scope
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let scope = Scope::open(&workspace).unwrap();
+        scope
             .apply_patch(
-                "*** Begin Patch\n*** Add File: ../outside.txt\n+nope\n*** End Patch\n",
+                "*** Begin Patch\n*** Add File: ../outside.txt\n+outside\n*** End Patch\n",
                 None,
             )
-            .unwrap_err();
-        assert!(matches!(error, ScopeError::OutsideRoot));
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("outside.txt")).unwrap(),
+            "outside\n"
+        );
         scope
             .apply_patch(
                 "*** Begin Patch\n*** Add File: nested/file.txt\n+inside\n*** End Patch\n",
@@ -1332,13 +1500,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            fs::read_to_string(temporary.path().join("nested/file.txt")).unwrap(),
+            fs::read_to_string(workspace.join("nested/file.txt")).unwrap(),
             "inside\n"
         );
     }
 
     #[test]
-    fn request_cwd_rebases_paths_without_changing_the_scope_boundary() {
+    fn patch_rejects_parent_traversal_through_non_directory_or_missing_components() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("plain-file"), "not a directory\n").unwrap();
+        fs::write(temporary.path().join("victim.txt"), "keep me\n").unwrap();
+        let scope = Scope::open(temporary.path()).unwrap();
+
+        let through_file = scope
+            .apply_patch(
+                "*** Begin Patch\n*** Delete File: plain-file/../victim.txt\n*** End Patch\n",
+                None,
+            )
+            .unwrap_err();
+        assert!(through_file.to_string().contains("non-directory component"));
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("victim.txt")).unwrap(),
+            "keep me\n"
+        );
+
+        let through_missing = scope
+            .apply_patch(
+                "*** Begin Patch\n*** Delete File: missing/../victim.txt\n*** End Patch\n",
+                None,
+            )
+            .unwrap_err();
+        assert!(through_missing.to_string().contains("missing component"));
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("victim.txt")).unwrap(),
+            "keep me\n"
+        );
+    }
+
+    #[test]
+    fn request_cwd_rebases_paths_without_creating_an_authorization_boundary() {
         let temporary = tempfile::tempdir().unwrap();
         fs::create_dir(temporary.path().join("project")).unwrap();
         fs::write(temporary.path().join("project/local.txt"), "inside").unwrap();
@@ -1365,13 +1565,16 @@ mod tests {
             fs::read_to_string(temporary.path().join("project/created.txt")).unwrap(),
             "created\n"
         );
-        assert!(matches!(
-            scope.apply_patch(
-                "*** Begin Patch\n*** Add File: ../outside.txt\n+nope\n*** End Patch\n",
-                Some("project")
-            ),
-            Err(ScopeError::OutsideRoot)
-        ));
+        scope
+            .apply_patch(
+                "*** Begin Patch\n*** Add File: ../outside.txt\n+outside\n*** End Patch\n",
+                Some("project"),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("outside.txt")).unwrap(),
+            "outside\n"
+        );
     }
 
     #[test]
@@ -1383,7 +1586,7 @@ mod tests {
                 "*** Begin Patch\n*** Add File: first.txt\n+created\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch\n", None
             )
             .unwrap_err();
-        assert!(error.to_string().contains("scope operation failed"));
+        assert!(error.to_string().contains("host operation failed"));
         assert!(!temporary.path().join("first.txt").exists());
     }
 

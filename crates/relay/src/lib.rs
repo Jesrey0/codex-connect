@@ -8,7 +8,7 @@ pub use actions::{ApprovalDecision, PermissionGrant, PermissionScope};
 use base64::Engine;
 pub use codex_connect_app_server::protocol::{
     ApprovalPolicy, CommandExec, CommandExecTerminalSize, ModelList, ReviewTarget, RpcId,
-    SandboxPolicy,
+    SandboxMode, SandboxPolicy,
 };
 use codex_connect_app_server::protocol::{
     CommandExecOutputDeltaNotification, CommandExecResize, CommandExecTerminate, CommandExecWrite,
@@ -54,7 +54,7 @@ const MAX_FS_READ_FILE_BYTES: u64 = ((MAX_APP_SERVER_RESPONSE_BYTES / 4) * 3) as
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
     pub codex_bin: PathBuf,
-    pub scope_root: PathBuf,
+    pub default_cwd: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -170,7 +170,7 @@ pub struct TextRead {
 
 impl Relay {
     pub async fn start(config: RelayConfig) -> Result<Self, RelayError> {
-        let scope = Scope::open(config.scope_root)?;
+        let scope = Scope::open(config.default_cwd)?;
         let app_server = Arc::new(
             AppServerClient::start(AppServerConfig {
                 codex_bin: config.codex_bin,
@@ -216,7 +216,7 @@ impl Relay {
     pub fn worker_available(&self) -> bool {
         self.app_server.is_available()
     }
-    pub fn scope_root(&self) -> String {
+    pub fn default_cwd(&self) -> String {
         self.scope.root().display().to_string()
     }
     pub fn app_server_user_agent(&self) -> String {
@@ -227,7 +227,7 @@ impl Relay {
     }
 
     /// Filesystem inspection is performed by the pinned App Server after the
-    /// scope resolves and fences the requested absolute path.
+    /// configured default cwd resolves relative paths to absolute host paths.
     pub async fn inspect_read_text(
         &self,
         requested: &str,
@@ -365,10 +365,7 @@ impl Relay {
                 .unwrap_or(DEFAULT_COMMAND_OUTPUT_BYTES),
         );
         let output_bytes_cap = request.output_bytes_cap.unwrap();
-        request.sandbox_policy = request
-            .sandbox_policy
-            .map(|p| self.root_sandbox_policy(p))
-            .transpose()?;
+        request.sandbox_policy = None;
         // App Server enforces process timeout; transport adds a small finite delivery allowance.
         let duration = Duration::from_millis(request.timeout_ms.unwrap() + 5_000);
         let started = Instant::now();
@@ -395,7 +392,6 @@ impl Relay {
         command: Vec<String>,
         cwd: Option<String>,
         env: Option<std::collections::BTreeMap<String, Option<String>>>,
-        sandbox_policy: Option<SandboxPolicy>,
         tty: bool,
         size: Option<CommandExecTerminalSize>,
     ) -> Result<Value, RelayError> {
@@ -411,9 +407,6 @@ impl Relay {
         let cwd = self
             .scope
             .resolve_app_server_directory(cwd.as_deref().unwrap_or("."))?;
-        let sandbox_policy = sandbox_policy
-            .map(|policy| self.root_sandbox_policy(policy))
-            .transpose()?;
         let process_id = format!(
             "cc-command-{}",
             self.next_command_id.fetch_add(1, Ordering::Relaxed)
@@ -443,7 +436,7 @@ impl Relay {
                 size,
                 cwd: Some(cwd),
                 env,
-                sandbox_policy,
+                sandbox_policy: None,
             })
             .await?;
 
@@ -596,10 +589,13 @@ impl Relay {
         if task.trim().is_empty() {
             return Err(RelayError::Invalid("task must not be empty".into()));
         }
-        let sandbox_policy = self.root_sandbox_policy(sandbox_policy)?;
+        validate_work_sandbox_policy(&sandbox_policy)?;
+        let thread_sandbox = sandbox_mode(&sandbox_policy);
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
-        let (thread_id, cwd) = self.prepare_thread(cwd, thread_id).await?;
+        let (thread_id, cwd) = self
+            .prepare_thread(cwd, thread_id, None, Some(thread_sandbox))
+            .await?;
         let response = self
             .app_server
             .request(TurnStart {
@@ -623,6 +619,8 @@ impl Relay {
         &self,
         cwd: Option<String>,
         thread_id: Option<String>,
+        new_thread_model: Option<String>,
+        new_thread_sandbox: Option<SandboxMode>,
     ) -> Result<(String, String), RelayError> {
         let cwd = cwd
             .map(|v| self.scope.resolve_app_server_directory(&v))
@@ -641,7 +639,9 @@ impl Relay {
         } else {
             self.app_server
                 .request(ThreadStart {
-                    cwd: Some(cwd.unwrap_or_else(|| self.scope_root())),
+                    model: new_thread_model,
+                    sandbox: new_thread_sandbox,
+                    cwd: Some(cwd.unwrap_or_else(|| self.default_cwd())),
                     service_name: Some("codex-connect".into()),
                     developer_instructions: Some(WORKSPACE_POLICY.into()),
                     ..ThreadStart::default()
@@ -915,10 +915,23 @@ impl Relay {
         cwd: Option<String>,
         thread_id: Option<String>,
         target: ReviewTarget,
+        model: Option<String>,
     ) -> Result<Value, RelayError> {
+        if thread_id.is_some() && model.is_some() {
+            return Err(RelayError::Invalid(
+                "model applies to new review threads only; omit threadId or omit model".into(),
+            ));
+        }
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
-        let (thread_id, _) = self.prepare_thread(cwd, thread_id).await?;
+        let (thread_id, _) = self
+            .prepare_thread(
+                cwd,
+                thread_id,
+                model,
+                created.then_some(SandboxMode::ReadOnly),
+            )
+            .await?;
         let response = self
             .app_server
             .request(ReviewStart {
@@ -955,7 +968,7 @@ impl Relay {
         force_reload: bool,
     ) -> Result<Value, RelayError> {
         let cwds = if cwds.is_empty() {
-            vec![self.scope_root()]
+            vec![self.default_cwd()]
         } else {
             cwds.into_iter()
                 .map(|v| self.scope.resolve_app_server_directory(&v))
@@ -1015,7 +1028,7 @@ impl Relay {
         let recent = self.journal.tail(64).await;
         Ok(json!({
             "workerAvailable": self.worker_available(),
-            "scopeRoot": self.scope_root(),
+            "defaultCwd": self.default_cwd(),
             "usage": usage,
             "usageRefreshMs": OBSERVER_USAGE_REFRESH_MS,
             "activeTurns": active_turns,
@@ -1072,32 +1085,26 @@ impl Relay {
             }
         });
     }
+}
 
-    fn root_sandbox_policy(&self, policy: SandboxPolicy) -> Result<SandboxPolicy, RelayError> {
-        match policy {
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots,
-                network_access,
-                exclude_slash_tmp,
-                exclude_tmpdir_env_var,
-            } => Ok(SandboxPolicy::WorkspaceWrite {
-                writable_roots: writable_roots
-                    .into_iter()
-                    .map(|v| {
-                        if !Path::new(&v).is_absolute() {
-                            return Err(RelayError::Invalid(
-                                "writableRoots must contain absolute paths".into(),
-                            ));
-                        }
-                        Ok(self.scope.resolve_app_server_directory(&v)?)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-                network_access,
-                exclude_slash_tmp,
-                exclude_tmpdir_env_var,
-            }),
-            other => Ok(other),
-        }
+fn validate_work_sandbox_policy(policy: &SandboxPolicy) -> Result<(), RelayError> {
+    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = policy
+        && writable_roots
+            .iter()
+            .any(|root| !Path::new(root).is_absolute())
+    {
+        return Err(RelayError::Invalid(
+            "writableRoots must contain absolute paths".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sandbox_mode(policy: &SandboxPolicy) -> SandboxMode {
+    match policy {
+        SandboxPolicy::DangerFullAccess => SandboxMode::DangerFullAccess,
+        SandboxPolicy::ReadOnly { .. } => SandboxMode::ReadOnly,
+        SandboxPolicy::WorkspaceWrite { .. } => SandboxMode::WorkspaceWrite,
     }
 }
 

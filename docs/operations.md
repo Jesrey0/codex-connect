@@ -128,20 +128,11 @@ codex_bin = "/home/you/.local/bin/codex"
 
 `setup` persists an absolute executable path for the user-global Codex CLI. It first reuses a valid configured executable and otherwise resolves `codex` from `PATH`. The exact absolute path depends on the user's installation method (for example npm under NVM may live beneath `~/.nvm`). Codex Connect does not install or prefer a workspace-local Codex binary. This is the canonical configuration shape for the pre-release backend. Historical configuration forms are not retained.
 
-### Host sandbox source of truth
+### Host and delegated authority
 
-**Operational invariant:** Codex Connect does not synthesize a default `sandboxPolicy` for host commands. When `command.exec` or `command.start` omits that field, Codex Connect also omits it on the official App Server request. App Server therefore uses the effective configuration already loaded from `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`).
+**Operational invariant:** Codex Connect launches its dedicated App Server with the process-local override `sandbox_mode="danger-full-access"`. Public host commands expose no `sandboxPolicy`; deterministic host execution therefore runs with primary-operator authority, subject to the OS account. The `[scope].root` configuration key is retained as the default workspace for relative paths and App Server startup, not as a filesystem authorization boundary.
 
-Sandbox defaults are intentionally not duplicated in Codex Connect configuration. For a workspace-write host baseline with network access, configure Codex itself:
-
-```toml
-sandbox_mode = "workspace-write"
-
-[sandbox_workspace_write]
-network_access = true
-```
-
-The public host-command schema exposes only `workspaceWrite` and `dangerFullAccess`; read-only host exploration belongs in `inspect`. `codex.start(mode=work)` is different by design: its public MCP contract requires an explicit `sandboxPolicy` for every delegated turn and still offers `readOnly`, `workspaceWrite`, and `dangerFullAccess`, so agent authority is selected at task start rather than inherited from the host default.
+The user-global `$CODEX_HOME/config.toml` should remain generic rather than carrying Codex Connect routing or sandbox defaults. `codex.start(mode=work)` is different by design: its public MCP contract requires an explicit `sandboxPolicy` for every delegated turn and offers `readOnly`, `workspaceWrite`, and `dangerFullAccess`. New official review threads are read-only and may select a model; existing thread IDs retain their established model and sandbox settings.
 
 ## Deployment boundary
 
@@ -160,4 +151,4 @@ That boundary is intentional. Backend deployment must not become tunnel lifecycl
 
 ## Security boundary
 
-Codex Connect is a high-trust host execution bridge. Scope fencing protects direct filesystem operations and establishes allowed starting paths; it does not sandbox the whole machine. Review [Security](../SECURITY.md) before changing ingress, scope, command execution, or service privileges.
+Codex Connect is a high-trust host execution bridge. The primary operator plane deliberately has host-user filesystem/process authority; the configured default workspace is not a security fence. Delegated Codex work is separately bounded by its explicit per-task sandbox policy. Review [Security](../SECURITY.md) before changing ingress, command execution, delegated policy, or service privileges.

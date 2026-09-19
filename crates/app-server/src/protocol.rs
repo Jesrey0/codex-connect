@@ -103,11 +103,21 @@ pub struct ThreadStart {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<ApprovalPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub developer_instructions: Option<String>,
 }
 request!(ThreadStart, "thread/start", ThreadResponse);
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
