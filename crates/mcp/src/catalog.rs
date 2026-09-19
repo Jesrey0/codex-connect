@@ -163,7 +163,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Start delegated Codex work or an official Codex review. Use mode=work only when autonomous reasoning or iteration materially improves the critical path or quality; Codex workers do not inherit the ChatGPT conversation, so task must be self-contained with relevant context, constraints, paths, decisions, and acceptance criteria. Work mode requires an explicit sandboxPolicy selected per task. New review threads are read-only and may select a model; existing review threads keep their established settings. Use mode=review for the official review/start lifecycle. Follow with codex.wait.",
+                "Start delegated Codex work or an official Codex review. Use mode=work only when autonomous reasoning or iteration materially improves the critical path or quality; Codex workers do not inherit the ChatGPT conversation, so task must be self-contained with relevant context, constraints, paths, decisions, and acceptance criteria. Work mode requires an explicit sandboxPolicy selected per task. New work threads may include developerInstructions for a concise operating contract; Codex Connect appends them after its server-owned workspace policy. developerInstructions is creation-time only and must be omitted when threadId resumes an existing thread. New review threads are read-only and may select a model; existing review threads keep their established settings. Use mode=review for the official review/start lifecycle. Follow with codex.wait.",
                 false,
                 true,
                 true,
@@ -610,6 +610,7 @@ fn codex_start_schema() -> Value {
                 "task":{"type":"string","minLength":1},
                 "cwd":{"type":"string"},
                 "threadId":{"type":"string"},
+                "developerInstructions":{"type":"string","minLength":1,"description":"Additional developer instructions for a new work thread. Codex Connect appends them after its server-owned workspace policy. Not valid with threadId; resumed threads keep their established developer instructions."},
                 "model":{"type":"string"},
                 "effort":{"type":"string"},
                 "serviceTier":{"type":"string"},
@@ -904,6 +905,12 @@ mod tests {
                 .iter()
                 .any(|value| value == "sandboxPolicy")
         );
+        assert_eq!(
+            work["properties"]["developerInstructions"]["type"],
+            "string"
+        );
+        assert_eq!(work["properties"]["developerInstructions"]["minLength"], 1);
+        assert!(review["properties"].get("developerInstructions").is_none());
         assert!(review["properties"].get("sandboxPolicy").is_none());
         assert!(review["properties"].get("effort").is_none());
         assert!(review["properties"].get("serviceTier").is_none());

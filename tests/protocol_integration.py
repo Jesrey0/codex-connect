@@ -731,6 +731,19 @@ class OperatorProtocolTests(unittest.TestCase):
                         policy["networkAccess"],
                     )
 
+        before = len(self.method_params("thread/start"))
+        instructed = self.start(
+            "complete",
+            developerInstructions="Prefer evidence over assumptions.",
+        )
+        self.assertEqual(self.wait(instructed)["state"], "terminal")
+        instructed_start = self.method_params("thread/start")[before]
+        self.assertTrue(instructed_start["developerInstructions"].startswith("Workspace policy:"))
+        self.assertIn(
+            "Operator-supplied developer instructions:\nPrefer evidence over assumptions.",
+            instructed_start["developerInstructions"],
+        )
+
         source = self.start("complete")
         self.assertEqual(self.wait(source)["state"], "terminal")
         resume_count = len(self.method_params("thread/resume"))
@@ -742,6 +755,17 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(self.wait(resumed)["state"], "terminal")
         self.assertEqual(len(self.method_params("thread/resume")), resume_count + 1)
         self.assertNotIn("sandbox", self.method_params("thread/resume")[-1])
+        self.assertNotIn("developerInstructions", self.method_params("thread/resume")[-1])
+
+        resumes_before_rejection = len(self.method_params("thread/resume"))
+        self.client.call("codex.start", {
+            "mode": "work",
+            "task": "complete",
+            "threadId": source["threadId"],
+            "developerInstructions": "Do something different.",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+        }, error=True)
+        self.assertEqual(len(self.method_params("thread/resume")), resumes_before_rejection)
 
         before_threads = len(self.method_params("thread/start"))
         before_reviews = len(self.method_params("review/start"))

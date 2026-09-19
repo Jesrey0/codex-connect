@@ -57,6 +57,15 @@ pub struct RelayConfig {
     pub default_cwd: PathBuf,
 }
 
+fn compose_developer_instructions(additional: Option<&str>) -> String {
+    match additional {
+        Some(additional) => {
+            format!("{WORKSPACE_POLICY}\n\nOperator-supplied developer instructions:\n{additional}")
+        }
+        None => WORKSPACE_POLICY.into(),
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandExecResult {
@@ -580,6 +589,7 @@ impl Relay {
         task: String,
         cwd: Option<String>,
         thread_id: Option<String>,
+        developer_instructions: Option<String>,
         model: Option<String>,
         effort: Option<String>,
         service_tier: Option<String>,
@@ -589,12 +599,32 @@ impl Relay {
         if task.trim().is_empty() {
             return Err(RelayError::Invalid("task must not be empty".into()));
         }
+        if developer_instructions
+            .as_ref()
+            .is_some_and(|instructions| instructions.trim().is_empty())
+        {
+            return Err(RelayError::Invalid(
+                "developerInstructions must not be empty".into(),
+            ));
+        }
+        if thread_id.is_some() && developer_instructions.is_some() {
+            return Err(RelayError::Invalid(
+                "developerInstructions applies to new work threads only; omit threadId or omit developerInstructions"
+                    .into(),
+            ));
+        }
         validate_work_sandbox_policy(&sandbox_policy)?;
         let thread_sandbox = sandbox_mode(&sandbox_policy);
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
         let (thread_id, cwd) = self
-            .prepare_thread(cwd, thread_id, None, Some(thread_sandbox))
+            .prepare_thread(
+                cwd,
+                thread_id,
+                None,
+                Some(thread_sandbox),
+                developer_instructions,
+            )
             .await?;
         let response = self
             .app_server
@@ -621,6 +651,7 @@ impl Relay {
         thread_id: Option<String>,
         new_thread_model: Option<String>,
         new_thread_sandbox: Option<SandboxMode>,
+        new_thread_developer_instructions: Option<String>,
     ) -> Result<(String, String), RelayError> {
         let cwd = cwd
             .map(|v| self.scope.resolve_app_server_directory(&v))
@@ -632,7 +663,7 @@ impl Relay {
                 .request(ThreadResume {
                     thread_id: id,
                     cwd,
-                    developer_instructions: Some(WORKSPACE_POLICY.into()),
+                    developer_instructions: None,
                     exclude_turns: true,
                 })
                 .await?
@@ -643,7 +674,9 @@ impl Relay {
                     sandbox: new_thread_sandbox,
                     cwd: Some(cwd.unwrap_or_else(|| self.default_cwd())),
                     service_name: Some("codex-connect".into()),
-                    developer_instructions: Some(WORKSPACE_POLICY.into()),
+                    developer_instructions: Some(compose_developer_instructions(
+                        new_thread_developer_instructions.as_deref(),
+                    )),
                     ..ThreadStart::default()
                 })
                 .await?
@@ -930,6 +963,7 @@ impl Relay {
                 thread_id,
                 model,
                 created.then_some(SandboxMode::ReadOnly),
+                None,
             )
             .await?;
         let response = self

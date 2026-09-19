@@ -30,7 +30,7 @@ use tokio::net::TcpListener;
 const DEFAULT_WAIT_MS: u64 = 60_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Deterministic host tools operate with the host user's authority through a dedicated App Server launched in danger-full-access; defaultCwd is only the navigation base for relative paths, not an authorization fence. Use codex.* for Codex threads, turns, reviews, discovery, usage, approvals, permissions, and user input; do not invoke the Codex CLI through host command tools as an alternate control plane when the semantic operation is available here. Prefer inspect for batched read-only host exploration, command.exec for bounded deterministic host commands, command.start/read/control for persistent or interactive deterministic commands, and apply_patch for exact known text edits. Delegated codex.start(mode=work) always requires an explicit per-task sandboxPolicy. New official review threads are read-only and may select a model; resumed threads keep their established settings. Use codex.start followed by codex.wait only when delegated autonomous reasoning or iteration materially improves the critical path or quality; delegation is an optimization, not the default. Codex workers do not inherit the ChatGPT conversation, so every delegated task must include its own relevant context, constraints, paths, decisions, and acceptance criteria. Minimize unnecessary Codex turns and discovery calls because model usage is constrained; batch independent discovery with codex.info. Preserve ownership boundaries: Codex CLI/App Server and tunnel-client are independently owned upstream dependencies, and Codex Connect must not install, relocate, duplicate, upgrade, delete, or supervise their owned state. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect projects those capabilities without inventing a second execution model.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Deterministic host tools operate with the host user's authority through a dedicated App Server launched in danger-full-access; defaultCwd is only the navigation base for relative paths, not an authorization fence. Use codex.* for Codex threads, turns, reviews, discovery, usage, approvals, permissions, and user input; do not invoke the Codex CLI through host command tools as an alternate control plane when the semantic operation is available here. Prefer inspect for batched read-only host exploration, command.exec for bounded deterministic host commands, command.start/read/control for persistent or interactive deterministic commands, and apply_patch for exact known text edits. Delegated codex.start(mode=work) always requires an explicit per-task sandboxPolicy. New work threads may also carry developerInstructions for a concise worker operating contract; keep task self-contained, and do not send developerInstructions when resuming with threadId because resumed threads keep their established instructions. New official review threads are read-only and may select a model; resumed threads keep their established settings. Use codex.start followed by codex.wait only when delegated autonomous reasoning or iteration materially improves the critical path or quality; delegation is an optimization, not the default. Codex workers do not inherit the ChatGPT conversation, so every delegated task must include its own relevant context, constraints, paths, decisions, and acceptance criteria. Minimize unnecessary Codex turns and discovery calls because model usage is constrained; batch independent discovery with codex.info. Preserve ownership boundaries: Codex CLI/App Server and tunnel-client are independently owned upstream dependencies, and Codex Connect must not install, relocate, duplicate, upgrade, delete, or supervise their owned state. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect projects those capabilities without inventing a second execution model.";
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -392,6 +392,7 @@ enum CodexStartArgs {
         task: String,
         cwd: Option<String>,
         thread_id: Option<String>,
+        developer_instructions: Option<String>,
         model: Option<String>,
         effort: Option<String>,
         service_tier: Option<String>,
@@ -564,6 +565,7 @@ async fn dispatch(
                 task,
                 cwd,
                 thread_id,
+                developer_instructions,
                 model,
                 effort,
                 service_tier,
@@ -574,6 +576,7 @@ async fn dispatch(
                     task,
                     cwd,
                     thread_id,
+                    developer_instructions,
                     model,
                     effort,
                     service_tier,
