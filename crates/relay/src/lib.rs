@@ -132,17 +132,39 @@ pub struct Relay {
 
 #[derive(Default)]
 struct LiveTurns {
-    turns: HashMap<(String, String), codex_connect_app_server::protocol::Turn>,
+    turns: HashMap<(String, String), ObservedTurn>,
     order: VecDeque<(String, String)>,
+}
+
+#[derive(Clone)]
+struct ObservedTurn {
+    turn: codex_connect_app_server::protocol::Turn,
+    mode: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    service_tier: Option<String>,
 }
 
 impl LiveTurns {
     fn insert(&mut self, thread_id: &str, turn: codex_connect_app_server::protocol::Turn) {
         let key = (thread_id.to_string(), turn.id.clone());
+        if let Some(existing) = self.turns.get_mut(&key) {
+            existing.turn = turn;
+            return;
+        }
         if !self.turns.contains_key(&key) {
             self.order.push_back(key.clone());
         }
-        self.turns.insert(key, turn);
+        self.turns.insert(
+            key,
+            ObservedTurn {
+                turn,
+                mode: None,
+                model: None,
+                effort: None,
+                service_tier: None,
+            },
+        );
         while self.turns.len() > MAX_LIVE_TURNS {
             if let Some(oldest) = self.order.pop_front() {
                 self.turns.remove(&oldest);
@@ -157,7 +179,27 @@ impl LiveTurns {
     ) -> Option<codex_connect_app_server::protocol::Turn> {
         self.turns
             .get(&(thread_id.to_string(), turn_id.to_string()))
-            .cloned()
+            .map(|observed| observed.turn.clone())
+    }
+
+    fn annotate(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: &str,
+        model: Option<String>,
+        effort: Option<String>,
+        service_tier: Option<String>,
+    ) {
+        if let Some(observed) = self
+            .turns
+            .get_mut(&(thread_id.to_string(), turn_id.to_string()))
+        {
+            observed.mode = Some(mode.to_string());
+            observed.model = model;
+            observed.effort = effort;
+            observed.service_tier = service_tier;
+        }
     }
 
     fn remove(&mut self, thread_id: &str, turn_id: &str) {
@@ -208,6 +250,25 @@ impl Relay {
         turn: &codex_connect_app_server::protocol::Turn,
     ) {
         self.live_turns.lock().await.insert(thread_id, turn.clone());
+    }
+
+    async fn annotate_live_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: &str,
+        model: Option<String>,
+        effort: Option<String>,
+        service_tier: Option<String>,
+    ) {
+        self.live_turns.lock().await.annotate(
+            thread_id,
+            turn_id,
+            mode,
+            model,
+            effort,
+            service_tier,
+        );
     }
 
     async fn live_turn(
@@ -634,12 +695,21 @@ impl Relay {
                 cwd,
                 approval_policy,
                 sandbox_policy: Some(sandbox_policy),
-                model,
-                effort,
-                service_tier,
+                model: model.clone(),
+                effort: effort.clone(),
+                service_tier: service_tier.clone(),
             })
             .await?;
         self.remember_live_turn(&thread_id, &response.turn).await;
+        self.annotate_live_turn(
+            &thread_id,
+            &response.turn.id,
+            "work",
+            model,
+            effort,
+            service_tier,
+        )
+        .await;
         Ok(
             json!({"threadId":thread_id,"turnId":response.turn.id,"createdThread":created,"cursor":cursor}),
         )
@@ -957,6 +1027,7 @@ impl Relay {
         }
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
+        let observer_model = model.clone();
         let (thread_id, _) = self
             .prepare_thread(
                 cwd,
@@ -975,6 +1046,15 @@ impl Relay {
             })
             .await?;
         self.remember_live_turn(&thread_id, &response.turn).await;
+        self.annotate_live_turn(
+            &thread_id,
+            &response.turn.id,
+            "review",
+            observer_model,
+            None,
+            None,
+        )
+        .await;
         // Live App Server 0.154.0 returns the inline review turn on the source thread even
         // when reviewThreadId names the internal reviewer thread. work.wait needs that pair.
         Ok(
@@ -1047,12 +1127,16 @@ impl Relay {
             live.order
                 .iter()
                 .filter_map(|(thread_id, turn_id)| {
-                    let turn = live.turns.get(&(thread_id.clone(), turn_id.clone()))?;
-                    (!turn.status.is_terminal()).then(|| {
+                    let observed = live.turns.get(&(thread_id.clone(), turn_id.clone()))?;
+                    (!observed.turn.status.is_terminal()).then(|| {
                         json!({
                             "threadId": thread_id,
-                            "turnId": turn.id,
-                            "status": turn.status,
+                            "turnId": observed.turn.id,
+                            "status": observed.turn.status,
+                            "mode": observed.mode,
+                            "model": observed.model,
+                            "effort": observed.effort,
+                            "serviceTier": observed.service_tier,
                         })
                     })
                 })

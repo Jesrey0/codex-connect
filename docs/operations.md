@@ -47,11 +47,11 @@ The organization variable is sent by `tunnel-client` as the `OpenAI-Organization
 
 ## Backend commands
 
-`setup` is installation/configuration. Normal operation uses `status`, the read-only observer `tui`, `restart`, `doctor`, and `logs`:
+`setup` is installation/configuration. Normal operation uses `status`, the read-only observer `console`, `restart`, `doctor`, and `logs`:
 
 ```bash
 codex-connect status
-codex-connect tui
+codex-connect console
 codex-connect restart
 codex-connect doctor
 codex-connect logs --follow
@@ -60,7 +60,7 @@ codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/projects/example-p
 
 `codex-connect restart` also enables the backend service if it was installed but disabled, so a successful recovery restores the next-boot invariant.
 
-`codex-connect tui` connects only to the configured loopback backend and renders its observer projection. The display is intentionally non-authoritative and non-actuating: active turns are turns observed by the current backend process, recent activity is bounded journal state, and quota values are cached briefly to avoid polling the upstream account endpoint on every screen refresh. Press Ctrl-C to exit. Approvals, permissions, semantic user input, worker delegation, steering, and interruption remain exclusively on the ChatGPT/Codex Connect control path.
+`codex-connect console` connects only to the configured loopback backend and renders its observer projection. The display is intentionally non-authoritative and non-actuating: active turns are turns observed by the current backend process, recent activity is bounded journal state, and quota values are cached briefly to avoid polling the upstream account endpoint on every screen refresh. Requested model, reasoning effort, and service tier are retained as projection metadata for turns started through this backend; when those values were omitted or cannot be authoritatively recovered, the console labels them `default/inherited` rather than guessing. Press Ctrl-C to exit. Approvals, permissions, semantic user input, worker delegation, steering, and interruption remain exclusively on the ChatGPT/Codex Connect control path.
 
 ## Uninstall
 

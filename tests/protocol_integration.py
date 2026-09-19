@@ -568,11 +568,27 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["wakeReason"],"terminal")
         self.assertEqual(result["turn"]["output"][0]["text"],"fixture complete")
         self.client.call("codex.wait",{"threadId":work["threadId"],"turnId":"missing","timeoutMs":0},error=True)
-        next_work = self.start("idle",threadId=work["threadId"])
+        next_work = self.start(
+            "idle",
+            threadId=work["threadId"],
+            model="gpt-6-astra",
+            effort="high",
+            serviceTier="priority",
+        )
         self.assertFalse(next_work["createdThread"])
         idle = self.wait(next_work,timeout=0)
         self.assertEqual(idle["state"],"active")
         self.assertEqual(idle["wakeReason"],"timeout")
+        with urllib.request.urlopen(self.url + "/observe") as response:
+            observer = json.load(response)
+        observed = next(
+            turn for turn in observer["projection"]["activeTurns"]
+            if turn["turnId"] == next_work["turnId"]
+        )
+        self.assertEqual(observed["mode"], "work")
+        self.assertEqual(observed["model"], "gpt-6-astra")
+        self.assertEqual(observed["effort"], "high")
+        self.assertEqual(observed["serviceTier"], "priority")
         snapshot = self.client.call("codex.wait",{"threadId":work["threadId"],"timeoutMs":0})
         self.assertEqual(snapshot["turn"]["id"], next_work["turnId"])
 

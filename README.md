@@ -123,7 +123,7 @@ Routine backend commands are:
 
 ```bash
 codex-connect status
-codex-connect tui
+codex-connect console
 codex-connect restart
 codex-connect doctor
 codex-connect logs --follow
@@ -131,7 +131,7 @@ codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/projects/example-p
 codex-connect uninstall
 ```
 
-`codex-connect tui` opens a local read-only observer dashboard backed by the running Codex Connect backend. It shows account quota telemetry, currently observed active turns, pending action counts, and the bounded recent worker-event journal. The dashboard has no approval, delegation, steering, interruption, permission, or input-response controls; those remain on the ChatGPT/Codex Connect operator path.
+`codex-connect console` opens the local read-only observability console backed by the running Codex Connect backend. It shows account quota telemetry, currently observed active turns, requested model/reasoning-effort metadata when known, pending action counts, and the bounded recent worker-event journal. The console has no approval, delegation, steering, interruption, permission, or input-response controls; those remain on the ChatGPT/Codex Connect operator path. `tui` remains a compatibility alias, but `console` is the canonical command.
 
 After a computer restart, verify the backend first, then inspect/resume the existing tunnel runtime with `tunnel-client runtimes status codex-connect --json`. See [Operations](docs/operations.md#after-a-computer-restart).
 

@@ -1,9 +1,9 @@
 mod artifact;
 mod config;
+mod console;
 mod deployment;
 mod management;
 mod service;
-mod tui;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -110,8 +110,9 @@ enum CommandName {
     },
     /// Run end-to-end deployment diagnostics.
     Doctor,
-    /// Watch the local read-only Codex Connect observer dashboard.
-    Tui,
+    /// Watch the local read-only Codex Connect observability console.
+    #[command(alias = "tui")]
+    Console,
     /// Probe the pinned Codex App Server directly without managed-service checks.
     Probe {
         /// Codex binary to probe.
@@ -196,7 +197,7 @@ async fn main() -> Result<()> {
         CommandName::Restart => management::restart().await,
         CommandName::Logs { lines, follow } => management::logs(lines, follow).await,
         CommandName::Doctor => management::doctor().await,
-        CommandName::Tui => tui::run().await,
+        CommandName::Console => console::run().await,
         CommandName::Probe { codex_bin, cwd } => probe_app_server(&codex_bin, &cwd).await,
         CommandName::RunBackend => management::run_backend().await,
         CommandName::PrepareDeployment {
