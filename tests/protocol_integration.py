@@ -156,49 +156,33 @@ class OperatorProtocolTests(unittest.TestCase):
         worker_events = status.pop("workerEvents", [])
         for event in worker_events:
             self.assertIn(event["kind"], {"turnTerminal", "actionRequired", "historyLost"})
-        self.assertTrue(status["healthy"])
-        self.assertTrue(status["experimentalApi"])
-        self.assertEqual(set(status), {
-            "healthy", "operatorContract", "defaultCwd", "endpoint", "buildId", "binarySha256",
-            "executable", "appServerTransport", "experimentalApi", "codex", "appServer",
+        self.assertTrue(status["ready"])
+        self.assertEqual(set(status), {"ready", "cwd", "buildId", "codex"})
+        self.assertEqual(status["cwd"], str(self.workspace))
+        self.assertEqual(set(status["codex"]), {"release", "defaults"})
+        self.assertEqual(set(status["codex"]["defaults"]), {
+            "model", "reasoningEffort", "serviceTier", "source",
         })
-        self.assertEqual(status["operatorContract"], {
-            "controlPlane": "codex-connect",
-            "codexAccess": "mcp",
-            "workerContext": "isolated",
-            "hostAccess": "dangerFullAccess",
-            "workerApprovalPolicy": "on-request",
-            "reviewPolicy": "readOnlyNewThread",
-            "commandDefaultTimeoutMs": 60000,
-            "commandMaxTimeoutMs": 60 * 60 * 1000,
-        })
-        self.assertEqual(status["defaultCwd"], str(self.workspace))
-        self.assertEqual(set(status["codex"]), {
-            "binary", "release", "home", "homeSource", "globalConfig",
-        })
-        self.assertEqual(set(status["codex"]["globalConfig"]), {
-            "path", "exists", "parsed", "model", "reasoningEffort", "serviceTier",
-            "approvalPolicy", "sandboxMode", "workspaceWriteNetworkAccess",
-        })
-        self.assertEqual(set(status["appServer"]), {
-            "transport", "workingDirectory", "userAgent", "experimentalApi", "launchOverrides",
-        })
-        self.assertEqual(status["appServer"]["transport"], "stdio")
-        self.assertTrue(status["appServer"]["experimentalApi"])
-        self.assertIn('sandbox_mode="danger-full-access"', status["appServer"]["launchOverrides"])
-        self.assertEqual(status["appServerTransport"], status["appServer"]["transport"])
+        self.assertIn(status["codex"]["defaults"]["source"], {"userConfig", "upstream"})
         with urllib.request.urlopen(self.url + "/status") as response:
             self.assertEqual(status, json.load(response))
+        with urllib.request.urlopen(self.url + "/runtime") as response:
+            runtime = json.load(response)
+        self.assertTrue(runtime["ready"])
+        self.assertEqual(runtime["cwd"], str(self.workspace))
+        self.assertIn("binarySha256", runtime)
+        self.assertEqual(runtime["appServerTransport"], "stdio")
+        self.assertTrue(runtime["experimentalApi"])
+        self.assertIn('sandbox_mode="danger-full-access"', runtime["appServer"]["launchOverrides"])
         with urllib.request.urlopen(self.url + "/observe") as response:
             observer = json.load(response)
-        self.assertEqual(observer["status"], status)
+        self.assertEqual(observer["runtime"], runtime)
         projection = observer["projection"]
         self.assertEqual(set(projection), {
-            "workerAvailable", "defaultCwd", "usage", "usageRefreshMs", "activeTurns",
+            "cwd", "usage", "usageRefreshMs", "activeTurns",
             "pendingActions", "cursor", "historyLost", "events",
         })
-        self.assertTrue(projection["workerAvailable"])
-        self.assertEqual(projection["defaultCwd"], str(self.workspace))
+        self.assertEqual(projection["cwd"], str(self.workspace))
         self.assertEqual(projection["usageRefreshMs"], 5000)
         self.assertIn("rateLimits", projection["usage"])
     def test_inspection_uses_default_cwd_and_accepts_absolute_host_paths(self):
@@ -739,7 +723,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(request_result["pendingActions"], [])
 
         status = self.client.call("status")
-        self.assertTrue(status["healthy"])
+        self.assertTrue(status["ready"])
 
     def test_questions_wake_wait_and_preserve_the_same_turn(self):
         work = self.start("delayed_question")

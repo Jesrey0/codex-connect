@@ -40,7 +40,7 @@ Codex Connect does **not** define another agent/session model.
 
 Connect-owned state is observational or transport-specific only: the bounded event journal, pending server-request registry, and bounded live-turn cache seeded from official turn-start responses/lifecycle events. None is authoritative Codex state; persisted thread history remains App Server-owned.
 
-The backend also exposes a loopback-only `GET /observe` endpoint for the local `codex-connect console`. This is deliberately outside the public MCP tool catalog and contains no mutation operations. It projects backend/runtime status, briefly cached `account/rateLimits/read` telemetry, currently active entries from the bounded live-turn cache, pending-action metadata, and the newest bounded journal events. For turns initiated through the relay, the projection also retains the requested mode/model/reasoning-effort/service-tier metadata because upstream `Turn` lifecycle objects do not carry those fields; lifecycle updates preserve this metadata without promoting it to authoritative Codex state. The projection resets with the backend process and must not be interpreted as global Codex thread enumeration.
+The backend also exposes loopback-only runtime/observer endpoints for local management and the `codex-connect console`. They are deliberately outside the public MCP tool catalog. Internal runtime status retains deployment and diagnostic provenance such as the exact binary SHA-256 and App Server launch context, while `/observe` adds briefly cached `account/rateLimits/read` telemetry, currently active entries from the bounded live-turn cache, pending-action metadata, and the newest bounded journal events. For turns initiated through the relay, the projection also retains the requested mode/model/reasoning-effort/service-tier metadata because upstream `Turn` lifecycle objects do not carry those fields; lifecycle updates preserve this metadata without promoting it to authoritative Codex state. The projection resets with the backend process and must not be interpreted as global Codex thread enumeration.
 
 ## App Server reuse invariant
 
@@ -58,7 +58,7 @@ The public surface therefore falls into three implementation classes:
 | Adapter | `view_image` | Image bytes come from official `fs/readFile`; Connect only validates/resizes them and emits an MCP image content block. |
 | Bridge | `inspect.searchContent` | The pinned App Server has no workspace-content-search RPC. The bridge is bounded, cancellation-aware, does not follow symlinks, and skips known build/cache trees. |
 | Bridge | `apply_patch` | The pinned App Server exposes byte-level filesystem mutations but no deterministic patch semantic RPC. Connect owns patch parsing/preflight/rollback semantics. |
-| Bridge | `status` | Operator/runtime health, content-addressed build identity, global Codex configuration provenance, App Server launch context, and the compact operator-contract marker are Connect deployment concerns, not Codex thread state. |
+| Bridge | `status` | Compact operator orientation: readiness, live build identity, navigation cwd, and worker-default values/provenance. Detailed deployment/App Server provenance remains on the loopback management plane rather than the public MCP surface. |
 
 The local observer endpoint and console do not add an MCP tool or a second control plane. They are a presentation-only projection over the same relay process; approval, permission, user-input, delegation, steering, and interruption authority remain on the existing ChatGPT-facing MCP path.
 
@@ -109,7 +109,7 @@ The pending registry preserves the exact official request ID, method, params, an
 - `searchContent`
 - `fuzzyFileSearch`
 
-Each inspection request may select a host `cwd`. Relative operation paths resolve from that request-local directory; omitted search paths mean the selected `cwd`, and omitted `cwd` means the configured `defaultCwd`. Absolute host paths are accepted. `defaultCwd` is a navigation default, not an authorization boundary. One failed inspection operation is returned as an indexed error beside successful results; malformed batches and cancellation still fail the whole request.
+Each inspection request may select a host `cwd`. Relative operation paths resolve from that request-local directory; omitted search paths mean the selected `cwd`, and omitted `cwd` means the configured navigation cwd. Absolute host paths are accepted. The configured cwd is a navigation default, not an authorization boundary. One failed inspection operation is returned as an indexed error beside successful results; malformed batches and cancellation still fail the whole request.
 
 `readText`, `readDirectory`, and `metadata` use the pinned `fs/readFile`, `fs/readDirectory`, and `fs/getMetadata` RPCs. `readText` rejects files that cannot fit safely inside the shared App Server JSONL frame before issuing `fs/readFile`, then decodes the base64 payload and applies its existing line-range presentation. `readDirectory` similarly estimates the pinned response size from entry names and rejects listings that could exceed the shared transport frame before issuing the RPC; App Server remains authoritative for the returned entry data. `fuzzyFileSearch` uses the pinned App Server RPC of the same name and preserves its ranked result contract (`root`, relative `path`, `match_type`, `file_name`, `score`, and optional `indices`) without adding synthetic limits or truncation semantics. Returned fuzzy matches are still checked against the selected search root so descendant symlink escapes are dropped. Directory and metadata results use the App Server field names; in particular, metadata has `createdAtMs`, `modifiedAtMs`, `isFile`, `isDirectory`, and `isSymlink`, and no synthetic `sizeBytes` field because the official metadata RPC does not report one.
 
@@ -161,7 +161,7 @@ Codex Connect intentionally does not advertise `openai/form` because the minimiz
 
 The generated schema artifact contains only the internal requests and server-response contracts needed by the adapter, including the explicitly selected user-input request contract. Upstream App Server schema identifiers are preserved verbatim and do not define generations of the Codex Connect MCP surface. Adding an App Server method to that artifact does not make it a public MCP tool; public tools are deliberately designed around ChatGPT goals.
 
-## Default workspace
+## Navigation cwd
 
 The backend has one configured default working directory, defaulting to `~/projects`. It is the base for relative paths and the App Server startup directory, not an authorization boundary. Project selection remains per operation through paths or official `cwd` fields. There is no active-project backend setting.
 

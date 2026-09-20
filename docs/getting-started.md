@@ -4,7 +4,7 @@ This is the shortest supported path from a fresh Linux host to a working Codex C
 
 The target success condition is simple:
 
-> From ChatGPT, `@codexConnect` can call `status` and receive the live backend/App Server status from your machine.
+> From ChatGPT, `@codexConnect` can call `status` and receive the live operator-ready state from your machine.
 
 ## Current support boundary
 
@@ -202,7 +202,7 @@ Do not rerun first-time setup or recreate the tunnel. The two runtime owners rec
    codex-connect doctor
    ```
 
-   If it is not healthy, run `codex-connect restart`. This starts the service if necessary, ensures it is enabled for future restarts, and waits for backend health.
+   If it is not ready, run `codex-connect restart`. This starts the service if necessary, ensures it is enabled for future restarts, and waits for backend readiness.
 
 2. **Tunnel:** the tunnel-client profile and alias survive reboot, but its native managed runtime may need to be resumed. Export the runtime key required by the profile, then inspect the saved alias:
 
@@ -245,7 +245,7 @@ Start a new ChatGPT conversation with the custom app/connector enabled and ask:
 @codexConnect check status
 ```
 
-A working installation should return live data from `status`, including an available worker and `stdio` App Server transport.
+A working installation should return `ready: true`, the live build identity, the configured navigation cwd, and the configured worker-default values plus their source (`userConfig` or `upstream`).
 
 Then test the useful boundary, not just connectivity:
 

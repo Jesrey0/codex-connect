@@ -60,6 +60,8 @@ codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/projects/example-p
 
 `codex-connect restart` also enables the backend service if it was installed but disabled, so a successful recovery restores the next-boot invariant.
 
+`status` is the concise readiness/orientation view. `console` is the rich read-only observability view for quota, workers, pending actions, and recent events. `doctor` remains the detailed local integration diagnostic.
+
 `codex-connect console` connects only to the configured loopback backend and renders its observer projection. The display is intentionally non-authoritative and non-actuating: active turns are turns observed by the current backend process, recent activity is bounded journal state, and quota values are cached briefly to avoid polling the upstream account endpoint on every screen refresh. Requested model, reasoning effort, and service tier are retained as projection metadata for turns started through this backend; when those values were omitted or cannot be authoritatively recovered, the console labels them `default/inherited` rather than guessing. Press Ctrl-C to exit. Approvals, permissions, semantic user input, worker delegation, steering, and interruption remain exclusively on the ChatGPT/Codex Connect control path.
 
 ## Uninstall
@@ -83,7 +85,7 @@ codex-connect status
 codex-connect doctor
 ```
 
-`codex-connect.service` should already be enabled. If the backend is stopped or unhealthy, run `codex-connect restart` and recheck it.
+`codex-connect.service` should already be enabled. If the backend is stopped or not ready, run `codex-connect restart` and recheck it.
 
 For the tunnel, export the runtime API key required by the saved profile and inspect the existing alias:
 

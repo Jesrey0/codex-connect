@@ -1247,8 +1247,7 @@ impl Relay {
         let pending_actions = self.pending_actions(None).await;
         let recent = self.journal.tail(64).await;
         Ok(json!({
-            "workerAvailable": self.worker_available(),
-            "defaultCwd": self.default_cwd(),
+            "cwd": self.default_cwd(),
             "usage": usage,
             "usageRefreshMs": OBSERVER_USAGE_REFRESH_MS,
             "activeTurns": active_turns,

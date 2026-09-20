@@ -26,7 +26,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "status",
                 "Read Operator Status",
-                "Use first to orient to Codex Connect health, default workspace, build identity, global Codex configuration provenance, and App Server launch context.",
+                "Use first to orient to Codex Connect readiness, live build identity, configured navigation cwd, and ordinary worker defaults. Detailed deployment/App Server diagnostics stay on the loopback management plane.",
                 true,
                 false,
                 false,
@@ -39,7 +39,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "inspect",
                 "Inspect Workspace",
-                "Use for structured read-only host exploration. Batch independent text reads, directory listings, metadata checks, content searches, and ranked App Server fuzzy file searches in one call whenever possible. Absolute host paths are accepted; relative paths resolve against request cwd, which defaults to defaultCwd. Each operation returns an indexed result or error without discarding successful siblings. Use command.exec instead when the answer is naturally produced by one deterministic repository/tool command.",
+                "Use for structured read-only host exploration. Batch independent text reads, directory listings, metadata checks, content searches, and ranked App Server fuzzy file searches in one call whenever possible. Absolute host paths are accepted; relative paths resolve against request cwd, which defaults to the configured navigation cwd. Each operation returns an indexed result or error without discarding successful siblings. Use command.exec instead when the answer is naturally produced by one deterministic repository/tool command.",
                 true,
                 false,
                 false,
@@ -52,7 +52,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "apply_patch",
                 "Apply Patch",
-                "Use when the exact textual file change is already known. Absolute host paths are accepted; relative patch paths resolve against request cwd, which defaults to defaultCwd. Patch transaction, regular-file, and symlink-mutation protections remain enforced. For delegated autonomous multi-step coding, use codex.start instead.",
+                "Use when the exact textual file change is already known. Absolute host paths are accepted; relative patch paths resolve against request cwd, which defaults to the configured navigation cwd. Patch transaction, regular-file, and symlink-mutation protections remain enforced. For delegated autonomous multi-step coding, use codex.start instead.",
                 false,
                 true,
                 false,
@@ -110,7 +110,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "view_image",
                 "View Image",
-                "Use to inspect an image file on the host. Absolute host paths are accepted; relative paths resolve against request cwd, which defaults to defaultCwd.",
+                "Use to inspect an image file on the host. Absolute host paths are accepted; relative paths resolve against request cwd, which defaults to the configured navigation cwd.",
                 true,
                 false,
                 false,
@@ -445,62 +445,20 @@ fn action_response_schema() -> Value {
 fn status_schema() -> Value {
     object_schema(
         json!({
-            "healthy":{"type":"boolean"},
-            "operatorContract":object_schema(json!({
-                "controlPlane":{"const":"codex-connect"},
-                "codexAccess":{"const":"mcp"},
-                "workerContext":{"const":"isolated"},
-                "hostAccess":{"const":"dangerFullAccess"},
-                "workerApprovalPolicy":{"const":"on-request"},
-                "reviewPolicy":{"const":"readOnlyNewThread"},
-                "commandDefaultTimeoutMs":{"type":"integer","minimum":1},
-                "commandMaxTimeoutMs":{"type":"integer","minimum":1}
-            }), &["controlPlane","codexAccess","workerContext","hostAccess","workerApprovalPolicy","reviewPolicy","commandDefaultTimeoutMs","commandMaxTimeoutMs"]),
-            "defaultCwd":{"type":"string"},
-            "endpoint":{"type":"string"},
+            "ready":{"type":"boolean"},
+            "cwd":{"type":"string"},
             "buildId":{"type":"string"},
-            "binarySha256":{"type":"string"},
-            "executable":{"type":"string"},
-            "appServerTransport":{"const":"stdio"},
-            "experimentalApi":{"const":true},
             "codex":object_schema(json!({
-                "binary":{"type":"string"},
                 "release":{"type":"string"},
-                "home":{"type":"string"},
-                "homeSource":{"type":"string","enum":["default","CODEX_HOME"]},
-                "globalConfig":object_schema(json!({
-                    "path":{"type":"string"},
-                    "exists":{"type":"boolean"},
-                    "parsed":{"type":"boolean"},
+                "defaults":object_schema(json!({
                     "model":{"type":["string","null"]},
                     "reasoningEffort":{"type":["string","null"]},
                     "serviceTier":{"type":["string","null"]},
-                    "approvalPolicy":{"type":["string","null"]},
-                    "sandboxMode":{"type":["string","null"]},
-                    "workspaceWriteNetworkAccess":{"type":["boolean","null"]}
-                }), &["path","exists","parsed","model","reasoningEffort","serviceTier","approvalPolicy","sandboxMode","workspaceWriteNetworkAccess"])
-            }), &["binary","release","home","homeSource","globalConfig"]),
-            "appServer":object_schema(json!({
-                "transport":{"const":"stdio"},
-                "workingDirectory":{"type":"string"},
-                "userAgent":{"type":"string"},
-                "experimentalApi":{"const":true},
-                "launchOverrides":{"type":"array","items":{"type":"string"}}
-            }), &["transport","workingDirectory","userAgent","experimentalApi","launchOverrides"])
+                    "source":{"enum":["userConfig","upstream"],"description":"userConfig means at least one ordinary worker default is explicitly set in the user Codex config; upstream means all three are left for Codex to resolve."}
+                }), &["model","reasoningEffort","serviceTier","source"])
+            }), &["release","defaults"])
         }),
-        &[
-            "healthy",
-            "operatorContract",
-            "defaultCwd",
-            "endpoint",
-            "buildId",
-            "binarySha256",
-            "executable",
-            "appServerTransport",
-            "experimentalApi",
-            "codex",
-            "appServer",
-        ],
+        &["ready", "cwd", "buildId", "codex"],
     )
 }
 fn work_started_schema() -> Value {
@@ -535,7 +493,7 @@ fn inspect_schema() -> Value {
     )
 }
 fn cwd_schema() -> Value {
-    json!({"type":["string","null"],"description":"Request working directory on the host. Absolute paths are accepted. Relative cwd is resolved from defaultCwd; omitted or null cwd selects defaultCwd. Relative operation paths resolve from the selected cwd."})
+    json!({"type":["string","null"],"description":"Request working directory on the host. Absolute paths are accepted. Relative cwd is resolved from the configured navigation cwd; omitted or null cwd selects that configured cwd. Relative operation paths resolve from the selected cwd."})
 }
 fn network_access_schema() -> Value {
     json!({"type":"boolean","default":false,"description":"Network access for an explicitly supplied sandbox policy. false may block sockets, including socket-based localhost tests. true enables broader network access, not only loopback. No automatic escalation or retry."})
@@ -885,44 +843,20 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn status_schema_exposes_codex_provenance_and_app_server_launch_context() {
+    fn status_schema_is_compact_operator_orientation() {
         let schema = status_schema();
         let properties = &schema["properties"];
-        assert_eq!(properties["operatorContract"]["type"], "object");
-        assert_eq!(
-            properties["operatorContract"]["properties"]["controlPlane"]["const"],
-            "codex-connect"
-        );
-        assert_eq!(
-            properties["operatorContract"]["properties"]["workerContext"]["const"],
-            "isolated"
-        );
-        assert_eq!(
-            properties["operatorContract"]["properties"]["workerApprovalPolicy"]["const"],
-            "on-request"
-        );
+        assert_eq!(properties["ready"]["type"], "boolean");
+        assert_eq!(properties["cwd"]["type"], "string");
+        assert_eq!(properties["buildId"]["type"], "string");
         assert_eq!(properties["codex"]["type"], "object");
-        assert_eq!(properties["appServer"]["type"], "object");
-        assert_eq!(properties["endpoint"]["type"], "string");
         assert_eq!(
-            properties["codex"]["properties"]["homeSource"]["enum"],
-            json!(["default", "CODEX_HOME"])
+            properties["codex"]["properties"]["defaults"]["properties"]["source"]["enum"],
+            json!(["userConfig", "upstream"])
         );
-        assert!(
-            properties["codex"]["properties"]["globalConfig"]["properties"]
-                .get("sandboxMode")
-                .is_some()
-        );
-        assert!(
-            properties["appServer"]["properties"]
-                .get("launchOverrides")
-                .is_some()
-        );
-        assert!(
-            properties["appServer"]["properties"]
-                .get("userAgent")
-                .is_some()
-        );
+        assert!(properties.get("operatorContract").is_none());
+        assert!(properties.get("binarySha256").is_none());
+        assert!(properties.get("appServer").is_none());
     }
 
     #[test]

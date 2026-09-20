@@ -30,7 +30,7 @@ use tokio::net::TcpListener;
 const DEFAULT_WAIT_MS: u64 = 60_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Deterministic host tools operate with the host user's authority through a dedicated App Server launched in danger-full-access; defaultCwd is only the navigation base for relative paths, not an authorization fence. Use codex.* for Codex threads, turns, reviews, discovery, usage, approvals, permissions, and user input; do not invoke the Codex CLI through host command tools as an alternate control plane when the semantic operation is available here. Prefer inspect for batched read-only host exploration, command.exec for bounded deterministic host commands, command.start/read/control for persistent or interactive deterministic commands, and apply_patch for exact known text edits. Delegated codex.start(mode=work) always requires an explicit per-task sandboxPolicy and runs with the server-owned on-request approval policy. New work threads may also carry developerInstructions for a concise worker operating contract; keep task self-contained, and do not send developerInstructions when resuming with threadId because resumed threads keep their established instructions. New official review threads are read-only and may select a model; resumed threads keep their established settings. Use codex.start followed by codex.wait only when delegated autonomous reasoning or iteration materially improves the critical path or quality; delegation is an optimization, not the default. After starting a worker, continue independent critical-path work instead of blocking on it. Successful host-plane tool results may include workerEvents when delegated work becomes terminal or requires operator action; treat those as semantic interrupts and use codex.wait for the detailed worker state rather than polling routinely. Codex workers do not inherit the ChatGPT conversation, so every delegated task must include its own relevant context, constraints, paths, decisions, and acceptance criteria. Minimize unnecessary Codex turns and discovery calls because model usage is constrained; batch independent discovery with codex.info. Preserve ownership boundaries: Codex CLI/App Server and tunnel-client are independently owned upstream dependencies, and Codex Connect must not install, relocate, duplicate, upgrade, delete, or supervise their owned state. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect projects those capabilities without inventing a second execution model.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Host tools run with host-user authority; the configured cwd is navigation only. Use codex.* for Codex semantics rather than invoking the Codex CLI through host commands. Delegated work requires an explicit sandboxPolicy, uses the server-owned on-request approval policy, and does not inherit the ChatGPT conversation; provide self-contained worker context. Delegate only when it materially improves progress or verification, continue independent critical-path work while workers run, and treat workerEvents as interrupts with codex.wait as the detailed join. Codex CLI/App Server and tunnel-client are upstream-owned. Do not create Git workflow state unless the user requests version-control work. Official App Server state is authoritative for Codex lifecycles.";
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,19 +73,6 @@ fn attach_worker_events(value: &mut Value, events: Vec<Value>) {
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OperatorContract {
-    pub control_plane: String,
-    pub codex_access: String,
-    pub worker_context: String,
-    pub host_access: String,
-    pub worker_approval_policy: String,
-    pub review_policy: String,
-    pub command_default_timeout_ms: u64,
-    pub command_max_timeout_ms: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CodexGlobalConfigSummary {
     pub path: String,
     pub exists: bool,
@@ -100,7 +87,7 @@ pub struct CodexGlobalConfigSummary {
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexOperatorStatus {
+pub struct RuntimeCodexStatus {
     pub binary: String,
     pub release: String,
     pub home: String,
@@ -110,7 +97,7 @@ pub struct CodexOperatorStatus {
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AppServerOperatorStatus {
+pub struct RuntimeAppServerStatus {
     pub transport: String,
     pub working_directory: String,
     pub user_agent: String,
@@ -184,6 +171,7 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
         runtime,
     };
     let operator_status = handler.clone();
+    let runtime_status = handler.clone();
     let observer = handler.clone();
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
@@ -203,6 +191,13 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
             }),
         )
         .route(
+            "/runtime",
+            axum::routing::get(move || {
+                let handler = runtime_status.clone();
+                async move { Json(handler.runtime_status_value()) }
+            }),
+        )
+        .route(
             "/observe",
             axum::routing::get(move || {
                 let handler = observer.clone();
@@ -213,7 +208,7 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
                         .await
                         .map(|projection| {
                             Json(json!({
-                                "status": handler.status_value(),
+                                "runtime": handler.runtime_status_value(),
                                 "projection": projection,
                             }))
                         })
@@ -241,49 +236,90 @@ struct McpHandler {
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OperatorStatus {
-    pub healthy: bool,
-    pub operator_contract: OperatorContract,
-    pub default_cwd: String,
+pub struct CodexDefaults {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpCodexStatus {
+    pub release: String,
+    pub defaults: CodexDefaults,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpStatus {
+    pub ready: bool,
+    pub build_id: String,
+    pub cwd: String,
+    pub codex: McpCodexStatus,
+}
+
+impl McpStatus {
+    fn read(relay: &Relay, runtime: &RuntimeIdentity) -> Self {
+        let config = &runtime.codex_global_config;
+        Self {
+            ready: relay.worker_available(),
+            build_id: runtime.build_id.clone(),
+            cwd: relay.default_cwd(),
+            codex: McpCodexStatus {
+                release: runtime.codex_release.clone(),
+                defaults: CodexDefaults {
+                    model: config.model.clone(),
+                    reasoning_effort: config.reasoning_effort.clone(),
+                    service_tier: config.service_tier.clone(),
+                    source: if config.model.is_some()
+                        || config.reasoning_effort.is_some()
+                        || config.service_tier.is_some()
+                    {
+                        "userConfig".into()
+                    } else {
+                        "upstream".into()
+                    },
+                },
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatus {
+    pub ready: bool,
+    pub cwd: String,
     pub endpoint: String,
     pub build_id: String,
     pub binary_sha256: String,
     pub executable: String,
     pub app_server_transport: String,
     pub experimental_api: bool,
-    pub codex: CodexOperatorStatus,
-    pub app_server: AppServerOperatorStatus,
+    pub codex: RuntimeCodexStatus,
+    pub app_server: RuntimeAppServerStatus,
 }
 
-impl OperatorStatus {
+impl RuntimeStatus {
     fn read(relay: &Relay, runtime: &RuntimeIdentity) -> Self {
         Self {
-            healthy: relay.worker_available(),
-            operator_contract: OperatorContract {
-                control_plane: "codex-connect".into(),
-                codex_access: "mcp".into(),
-                worker_context: "isolated".into(),
-                host_access: "dangerFullAccess".into(),
-                worker_approval_policy: "on-request".into(),
-                review_policy: "readOnlyNewThread".into(),
-                command_default_timeout_ms: codex_connect_relay::DEFAULT_COMMAND_MS,
-                command_max_timeout_ms: codex_connect_relay::MAX_COMMAND_MS,
-            },
-            default_cwd: relay.default_cwd(),
+            ready: relay.worker_available(),
+            cwd: relay.default_cwd(),
             endpoint: runtime.endpoint.clone(),
             build_id: runtime.build_id.clone(),
             binary_sha256: runtime.binary_sha256.clone(),
             executable: runtime.executable.clone(),
             app_server_transport: "stdio".into(),
             experimental_api: true,
-            codex: CodexOperatorStatus {
+            codex: RuntimeCodexStatus {
                 binary: runtime.codex_binary.clone(),
                 release: runtime.codex_release.clone(),
                 home: runtime.codex_home.clone(),
                 home_source: runtime.codex_home_source.clone(),
                 global_config: runtime.codex_global_config.clone(),
             },
-            app_server: AppServerOperatorStatus {
+            app_server: RuntimeAppServerStatus {
                 transport: "stdio".into(),
                 working_directory: runtime.app_server_working_directory.clone(),
                 user_agent: relay.app_server_user_agent(),
@@ -295,8 +331,12 @@ impl OperatorStatus {
 }
 
 impl McpHandler {
-    fn status_value(&self) -> OperatorStatus {
-        OperatorStatus::read(&self.relay, &self.runtime)
+    fn status_value(&self) -> McpStatus {
+        McpStatus::read(&self.relay, &self.runtime)
+    }
+
+    fn runtime_status_value(&self) -> RuntimeStatus {
+        RuntimeStatus::read(&self.relay, &self.runtime)
     }
 }
 
@@ -527,7 +567,7 @@ async fn dispatch(
     match name {
         "status" => {
             ensure_empty(arguments)?;
-            Ok(serde_json::to_value(OperatorStatus::read(relay, runtime))?)
+            Ok(serde_json::to_value(McpStatus::read(relay, runtime))?)
         }
         "inspect" => inspect(relay, host, parse(arguments)?, context).await,
         "apply_patch" => {
@@ -911,15 +951,12 @@ mod tests {
     #[test]
     fn server_instructions_calibrate_control_plane_and_delegation() {
         assert!(SERVER_INSTRUCTIONS.contains("primary host and Codex control plane"));
-        assert!(
-            SERVER_INSTRUCTIONS.contains("do not invoke the Codex CLI through host command tools")
-        );
-        assert!(SERVER_INSTRUCTIONS.contains("do not inherit the ChatGPT conversation"));
-        assert!(SERVER_INSTRUCTIONS.contains("delegation is an optimization, not the default"));
+        assert!(SERVER_INSTRUCTIONS.contains("rather than invoking the Codex CLI"));
+        assert!(SERVER_INSTRUCTIONS.contains("does not inherit the ChatGPT conversation"));
         assert!(SERVER_INSTRUCTIONS.contains("server-owned on-request approval policy"));
         assert!(SERVER_INSTRUCTIONS.contains("continue independent critical-path work"));
         assert!(SERVER_INSTRUCTIONS.contains("workerEvents"));
-        assert!(SERVER_INSTRUCTIONS.contains("model usage is constrained"));
-        assert!(SERVER_INSTRUCTIONS.contains("batch independent discovery with codex.info"));
+        assert!(SERVER_INSTRUCTIONS.contains("upstream-owned"));
+        assert!(SERVER_INSTRUCTIONS.contains("Official App Server state is authoritative"));
     }
 }

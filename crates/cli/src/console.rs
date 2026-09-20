@@ -128,13 +128,13 @@ fn draw(snapshot: Option<&Value>, last_error: Option<&str>, frame: usize) -> Res
 }
 
 fn render_snapshot(lines: &mut Vec<String>, snapshot: &Value, width: usize) {
-    let status = &snapshot["status"];
+    let runtime = &snapshot["runtime"];
     let projection = &snapshot["projection"];
-    let healthy = status["healthy"].as_bool().unwrap_or(false);
-    let health = if healthy { "● ONLINE" } else { "○ OFFLINE" };
-    let build = text(&status["buildId"], "unknown");
-    let release = text(&status["codex"]["release"], "unknown");
-    let health_style = if healthy { GREEN } else { RED };
+    let ready = runtime["ready"].as_bool().unwrap_or(false);
+    let health = if ready { "● ONLINE" } else { "○ OFFLINE" };
+    let build = text(&runtime["buildId"], "unknown");
+    let release = text(&runtime["codex"]["release"], "unknown");
+    let health_style = if ready { GREEN } else { RED };
 
     lines.push(styled(
         row_lr(
@@ -146,7 +146,7 @@ fn render_snapshot(lines: &mut Vec<String>, snapshot: &Value, width: usize) {
     ));
     lines.push(styled(
         row_lr(
-            &format!(" ⌂ {}", text(&projection["defaultCwd"], "unknown")),
+            &format!(" ⌂ {}", text(&projection["cwd"], "unknown")),
             &format!("refresh {}ms ", REFRESH_MS),
             width,
         ),

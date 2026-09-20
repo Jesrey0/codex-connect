@@ -8,7 +8,7 @@ use crate::service::{ServiceManager, SystemdManager, UnitState, backend_unit};
 use crate::{ServeConfig, serve_mcp};
 use anyhow::{Context, Result, bail};
 use codex_connect_app_server::verify_codex_pin;
-use codex_connect_mcp::OperatorStatus;
+use codex_connect_mcp::RuntimeStatus;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -125,11 +125,11 @@ async fn deployment_effect_visible(record: &deployment::DeploymentRecord) -> Res
         return Ok(true);
     }
     let (_, config) = load_config()?;
-    let runtime = match backend_status_once(&config.backend).await {
+    let runtime = match runtime_status_once(&config.backend).await {
         Ok(runtime) => runtime,
         Err(_) => return Ok(false),
     };
-    Ok(runtime.healthy && runtime.binary_sha256 == expected_sha256)
+    Ok(runtime.ready && runtime.binary_sha256 == expected_sha256)
 }
 
 pub async fn deploy_prepare() -> Result<()> {
@@ -362,10 +362,10 @@ pub async fn deploy_status(operation_id: &str) -> Result<()> {
                 .as_deref()
                 .context("successful deployment has no SHA-256")?;
             let (_, config) = load_config()?;
-            let runtime = backend_status_once(&config.backend)
+            let runtime = runtime_status_once(&config.backend)
                 .await
                 .context("deployment succeeded but the backend health endpoint is unavailable")?;
-            if !runtime.healthy || runtime.binary_sha256 != expected_sha256 {
+            if !runtime.ready || runtime.binary_sha256 != expected_sha256 {
                 bail!(
                     "deployment {} recorded success but live backend is build {} ({})",
                     record.operation_id,
@@ -373,7 +373,7 @@ pub async fn deploy_status(operation_id: &str) -> Result<()> {
                     runtime.binary_sha256
                 );
             }
-            println!("Live verification: healthy build {} ✓", runtime.build_id);
+            println!("Live verification: ready build {} ✓", runtime.build_id);
             println!(
                 "DEPLOYMENT_STATUS operation_id={} state=succeeded build_id={} sha256={} verified=true",
                 record.operation_id, runtime.build_id, runtime.binary_sha256
@@ -506,7 +506,7 @@ pub async fn setup(no_start: bool) -> Result<()> {
     }
     activate_operator_symlink(&binary)?;
     println!(
-        "✓ Backend installed and healthy at http://{}/mcp",
+        "✓ Backend installed and ready at http://{}/mcp",
         config.backend.listen
     );
     println!(
@@ -516,7 +516,7 @@ pub async fn setup(no_start: bool) -> Result<()> {
 }
 
 pub async fn status() -> Result<()> {
-    let (store, config) = load_config()?;
+    let (_, config) = load_config()?;
     let manager = SystemdManager;
     manager.available()?;
     let operator = artifact::current()?;
@@ -528,11 +528,12 @@ pub async fn status() -> Result<()> {
         state.unit_file_state
     );
     println!("Endpoint: http://{}/mcp", config.backend.listen);
-    println!("Default workspace: {}", config.workspace.default_cwd);
-    match backend_status_once(&config.backend).await {
+    println!("Navigation cwd: {}", config.workspace.default_cwd);
+    match runtime_status_once(&config.backend).await {
         Ok(runtime) => {
             println!(
-                "Health: ready ✓  build {}{}",
+                "Ready: {}  build {}{}",
+                if runtime.ready { "yes ✓" } else { "no" },
                 runtime.build_id,
                 if runtime.binary_sha256 == operator.sha256 {
                     " ✓"
@@ -540,38 +541,17 @@ pub async fn status() -> Result<()> {
                     " ≠"
                 }
             );
+            println!("Codex: {}", runtime.codex.release);
+            let defaults = &runtime.codex.global_config;
             println!(
-                "Codex CLI: {} ({})",
-                runtime.codex.binary, runtime.codex.release
-            );
-            println!(
-                "Codex home: {} ({})",
-                runtime.codex.home, runtime.codex.home_source
-            );
-            println!(
-                "Codex global config: {} [{}]",
-                runtime.codex.global_config.path,
-                if runtime.codex.global_config.parsed {
-                    "parsed"
-                } else if runtime.codex.global_config.exists {
-                    "unparsed"
-                } else {
-                    "missing"
-                }
-            );
-            println!(
-                "App Server: {}  user-agent={}  cwd={}",
-                runtime.app_server.transport,
-                runtime.app_server.user_agent,
-                runtime.app_server.working_directory
+                "Worker defaults: model={}  reasoning={}  serviceTier={}",
+                defaults.model.as_deref().unwrap_or("upstream"),
+                defaults.reasoning_effort.as_deref().unwrap_or("upstream"),
+                defaults.service_tier.as_deref().unwrap_or("upstream")
             );
         }
-        Err(error) => println!("Health: {error}"),
+        Err(error) => println!("Ready: no ({error})"),
     }
-    println!(
-        "Native tunnel: managed by tunnel-client; inspect with `tunnel-client runtimes status <alias>`."
-    );
-    println!("Config: {}", store.path().display());
     Ok(())
 }
 
@@ -586,10 +566,7 @@ pub async fn restart() -> Result<()> {
         manager.enable_start(BACKEND_SERVICE)?;
     }
     let runtime = wait_for_backend_health(&config, Some(&artifact::current()?.sha256)).await?;
-    println!(
-        "✓ Restarted backend — healthy build {}. The native tunnel-client runtime was not restarted.",
-        runtime.build_id
-    );
+    println!("✓ Restarted backend — ready build {}.", runtime.build_id);
     Ok(())
 }
 
@@ -649,8 +626,8 @@ pub async fn doctor() -> Result<()> {
             failures.push("backend".to_string());
         }
     }
-    match backend_status_once(&config.backend).await {
-        Ok(status) if status.healthy && status.app_server_transport == "stdio" => {
+    match runtime_status_once(&config.backend).await {
+        Ok(status) if status.ready && status.app_server_transport == "stdio" => {
             print_check("App Server", true, "stdio ready")
         }
         Ok(_) => {
@@ -855,21 +832,19 @@ fn is_enabled(state: &UnitState) -> bool {
 async fn wait_for_backend_health(
     config: &Config,
     expected_sha256: Option<&str>,
-) -> Result<OperatorStatus> {
+) -> Result<RuntimeStatus> {
     let expected_default_cwd =
         resolve_required_directory(&config.workspace.default_cwd, "default workspace")?;
     let mut last_error = None;
     for _ in 0..40 {
-        match backend_status_once(&config.backend).await {
-            Ok(status)
-                if PathBuf::from(&status.default_cwd).canonicalize()? != expected_default_cwd =>
-            {
+        match runtime_status_once(&config.backend).await {
+            Ok(status) if PathBuf::from(&status.cwd).canonicalize()? != expected_default_cwd => {
                 last_error = Some(anyhow::anyhow!("backend reports a different default cwd"))
             }
             Ok(status) if expected_sha256.is_some_and(|hash| status.binary_sha256 != hash) => {
                 last_error = Some(anyhow::anyhow!("backend is running a stale build"))
             }
-            Ok(status) if !status.healthy => {
+            Ok(status) if !status.ready => {
                 last_error = Some(anyhow::anyhow!("App Server worker is unavailable"))
             }
             Ok(status) if !status.experimental_api => {
@@ -883,20 +858,20 @@ async fn wait_for_backend_health(
         sleep(Duration::from_millis(250)).await;
     }
     bail!(
-        "backend did not become healthy: {}",
+        "backend did not become ready: {}",
         last_error
             .map(|error| error.to_string())
             .unwrap_or_else(|| "no response".to_string())
     )
 }
-async fn backend_status_once(config: &BackendConfig) -> Result<OperatorStatus> {
+async fn runtime_status_once(config: &BackendConfig) -> Result<RuntimeStatus> {
     let addr = config.listen_addr()?;
     if http_get(addr, "/healthz").await?.0 != 200 {
         bail!("health endpoint did not return HTTP 200");
     }
-    let (status, body) = http_get(addr, "/status").await?;
+    let (status, body) = http_get(addr, "/runtime").await?;
     if status != 200 {
-        bail!("status endpoint returned HTTP {status}");
+        bail!("runtime endpoint returned HTTP {status}");
     }
     Ok(serde_json::from_slice(&body)?)
 }
