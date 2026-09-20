@@ -130,8 +130,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.client.catalog), 13)
         self.assertEqual(set(self.client.tools), EXPECTED)
         wait_timeout = self.client.tools["codex.wait"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(wait_timeout["default"], 60000)
-        self.assertEqual(wait_timeout["maximum"], 120000)
+        self.assertEqual(wait_timeout["default"], 45000)
+        self.assertEqual(wait_timeout["maximum"], 45000)
         exec_timeout = self.client.tools["command.exec"]["inputSchema"]["properties"]["timeoutMs"]
         self.assertEqual(exec_timeout["default"], 60000)
         self.assertEqual(exec_timeout["maximum"], 60 * 60 * 1000)
@@ -610,7 +610,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.client.call("codex.wait", {
             "threadId": work["threadId"],
             "turnId": work["turnId"],
-            "timeoutMs": 120001,
+            "timeoutMs": 45001,
         }, error=True, validate_input=False)
         self.assertEqual(len(self.method_params("thread/read")), reads_before)
         self.client.call("codex.control", {

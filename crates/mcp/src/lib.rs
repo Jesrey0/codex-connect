@@ -27,10 +27,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-const DEFAULT_WAIT_MS: u64 = 60_000;
+const DEFAULT_WAIT_MS: u64 = 45_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Host tools run with host-user authority; the configured cwd is navigation only. Use codex.* for Codex semantics rather than invoking the Codex CLI through host commands. Delegated work requires an explicit sandboxPolicy, uses the server-owned on-request approval policy, and does not inherit the ChatGPT conversation; provide self-contained worker context. Delegate only when it materially improves progress or verification, continue independent critical-path work while workers run, and treat workerEvents as interrupts with codex.wait as the detailed join. Codex CLI/App Server and tunnel-client are upstream-owned. Do not create Git workflow state unless the user requests version-control work. Official App Server state is authoritative for Codex lifecycles.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Host tools run with host-user authority; the configured cwd is navigation only. Use codex.* for Codex semantics rather than invoking the Codex CLI through host commands. Delegated work requires an explicit sandboxPolicy, uses the server-owned on-request approval policy, and does not inherit the ChatGPT conversation; provide self-contained worker context. Delegate only when autonomous reasoning materially improves progress or verification. Once delegated, the worker owns its assigned scope until it becomes terminal, blocks for operator action, or is explicitly interrupted; continue only non-overlapping operator work and do not redo the delegated task because a codex.wait lease expired. codex.wait is a short bounded join, and timeout means the worker is still active rather than stalled; when delegated work owns the remaining critical path, repeat bounded joins instead of taking over the same scope. Treat workerEvents as semantic interrupts and codex.wait as the authoritative detailed join. Codex CLI/App Server and tunnel-client are upstream-owned. Do not create Git workflow state unless the user requests version-control work. Official App Server state is authoritative for Codex lifecycles.";
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -942,7 +942,8 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("rather than invoking the Codex CLI"));
         assert!(SERVER_INSTRUCTIONS.contains("does not inherit the ChatGPT conversation"));
         assert!(SERVER_INSTRUCTIONS.contains("server-owned on-request approval policy"));
-        assert!(SERVER_INSTRUCTIONS.contains("continue independent critical-path work"));
+        assert!(SERVER_INSTRUCTIONS.contains("worker owns its assigned scope"));
+        assert!(SERVER_INSTRUCTIONS.contains("repeat bounded joins"));
         assert!(SERVER_INSTRUCTIONS.contains("workerEvents"));
         assert!(SERVER_INSTRUCTIONS.contains("upstream-owned"));
         assert!(SERVER_INSTRUCTIONS.contains("Official App Server state is authoritative"));

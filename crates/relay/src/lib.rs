@@ -37,7 +37,7 @@ use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, Instant};
 
-pub const MAX_WAIT_MS: u64 = 120_000;
+pub const MAX_WAIT_MS: u64 = 45_000;
 const WAIT_RECONCILE_MS: u64 = 1_000;
 const OBSERVER_USAGE_REFRESH_MS: u64 = 5_000;
 const MAX_LIVE_TURNS: usize = 256;

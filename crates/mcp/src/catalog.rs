@@ -163,7 +163,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Start delegated Codex work or an official Codex review. Use mode=work only when autonomous reasoning or iteration materially improves the critical path or quality; Codex workers do not inherit the ChatGPT conversation, so task must be self-contained with relevant context, constraints, paths, decisions, and acceptance criteria. Work mode requires an explicit sandboxPolicy selected per task. New work threads may include developerInstructions for a concise operating contract; Codex Connect appends them after its server-owned workspace policy. developerInstructions is creation-time only and must be omitted when threadId resumes an existing thread. New review threads are read-only and may select a model; existing review threads keep their established settings. Use mode=review for the official review/start lifecycle. Follow with codex.wait.",
+                "Start delegated Codex work or an official Codex review. Use mode=work only when autonomous reasoning or iteration materially improves the critical path or quality; Codex workers do not inherit the ChatGPT conversation, so task must be self-contained with relevant context, constraints, paths, decisions, and acceptance criteria. Once started, the worker owns its assigned scope until terminal, blocked for operator action, or explicitly interrupted; the operator should continue only non-overlapping work rather than independently redoing the delegated task. Work mode requires an explicit sandboxPolicy selected per task. New work threads may include developerInstructions for a concise operating contract; Codex Connect appends them after its server-owned workspace policy. developerInstructions is creation-time only and must be omitted when threadId resumes an existing thread. New review threads are read-only and may select a model; existing review threads keep their established settings. Use mode=review for the official review/start lifecycle. Follow with codex.wait.",
                 false,
                 true,
                 true,
@@ -176,7 +176,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.wait",
                 "Read or Wait for Codex Turn",
-                "Read or quietly join a delegated Codex turn. timeoutMs=0 is a non-blocking authoritative snapshot; positive values wait up to 120 seconds. Routine tool calls, file changes, and worker commentary remain journaled but do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required; pendingActions are returned directly for codex.action.respond.",
+                "Read or quietly join a delegated Codex turn. timeoutMs=0 is a non-blocking authoritative snapshot; positive values are short leases capped at 45 seconds to leave headroom beneath the observed outer connector response deadline. Routine tool calls, file changes, and worker commentary remain journaled but do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required; pendingActions are returned directly for codex.action.respond. Lease timeout means the worker is still active, not stalled. If delegated work owns the remaining critical path, repeat bounded joins rather than duplicating or taking over the same scope.",
                 true,
                 false,
                 false,
@@ -687,7 +687,7 @@ fn codex_start_schema() -> Value {
 }
 fn codex_wait_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by codex.start/codex.wait. Matching events after this cursor are returned when the quiet join ends but do not wake it by themselves."},"timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet-join lease in milliseconds. Set to 0 for a non-blocking state/journal pull."}}),
+        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by codex.start/codex.wait. Matching events after this cursor are returned when the quiet join ends but do not wake it by themselves."},"timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Short quiet-join lease in milliseconds. Set to 0 for a non-blocking state/journal pull. Lease expiry means the worker remains active; repeat the join when it still owns the remaining critical path."}}),
         &["threadId", "turnId"],
     )
 }
