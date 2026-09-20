@@ -192,7 +192,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
                 "Mutate an active official Codex turn. Use action=steer to add self-contained instructions to the currently steerable turn without creating a new thread, or action=interrupt to stop the selected turn.",
                 false,
                 true,
-                true,
+                false,
                 false,
             ),
             codex_control_schema(),
@@ -205,7 +205,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
                 "Resolve a pending Codex approval, permission request, semantic user-input question, or MCP elicitation returned by codex.wait. The response type must match the authoritative pending action associated with requestId; accepted elicitations require content while decline/cancel omit it.",
                 false,
                 true,
-                true,
+                false,
                 false,
             ),
             codex_action_respond_schema(),
@@ -1207,6 +1207,20 @@ mod tests {
                 "tool schema too large: {}",
                 tool["name"]
             );
+        }
+    }
+
+    #[test]
+    fn scoped_codex_control_tools_are_closed_world() {
+        let value = serde_json::to_value(tool_catalog()).unwrap();
+        let tools = value.as_array().unwrap();
+        for name in ["codex.control", "codex.action.respond"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            let annotations = &tool["annotations"];
+            assert_eq!(annotations["readOnlyHint"], false);
+            assert_eq!(annotations["destructiveHint"], true);
+            assert_eq!(annotations["openWorldHint"], false);
+            assert_eq!(annotations["idempotentHint"], false);
         }
     }
 
