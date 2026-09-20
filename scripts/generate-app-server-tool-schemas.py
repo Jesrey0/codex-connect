@@ -29,6 +29,7 @@ METHODS = {
     "thread/items/list": ("v2/ThreadItemsListParams", "v2/ThreadItemsListResponse"),
     "thread/resume": ("v2/ThreadResumeParams", "v2/ThreadResumeResponse"),
     "thread/start": ("v2/ThreadStartParams", "v2/ThreadStartResponse"),
+    "thread/unsubscribe": ("v2/ThreadUnsubscribeParams", "v2/ThreadUnsubscribeResponse"),
     "thread/turns/list": ("v2/ThreadTurnsListParams", "v2/ThreadTurnsListResponse"),
     "turn/interrupt": ("v2/TurnInterruptParams", "v2/TurnInterruptResponse"),
     "turn/start": ("v2/TurnStartParams", "v2/TurnStartResponse"),

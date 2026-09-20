@@ -16,7 +16,8 @@ use codex_connect_app_server::protocol::{
     FsGetMetadata, FsGetMetadataResponse, FsReadDirectory, FsReadDirectoryResponse, FsReadFile,
     FuzzyFileSearch, FuzzyFileSearchResponse, RateLimitsRead, ReviewStart, SkillsList,
     SortDirection, StreamingCommandExec, TextInput, Thread, ThreadItemsList, ThreadRead,
-    ThreadResume, ThreadStart, ThreadTurnsList, TurnInterrupt, TurnItemsView, TurnStart, TurnSteer,
+    ThreadResume, ThreadStart, ThreadTurnsList, ThreadUnsubscribe, TurnInterrupt, TurnItemsView,
+    TurnStart, TurnSteer,
 };
 use codex_connect_app_server::{
     AppServerClient, AppServerConfig, AppServerError, DEFAULT_REQUEST_TIMEOUT, DeferredRequest,
@@ -26,13 +27,14 @@ pub use codex_connect_app_server::{PendingActionKind, PendingServerRequest};
 use codex_connect_host::{Host, HostError, MAX_IMAGE_BYTES};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::futures::OwnedNotified;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, Instant};
 
 pub const MAX_WAIT_MS: u64 = 120_000;
@@ -128,6 +130,7 @@ pub struct Relay {
     journal: event_journal::EventJournal,
     operator_inbox: operator_inbox::OperatorInbox,
     live_turns: Arc<Mutex<LiveTurns>>,
+    thread_subscriptions: Arc<Mutex<ThreadSubscriptions>>,
     observer_usage: Arc<Mutex<Option<(Instant, Value)>>>,
     command_sessions: command_sessions::CommandSessions,
     command_generation: Arc<str>,
@@ -147,6 +150,102 @@ struct ObservedTurn {
     model: Option<String>,
     effort: Option<String>,
     service_tier: Option<String>,
+}
+
+#[derive(Default)]
+struct ThreadSubscriptions {
+    threads: HashMap<String, ThreadSubscription>,
+}
+
+struct ThreadSubscription {
+    starting: usize,
+    active_turns: HashSet<String>,
+    subscribed: bool,
+    unsubscribing: bool,
+    notify: Arc<Notify>,
+}
+
+impl Default for ThreadSubscription {
+    fn default() -> Self {
+        Self {
+            starting: 0,
+            active_turns: HashSet::new(),
+            subscribed: false,
+            unsubscribing: false,
+            notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl ThreadSubscriptions {
+    fn begin_start(&mut self, thread_id: &str) -> Option<OwnedNotified> {
+        let state = self.threads.entry(thread_id.to_string()).or_default();
+        if state.unsubscribing {
+            return Some(state.notify.clone().notified_owned());
+        }
+        state.starting += 1;
+        None
+    }
+
+    fn mark_subscribed(&mut self, thread_id: &str) {
+        self.threads
+            .entry(thread_id.to_string())
+            .or_default()
+            .subscribed = true;
+    }
+
+    fn finish_start(&mut self, thread_id: &str, turn_id: Option<&str>) -> bool {
+        let (should_unsubscribe, remove_inactive) = {
+            let Some(state) = self.threads.get_mut(thread_id) else {
+                return false;
+            };
+            state.starting = state.starting.saturating_sub(1);
+            if let Some(turn_id) = turn_id {
+                state.active_turns.insert(turn_id.to_string());
+            }
+            let should_unsubscribe = Self::claim_unsubscribe(state);
+            let remove_inactive = !state.subscribed
+                && !state.unsubscribing
+                && state.starting == 0
+                && state.active_turns.is_empty();
+            (should_unsubscribe, remove_inactive)
+        };
+        if remove_inactive {
+            self.threads.remove(thread_id);
+        }
+        should_unsubscribe
+    }
+
+    fn finish_turn(&mut self, thread_id: &str, turn_id: &str) -> bool {
+        let Some(state) = self.threads.get_mut(thread_id) else {
+            return false;
+        };
+        state.active_turns.remove(turn_id);
+        Self::claim_unsubscribe(state)
+    }
+
+    fn claim_unsubscribe(state: &mut ThreadSubscription) -> bool {
+        if state.subscribed
+            && !state.unsubscribing
+            && state.starting == 0
+            && state.active_turns.is_empty()
+        {
+            state.unsubscribing = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_unsubscribe(&mut self, thread_id: &str, success: bool) -> Option<Arc<Notify>> {
+        let state = self.threads.get_mut(thread_id)?;
+        state.unsubscribing = false;
+        let notify = state.notify.clone();
+        if success {
+            self.threads.remove(thread_id);
+        }
+        Some(notify)
+    }
 }
 
 impl LiveTurns {
@@ -247,6 +346,7 @@ impl Relay {
             journal: event_journal::EventJournal::default(),
             operator_inbox: operator_inbox::OperatorInbox::default(),
             live_turns: Arc::new(Mutex::new(LiveTurns::default())),
+            thread_subscriptions: Arc::new(Mutex::new(ThreadSubscriptions::default())),
             observer_usage: Arc::new(Mutex::new(None)),
             command_sessions: command_sessions::CommandSessions::default(),
             command_generation: format!(
@@ -291,7 +391,81 @@ impl Relay {
         };
         if let Some(observed) = terminal {
             self.push_terminal_worker_event(thread_id, &observed).await;
+            self.observe_terminal_turn(thread_id, turn_id).await;
         }
+    }
+
+    async fn begin_thread_start(&self, thread_id: &str) {
+        loop {
+            let wait = self
+                .thread_subscriptions
+                .lock()
+                .await
+                .begin_start(thread_id);
+            match wait {
+                Some(notified) => notified.await,
+                None => return,
+            }
+        }
+    }
+
+    async fn mark_thread_subscribed(&self, thread_id: &str) {
+        self.thread_subscriptions
+            .lock()
+            .await
+            .mark_subscribed(thread_id);
+    }
+
+    async fn finish_thread_start(&self, thread_id: &str, turn_id: Option<&str>) {
+        let should_unsubscribe = self
+            .thread_subscriptions
+            .lock()
+            .await
+            .finish_start(thread_id, turn_id);
+        if should_unsubscribe {
+            self.spawn_thread_unsubscribe(thread_id.to_string());
+        }
+    }
+
+    async fn observe_terminal_turn(&self, thread_id: &str, turn_id: &str) {
+        let should_unsubscribe = self
+            .thread_subscriptions
+            .lock()
+            .await
+            .finish_turn(thread_id, turn_id);
+        if should_unsubscribe {
+            self.spawn_thread_unsubscribe(thread_id.to_string());
+        }
+    }
+
+    fn spawn_thread_unsubscribe(&self, thread_id: String) {
+        let app_server = self.app_server.clone();
+        let subscriptions = self.thread_subscriptions.clone();
+        let journal = self.journal.clone();
+        tokio::spawn(async move {
+            let result = app_server
+                .request(ThreadUnsubscribe {
+                    thread_id: thread_id.clone(),
+                })
+                .await;
+            let success = result.is_ok();
+            let error = result.err().map(|error| error.to_string());
+            let notify = subscriptions
+                .lock()
+                .await
+                .finish_unsubscribe(&thread_id, success);
+            if let Some(notify) = notify {
+                notify.notify_waiters();
+            }
+            if let Some(error) = error {
+                journal
+                    .push(
+                        "codexConnect/threadUnsubscribeFailed",
+                        &json!({"threadId":thread_id,"error":error}),
+                    )
+                    .await;
+            }
+        });
     }
 
     async fn live_turn(
@@ -710,7 +884,7 @@ impl Relay {
                 developer_instructions,
             )
             .await?;
-        let response = self
+        let response = match self
             .app_server
             .request(TurnStart {
                 thread_id: thread_id.clone(),
@@ -722,7 +896,16 @@ impl Relay {
                 effort: effort.clone(),
                 service_tier_for_turn: service_tier.clone(),
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.finish_thread_start(&thread_id, None).await;
+                return Err(error.into());
+            }
+        };
+        self.finish_thread_start(&thread_id, Some(&response.turn.id))
+            .await;
         self.remember_live_turn(&thread_id, &response.turn).await;
         self.annotate_live_turn(
             &thread_id,
@@ -750,18 +933,35 @@ impl Relay {
             .map(|v| self.host.resolve_app_server_directory(&v))
             .transpose()?;
         let response = if let Some(id) = thread_id {
-            // Verify the stored cwd before resume can load hooks or tools for it.
-            self.read_thread_metadata(id.clone()).await?;
-            self.app_server
+            self.begin_thread_start(&id).await;
+            // Serialize the whole resume preparation against an in-flight unsubscribe, then
+            // verify the stored cwd before resume can load hooks or tools for it.
+            if let Err(error) = self.read_thread_metadata(id.clone()).await {
+                self.finish_thread_start(&id, None).await;
+                return Err(error);
+            }
+            let response = self
+                .app_server
                 .request(ThreadResume {
-                    thread_id: id,
+                    thread_id: id.clone(),
                     cwd,
                     developer_instructions: None,
                     exclude_turns: true,
                 })
-                .await?
+                .await;
+            match response {
+                Ok(response) => {
+                    self.mark_thread_subscribed(&id).await;
+                    response
+                }
+                Err(error) => {
+                    self.finish_thread_start(&id, None).await;
+                    return Err(error.into());
+                }
+            }
         } else {
-            self.app_server
+            let response = self
+                .app_server
                 .request(ThreadStart {
                     model: new_thread_model,
                     sandbox: new_thread_sandbox,
@@ -772,10 +972,20 @@ impl Relay {
                     )),
                     ..ThreadStart::default()
                 })
-                .await?
+                .await?;
+            self.begin_thread_start(&response.thread.id).await;
+            self.mark_thread_subscribed(&response.thread.id).await;
+            response
         };
-        let cwd = self.host.resolve_app_server_directory(&response.cwd)?;
-        Ok((response.thread.id, cwd))
+        let thread_id = response.thread.id;
+        let cwd = match self.host.resolve_app_server_directory(&response.cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                self.finish_thread_start(&thread_id, None).await;
+                return Err(error.into());
+            }
+        };
+        Ok((thread_id, cwd))
     }
 
     async fn read_thread_metadata(&self, thread_id: String) -> Result<Thread, RelayError> {
@@ -883,9 +1093,6 @@ impl Relay {
                     )));
                 }
             };
-            if selected.status.is_terminal() && stored_terminal {
-                self.forget_live_turn(&thread_id, &turn_id).await;
-            }
             let selected_id = Some(selected.id.as_str());
             let pending = self
                 .app_server
@@ -910,6 +1117,12 @@ impl Relay {
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 });
                 self.acknowledge_wait_result(&result).await;
+                if selected.status.is_terminal() {
+                    if stored_terminal {
+                        self.forget_live_turn(&thread_id, &turn_id).await;
+                    }
+                    self.observe_terminal_turn(&thread_id, &turn_id).await;
+                }
                 return Ok(result);
             }
             if Instant::now() >= deadline {
@@ -1053,14 +1266,23 @@ impl Relay {
                 None,
             )
             .await?;
-        let response = self
+        let response = match self
             .app_server
             .request(ReviewStart {
                 thread_id: thread_id.clone(),
                 target,
                 delivery: "inline",
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.finish_thread_start(&thread_id, None).await;
+                return Err(error.into());
+            }
+        };
+        self.finish_thread_start(&thread_id, Some(&response.turn.id))
+            .await;
         self.remember_live_turn(&thread_id, &response.turn).await;
         self.annotate_live_turn(
             &thread_id,
@@ -1234,6 +1456,7 @@ impl Relay {
         let journal = self.journal.clone();
         let live_turns = self.live_turns.clone();
         let operator_inbox = self.operator_inbox.clone();
+        let relay = self.clone();
         let mut events = self.app_server.subscribe();
         tokio::spawn(async move {
             loop {
@@ -1248,6 +1471,7 @@ impl Relay {
                             if method == "command/exec/outputDelta" {
                                 continue;
                             }
+                            let mut terminal_turn = None;
                             if matches!(method, "turn/started" | "turn/completed") {
                                 let params = event.get("params").unwrap_or(&Value::Null);
                                 if let (Some(thread_id), Some(turn)) = (
@@ -1283,12 +1507,16 @@ impl Relay {
                                                 }),
                                             )
                                             .await;
+                                        terminal_turn = Some((thread_id.to_string(), turn_id));
                                     }
                                 }
                             }
                             journal
                                 .push(method, event.get("params").unwrap_or(&Value::Null))
                                 .await;
+                            if let Some((thread_id, turn_id)) = terminal_turn {
+                                relay.observe_terminal_turn(&thread_id, &turn_id).await;
+                            }
                             if method == "codexConnect/appServerStopped" {
                                 break;
                             }

@@ -107,6 +107,15 @@ class OperatorProtocolTests(unittest.TestCase):
             if entry["kind"] == "method" and entry["name"] == method and "params" in entry
         ]
 
+    def wait_for_method_count(self, method, count, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            params = self.method_params(method)
+            if len(params) >= count:
+                return params
+            time.sleep(0.025)
+        self.fail(f"{method} did not reach {count} calls")
+
     def wait_for_worker_event(self, predicate, timeout=2.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -596,6 +605,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["turn"]["id"], next_work["turnId"])
 
     def test_observer_does_not_regress_early_completed_turn_to_in_progress(self):
+        unsubscribes_before = len(self.method_params("thread/unsubscribe"))
         work = self.start(
             "early_complete",
             model="gpt-6-astra",
@@ -610,9 +620,18 @@ class OperatorProtocolTests(unittest.TestCase):
         result = self.wait(work)
         self.assertEqual(result["state"], "terminal")
         self.assertEqual(result["turn"]["status"], "completed")
+        unsubscribes = self.wait_for_method_count(
+            "thread/unsubscribe", unsubscribes_before + 1,
+        )
+        self.assertEqual(
+            unsubscribes[unsubscribes_before],
+            {"threadId": work["threadId"]},
+        )
+        self.assertEqual(len(self.method_params("thread/unsubscribe")), unsubscribes_before + 1)
 
     def test_host_plane_delivers_terminal_and_action_worker_events_once(self):
         self.client.call("status")  # discard events from earlier tests
+        unsubscribes_before = len(self.method_params("thread/unsubscribe"))
         complete_work = self.start("complete")
         terminal = self.wait_for_worker_event(
             lambda event: event.get("kind") == "turnTerminal"
@@ -624,7 +643,16 @@ class OperatorProtocolTests(unittest.TestCase):
             event.get("turnId") == complete_work["turnId"]
             for event in self.client.call("status").get("workerEvents", [])
         ))
+        unsubscribes = self.wait_for_method_count(
+            "thread/unsubscribe", unsubscribes_before + 1,
+        )
+        self.assertEqual(
+            unsubscribes[unsubscribes_before],
+            {"threadId": complete_work["threadId"]},
+        )
         self.assertEqual(self.wait(complete_work)["state"], "terminal")
+        time.sleep(0.05)
+        self.assertEqual(len(self.method_params("thread/unsubscribe")), unsubscribes_before + 1)
 
         self.client.call("status")
         approval_work = self.start("approval")
@@ -669,6 +697,87 @@ class OperatorProtocolTests(unittest.TestCase):
             "decision": "approve",
         })
         self.assertEqual(self.wait(approval_work)["state"], "terminal")
+
+    def test_authoritative_terminal_reconciliation_releases_thread_subscription(self):
+        unsubscribes_before = len(self.method_params("thread/unsubscribe"))
+        work = self.start("no_event")
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        unsubscribes = self.wait_for_method_count(
+            "thread/unsubscribe", unsubscribes_before + 1,
+        )
+        self.assertEqual(
+            unsubscribes[unsubscribes_before],
+            {"threadId": work["threadId"]},
+        )
+        self.assertEqual(len(self.method_params("thread/unsubscribe")), unsubscribes_before + 1)
+
+    def test_start_failure_after_thread_load_releases_subscription(self):
+        unsubscribes_before = len(self.method_params("thread/unsubscribe"))
+        self.client.call("codex.start", {
+            "mode": "work",
+            "task": "start_error",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+        }, error=True)
+        unsubscribes = self.wait_for_method_count(
+            "thread/unsubscribe", unsubscribes_before + 1,
+        )
+        self.assertEqual(len(unsubscribes), unsubscribes_before + 1)
+
+    def test_unsubscribe_failure_is_visible_and_retried_after_reuse(self):
+        unsubscribes_before = len(self.method_params("thread/unsubscribe"))
+        work = self.start("unsubscribe_error")
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        self.wait_for_method_count("thread/unsubscribe", unsubscribes_before + 1)
+
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            with urllib.request.urlopen(self.url + "/observe") as response:
+                observer = json.load(response)
+            failures = [
+                event for event in observer["projection"]["events"]
+                if event["method"] == "codexConnect/threadUnsubscribeFailed"
+                and event["threadId"] == work["threadId"]
+            ]
+            if failures:
+                break
+            time.sleep(0.025)
+        else:
+            self.fail("unsubscribe failure was not exposed through the observer journal")
+
+        resumed = self.start("complete", threadId=work["threadId"])
+        self.assertEqual(self.wait(resumed)["state"], "terminal")
+        unsubscribes = self.wait_for_method_count(
+            "thread/unsubscribe", unsubscribes_before + 2,
+        )
+        self.assertEqual(
+            unsubscribes[-1],
+            {"threadId": work["threadId"]},
+        )
+
+    def test_thread_subscription_is_released_only_after_the_last_active_turn(self):
+        unsubscribes_before = len(self.method_params("thread/unsubscribe"))
+        first = self.start("idle")
+        second = self.start("idle", threadId=first["threadId"])
+
+        self.client.call("codex.control", {
+            "action": "interrupt", "threadId": first["threadId"], "turnId": first["turnId"],
+        })
+        self.assertEqual(self.wait(first)["state"], "terminal")
+        time.sleep(0.05)
+        self.assertEqual(len(self.method_params("thread/unsubscribe")), unsubscribes_before)
+
+        self.client.call("codex.control", {
+            "action": "interrupt", "threadId": second["threadId"], "turnId": second["turnId"],
+        })
+        self.assertEqual(self.wait(second)["state"], "terminal")
+        unsubscribes = self.wait_for_method_count(
+            "thread/unsubscribe", unsubscribes_before + 1,
+        )
+        self.assertEqual(
+            unsubscribes[unsubscribes_before],
+            {"threadId": first["threadId"]},
+        )
+        self.assertEqual(len(self.method_params("thread/unsubscribe")), unsubscribes_before + 1)
 
     def test_observer_hides_unannotated_review_auxiliary_turn(self):
         review = self.client.call("codex.start", {

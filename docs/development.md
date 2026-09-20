@@ -45,7 +45,7 @@ line coverage is useful separately but is not a substitute for protocol conforma
 | --- | --- | --- |
 | Selected request/response field shapes, enums, requiredness, and experimental fields | JSON Schema emitted by the pinned Codex CLI | schema regeneration `--check`, schema tests, schema-valid fake App Server |
 | `initialize` → `initialized`, negotiated capabilities, and required process feature flags | App Server initialization/experimental API contract | fake-peer handshake assertions plus app-server launch/capability tests |
-| Thread/turn ownership, resume/read/pagination, start/steer/interrupt, review, and terminal reconciliation | App Server thread/turn lifecycle contract | protocol integration tests and the complete contract-surface smoke test |
+| Thread/turn ownership, subscribe/resume/unsubscribe, read/pagination, start/steer/interrupt, review, and terminal reconciliation | App Server thread/turn lifecycle contract | protocol integration tests and the complete contract-surface smoke test |
 | Command/file approvals, permissions, MCP elicitation, and request-user-input responses | App Server server-request/approval contract | exact selected server-request schemas, typed action unit tests, protocol integration responses |
 | Connection-scoped streaming command control and `command/exec/outputDelta` | App Server streaming command contract | persistent command integration tests plus semantic-notification schema validation |
 | Public ChatGPT-facing tool names and input/output projection | Codex Connect architecture, not the raw App Server catalog | exact MCP catalog tests plus Draft 2020-12 validation of every integration tool call/result |

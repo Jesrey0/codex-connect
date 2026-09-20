@@ -68,6 +68,8 @@ def validate(value, schema):
 
 lock = threading.RLock()
 threads = {}
+subscriptions = set()
+unsubscribe_failures = set()
 pending = {}
 command_sessions = {}
 initialized = False
@@ -203,6 +205,7 @@ for line in sys.stdin:
         thread = result["thread"]
         thread.update(id=thread_id, cwd=params.get("cwd", os.getcwd()), turns=[])
         threads[thread_id] = thread
+        subscriptions.add(thread_id)
         result["cwd"] = thread["cwd"]
     elif method in ("thread/resume", "thread/read"):
         thread = copy.deepcopy(threads[params["threadId"]])
@@ -212,7 +215,21 @@ for line in sys.stdin:
         result["thread"] = thread
         if method == "thread/resume":
             thread["cwd"] = params.get("cwd", thread["cwd"])
+            subscriptions.add(params["threadId"])
             result["cwd"] = thread["cwd"]
+    elif method == "thread/unsubscribe":
+        thread_id = params["threadId"]
+        if thread_id in unsubscribe_failures:
+            unsubscribe_failures.remove(thread_id)
+            send({"id": message["id"], "error": {"code": -32000, "message": "fixture unsubscribe failure"}})
+            continue
+        if thread_id not in threads:
+            result["status"] = "notLoaded"
+        elif thread_id not in subscriptions:
+            result["status"] = "notSubscribed"
+        else:
+            subscriptions.remove(thread_id)
+            result["status"] = "unsubscribed"
     elif method == "thread/items/list":
         entries = []
         for turn in threads[params["threadId"]]["turns"]:
@@ -237,12 +254,16 @@ for line in sys.stdin:
         assert "sandboxPolicy" in params
         assert "serviceTier" not in params
         thread_id = params["threadId"]
+        assert thread_id in subscriptions
         thread = threads[thread_id]
+        scenario = params["input"][0]["text"]
+        if scenario == "start_error":
+            send({"id": message["id"], "error": {"code": -32001, "message": "fixture turn/start failure"}})
+            continue
         turn = result["turn"]
         turn_id = f"{thread_id}-turn-{len(thread['turns']) + 1}"
         turn.update(id=turn_id, status="inProgress", items=[], error=None)
         thread["turns"].append(turn)
-        scenario = params["input"][0]["text"]
         if scenario == "early_complete":
             stale_result = copy.deepcopy(result)
             notify("turn/started", {"threadId": thread_id, "turn": turn})
@@ -273,6 +294,9 @@ for line in sys.stdin:
                 )
                 thread["turns"].append(filler)
             complete(thread_id, turn_id)
+        elif scenario == "unsubscribe_error":
+            unsubscribe_failures.add(thread_id)
+            complete(thread_id, turn_id)
         elif scenario == "delayed_question":
             timer = threading.Timer(0.25, action, (thread_id, turn_id, "question"))
             timer.daemon = True
@@ -285,6 +309,7 @@ for line in sys.stdin:
     elif method == "review/start":
         assert params["delivery"] == "inline"
         thread_id = params["threadId"]
+        assert thread_id in subscriptions
         thread = threads[thread_id]
         turn = result["turn"]
         turn_id = f"{thread_id}-turn-{len(thread['turns']) + 1}"

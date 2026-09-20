@@ -137,6 +137,30 @@ request!(ThreadResume, "thread/resume", ThreadResponse);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ThreadUnsubscribe {
+    pub thread_id: String,
+}
+request!(
+    ThreadUnsubscribe,
+    "thread/unsubscribe",
+    ThreadUnsubscribeResponse
+);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadUnsubscribeStatus {
+    NotLoaded,
+    NotSubscribed,
+    Unsubscribed,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ThreadUnsubscribeResponse {
+    pub status: ThreadUnsubscribeStatus,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadRead {
     pub thread_id: String,
     pub include_turns: bool,

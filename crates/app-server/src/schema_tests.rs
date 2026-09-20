@@ -44,6 +44,13 @@ fn thread_start_projects_model_and_coarse_sandbox_without_changing_review_start(
 #[test]
 fn turn_pagination_matches_the_pinned_wire_shape() {
     assert_eq!(
+        serde_json::to_value(ThreadUnsubscribe {
+            thread_id: "thread-1".into(),
+        })
+        .unwrap(),
+        json!({"threadId":"thread-1"})
+    );
+    assert_eq!(
         serde_json::to_value(ThreadItemsList {
             thread_id: "thread-1".into(),
             turn_id: Some("turn-1".into()),
@@ -85,6 +92,7 @@ fn exact_internal_contracts_include_initialization_and_selected_actions() {
         Initialize::METHOD,
         ThreadStart::METHOD,
         ThreadResume::METHOD,
+        ThreadUnsubscribe::METHOD,
         ThreadRead::METHOD,
         ThreadItemsList::METHOD,
         ThreadTurnsList::METHOD,
@@ -351,5 +359,18 @@ fn terminal_states_are_explicit_and_unknown_states_fail_closed() {
     assert_eq!(
         artifact()["definitions"]["v2"]["TurnStatus"]["enum"],
         json!(["completed", "interrupted", "failed", "inProgress"])
+    );
+
+    for (value, expected) in [
+        ("notLoaded", ThreadUnsubscribeStatus::NotLoaded),
+        ("notSubscribed", ThreadUnsubscribeStatus::NotSubscribed),
+        ("unsubscribed", ThreadUnsubscribeStatus::Unsubscribed),
+    ] {
+        let response: ThreadUnsubscribeResponse =
+            serde_json::from_value(json!({"status": value})).unwrap();
+        assert_eq!(response.status, expected);
+    }
+    assert!(
+        serde_json::from_value::<ThreadUnsubscribeResponse>(json!({"status":"unknown"})).is_err()
     );
 }
