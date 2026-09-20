@@ -599,6 +599,10 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(observed["model"], "gpt-6-astra")
         self.assertEqual(observed["effort"], "high")
         self.assertEqual(observed["serviceTier"], "priority")
+        self.assertGreater(observed["lastActivityAtMs"], 0)
+        self.assertIn(observed["activityKind"], {"turn", "think", "message", "tool", "file", "search", "item", "waiting"})
+        self.assertIn("activitySummary", observed)
+        self.assertEqual(set(observed["tokenUsage"]), {"totalTokens", "modelContextWindow"})
         snapshot = self.client.call("codex.wait",{
             "threadId": work["threadId"], "turnId": next_work["turnId"], "timeoutMs": 0,
         })

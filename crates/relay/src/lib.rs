@@ -150,6 +150,13 @@ struct ObservedTurn {
     model: Option<String>,
     effort: Option<String>,
     service_tier: Option<String>,
+    last_activity_at_ms: u64,
+    activity_kind: String,
+    activity_summary: Option<String>,
+    message_item_id: Option<String>,
+    message_excerpt: String,
+    token_usage_total: Option<u64>,
+    model_context_window: Option<u64>,
 }
 
 #[derive(Default)]
@@ -272,6 +279,13 @@ impl LiveTurns {
                 model: None,
                 effort: None,
                 service_tier: None,
+                last_activity_at_ms: now_epoch_ms(),
+                activity_kind: "turn".into(),
+                activity_summary: Some("turn observed".into()),
+                message_item_id: None,
+                message_excerpt: String::new(),
+                token_usage_total: None,
+                model_context_window: None,
             },
         );
         while self.turns.len() > MAX_LIVE_TURNS {
@@ -311,10 +325,134 @@ impl LiveTurns {
         }
     }
 
+    fn observe_event(&mut self, method: &str, params: &Value) {
+        let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+            return;
+        };
+        let turn_id = params.get("turnId").and_then(Value::as_str).or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+        });
+        let Some(turn_id) = turn_id else {
+            return;
+        };
+        let Some(observed) = self
+            .turns
+            .get_mut(&(thread_id.to_string(), turn_id.to_string()))
+        else {
+            return;
+        };
+
+        if method == "thread/tokenUsage/updated" {
+            let usage = &params["tokenUsage"];
+            observed.token_usage_total = usage["total"]["totalTokens"].as_u64();
+            observed.model_context_window = usage["modelContextWindow"].as_u64();
+            return;
+        }
+
+        observed.last_activity_at_ms = now_epoch_ms();
+        match method {
+            "turn/started" => {
+                observed.activity_kind = "turn".into();
+                observed.activity_summary = Some("started".into());
+            }
+            "turn/completed" => {
+                observed.activity_kind = "turn".into();
+                observed.activity_summary = params["turn"]["status"]
+                    .as_str()
+                    .map(|status| format!("turn {status}"));
+            }
+            "item/agentMessage/delta" => {
+                let item_id = params["itemId"].as_str().unwrap_or_default();
+                if observed.message_item_id.as_deref() != Some(item_id) {
+                    observed.message_item_id = Some(item_id.to_string());
+                    observed.message_excerpt.clear();
+                }
+                if let Some(delta) = params["delta"].as_str() {
+                    observed.message_excerpt.push_str(delta);
+                    observed.message_excerpt = compact_text(&observed.message_excerpt, 240);
+                }
+                observed.activity_kind = "message".into();
+                observed.activity_summary = (!observed.message_excerpt.is_empty())
+                    .then(|| observed.message_excerpt.clone());
+            }
+            "item/started" | "item/completed" => {
+                let item = &params["item"];
+                let item_type = item["type"].as_str().unwrap_or("item");
+                match item_type {
+                    "reasoning" => {
+                        // The observer intentionally exposes only the phase, never hidden
+                        // reasoning content or summaries.
+                        observed.activity_kind = "think".into();
+                        observed.activity_summary = None;
+                    }
+                    "commandExecution" => {
+                        observed.activity_kind = "tool".into();
+                        observed.activity_summary = item["command"]
+                            .as_str()
+                            .map(|command| compact_text(command, 320));
+                    }
+                    "agentMessage" => {
+                        observed.activity_kind = "message".into();
+                        observed.activity_summary = item["text"]
+                            .as_str()
+                            .map(|message| compact_text(message, 240));
+                    }
+                    "fileChange" => {
+                        observed.activity_kind = "file".into();
+                        observed.activity_summary = Some("filesystem change".into());
+                    }
+                    "mcpToolCall" => {
+                        observed.activity_kind = "tool".into();
+                        observed.activity_summary = item["tool"]
+                            .as_str()
+                            .or_else(|| item["name"].as_str())
+                            .map(|tool| compact_text(tool, 160));
+                    }
+                    "webSearch" => {
+                        observed.activity_kind = "search".into();
+                        observed.activity_summary =
+                            item["query"].as_str().map(|query| compact_text(query, 200));
+                    }
+                    other => {
+                        observed.activity_kind = "item".into();
+                        observed.activity_summary = Some(other.to_string());
+                    }
+                }
+            }
+            method if method.contains("requestApproval") || method.contains("requestUserInput") => {
+                observed.activity_kind = "waiting".into();
+                observed.activity_summary = Some("operator action required".into());
+            }
+            _ => {}
+        }
+    }
+
     fn remove(&mut self, thread_id: &str, turn_id: &str) {
         let key = (thread_id.to_string(), turn_id.to_string());
         self.turns.remove(&key);
         self.order.retain(|candidate| candidate != &key);
+    }
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn compact_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let clipped = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{clipped}…")
+    } else {
+        clipped
     }
 }
 
@@ -1477,6 +1615,13 @@ impl Relay {
                             "model": observed.model,
                             "effort": observed.effort,
                             "serviceTier": observed.service_tier,
+                            "lastActivityAtMs": observed.last_activity_at_ms,
+                            "activityKind": observed.activity_kind,
+                            "activitySummary": observed.activity_summary,
+                            "tokenUsage": {
+                                "totalTokens": observed.token_usage_total,
+                                "modelContextWindow": observed.model_context_window,
+                            },
                         })
                     })
                 })
@@ -1555,6 +1700,10 @@ impl Relay {
                                     }
                                 }
                             }
+                            live_turns
+                                .lock()
+                                .await
+                                .observe_event(method, event.get("params").unwrap_or(&Value::Null));
                             journal
                                 .push(method, event.get("params").unwrap_or(&Value::Null))
                                 .await;
