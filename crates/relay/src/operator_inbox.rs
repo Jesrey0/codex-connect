@@ -48,6 +48,10 @@ impl OperatorInbox {
             .iter()
             .map(|(key, _)| key.clone())
             .collect::<HashSet<_>>();
+        state.events.retain(|(key, event)| {
+            event.get("kind").and_then(Value::as_str) != Some("actionRequired")
+                || current.contains(key)
+        });
         state.pending_seen.retain(|key| current.contains(key));
         for (key, event) in actions {
             if state.pending_seen.insert(key.clone()) {
@@ -141,6 +145,29 @@ mod tests {
         inbox.sync_actions(Vec::new()).await;
         inbox.sync_actions(action()).await;
         assert_eq!(inbox.take().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolved_actions_are_removed_before_queued_delivery() {
+        let inbox = OperatorInbox::default();
+        for index in 0..MAX_DELIVERY {
+            inbox
+                .push_terminal(
+                    format!("turn:a:{index}"),
+                    json!({"kind":"turnTerminal","turnId":index.to_string()}),
+                )
+                .await;
+        }
+        inbox
+            .sync_actions(vec![(
+                "action:1".into(),
+                json!({"kind":"actionRequired","requestId":1}),
+            )])
+            .await;
+
+        assert_eq!(inbox.take().await.len(), MAX_DELIVERY);
+        inbox.sync_actions(Vec::new()).await;
+        assert!(inbox.take().await.is_empty());
     }
 
     #[tokio::test]
