@@ -19,6 +19,10 @@ pub enum ServiceStatus {
     Unknown,
 }
 
+fn same_directory(left: &Path, right: &Path) -> Result<bool> {
+    Ok(left.canonicalize()? == right.canonicalize()?)
+}
+
 impl ServiceStatus {
     pub fn label(&self) -> &'static str {
         match self {
@@ -161,6 +165,9 @@ impl ServiceManager for SystemdManager {
                 registration_directory.display()
             )
         })?;
+        if same_directory(&directory, &registration_directory)? {
+            return Ok(());
+        }
         let registration = registration_directory.join(unit);
         let temporary_registration =
             registration_directory.join(format!(".{unit}-link-{}", std::process::id()));
@@ -451,6 +458,17 @@ mod tests {
             map_service_status("not-found", "inactive", "dead"),
             ServiceStatus::NotInstalled
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_directory_detects_symlink_equivalent_registration_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let canonical = temporary.path().join("canonical");
+        let alias = temporary.path().join("alias");
+        fs::create_dir(&canonical).unwrap();
+        std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+        assert!(same_directory(&canonical, &alias).unwrap());
     }
 
     #[test]

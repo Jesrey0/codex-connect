@@ -27,7 +27,7 @@ mod initialize_tests {
             json!({
                 "experimentalApi": true,
                 "requestAttestation": false,
-                "extensions": {}
+                "extensions": {"openai/form": {}}
             })
         );
     }
@@ -62,8 +62,12 @@ impl Initialize {
             },
             capabilities: InitializeCapabilities {
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 request_attestation: false,
-                extensions: BTreeMap::new(),
+                extensions: BTreeMap::from([(
+                    "openai/form".into(),
+                    Value::Object(Default::default()),
+                )]),
             },
         }
     }
@@ -81,6 +85,8 @@ pub struct ClientInfo {
 #[serde(rename_all = "camelCase")]
 pub struct InitializeCapabilities {
     pub experimental_api: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mcp_server_openai_form_elicitation: bool,
     pub request_attestation: bool,
     pub extensions: BTreeMap<String, Value>,
 }
@@ -96,8 +102,6 @@ pub struct InitializeResponse {
 pub struct ThreadStart {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,7 +273,7 @@ pub struct TurnStart {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
+    pub service_tier_for_turn: Option<String>,
 }
 request!(TurnStart, "turn/start", TurnStartResponse);
 

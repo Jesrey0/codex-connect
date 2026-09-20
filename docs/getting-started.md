@@ -28,7 +28,7 @@ Treat the first bullet as this project's observed behavior, not as an official O
 Before obtaining the source tree, you need:
 
 - a Linux machine with `systemctl --user` available;
-- Rust **1.85 or newer** and Cargo;
+- Rust **1.88 or newer** and Cargo;
 - the official OpenAI Codex CLI release pinned by this project;
 - an authenticated Codex CLI session;
 - the official OpenAI `tunnel-client` for Secure MCP Tunnel;

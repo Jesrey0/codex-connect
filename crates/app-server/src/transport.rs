@@ -303,25 +303,24 @@ impl Connection {
                 self.wake();
                 return;
             }
-            if method == "serverRequest/resolved" {
-                if let Some(id) = params
+            if method == "serverRequest/resolved"
+                && let Some(id) = params
                     .get("requestId")
                     .cloned()
                     .and_then(|v| serde_json::from_value::<RpcId>(v).ok())
-                {
-                    self.actions.lock().unwrap().remove(&id);
-                }
+            {
+                self.actions.lock().unwrap().remove(&id);
             }
             let _ = self.events.send(message);
             self.wake();
-        } else if let Some(id) = id {
-            if let Some(pending) = self.calls.lock().unwrap().remove(&id) {
-                let result = message
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| remote_error(&message, pending.method));
-                let _ = pending.sender.send(result);
-            }
+        } else if let Some(id) = id
+            && let Some(pending) = self.calls.lock().unwrap().remove(&id)
+        {
+            let result = message
+                .get("result")
+                .cloned()
+                .ok_or_else(|| remote_error(&message, pending.method));
+            let _ = pending.sender.send(result);
         }
     }
 }

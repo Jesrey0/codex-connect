@@ -626,13 +626,18 @@ pub async fn doctor() -> Result<()> {
             failures.push("backend".to_string());
         }
     }
+    let expected_default_cwd =
+        resolve_required_directory(&config.workspace.default_cwd, "default workspace")?;
+    let expected_sha256 = artifact::current()?.sha256;
     match runtime_status_once(&config.backend).await {
-        Ok(status) if status.ready && status.app_server_transport == "stdio" => {
-            print_check("App Server", true, "stdio ready")
-        }
-        Ok(_) => {
-            print_check("App Server", false, "worker unavailable");
-            failures.push("backend".to_string());
+        Ok(status) => {
+            match validate_runtime_status(&status, &expected_default_cwd, Some(&expected_sha256)) {
+                Ok(()) => print_check("App Server", true, "stdio ready; identity matched"),
+                Err(error) => {
+                    print_check("App Server", false, &error.to_string());
+                    failures.push("backend".to_string());
+                }
+            }
         }
         Err(error) => {
             print_check("Backend health", false, &error.to_string());
@@ -838,21 +843,12 @@ async fn wait_for_backend_health(
     let mut last_error = None;
     for _ in 0..40 {
         match runtime_status_once(&config.backend).await {
-            Ok(status) if PathBuf::from(&status.cwd).canonicalize()? != expected_default_cwd => {
-                last_error = Some(anyhow::anyhow!("backend reports a different default cwd"))
+            Ok(status) => {
+                match validate_runtime_status(&status, &expected_default_cwd, expected_sha256) {
+                    Ok(()) => return Ok(status),
+                    Err(error) => last_error = Some(error),
+                }
             }
-            Ok(status) if expected_sha256.is_some_and(|hash| status.binary_sha256 != hash) => {
-                last_error = Some(anyhow::anyhow!("backend is running a stale build"))
-            }
-            Ok(status) if !status.ready => {
-                last_error = Some(anyhow::anyhow!("App Server worker is unavailable"))
-            }
-            Ok(status) if !status.experimental_api => {
-                last_error = Some(anyhow::anyhow!(
-                    "backend does not report the required protocol capabilities"
-                ))
-            }
-            Ok(status) => return Ok(status),
             Err(error) => last_error = Some(error),
         }
         sleep(Duration::from_millis(250)).await;
@@ -864,6 +860,30 @@ async fn wait_for_backend_health(
             .unwrap_or_else(|| "no response".to_string())
     )
 }
+
+fn validate_runtime_status(
+    status: &RuntimeStatus,
+    expected_default_cwd: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<()> {
+    if PathBuf::from(&status.cwd).canonicalize()? != expected_default_cwd {
+        bail!("backend reports a different default cwd");
+    }
+    if expected_sha256.is_some_and(|hash| status.binary_sha256 != hash) {
+        bail!("backend is running a stale build");
+    }
+    if !status.ready {
+        bail!("App Server worker is unavailable");
+    }
+    if !status.experimental_api {
+        bail!("backend does not report the required protocol capabilities");
+    }
+    if status.app_server_transport != "stdio" {
+        bail!("backend reports an unexpected App Server transport");
+    }
+    Ok(())
+}
+
 async fn runtime_status_once(config: &BackendConfig) -> Result<RuntimeStatus> {
     let addr = config.listen_addr()?;
     if http_get(addr, "/healthz").await?.0 != 200 {

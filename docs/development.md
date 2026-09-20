@@ -102,7 +102,7 @@ When adding event handling:
 
 Server-request response shapes must come from the pinned generated schemas. Public responders should normalize only the operator decision and translate it to the official shape. Never reintroduce a generic `result: any` public responder.
 
-`experimentalApi` is enabled because Codex Connect intentionally supports `item/tool/requestUserInput`. The dedicated App Server launch sets the host-plane `sandbox_mode="danger-full-access"` override and enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` flags. Initialize deliberately advertises no form/elicitation extension because the minimized public MCP surface has no elicitation response operation; unexpected elicitation requests are still parsed and surfaced fail-closed. These are explicit integration requirements, not blanket permission to expose unrelated experimental methods.
+`experimentalApi` is enabled because Codex Connect intentionally supports `item/tool/requestUserInput`. Initialize advertises the canonical `openai/form` App Server extension and routes elicitation through the existing typed `codex.action.respond` surface; do not use the legacy `mcpServerOpenaiFormElicitation` compatibility flag. The dedicated App Server launch sets the host-plane `sandbox_mode="danger-full-access"` override and enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` flags. These are explicit integration requirements, not blanket permission to expose unrelated experimental methods.
 
 ## App Server reuse gate
 

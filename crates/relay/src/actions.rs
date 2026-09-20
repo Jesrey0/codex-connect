@@ -1,4 +1,4 @@
-//! Operator decisions translated to the three public server-response contracts.
+//! Operator decisions translated to the public App Server response contracts.
 
 use crate::{PendingActionKind, PendingServerRequest, Relay, RelayError, RpcId};
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,14 @@ use std::sync::Arc;
 pub enum ApprovalDecision {
     Approve,
     ApproveForSession,
+    Decline,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ElicitationAction {
+    Accept,
     Decline,
     Cancel,
 }
@@ -166,6 +174,39 @@ impl Relay {
         let result = user_input_response(&request, answers)?;
         self.answer(request, result).await
     }
+
+    pub async fn respond_elicitation(
+        &self,
+        id: RpcId,
+        action: ElicitationAction,
+        content: Option<Value>,
+    ) -> Result<Value, RelayError> {
+        let request = self.pending(&id, PendingActionKind::Elicitation)?;
+        let result = elicitation_response(action, content)?;
+        self.answer(request, result).await
+    }
+}
+
+fn elicitation_response(
+    action: ElicitationAction,
+    content: Option<Value>,
+) -> Result<Value, RelayError> {
+    if matches!(action, ElicitationAction::Accept) && content.is_none() {
+        return Err(RelayError::Invalid(
+            "accepted elicitation responses require content".into(),
+        ));
+    }
+    if !matches!(action, ElicitationAction::Accept) && content.is_some() {
+        return Err(RelayError::Invalid(
+            "declined or cancelled elicitation responses must omit content".into(),
+        ));
+    }
+    let action = match action {
+        ElicitationAction::Accept => "accept",
+        ElicitationAction::Decline => "decline",
+        ElicitationAction::Cancel => "cancel",
+    };
+    Ok(json!({"action":action,"content":content}))
 }
 
 fn approval_response(
@@ -287,5 +328,20 @@ mod tests {
             json!({"network":{"enabled":true},"fileSystem":{"write":["/work"]}})
         );
         assert!(serde_json::from_value::<PermissionGrant>(json!({"arbitrary":true})).is_err());
+    }
+
+    #[test]
+    fn elicitation_response_requires_content_only_for_accept() {
+        assert!(elicitation_response(ElicitationAction::Accept, None).is_err());
+        assert_eq!(
+            elicitation_response(ElicitationAction::Accept, Some(json!({"name":"Operator"})))
+                .unwrap(),
+            json!({"action":"accept","content":{"name":"Operator"}})
+        );
+        assert_eq!(
+            elicitation_response(ElicitationAction::Cancel, None).unwrap(),
+            json!({"action":"cancel","content":null})
+        );
+        assert!(elicitation_response(ElicitationAction::Decline, Some(json!({}))).is_err());
     }
 }

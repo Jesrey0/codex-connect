@@ -164,8 +164,6 @@ class OperatorProtocolTests(unittest.TestCase):
             "model", "reasoningEffort", "serviceTier", "source",
         })
         self.assertIn(status["codex"]["defaults"]["source"], {"userConfig", "upstream"})
-        with urllib.request.urlopen(self.url + "/status") as response:
-            self.assertEqual(status, json.load(response))
         with urllib.request.urlopen(self.url + "/runtime") as response:
             runtime = json.load(response)
         self.assertTrue(runtime["ready"])
@@ -174,6 +172,15 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(runtime["appServerTransport"], "stdio")
         self.assertTrue(runtime["experimentalApi"])
         self.assertIn('sandbox_mode="danger-full-access"', runtime["appServer"]["launchOverrides"])
+        request = urllib.request.Request(
+            self.url + "/mcp",
+            data=b"{}",
+            headers={"Content-Type": "application/json", "Origin": "https://evil.example"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request)
+        self.assertEqual(rejected.exception.code, 403)
         with urllib.request.urlopen(self.url + "/observe") as response:
             observer = json.load(response)
         self.assertEqual(observer["runtime"], runtime)
@@ -583,7 +590,9 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(observed["model"], "gpt-6-astra")
         self.assertEqual(observed["effort"], "high")
         self.assertEqual(observed["serviceTier"], "priority")
-        snapshot = self.client.call("codex.wait",{"threadId":work["threadId"],"timeoutMs":0})
+        snapshot = self.client.call("codex.wait",{
+            "threadId": work["threadId"], "turnId": next_work["turnId"], "timeoutMs": 0,
+        })
         self.assertEqual(snapshot["turn"]["id"], next_work["turnId"])
 
     def test_observer_does_not_regress_early_completed_turn_to_in_progress(self):
@@ -741,7 +750,9 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(completed["state"],"terminal")
         self.assertEqual(completed["wakeReason"],"terminal")
         self.client.call("codex.action.respond",{"type":"userInput","requestId":request_id,"answers":{"format":["JSON"]}},error=True)
-        self.assertEqual(self.client.call("codex.wait",{"threadId":work["threadId"],"timeoutMs":0})["pendingActions"],[])
+        self.assertEqual(self.client.call("codex.wait",{
+            "threadId": work["threadId"], "turnId": work["turnId"], "timeoutMs": 0,
+        })["pendingActions"], [])
 
     def test_nonblocking_question_does_not_wake_join_and_interrupt_cleans_up(self):
         work = self.start("nonblocking")
@@ -750,9 +761,11 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["wakeReason"],"timeout")
         self.assertFalse(result["pendingActions"][0]["isBlocking"])
         self.client.call("codex.control",{"action":"interrupt","threadId":work["threadId"],"turnId":work["turnId"]})
-        self.assertEqual(self.client.call("codex.wait",{"threadId":work["threadId"],"timeoutMs":0})["pendingActions"],[])
+        self.assertEqual(self.client.call("codex.wait",{
+            "threadId": work["threadId"], "turnId": work["turnId"], "timeoutMs": 0,
+        })["pendingActions"], [])
 
-    def test_typed_approval_permission_and_unexposed_elicitation_paths(self):
+    def test_typed_approval_permission_and_elicitation_paths(self):
         cases = [
             ("approval",{"type":"approval","decision":"approve"}),
             ("file",{"type":"approval","decision":"decline"}),
@@ -770,17 +783,18 @@ class OperatorProtocolTests(unittest.TestCase):
                 self.assertEqual(completed["state"],"terminal")
                 self.assertEqual(completed["wakeReason"],"terminal")
 
-        for scenario in ("form", "openai_form", "url"):
+        for scenario, response in [
+            ("form", {"action": "accept", "content": {"name": "Operator"}}),
+            ("openai_form", {"action": "accept", "content": {"opaque": True}}),
+            ("url", {"action": "cancel"}),
+        ]:
             with self.subTest(scenario=scenario):
                 work = self.start(scenario)
                 result = self.wait(work)
                 pending = result["pendingActions"][0]
                 self.assertEqual(pending["kind"], "elicitation")
                 self.client.call("codex.action.respond", {
-                    "type": "approval", "requestId": pending["requestId"], "decision": "cancel",
-                }, error=True)
-                self.client.call("codex.control", {
-                    "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
+                    "type": "elicitation", "requestId": pending["requestId"], **response,
                 })
                 self.assertEqual(self.wait(work)["state"], "terminal")
 
@@ -931,7 +945,9 @@ class OperatorProtocolTests(unittest.TestCase):
 
         source = self.start("complete")
         self.assertEqual(self.wait(source)["state"], "terminal")
-        self.client.call("codex.wait", {"threadId": source["threadId"], "timeoutMs": 0})
+        self.client.call("codex.wait", {
+            "threadId": source["threadId"], "turnId": source["turnId"], "timeoutMs": 0,
+        })
 
         resumed = self.start("idle", threadId=source["threadId"])
         self.client.call("codex.control", {
@@ -977,8 +993,9 @@ class OperatorProtocolTests(unittest.TestCase):
         elicitation = self.start("form")
         pending = self.wait(elicitation)["pendingActions"][0]
         self.assertEqual(pending["kind"], "elicitation")
-        self.client.call("codex.control", {
-            "action": "interrupt", "threadId": elicitation["threadId"], "turnId": elicitation["turnId"],
+        self.client.call("codex.action.respond", {
+            "type": "elicitation", "requestId": pending["requestId"],
+            "action": "accept", "content": {"name": "Operator"},
         })
         self.assertEqual(self.wait(elicitation)["state"], "terminal")
 

@@ -15,6 +15,54 @@ pub struct CommandSessions {
     changed: watch::Sender<u64>,
 }
 
+fn retain_chunk(session: &mut CommandSession, stream: CommandExecOutputStream, bytes: Vec<u8>) {
+    session.retained_bytes = session.retained_bytes.saturating_add(bytes.len());
+    session.chunks.push_back(OutputChunk {
+        cursor: session.cursor,
+        stream,
+        bytes,
+    });
+    while session.retained_bytes > MAX_RETAINED_BYTES {
+        let Some(dropped) = session.chunks.pop_front() else {
+            break;
+        };
+        session.retained_bytes = session.retained_bytes.saturating_sub(dropped.bytes.len());
+        session.dropped_through = session.dropped_through.max(dropped.cursor);
+    }
+}
+
+fn flush_utf8_pending(session: &mut CommandSession) {
+    for stream in [
+        CommandExecOutputStream::Stdout,
+        CommandExecOutputStream::Stderr,
+    ] {
+        let bytes = match stream {
+            CommandExecOutputStream::Stdout => std::mem::take(&mut session.stdout_utf8_pending),
+            CommandExecOutputStream::Stderr => std::mem::take(&mut session.stderr_utf8_pending),
+        };
+        if !bytes.is_empty() {
+            retain_chunk(session, stream, bytes);
+        }
+    }
+}
+
+fn incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(_) => return None,
+            Err(error) => {
+                offset += error.valid_up_to();
+                match error.error_len() {
+                    Some(length) => offset = offset.saturating_add(length),
+                    None => return Some(offset),
+                }
+            }
+        }
+    }
+    None
+}
+
 impl Default for CommandSessions {
     fn default() -> Self {
         Self {
@@ -37,6 +85,8 @@ struct CommandSession {
     dropped_through: u64,
     retained_bytes: usize,
     chunks: VecDeque<OutputChunk>,
+    stdout_utf8_pending: Vec<u8>,
+    stderr_utf8_pending: Vec<u8>,
     terminal: Option<TerminalState>,
 }
 
@@ -94,6 +144,8 @@ impl CommandSessions {
                 dropped_through: 0,
                 retained_bytes: 0,
                 chunks: VecDeque::new(),
+                stdout_utf8_pending: Vec::new(),
+                stderr_utf8_pending: Vec::new(),
                 terminal: None,
             },
         );
@@ -115,6 +167,8 @@ impl CommandSessions {
         };
         session.cursor = session.cursor.wrapping_add(1);
         session.dropped_through = session.cursor;
+        session.stdout_utf8_pending.clear();
+        session.stderr_utf8_pending.clear();
         drop(state);
         self.wake();
     }
@@ -130,23 +184,29 @@ impl CommandSessions {
             return;
         };
         session.cursor = session.cursor.wrapping_add(1);
+        let pending = match stream {
+            CommandExecOutputStream::Stdout => &mut session.stdout_utf8_pending,
+            CommandExecOutputStream::Stderr => &mut session.stderr_utf8_pending,
+        };
+        if !pending.is_empty() {
+            let mut merged = std::mem::take(pending);
+            merged.extend_from_slice(&bytes);
+            bytes = merged;
+        }
         if bytes.len() > MAX_CHUNK_BYTES {
             let drain = bytes.len() - MAX_CHUNK_BYTES;
             bytes.drain(..drain);
             session.dropped_through = session.cursor;
         }
-        session.retained_bytes = session.retained_bytes.saturating_add(bytes.len());
-        session.chunks.push_back(OutputChunk {
-            cursor: session.cursor,
-            stream,
-            bytes,
-        });
-        while session.retained_bytes > MAX_RETAINED_BYTES {
-            let Some(dropped) = session.chunks.pop_front() else {
-                break;
-            };
-            session.retained_bytes = session.retained_bytes.saturating_sub(dropped.bytes.len());
-            session.dropped_through = session.dropped_through.max(dropped.cursor);
+        if let Some(split) = incomplete_utf8_start(&bytes) {
+            let trailing = bytes.split_off(split);
+            match stream {
+                CommandExecOutputStream::Stdout => session.stdout_utf8_pending = trailing,
+                CommandExecOutputStream::Stderr => session.stderr_utf8_pending = trailing,
+            }
+        }
+        if !bytes.is_empty() {
+            retain_chunk(session, stream, bytes);
         }
         drop(state);
         self.wake();
@@ -158,6 +218,7 @@ impl CommandSessions {
             return;
         };
         session.cursor = session.cursor.wrapping_add(1);
+        flush_utf8_pending(session);
         session.stdin_open = false;
         session.terminal = Some(TerminalState::Exited {
             exit_code: response.exit_code,
@@ -172,6 +233,7 @@ impl CommandSessions {
             return;
         };
         session.cursor = session.cursor.wrapping_add(1);
+        flush_utf8_pending(session);
         session.stdin_open = false;
         session.terminal = Some(TerminalState::Failed { error });
         drop(state);
@@ -308,5 +370,47 @@ mod tests {
         assert_eq!(second.value["hasMoreOutput"], false);
         assert_eq!(second.value["drained"], true);
         assert_eq!(second.value["cursor"].as_u64(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn split_utf8_is_buffered_across_output_notifications() {
+        let sessions = CommandSessions::default();
+        sessions.insert("process".into(), false).await.unwrap();
+        sessions
+            .push_output("process", CommandExecOutputStream::Stdout, vec![0xe2, 0x82])
+            .await;
+        let first = sessions.read_after("process", 0).await.unwrap();
+        assert_eq!(first.value["stdout"], "");
+        assert_eq!(first.value["cursor"], 1);
+
+        sessions
+            .push_output("process", CommandExecOutputStream::Stdout, vec![0xac])
+            .await;
+        let second = sessions.read_after("process", 1).await.unwrap();
+        assert_eq!(second.value["stdout"], "€");
+        assert_eq!(second.value["cursor"], 2);
+        assert_eq!(second.value["historyLost"], false);
+    }
+
+    #[tokio::test]
+    async fn terminal_flushes_incomplete_utf8_without_hiding_bytes() {
+        let sessions = CommandSessions::default();
+        sessions.insert("process".into(), false).await.unwrap();
+        sessions
+            .push_output("process", CommandExecOutputStream::Stderr, vec![0xe2])
+            .await;
+        sessions
+            .complete(
+                "process",
+                CommandExecResponse {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .await;
+        let result = sessions.read_after("process", 0).await.unwrap();
+        assert_eq!(result.value["stderr"], "�");
+        assert_eq!(result.value["drained"], true);
     }
 }

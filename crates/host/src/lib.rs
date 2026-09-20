@@ -297,7 +297,11 @@ impl Host {
                     ensure_patch_destination(&path)?;
                     register_patch_path(&mut touched, &path)?;
                     applied.push(self.relative(&path));
-                    actions.push(PatchAction::Write { path, content });
+                    actions.push(PatchAction::Write {
+                        path,
+                        content,
+                        permissions: None,
+                    });
                 }
                 PatchChange::Delete { path } => {
                     let path = self.resolve_mutation_path(&Self::path_from_cwd(cwd, &path)?)?;
@@ -313,6 +317,7 @@ impl Host {
                 } => {
                     let source = self.resolve_mutation_path(&Self::path_from_cwd(cwd, &path)?)?;
                     ensure_regular_file(&source)?;
+                    let permissions = fs::metadata(&source)?.permissions();
                     let original = fs::read(&source)?;
                     let original = std::str::from_utf8(&original).map_err(|_| {
                         HostError::PatchFailed(format!(
@@ -336,6 +341,7 @@ impl Host {
                     actions.push(PatchAction::Write {
                         path: destination.clone(),
                         content,
+                        permissions: Some(permissions),
                     });
                     if destination != source {
                         actions.push(PatchAction::Delete { path: source });
@@ -353,9 +359,13 @@ impl Host {
             for action in &plan.actions {
                 let path = action.path();
                 match action {
-                    PatchAction::Write { content, .. } => {
+                    PatchAction::Write {
+                        content,
+                        permissions,
+                        ..
+                    } => {
                         created_directories.extend(create_missing_parent_directories(path)?);
-                        let stage = StagedPatchFile::new(path, content)?;
+                        let stage = StagedPatchFile::new(path, content, permissions.as_ref())?;
                         let backup = if path.exists() {
                             let backup = reserve_patch_backup(path)?;
                             if let Err(error) = fs::rename(path, &backup) {
@@ -630,7 +640,7 @@ enum PatchChange {
 
 struct PatchHunk {
     lines: Vec<PatchLine>,
-    line_hint: Option<usize>,
+    change_context: Option<String>,
     end_of_file: bool,
 }
 
@@ -646,8 +656,14 @@ struct PatchPlan {
 }
 
 enum PatchAction {
-    Write { path: PathBuf, content: Vec<u8> },
-    Delete { path: PathBuf },
+    Write {
+        path: PathBuf,
+        content: Vec<u8>,
+        permissions: Option<fs::Permissions>,
+    },
+    Delete {
+        path: PathBuf,
+    },
 }
 
 impl PatchAction {
@@ -755,7 +771,19 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, HostError> {
                         "updated files require `@@` hunk headers".to_string(),
                     ));
                 }
-                let line_hint = parse_line_hint(header);
+                let change_context = if header == "@@" {
+                    None
+                } else if let Some(context) = header.strip_prefix("@@ ") {
+                    if context.is_empty() {
+                        None
+                    } else {
+                        Some(context.to_string())
+                    }
+                } else {
+                    return Err(HostError::PatchFailed(
+                        "patch hunk headers must be `@@` or `@@ <context>`".to_string(),
+                    ));
+                };
                 index += 1;
                 let mut hunk_lines = Vec::new();
                 let mut end_of_file = false;
@@ -773,13 +801,13 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, HostError> {
                             if line.trim().is_empty() {
                                 let next_non_empty =
                                     lines[index..=end].iter().find(|l| !l.trim().is_empty());
-                                if let Some(next) = next_non_empty {
-                                    if next.starts_with("@@") || next.starts_with("*** ") {
-                                        while index < end && lines[index].trim().is_empty() {
-                                            index += 1;
-                                        }
-                                        break;
+                                if let Some(next) = next_non_empty
+                                    && (next.starts_with("@@") || next.starts_with("*** "))
+                                {
+                                    while index < end && lines[index].trim().is_empty() {
+                                        index += 1;
                                     }
+                                    break;
                                 }
                             }
                             return Err(HostError::PatchFailed(
@@ -799,7 +827,7 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, HostError> {
                 }
                 hunks.push(PatchHunk {
                     lines: hunk_lines,
-                    line_hint,
+                    change_context,
                     end_of_file,
                 });
                 if end_of_file {
@@ -845,15 +873,6 @@ fn require_patch_path(path: &str) -> Result<(), HostError> {
     Ok(())
 }
 
-fn parse_line_hint(header: &str) -> Option<usize> {
-    header
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix('+'))
-        .and_then(|part| part.split(',').next())
-        .and_then(|part| part.parse::<usize>().ok())
-        .map(|line| line.saturating_sub(1))
-}
-
 fn apply_hunks(original: &str, hunks: &[PatchHunk]) -> Result<Vec<u8>, HostError> {
     let newline = if original.contains("\r\n") {
         "\r\n"
@@ -867,13 +886,21 @@ fn apply_hunks(original: &str, hunks: &[PatchHunk]) -> Result<Vec<u8>, HostError
     } else {
         body.split(newline).map(str::to_string).collect::<Vec<_>>()
     };
-    let mut offset = 0_i64;
+    let mut search_start = 0usize;
     for hunk in hunks {
+        if let Some(context) = &hunk.change_context {
+            let pattern = [context.clone()];
+            let position =
+                find_lines(&current, &pattern, search_start, false).ok_or_else(|| {
+                    HostError::PatchFailed(format!("patch context `{context}` was not found"))
+                })?;
+            search_start = position + 1;
+        }
         let old = hunk
             .lines
             .iter()
             .filter_map(|line| match line {
-                PatchLine::Context(value) | PatchLine::Remove(value) => Some(value),
+                PatchLine::Context(value) | PatchLine::Remove(value) => Some(value.clone()),
                 PatchLine::Add(_) => None,
             })
             .collect::<Vec<_>>();
@@ -885,38 +912,74 @@ fn apply_hunks(original: &str, hunks: &[PatchHunk]) -> Result<Vec<u8>, HostError
                 PatchLine::Remove(_) => None,
             })
             .collect::<Vec<_>>();
-        let base = hunk.line_hint.unwrap_or(current.len());
-        let hinted = (base as i64 + offset).max(0) as usize;
         let position = if old.is_empty() {
-            hinted.min(current.len())
+            if hunk.end_of_file {
+                current.len()
+            } else {
+                search_start.min(current.len())
+            }
         } else {
-            find_lines(&current, &old, hinted).ok_or_else(|| {
+            find_lines(&current, &old, search_start, hunk.end_of_file).ok_or_else(|| {
                 HostError::PatchFailed("patch context did not match the target file".to_string())
             })?
         };
         let removed = old.len();
         current.splice(position..position + removed, replacement.clone());
-        offset += replacement.len() as i64 - removed as i64;
+        search_start = position + replacement.len();
     }
     let mut output = current.join(newline);
-    if !hunks.iter().any(|hunk| hunk.end_of_file) && (trailing_newline || !output.is_empty()) {
+    if trailing_newline || !output.is_empty() {
         output.push_str(newline);
     }
     Ok(output.into_bytes())
 }
 
-fn find_lines(lines: &[String], pattern: &[&String], hinted: usize) -> Option<usize> {
+fn find_lines(
+    lines: &[String],
+    pattern: &[String],
+    start: usize,
+    end_of_file: bool,
+) -> Option<usize> {
+    if pattern.is_empty() {
+        return Some(start.min(lines.len()));
+    }
+    if pattern.len() > lines.len() {
+        return None;
+    }
     let matches_at = |start: usize| {
         start + pattern.len() <= lines.len()
             && lines[start..start + pattern.len()]
                 .iter()
                 .zip(pattern)
-                .all(|(actual, expected)| actual == *expected)
+                .all(|(actual, expected)| actual == expected)
     };
-    if matches_at(hinted) {
-        return Some(hinted);
+    let matches_rstrip = |start: usize| {
+        start + pattern.len() <= lines.len()
+            && lines[start..start + pattern.len()]
+                .iter()
+                .zip(pattern)
+                .all(|(actual, expected)| actual.trim_end() == expected.trim_end())
+    };
+    let matches_trim = |start: usize| {
+        start + pattern.len() <= lines.len()
+            && lines[start..start + pattern.len()]
+                .iter()
+                .zip(pattern)
+                .all(|(actual, expected)| actual.trim() == expected.trim())
+    };
+    let search_start = if end_of_file {
+        lines.len().saturating_sub(pattern.len()).max(start)
+    } else {
+        start
+    };
+    let last = lines.len().saturating_sub(pattern.len());
+    if search_start > last {
+        return None;
     }
-    (0..=lines.len().saturating_sub(pattern.len())).find(|start| matches_at(*start))
+    (search_start..=last)
+        .find(|index| matches_at(*index))
+        .or_else(|| (search_start..=last).find(|index| matches_rstrip(*index)))
+        .or_else(|| (search_start..=last).find(|index| matches_trim(*index)))
 }
 
 fn ensure_regular_file(path: &Path) -> Result<(), HostError> {
@@ -994,7 +1057,11 @@ struct StagedPatchFile {
 }
 
 impl StagedPatchFile {
-    fn new(path: &Path, content: &[u8]) -> Result<Self, HostError> {
+    fn new(
+        path: &Path,
+        content: &[u8],
+        permissions: Option<&fs::Permissions>,
+    ) -> Result<Self, HostError> {
         let parent = path.parent().ok_or_else(|| {
             HostError::PatchFailed(format!(
                 "patch destination has no parent: {}",
@@ -1014,6 +1081,9 @@ impl StagedPatchFile {
             .write(true)
             .create_new(true)
             .open(&guard.path)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions.clone())?;
+        }
         file.write_all(content)?;
         file.sync_all()?;
         drop(file);
@@ -1150,7 +1220,7 @@ mod tests {
     fn abandoned_patch_stage_is_removed_by_guard() {
         let temporary = tempfile::tempdir().unwrap();
         let destination = temporary.path().join("destination.txt");
-        let stage = StagedPatchFile::new(&destination, b"staged\n").unwrap();
+        let stage = StagedPatchFile::new(&destination, b"staged\n", None).unwrap();
         let stage_path = stage.path.clone();
         assert!(stage_path.is_file());
         drop(stage);
@@ -1435,13 +1505,13 @@ mod tests {
         let host = Host::open(temporary.path()).unwrap();
         host
             .apply_patch(
-                "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n\n\n*** End of File\n*** End Patch\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-after\n+changed\n\n\n*** End of File\n*** End Patch\n",
                 None,
             )
             .unwrap();
         assert_eq!(
             fs::read_to_string(temporary.path().join("file.txt")).unwrap(),
-            "changed\nafter"
+            "before\nchanged\n"
         );
     }
 
@@ -1452,14 +1522,14 @@ mod tests {
         let host = Host::open(temporary.path()).unwrap();
         let changed = host
             .apply_patch(
-                "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n*** End of File\n\n\n*** Add File: added.txt\n+added\n*** End Patch\n",
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-after\n+changed\n*** End of File\n\n\n*** Add File: added.txt\n+added\n*** End Patch\n",
                 None,
             )
             .unwrap();
         assert_eq!(changed, vec!["file.txt", "added.txt"]);
         assert_eq!(
             fs::read_to_string(temporary.path().join("file.txt")).unwrap(),
-            "changed\nafter"
+            "before\nchanged\n"
         );
         assert_eq!(
             fs::read_to_string(temporary.path().join("added.txt")).unwrap(),
@@ -1600,12 +1670,86 @@ mod tests {
         let host = Host::open(temporary.path()).unwrap();
         host
             .apply_patch(
-                "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n*** End of File\n*** End Patch\n", None
+                "*** Begin Patch\n*** Update File: file.txt\n@@\n-after\n+changed\n*** End of File\n*** End Patch\n", None
             )
             .unwrap();
         assert_eq!(
             fs::read_to_string(temporary.path().join("file.txt")).unwrap(),
-            "changed\r\nafter"
+            "before\r\nchanged\r\n"
+        );
+    }
+
+    #[test]
+    fn patch_context_headers_anchor_repeated_content() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(
+            temporary.path().join("sample.py"),
+            "class First:\n    def run(self):\n        return \"same\"\n\nclass Target:\n    def run(self):\n        return \"same\"\n",
+        )
+        .unwrap();
+        let host = Host::open(temporary.path()).unwrap();
+        host.apply_patch(
+            "*** Begin Patch\n*** Update File: sample.py\n@@ class Target:\n-        return \"same\"\n+        return \"changed\"\n*** End Patch\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("sample.py")).unwrap(),
+            "class First:\n    def run(self):\n        return \"same\"\n\nclass Target:\n    def run(self):\n        return \"changed\"\n"
+        );
+    }
+
+    #[test]
+    fn patch_hunks_search_forward_in_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(
+            temporary.path().join("file.txt"),
+            "same\nfirst\nsame\nsecond\n",
+        )
+        .unwrap();
+        let host = Host::open(temporary.path()).unwrap();
+        host.apply_patch(
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n-same\n+one\n@@\n-same\n+two\n*** End Patch\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("file.txt")).unwrap(),
+            "one\nfirst\ntwo\nsecond\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_updates_and_moves_preserve_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("tool.sh");
+        fs::write(&executable, "old\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let private = temporary.path().join("private.txt");
+        fs::write(&private, "secret\n").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let host = Host::open(temporary.path()).unwrap();
+        host.apply_patch(
+            "*** Begin Patch\n*** Update File: tool.sh\n@@\n-old\n+new\n*** Update File: private.txt\n*** Move to: moved.txt\n@@\n-secret\n+kept\n*** End Patch\n",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(temporary.path().join("moved.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
     }
 }

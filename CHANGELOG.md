@@ -8,13 +8,13 @@ Initial public alpha of the single-user, self-hosted Codex Connect architecture.
 
 ### Included
 
-- ChatGPT-facing MCP surface for scoped host inspection, deterministic command/file operations, persistent command sessions, Codex work/review workflows, typed pending actions, model/skill discovery, and Codex usage telemetry.
+- ChatGPT-facing MCP surface for host-authoritative inspection, deterministic command/file operations, persistent command sessions, Codex work/review workflows, typed pending actions, model/skill discovery, and Codex usage telemetry.
 - Official Codex App Server as the authority for thread, turn, command, review, approval, permission, elicitation, and account semantics.
 - Loopback-only MCP backend intended for OpenAI Secure MCP Tunnel.
 - Linux/systemd managed setup, health/doctor/restart/log operations, content-addressed backend artifacts, and detached two-phase source deployment.
-- Explicit sandbox ownership: host commands inherit upstream Codex policy only when no override is supplied; autonomous Codex work requires an explicit policy.
+- Explicit authority separation: host commands run on the primary host plane, while autonomous Codex work requires an explicit delegated sandbox policy.
 - Pinned Codex CLI protocol contract with generated-schema drift checks and end-to-end protocol integration coverage.
-- Reversible `codex-connect uninstall` for Codex Connect-owned backend state while preserving source, Codex CLI, and tunnel-client state.
+- `codex-connect uninstall` removes Codex Connect-owned backend state while preserving source, Codex CLI, and tunnel-client state.
 
 ### Support boundary
 

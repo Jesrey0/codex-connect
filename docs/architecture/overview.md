@@ -89,13 +89,14 @@ sequenceDiagram
 
 ## Typed action loop
 
-Public operator-actionable server requests are normalized into three categories and resolved through `codex.action.respond`:
+Public operator-actionable server requests are normalized into four categories and resolved through `codex.action.respond`:
 
 - command/file approvals → `type=approval`
 - permission grants → `type=permissions`
 - Codex semantic questions → `type=userInput`
+- MCP form/URL elicitation → `type=elicitation`
 
-The pending registry preserves the exact official request ID, method, params, and correlated thread ID. `codex.wait` returns those pending actions directly, eliminating a separate list tool. The responder validates the action category against the authoritative request kind and translates the compact public decision into the pinned official response shape. MCP elicitation remains recognized by the transport so an unexpected request is observable and can fail closed, but Codex Connect does not advertise the `openai/form` extension and exposes no elicitation response operation.
+The pending registry preserves the exact official request ID, method, params, and correlated thread ID. `codex.wait` returns those pending actions directly, eliminating a separate list tool. The responder validates the action category against the authoritative request kind and translates the compact public decision into the pinned official response shape. `openai/form` is advertised through the App Server initialize extension map; elicitation reuses the same typed responder, so the minimized MCP tool surface does not grow.
 
 `item/tool/requestUserInput` is the one deliberate experimental exception. It is exposed because semantic worker questions materially improve operator collaboration; all other experimental App Server methods remain private and unavailable unless separately designed into the public surface.
 
@@ -150,12 +151,12 @@ The App Server handshake explicitly sets:
 ```text
 experimentalApi = true
 requestAttestation = false
-extensions = {}
+extensions = { "openai/form" = {} }
 ```
 
 The dedicated pinned App Server process is launched with `sandbox_mode="danger-full-access"` plus `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals`. Codex Connect owns these process-local requirements rather than depending on a user's global Codex configuration.
 
-Codex Connect intentionally does not advertise `openai/form` because the minimized public surface has no elicitation response operation. The transport still recognizes `mcpServer/elicitation/request` so unexpected requests are visible and fail closed rather than corrupting the connection.
+Codex Connect advertises `openai/form` through the canonical App Server extension map and answers `mcpServer/elicitation/request` through `codex.action.respond`. The legacy `mcpServerOpenaiFormElicitation` boolean is not advertised.
 
 `codex.info(type=usage)` preserves the pinned App Server account usage payload rather than projecting only percentages. This includes `ordinaryUsageAllowed`, reset-credit summary state, per-limit snapshots, and other top-level fields supplied by `account/rateLimits/read`, so the operator does not infer availability from percentages or reset timestamps.
 

@@ -1,15 +1,15 @@
 //! ChatGPT-native MCP surface over Codex App Server and the operator host.
 
 mod catalog;
-use catalog::tool_catalog;
+use catalog::{host_plane_reports_worker_events, tool_catalog};
 
 use axum::Router;
 use axum::http::StatusCode;
 use axum::response::Json;
 use codex_connect_host::Host;
 use codex_connect_relay::{
-    ApprovalDecision, CommandExec, CommandExecTerminalSize, MAX_WAIT_MS, ModelList,
-    PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
+    ApprovalDecision, CommandExec, CommandExecTerminalSize, ElicitationAction, MAX_WAIT_MS,
+    ModelList, PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
 };
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
@@ -46,20 +46,6 @@ pub struct RuntimeIdentity {
     pub codex_global_config: CodexGlobalConfigSummary,
     pub app_server_working_directory: String,
     pub app_server_launch_overrides: Vec<String>,
-}
-
-fn host_plane_reports_worker_events(name: &str) -> bool {
-    matches!(
-        name,
-        "status"
-            | "inspect"
-            | "apply_patch"
-            | "command.exec"
-            | "command.start"
-            | "command.read"
-            | "command.control"
-            | "view_image"
-    )
 }
 
 fn attach_worker_events(value: &mut Value, events: Vec<Value>) {
@@ -170,7 +156,6 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
         host,
         runtime,
     };
-    let operator_status = handler.clone();
     let runtime_status = handler.clone();
     let observer = handler.clone();
     let service = StreamableHttpService::new(
@@ -178,18 +163,12 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
+            .with_allowed_origins(["https://chatgpt.com", "https://chat.openai.com"])
             .with_json_response(true),
     );
     Router::new()
         .nest_service("/mcp", service)
         .route("/healthz", axum::routing::get(|| async { StatusCode::OK }))
-        .route(
-            "/status",
-            axum::routing::get(move || {
-                let handler = operator_status.clone();
-                async move { Json(handler.status_value()) }
-            }),
-        )
         .route(
             "/runtime",
             axum::routing::get(move || {
@@ -331,10 +310,6 @@ impl RuntimeStatus {
 }
 
 impl McpHandler {
-    fn status_value(&self) -> McpStatus {
-        McpStatus::read(&self.relay, &self.runtime)
-    }
-
     fn runtime_status_value(&self) -> RuntimeStatus {
         RuntimeStatus::read(&self.relay, &self.runtime)
     }
@@ -476,7 +451,7 @@ enum CodexStartArgs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CodexWaitArgs {
     thread_id: String,
-    turn_id: Option<String>,
+    turn_id: String,
     #[serde(default)]
     after_cursor: u64,
     #[serde(default = "default_wait_ms")]
@@ -525,6 +500,11 @@ enum CodexActionRespondArgs {
     UserInput {
         request_id: RpcId,
         answers: std::collections::BTreeMap<String, Vec<String>>,
+    },
+    Elicitation {
+        request_id: RpcId,
+        action: ElicitationAction,
+        content: Option<Value>,
     },
 }
 
@@ -700,6 +680,14 @@ async fn dispatch(
                 answers,
             } => relay
                 .respond_user_input(request_id, answers)
+                .await
+                .map_err(Into::into),
+            CodexActionRespondArgs::Elicitation {
+                request_id,
+                action,
+                content,
+            } => relay
+                .respond_elicitation(request_id, action, content)
                 .await
                 .map_err(Into::into),
         },

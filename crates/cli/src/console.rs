@@ -278,11 +278,12 @@ fn worker_row(turn: &Value, width: usize) -> String {
     )
 }
 
-fn quota_line(label: &str, value: &Value) -> String {
-    let used = value["usedPercent"]
-        .as_f64()
-        .unwrap_or(0.0)
-        .clamp(0.0, 100.0);
+fn quota_line(fallback_label: &str, value: &Value) -> String {
+    let label = quota_label(value).unwrap_or_else(|| fallback_label.to_string());
+    let Some(used) = value["usedPercent"].as_f64() else {
+        return format!(" {label:<3} quota unavailable · reset unknown");
+    };
+    let used = used.clamp(0.0, 100.0);
     let remaining = 100.0 - used;
     let filled = ((used / 100.0) * 28.0).round() as usize;
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(28 - filled));
@@ -291,9 +292,20 @@ fn quota_line(label: &str, value: &Value) -> String {
         .map(reset_in)
         .unwrap_or_else(|| "reset unknown".into());
     format!(
-        " {label:<2}  {bar}  {:>5.1}% used  {:>5.1}% left  · {reset}",
+        " {label:<3} {bar}  {:>5.1}% used  {:>5.1}% left  · {reset}",
         used, remaining
     )
+}
+
+fn quota_label(value: &Value) -> Option<String> {
+    let minutes = value["windowDurationMins"].as_u64()?;
+    if minutes % (24 * 60) == 0 {
+        Some(format!("{}D", minutes / (24 * 60)))
+    } else if minutes % 60 == 0 {
+        Some(format!("{}H", minutes / 60))
+    } else {
+        Some(format!("{minutes}M"))
+    }
 }
 
 fn reset_in(epoch_seconds: u64) -> String {
@@ -442,11 +454,20 @@ mod tests {
 
     #[test]
     fn quota_line_has_fixed_bar_width() {
-        let value = serde_json::json!({"usedPercent": 50.0, "resetsAt": 0});
+        let value =
+            serde_json::json!({"usedPercent": 50.0, "resetsAt": 0, "windowDurationMins": 300});
         let line = quota_line("5H", &value);
         assert!(line.contains("██████████████░░░░░░░░░░░░░░"));
+        assert!(line.contains("5H"));
         assert!(line.contains("50.0% used"));
         assert!(line.contains("50.0% left"));
+    }
+
+    #[test]
+    fn quota_line_keeps_unavailable_telemetry_unknown() {
+        assert!(quota_line("5H", &Value::Null).contains("quota unavailable"));
+        let daily = serde_json::json!({"usedPercent": 10, "windowDurationMins": 1440});
+        assert!(quota_line("fallback", &daily).contains("1D"));
     }
 
     #[test]

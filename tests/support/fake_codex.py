@@ -192,7 +192,7 @@ for line in sys.stdin:
         assert params["capabilities"] == {
             "experimentalApi": True,
             "requestAttestation": False,
-            "extensions": {},
+            "extensions": {"openai/form": {}},
         }
         handshake = True
         respond(message, result)
@@ -235,6 +235,7 @@ for line in sys.stdin:
         result["nextCursor"] = str(start + limit) if start + limit < len(turns) else None
     elif method == "turn/start":
         assert "sandboxPolicy" in params
+        assert "serviceTier" not in params
         thread_id = params["threadId"]
         thread = threads[thread_id]
         turn = result["turn"]

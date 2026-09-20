@@ -202,7 +202,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.action.respond",
                 "Respond to Pending Codex Action",
-                "Resolve a pending Codex approval, permission request, or semantic user-input question returned by codex.wait. The response type must match the authoritative pending action associated with requestId. MCP elicitation remains transport-recognized but is intentionally not exposed as a public response capability.",
+                "Resolve a pending Codex approval, permission request, semantic user-input question, or MCP elicitation returned by codex.wait. The response type must match the authoritative pending action associated with requestId; accepted elicitations require content while decline/cancel omit it.",
                 false,
                 true,
                 true,
@@ -218,7 +218,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
                 "Batch read-only Codex discovery/account queries in one call. Use type=models for model and reasoning-effort discovery, type=skills for skills available to selected working directories, and type=usage for authoritative account usage/rate-limit telemetry. Independent query failures are returned per result without discarding successful siblings.",
                 true,
                 false,
-                true,
+                false,
                 true,
             ),
             codex_info_schema(),
@@ -273,7 +273,7 @@ fn tool(metadata: ToolMetadata, input: Value, output: Option<Value>) -> Tool {
     }
 }
 
-fn host_plane_reports_worker_events(name: &str) -> bool {
+pub(super) fn host_plane_reports_worker_events(name: &str) -> bool {
     matches!(
         name,
         "status"
@@ -289,11 +289,10 @@ fn host_plane_reports_worker_events(name: &str) -> bool {
 
 fn with_worker_events(mut schema: Value) -> Value {
     fn add(schema: &mut Value) {
-        if schema.get("type").and_then(Value::as_str) == Some("object") {
-            if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-                properties.insert("workerEvents".into(), worker_events_schema());
-            }
-            return;
+        if schema.get("type").and_then(Value::as_str) == Some("object")
+            && let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut)
+        {
+            properties.insert("workerEvents".into(), worker_events_schema());
         }
         if let Some(one_of) = schema.get_mut("oneOf").and_then(Value::as_array_mut) {
             for branch in one_of {
@@ -353,6 +352,9 @@ fn empty_schema() -> Value {
 }
 fn object_schema(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+}
+fn union_object_schema(branches: Vec<Value>) -> Value {
+    json!({"type":"object","oneOf":branches})
 }
 fn rpc_id_schema() -> Value {
     json!({"oneOf":[{"type":"string","minLength":1},{"type":"integer"}]})
@@ -603,31 +605,49 @@ fn command_read_output_schema() -> Value {
     )
 }
 fn command_control_schema() -> Value {
-    json!({"oneOf":[
-        object_schema(json!({
-            "action":{"const":"write"},
-            "processId":{"type":"string","minLength":1},
-            "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES},
-            "closeStdin":{"type":"boolean","default":false}
-        }), &["action","processId"]),
-        object_schema(json!({
-            "action":{"const":"resize"},
-            "processId":{"type":"string","minLength":1},
-            "rows":{"type":"integer","minimum":1,"maximum":65535},
-            "cols":{"type":"integer","minimum":1,"maximum":65535}
-        }), &["action","processId","rows","cols"]),
-        object_schema(json!({
-            "action":{"const":"terminate"},
-            "processId":{"type":"string","minLength":1}
-        }), &["action","processId"])
-    ]})
+    union_object_schema(vec![
+        object_schema(
+            json!({
+                "action":{"const":"write"},
+                "processId":{"type":"string","minLength":1},
+                "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES},
+                "closeStdin":{"type":"boolean","default":false}
+            }),
+            &["action", "processId"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"resize"},
+                "processId":{"type":"string","minLength":1},
+                "rows":{"type":"integer","minimum":1,"maximum":65535},
+                "cols":{"type":"integer","minimum":1,"maximum":65535}
+            }),
+            &["action", "processId", "rows", "cols"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"terminate"},
+                "processId":{"type":"string","minLength":1}
+            }),
+            &["action", "processId"],
+        ),
+    ])
 }
 fn command_control_output_schema() -> Value {
-    json!({"oneOf":[
-        object_schema(json!({"processId":{"type":"string"},"written":{"const":true},"stdinClosed":{"type":"boolean"}}), &["processId","written","stdinClosed"]),
-        object_schema(json!({"processId":{"type":"string"},"resized":{"const":true}}), &["processId","resized"]),
-        object_schema(json!({"processId":{"type":"string"},"terminationRequested":{"const":true}}), &["processId","terminationRequested"])
-    ]})
+    union_object_schema(vec![
+        object_schema(
+            json!({"processId":{"type":"string"},"written":{"const":true},"stdinClosed":{"type":"boolean"}}),
+            &["processId", "written", "stdinClosed"],
+        ),
+        object_schema(
+            json!({"processId":{"type":"string"},"resized":{"const":true}}),
+            &["processId", "resized"],
+        ),
+        object_schema(
+            json!({"processId":{"type":"string"},"terminationRequested":{"const":true}}),
+            &["processId", "terminationRequested"],
+        ),
+    ])
 }
 fn review_target_schema() -> Value {
     json!({"oneOf":[
@@ -638,7 +658,7 @@ fn review_target_schema() -> Value {
     ]})
 }
 fn codex_start_schema() -> Value {
-    json!({"oneOf":[
+    union_object_schema(vec![
         object_schema(
             json!({
                 "mode":{"const":"work"},
@@ -651,7 +671,7 @@ fn codex_start_schema() -> Value {
                 "serviceTier":{"type":"string"},
                 "sandboxPolicy":work_sandbox_schema()
             }),
-            &["mode","task","sandboxPolicy"],
+            &["mode", "task", "sandboxPolicy"],
         ),
         object_schema(
             json!({
@@ -661,56 +681,83 @@ fn codex_start_schema() -> Value {
                 "target":review_target_schema(),
                 "model":{"type":"string"}
             }),
-            &["mode","target"],
-        )
-    ]})
+            &["mode", "target"],
+        ),
+    ])
 }
 fn codex_wait_schema() -> Value {
     object_schema(
         json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by codex.start/codex.wait. Matching events after this cursor are returned when the quiet join ends but do not wake it by themselves."},"timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet-join lease in milliseconds. Set to 0 for a non-blocking state/journal pull."}}),
-        &["threadId"],
+        &["threadId", "turnId"],
     )
 }
 fn codex_control_schema() -> Value {
-    json!({"oneOf":[
-        object_schema(json!({
-            "action":{"const":"steer"},
-            "threadId":{"type":"string"},
-            "expectedTurnId":{"type":"string"},
-            "instruction":{"type":"string","minLength":1}
-        }), &["action","threadId","expectedTurnId","instruction"]),
-        object_schema(json!({
-            "action":{"const":"interrupt"},
-            "threadId":{"type":"string"},
-            "turnId":{"type":"string"}
-        }), &["action","threadId","turnId"])
-    ]})
+    union_object_schema(vec![
+        object_schema(
+            json!({
+                "action":{"const":"steer"},
+                "threadId":{"type":"string"},
+                "expectedTurnId":{"type":"string"},
+                "instruction":{"type":"string","minLength":1}
+            }),
+            &["action", "threadId", "expectedTurnId", "instruction"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"interrupt"},
+                "threadId":{"type":"string"},
+                "turnId":{"type":"string"}
+            }),
+            &["action", "threadId", "turnId"],
+        ),
+    ])
 }
 fn codex_control_output_schema() -> Value {
-    json!({"oneOf":[
+    union_object_schema(vec![
         object_schema(json!({"turnId":{"type":"string"}}), &["turnId"]),
-        object_schema(json!({"turnId":{"type":"string"},"interrupted":{"const":true}}), &["turnId","interrupted"])
-    ]})
+        object_schema(
+            json!({"turnId":{"type":"string"},"interrupted":{"const":true}}),
+            &["turnId", "interrupted"],
+        ),
+    ])
 }
 fn codex_action_respond_schema() -> Value {
-    json!({"oneOf":[
-        object_schema(json!({
-            "type":{"const":"approval"},
-            "requestId":rpc_id_schema(),
-            "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"]}
-        }), &["type","requestId","decision"]),
-        object_schema(json!({
-            "type":{"const":"permissions"},
-            "requestId":rpc_id_schema(),
-            "permissions":permissions_schema(),
-            "scope":{"type":"string","enum":["turn","session"]}
-        }), &["type","requestId","permissions"]),
-        object_schema(json!({
-            "type":{"const":"userInput"},
-            "requestId":rpc_id_schema(),
-            "answers":{"type":"object","minProperties":1,"additionalProperties":{"type":"array","items":{"type":"string"}}}
-        }), &["type","requestId","answers"])
-    ]})
+    union_object_schema(vec![
+        object_schema(
+            json!({
+                "type":{"const":"approval"},
+                "requestId":rpc_id_schema(),
+                "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"]}
+            }),
+            &["type", "requestId", "decision"],
+        ),
+        object_schema(
+            json!({
+                "type":{"const":"permissions"},
+                "requestId":rpc_id_schema(),
+                "permissions":permissions_schema(),
+                "scope":{"type":"string","enum":["turn","session"]}
+            }),
+            &["type", "requestId", "permissions"],
+        ),
+        object_schema(
+            json!({
+                "type":{"const":"userInput"},
+                "requestId":rpc_id_schema(),
+                "answers":{"type":"object","minProperties":1,"additionalProperties":{"type":"array","items":{"type":"string"}}}
+            }),
+            &["type", "requestId", "answers"],
+        ),
+        object_schema(
+            json!({
+                "type":{"const":"elicitation"},
+                "requestId":rpc_id_schema(),
+                "action":{"type":"string","enum":["accept","decline","cancel"]},
+                "content":{}
+            }),
+            &["type", "requestId", "action"],
+        ),
+    ])
 }
 fn codex_info_schema() -> Value {
     let query = json!({"oneOf":[
@@ -765,8 +812,9 @@ fn turn_schema() -> Value {
             "id":{"type":"string"},"status":{"enum":["inProgress","completed","failed","interrupted"]},
             "error":{"type":["object","null"]},
             "output":{"type":"array","items":object_schema(json!({
-                "type":{"enum":["agentMessage","exitedReviewMode"]},"text":{"type":"string"},"truncated":{"type":"boolean"}
-            }), &["type","text","truncated"])}
+                "id":{"type":["string","null"]},"type":{"enum":["agentMessage","exitedReviewMode"]},
+                "phase":{"type":["string","null"]},"text":{"type":"string"},"truncated":{"type":"boolean"}
+            }), &["id","type","phase","text","truncated"])}
         }),
         &["id", "status", "error", "output"],
     )
@@ -1039,6 +1087,12 @@ mod tests {
         assert!(!output.to_string().contains("progress"));
 
         let input = codex_wait_schema();
+        assert!(
+            input["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("turnId"))
+        );
         assert_eq!(input["properties"]["timeoutMs"]["minimum"], 0);
         assert!(
             input["properties"]["timeoutMs"]["description"]
@@ -1146,6 +1200,8 @@ mod tests {
             }
             assert!(tool["inputSchema"].is_object());
             assert!(tool["outputSchema"].is_object());
+            assert_eq!(tool["inputSchema"]["type"], "object");
+            assert_eq!(tool["outputSchema"]["type"], "object");
             assert!(
                 serde_json::to_vec(tool).unwrap().len() < 20_000,
                 "tool schema too large: {}",
@@ -1155,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn golden_tool_selection_fixture_is_unambiguous() {
+    fn tool_selection_fixture_references_only_canonical_tools() {
         let cases = [
             ("find where Relay is defined", Some("inspect")),
             (

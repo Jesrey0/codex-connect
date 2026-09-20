@@ -94,7 +94,7 @@ The canonical MCP surface contains 13 tools:
 
 `codex.*` is the public namespace for interacting with the Codex CLI/App Server agent domain. `codex-connect` and `@codexConnect` remain the implementation and connector/product identities of the bridge; host/operator tools remain un-namespaced or under `command.*`.
 
-The App Server is initialized with `experimentalApi: true` but advertises no form/elicitation extension because the minimized public MCP surface has no elicitation response operation. Elicitation remains transport-recognized for observability and fail-closed handling. The dedicated App Server process also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` feature flags so the public `codex.action.respond` collaboration paths can be exercised without relying on a user's global Codex configuration.
+The App Server is initialized with `experimentalApi: true` and the canonical `openai/form` client extension. Form/URL elicitation is resolved through the existing `codex.action.respond` collaboration tool rather than a separate public responder. The dedicated App Server process also enables the pinned `default_mode_request_user_input`, `request_permissions_tool`, and `exec_permission_approvals` feature flags so the public collaboration paths can be exercised without relying on a user's global Codex configuration.
 
 The configured default workspace is a navigation base, not an authorization boundary, and it is not implicitly a Git repository. Version control is optional. Codex Connect and its agents must not initialize repositories, create branches, commits, or tags, or use Git as a workflow/checkpoint mechanism unless the user explicitly requests version-control work.
 

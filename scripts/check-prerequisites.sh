@@ -34,7 +34,7 @@ fi
 
 if command -v rustc >/dev/null 2>&1; then
   rust_version="$(rustc --version | awk '{print $2}')"
-  minimum="1.85.0"
+  minimum="1.88.0"
   if [[ "$(printf '%s\n%s\n' "$minimum" "$rust_version" | sort -V | head -n1)" == "$minimum" ]]; then
     pass "rustc $rust_version (>= $minimum)"
   else

@@ -4,7 +4,7 @@ Codex Connect is a deliberately narrow bridge between ChatGPT, the official Open
 
 ## Development prerequisites
 
-Use Linux with a working Rust toolchain (Rust 1.85 or newer), Python 3, and the exact Codex CLI release in `config/codex-cli-pin`. The protocol integration suite also requires the Python `jsonschema` package.
+Use Linux with a working Rust toolchain (Rust 1.88 or newer), Python 3, and the exact Codex CLI release in `config/codex-cli-pin`. The protocol integration suite also requires the Python `jsonschema` package.
 
 For architecture and protocol invariants, read [docs/development.md](docs/development.md) and [docs/architecture/overview.md](docs/architecture/overview.md) before changing public MCP behavior, sandbox semantics, App Server integration, deployment, or service management.
 
