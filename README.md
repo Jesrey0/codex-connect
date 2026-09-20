@@ -12,7 +12,7 @@ Codex Connect is developer infrastructure for people who deliberately want a hig
 
 The managed setup currently targets **Linux with systemd user services**. It requires an authenticated Codex CLI, OpenAI Secure MCP Tunnel, and a ChatGPT account where Developer mode/custom MCP app creation is available. The repository builds from source; prebuilt packages are not currently distributed.
 
-The default host scope and workspace-local installation layout use `~/projects`. Codex Connect keeps its backend on loopback and does not expose port `8767` directly to the internet.
+The default workspace and workspace-local installation layout use `~/projects`. Codex Connect keeps its backend on loopback and does not expose port `8767` directly to the internet.
 
 ### Dependency ownership boundary
 
@@ -131,7 +131,7 @@ codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/projects/example-p
 codex-connect uninstall
 ```
 
-`codex-connect console` opens the local read-only observability console backed by the running Codex Connect backend. It shows account quota telemetry, currently observed active turns, requested model/reasoning-effort metadata when known, pending action counts, and the bounded recent worker-event journal. The console has no approval, delegation, steering, interruption, permission, or input-response controls; those remain on the ChatGPT/Codex Connect operator path. `tui` remains a compatibility alias, but `console` is the canonical command.
+`codex-connect console` opens the local read-only observability console backed by the running Codex Connect backend. It shows account quota telemetry, currently observed active turns, requested model/reasoning-effort metadata when known, pending action counts, and the bounded recent worker-event journal. The console has no approval, delegation, steering, interruption, permission, or input-response controls; those remain on the ChatGPT/Codex Connect operator path.
 
 After a computer restart, verify the backend first, then inspect/resume the existing tunnel runtime with `tunnel-client runtimes status codex-connect --json`. See [Operations](docs/operations.md#after-a-computer-restart).
 

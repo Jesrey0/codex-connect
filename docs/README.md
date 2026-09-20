@@ -6,7 +6,7 @@
 
 ## Architecture
 
-- [Architecture overview](architecture/overview.md) — ChatGPT-native MCP surface, App Server authority, event journal, typed actions, host scope, and runtime boundaries
+- [Architecture overview](architecture/overview.md) — ChatGPT-native MCP surface, App Server authority, event journal, typed actions, host operations, and runtime boundaries
 
 ## Operations
 

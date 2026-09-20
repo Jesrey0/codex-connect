@@ -220,9 +220,9 @@ dependencies = [
  "anyhow",
  "clap",
  "codex-connect-app-server",
+ "codex-connect-host",
  "codex-connect-mcp",
  "codex-connect-relay",
- "codex-connect-scope",
  "libc",
  "serde",
  "serde_json",
@@ -242,13 +242,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-connect-host"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "base64",
+ "image",
+ "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "codex-connect-mcp"
 version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
+ "codex-connect-host",
  "codex-connect-relay",
- "codex-connect-scope",
  "rmcp",
  "serde",
  "serde_json",
@@ -261,22 +272,11 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "codex-connect-app-server",
- "codex-connect-scope",
+ "codex-connect-host",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "codex-connect-scope"
-version = "0.1.0-alpha.1"
-dependencies = [
- "base64",
- "image",
- "serde",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]

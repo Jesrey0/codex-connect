@@ -37,7 +37,7 @@ const SKIPPED_DIRECTORIES: &[&str] = &[
 ];
 
 #[derive(Debug, Error)]
-pub enum ScopeError {
+pub enum HostError {
     #[error("the configured default cwd is not a directory")]
     InvalidDefaultCwd,
     #[error("host path is not valid UTF-8 for App Server")]
@@ -63,8 +63,8 @@ pub enum ScopeError {
 }
 
 #[derive(Clone, Debug)]
-pub struct Scope {
-    root: PathBuf,
+pub struct Host {
+    default_cwd: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,47 +92,47 @@ pub struct ImageFile {
     pub base64_data: String,
 }
 
-/// The configured root is only the default working directory for relative paths.
+/// The configured default cwd is only the working directory for relative paths.
 /// Absolute paths are host paths governed by the OS and the caller's execution policy.
-impl Scope {
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self, ScopeError> {
-        let root = root.into().canonicalize()?;
-        if !root.is_dir() {
-            return Err(ScopeError::InvalidDefaultCwd);
+impl Host {
+    pub fn open(default_cwd: impl Into<PathBuf>) -> Result<Self, HostError> {
+        let default_cwd = default_cwd.into().canonicalize()?;
+        if !default_cwd.is_dir() {
+            return Err(HostError::InvalidDefaultCwd);
         }
-        Ok(Self { root })
+        Ok(Self { default_cwd })
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
+    pub fn default_cwd(&self) -> &Path {
+        &self.default_cwd
     }
 
     /// Resolve a request-local cwd; omission selects the configured default cwd.
-    pub fn resolve_cwd(&self, cwd: Option<&str>) -> Result<String, ScopeError> {
+    pub fn resolve_cwd(&self, cwd: Option<&str>) -> Result<String, HostError> {
         self.resolve_app_server_directory(cwd.unwrap_or("."))
     }
 
     /// Join against an already resolved cwd.
-    pub fn path_from_cwd(cwd: &str, requested: &str) -> Result<String, ScopeError> {
+    pub fn path_from_cwd(cwd: &str, requested: &str) -> Result<String, HostError> {
         Path::new(cwd)
             .join(requested)
             .to_str()
             .map(str::to_owned)
-            .ok_or(ScopeError::NonUtf8Path)
+            .ok_or(HostError::NonUtf8Path)
     }
 
-    pub fn resolve_app_server_existing(&self, requested: &str) -> Result<String, ScopeError> {
+    pub fn resolve_app_server_existing(&self, requested: &str) -> Result<String, HostError> {
         let canonical = self.resolve_existing(requested)?;
         canonical
             .to_str()
             .map(str::to_owned)
-            .ok_or(ScopeError::NonUtf8Path)
+            .ok_or(HostError::NonUtf8Path)
     }
 
-    pub fn resolve_app_server_directory(&self, requested: &str) -> Result<String, ScopeError> {
+    pub fn resolve_app_server_directory(&self, requested: &str) -> Result<String, HostError> {
         let candidate = self.resolve_app_server_existing(requested)?;
         if !Path::new(&candidate).is_dir() {
-            return Err(ScopeError::PatchFailed(format!(
+            return Err(HostError::PatchFailed(format!(
                 "host path is not a directory: {requested}"
             )));
         }
@@ -146,17 +146,17 @@ impl Scope {
         result_base: Option<&str>,
         max_results: Option<usize>,
         is_cancelled: impl Fn() -> bool,
-    ) -> Result<SearchResults, ScopeError> {
+    ) -> Result<SearchResults, HostError> {
         if query.is_empty() {
-            return Err(ScopeError::EmptyQuery);
+            return Err(HostError::EmptyQuery);
         }
         let root = match requested {
             Some(path) => self.resolve_existing(path)?,
-            None => self.root.clone(),
+            None => self.default_cwd.clone(),
         };
         let result_base = match result_base {
             Some(path) => self.resolve_existing(path)?,
-            None => self.root.clone(),
+            None => self.default_cwd.clone(),
         };
         let max_results = max_results.unwrap_or(MAX_SEARCH_RESULTS).clamp(1, 1_000);
         let mut matches = Vec::new();
@@ -180,7 +180,7 @@ impl Scope {
         query: &str,
         requested: Option<&str>,
         max_results: Option<usize>,
-    ) -> Result<SearchResults, ScopeError> {
+    ) -> Result<SearchResults, HostError> {
         self.search_with_cancel(query, requested, None, max_results, || false)
     }
 
@@ -189,27 +189,27 @@ impl Scope {
         requested: &str,
         bytes: Vec<u8>,
         detail: Option<&str>,
-    ) -> Result<ImageFile, ScopeError> {
+    ) -> Result<ImageFile, HostError> {
         let detail = match detail {
             None | Some("high") => "high",
             Some("original") => "original",
-            Some(_) => return Err(ScopeError::InvalidImageDetail),
+            Some(_) => return Err(HostError::InvalidImageDetail),
         };
         let path = self.resolve_existing(requested)?;
         if bytes.len() > MAX_IMAGE_BYTES {
-            return Err(ScopeError::LargeImage);
+            return Err(HostError::LargeImage);
         }
         let format = image::guess_format(&bytes)
-            .map_err(|_| ScopeError::InvalidImage(self.relative(&path)))?;
+            .map_err(|_| HostError::InvalidImage(self.relative(&path)))?;
         let mime_type = match format {
             ImageFormat::Png => "image/png",
             ImageFormat::Jpeg => "image/jpeg",
             ImageFormat::Gif => "image/gif",
             ImageFormat::WebP => "image/webp",
-            _ => return Err(ScopeError::UnsupportedImage(self.relative(&path))),
+            _ => return Err(HostError::UnsupportedImage(self.relative(&path))),
         };
         let image = image::load_from_memory_with_format(&bytes, format)
-            .map_err(|_| ScopeError::InvalidImage(self.relative(&path)))?;
+            .map_err(|_| HostError::InvalidImage(self.relative(&path)))?;
         let limits = match detail {
             "high" => (HIGH_IMAGE_MAX_DIMENSION, HIGH_IMAGE_MAX_PATCHES),
             "original" => (ORIGINAL_IMAGE_MAX_DIMENSION, ORIGINAL_IMAGE_MAX_PATCHES),
@@ -238,10 +238,10 @@ impl Scope {
                 let mut encoded = Cursor::new(Vec::new());
                 image
                     .write_to(&mut encoded, output_format)
-                    .map_err(|_| ScopeError::InvalidImage(self.relative(&path)))?;
+                    .map_err(|_| HostError::InvalidImage(self.relative(&path)))?;
                 let encoded = encoded.into_inner();
                 if encoded.len() > MAX_IMAGE_BYTES {
-                    return Err(ScopeError::LargeImage);
+                    return Err(HostError::LargeImage);
                 }
                 let mime_type = match output_format {
                     ImageFormat::Png => "image/png",
@@ -264,21 +264,21 @@ impl Scope {
         &self,
         requested: &str,
         detail: Option<&str>,
-    ) -> Result<ImageFile, ScopeError> {
+    ) -> Result<ImageFile, HostError> {
         let bytes = fs::read(self.resolve_existing(requested)?)?;
         self.image_from_bytes(requested, bytes, detail)
     }
 
     #[cfg(test)]
-    fn image(&self, requested: &str) -> Result<ImageFile, ScopeError> {
+    fn image(&self, requested: &str) -> Result<ImageFile, HostError> {
         self.image_with_detail(requested, None)
     }
 
-    pub fn apply_patch(&self, patch: &str, cwd: Option<&str>) -> Result<Vec<String>, ScopeError> {
+    pub fn apply_patch(&self, patch: &str, cwd: Option<&str>) -> Result<Vec<String>, HostError> {
         let document = parse_patch(patch)?;
         if document.environment_id.is_some() {
-            return Err(ScopeError::PatchFailed(
-                "apply_patch environment selection is unavailable for this scope".to_string(),
+            return Err(HostError::PatchFailed(
+                "apply_patch environment selection is unavailable for this host".to_string(),
             ));
         }
         let cwd = self.resolve_cwd(cwd)?;
@@ -286,7 +286,7 @@ impl Scope {
         self.apply_patch_plan(plan)
     }
 
-    fn plan_patch(&self, changes: Vec<PatchChange>, cwd: &str) -> Result<PatchPlan, ScopeError> {
+    fn plan_patch(&self, changes: Vec<PatchChange>, cwd: &str) -> Result<PatchPlan, HostError> {
         let mut actions = Vec::with_capacity(changes.len());
         let mut applied = Vec::with_capacity(changes.len());
         let mut touched = HashSet::new();
@@ -315,7 +315,7 @@ impl Scope {
                     ensure_regular_file(&source)?;
                     let original = fs::read(&source)?;
                     let original = std::str::from_utf8(&original).map_err(|_| {
-                        ScopeError::PatchFailed(format!(
+                        HostError::PatchFailed(format!(
                             "cannot update non-UTF-8 file: {}",
                             self.relative(&source)
                         ))
@@ -346,10 +346,10 @@ impl Scope {
         Ok(PatchPlan { actions, applied })
     }
 
-    fn apply_patch_plan(&self, plan: PatchPlan) -> Result<Vec<String>, ScopeError> {
+    fn apply_patch_plan(&self, plan: PatchPlan) -> Result<Vec<String>, HostError> {
         let mut completed = Vec::with_capacity(plan.actions.len());
         let mut created_directories = Vec::new();
-        let result = (|| -> Result<(), ScopeError> {
+        let result = (|| -> Result<(), HostError> {
             for action in &plan.actions {
                 let path = action.path();
                 match action {
@@ -401,24 +401,24 @@ impl Scope {
         Ok(plan.applied)
     }
 
-    fn resolve_existing(&self, requested: &str) -> Result<PathBuf, ScopeError> {
+    fn resolve_existing(&self, requested: &str) -> Result<PathBuf, HostError> {
         let requested = Path::new(requested);
         let candidate = if requested.is_absolute() {
             requested.to_path_buf()
         } else {
-            self.root.join(requested)
+            self.default_cwd.join(requested)
         };
         Ok(candidate.canonicalize()?)
     }
 
     fn relative(&self, path: &Path) -> String {
-        match path.strip_prefix(&self.root) {
+        match path.strip_prefix(&self.default_cwd) {
             Ok(relative) => relative.to_string_lossy().to_string(),
             Err(_) => path.to_string_lossy().to_string(),
         }
     }
 
-    fn resolve_mutation_path(&self, requested: &str) -> Result<PathBuf, ScopeError> {
+    fn resolve_mutation_path(&self, requested: &str) -> Result<PathBuf, HostError> {
         #[derive(Clone, Copy)]
         enum ComponentState {
             ExistingDirectory,
@@ -430,7 +430,7 @@ impl Scope {
         let requested = if requested.is_absolute() {
             requested.to_path_buf()
         } else {
-            self.root.join(requested)
+            self.default_cwd.join(requested)
         };
         let mut current = PathBuf::from("/");
         let mut states = Vec::new();
@@ -443,19 +443,19 @@ impl Scope {
                         current.pop();
                     }
                     Some(ComponentState::ExistingNonDirectory) => {
-                        return Err(ScopeError::PatchFailed(format!(
+                        return Err(HostError::PatchFailed(format!(
                             "patch path traverses parent through a non-directory component: {}",
                             current.display()
                         )));
                     }
                     Some(ComponentState::Missing) => {
-                        return Err(ScopeError::PatchFailed(format!(
+                        return Err(HostError::PatchFailed(format!(
                             "patch path traverses parent through a missing component: {}",
                             current.display()
                         )));
                     }
                     None => {
-                        return Err(ScopeError::PatchFailed(format!(
+                        return Err(HostError::PatchFailed(format!(
                             "patch path traverses above the filesystem root: {}",
                             requested.display()
                         )));
@@ -465,7 +465,7 @@ impl Scope {
                     current.push(component);
                     let state = match fs::symlink_metadata(&current) {
                         Ok(metadata) if metadata.file_type().is_symlink() => {
-                            return Err(ScopeError::SymlinkMutation(self.relative(&current)));
+                            return Err(HostError::SymlinkMutation(self.relative(&current)));
                         }
                         Ok(metadata) if metadata.is_dir() => ComponentState::ExistingDirectory,
                         Ok(_) => ComponentState::ExistingNonDirectory,
@@ -477,7 +477,7 @@ impl Scope {
                     states.push(state);
                 }
                 std::path::Component::Prefix(_) => {
-                    return Err(ScopeError::PatchFailed(format!(
+                    return Err(HostError::PatchFailed(format!(
                         "unsupported host mutation path: {}",
                         requested.display()
                     )));
@@ -496,9 +496,9 @@ fn search_tree(
     max_results: usize,
     matches: &mut Vec<SearchMatch>,
     is_cancelled: &impl Fn() -> bool,
-) -> Result<(), ScopeError> {
+) -> Result<(), HostError> {
     if is_cancelled() {
-        return Err(ScopeError::Cancelled);
+        return Err(HostError::Cancelled);
     }
     if matches.len() >= max_results {
         return Ok(());
@@ -538,7 +538,7 @@ fn search_tree(
     let reader = BufReader::new(file).take(MAX_SEARCH_FILE_BYTES);
     for (index, line) in reader.lines().enumerate() {
         if is_cancelled() {
-            return Err(ScopeError::Cancelled);
+            return Err(HostError::Cancelled);
         }
         let line = match line {
             Ok(line) => line,
@@ -669,12 +669,12 @@ enum CompletedPatchAction {
     },
 }
 
-fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
+fn parse_patch(patch: &str) -> Result<PatchDocument, HostError> {
     let lines = patch.trim().lines().collect::<Vec<_>>();
     if lines.first().map(|s| s.trim()) != Some("*** Begin Patch")
         || lines.last().map(|s| s.trim()) != Some("*** End Patch")
     {
-        return Err(ScopeError::PatchFailed(
+        return Err(HostError::PatchFailed(
             "expected the official `*** Begin Patch` / `*** End Patch` format".to_string(),
         ));
     }
@@ -686,7 +686,7 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
         .map(str::to_string);
     if environment_id.is_some() {
         if environment_id.as_deref() == Some("") {
-            return Err(ScopeError::PatchFailed(
+            return Err(HostError::PatchFailed(
                 "apply_patch environment_id cannot be empty".to_string(),
             ));
         }
@@ -702,7 +702,7 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
             let mut count = 0;
             while index < end && !lines[index].starts_with("*** ") {
                 let line = lines[index].strip_prefix('+').ok_or_else(|| {
-                    ScopeError::PatchFailed("added file lines must start with `+`".to_string())
+                    HostError::PatchFailed("added file lines must start with `+`".to_string())
                 })?;
                 content.push_str(line);
                 content.push('\n');
@@ -710,7 +710,7 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
                 index += 1;
             }
             if count == 0 {
-                return Err(ScopeError::PatchFailed(
+                return Err(HostError::PatchFailed(
                     "added files require at least one `+` line".to_string(),
                 ));
             }
@@ -751,7 +751,7 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
                     continue;
                 }
                 if !header.starts_with("@@") {
-                    return Err(ScopeError::PatchFailed(
+                    return Err(HostError::PatchFailed(
                         "updated files require `@@` hunk headers".to_string(),
                     ));
                 }
@@ -782,7 +782,7 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
                                     }
                                 }
                             }
-                            return Err(ScopeError::PatchFailed(
+                            return Err(HostError::PatchFailed(
                                 "patch hunk lines must start with ` `, `+`, or `-`".to_string(),
                             ));
                         }
@@ -795,7 +795,7 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
                     index += 1;
                 }
                 if hunk_lines.is_empty() {
-                    return Err(ScopeError::PatchFailed("patch hunk is empty".to_string()));
+                    return Err(HostError::PatchFailed("patch hunk is empty".to_string()));
                 }
                 hunks.push(PatchHunk {
                     lines: hunk_lines,
@@ -810,7 +810,7 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
                 }
             }
             if hunks.is_empty() && move_path.is_none() {
-                return Err(ScopeError::PatchFailed(
+                return Err(HostError::PatchFailed(
                     "updated files require a hunk or `*** Move to:` directive".to_string(),
                 ));
             }
@@ -821,12 +821,12 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
             });
             continue;
         }
-        return Err(ScopeError::PatchFailed(format!(
+        return Err(HostError::PatchFailed(format!(
             "unknown patch directive: {header}"
         )));
     }
     if changes.is_empty() {
-        return Err(ScopeError::PatchFailed(
+        return Err(HostError::PatchFailed(
             "patch contains no file changes".to_string(),
         ));
     }
@@ -836,9 +836,9 @@ fn parse_patch(patch: &str) -> Result<PatchDocument, ScopeError> {
     })
 }
 
-fn require_patch_path(path: &str) -> Result<(), ScopeError> {
+fn require_patch_path(path: &str) -> Result<(), HostError> {
     if path.is_empty() {
-        return Err(ScopeError::PatchFailed(
+        return Err(HostError::PatchFailed(
             "patch file paths must not be empty".to_string(),
         ));
     }
@@ -854,7 +854,7 @@ fn parse_line_hint(header: &str) -> Option<usize> {
         .map(|line| line.saturating_sub(1))
 }
 
-fn apply_hunks(original: &str, hunks: &[PatchHunk]) -> Result<Vec<u8>, ScopeError> {
+fn apply_hunks(original: &str, hunks: &[PatchHunk]) -> Result<Vec<u8>, HostError> {
     let newline = if original.contains("\r\n") {
         "\r\n"
     } else {
@@ -891,7 +891,7 @@ fn apply_hunks(original: &str, hunks: &[PatchHunk]) -> Result<Vec<u8>, ScopeErro
             hinted.min(current.len())
         } else {
             find_lines(&current, &old, hinted).ok_or_else(|| {
-                ScopeError::PatchFailed("patch context did not match the target file".to_string())
+                HostError::PatchFailed("patch context did not match the target file".to_string())
             })?
         };
         let removed = old.len();
@@ -919,13 +919,13 @@ fn find_lines(lines: &[String], pattern: &[&String], hinted: usize) -> Option<us
     (0..=lines.len().saturating_sub(pattern.len())).find(|start| matches_at(*start))
 }
 
-fn ensure_regular_file(path: &Path) -> Result<(), ScopeError> {
+fn ensure_regular_file(path: &Path) -> Result<(), HostError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
-        return Err(ScopeError::SymlinkMutation(path.display().to_string()));
+        return Err(HostError::SymlinkMutation(path.display().to_string()));
     }
     if !metadata.is_file() {
-        return Err(ScopeError::PatchFailed(format!(
+        return Err(HostError::PatchFailed(format!(
             "expected a regular file: {}",
             path.display()
         )));
@@ -933,12 +933,12 @@ fn ensure_regular_file(path: &Path) -> Result<(), ScopeError> {
     Ok(())
 }
 
-fn ensure_patch_destination(path: &Path) -> Result<(), ScopeError> {
+fn ensure_patch_destination(path: &Path) -> Result<(), HostError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err(ScopeError::SymlinkMutation(path.display().to_string()))
+            Err(HostError::SymlinkMutation(path.display().to_string()))
         }
-        Ok(metadata) if !metadata.is_file() => Err(ScopeError::PatchFailed(format!(
+        Ok(metadata) if !metadata.is_file() => Err(HostError::PatchFailed(format!(
             "patch destination is not a regular file: {}",
             path.display()
         ))),
@@ -946,21 +946,21 @@ fn ensure_patch_destination(path: &Path) -> Result<(), ScopeError> {
     }
 }
 
-fn register_patch_path(touched: &mut HashSet<PathBuf>, path: &Path) -> Result<(), ScopeError> {
+fn register_patch_path(touched: &mut HashSet<PathBuf>, path: &Path) -> Result<(), HostError> {
     if touched.insert(path.to_path_buf()) {
         Ok(())
     } else {
-        Err(ScopeError::PatchFailed(format!(
+        Err(HostError::PatchFailed(format!(
             "patch changes the same path more than once: {}",
             path.display()
         )))
     }
 }
 
-fn create_missing_parent_directories(path: &Path) -> Result<Vec<PathBuf>, ScopeError> {
+fn create_missing_parent_directories(path: &Path) -> Result<Vec<PathBuf>, HostError> {
     let mut missing = Vec::new();
     let mut current = path.parent().ok_or_else(|| {
-        ScopeError::PatchFailed(format!(
+        HostError::PatchFailed(format!(
             "patch destination has no parent: {}",
             path.display()
         ))
@@ -968,14 +968,14 @@ fn create_missing_parent_directories(path: &Path) -> Result<Vec<PathBuf>, ScopeE
     while !current.exists() {
         missing.push(current.to_path_buf());
         current = current.parent().ok_or_else(|| {
-            ScopeError::PatchFailed(format!(
+            HostError::PatchFailed(format!(
                 "unable to resolve patch destination parent: {}",
                 path.display()
             ))
         })?;
     }
     if !current.is_dir() {
-        return Err(ScopeError::PatchFailed(format!(
+        return Err(HostError::PatchFailed(format!(
             "patch destination parent is not a directory: {}",
             current.display()
         )));
@@ -994,9 +994,9 @@ struct StagedPatchFile {
 }
 
 impl StagedPatchFile {
-    fn new(path: &Path, content: &[u8]) -> Result<Self, ScopeError> {
+    fn new(path: &Path, content: &[u8]) -> Result<Self, HostError> {
         let parent = path.parent().ok_or_else(|| {
-            ScopeError::PatchFailed(format!(
+            HostError::PatchFailed(format!(
                 "patch destination has no parent: {}",
                 path.display()
             ))
@@ -1035,9 +1035,9 @@ impl Drop for StagedPatchFile {
     }
 }
 
-fn reserve_patch_backup(path: &Path) -> Result<PathBuf, ScopeError> {
+fn reserve_patch_backup(path: &Path) -> Result<PathBuf, HostError> {
     let parent = path.parent().ok_or_else(|| {
-        ScopeError::PatchFailed(format!("patch path has no parent: {}", path.display()))
+        HostError::PatchFailed(format!("patch path has no parent: {}", path.display()))
     })?;
     let temporary = tempfile::Builder::new()
         .prefix(".codex-connect-patch-backup-")
@@ -1086,26 +1086,30 @@ fn remove_created_directories(directories: &[PathBuf]) {
 
 #[cfg(test)]
 mod tests {
-    use super::Scope;
-    use super::ScopeError;
+    use super::Host;
+    use super::HostError;
     use super::StagedPatchFile;
     use base64::Engine;
     use std::fs;
 
     #[test]
     fn app_server_paths_use_default_cwd_but_allow_absolute_host_paths() {
-        let scope_dir = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
-        fs::write(scope_dir.path().join("inside.txt"), "inside").unwrap();
+        fs::write(workspace_dir.path().join("inside.txt"), "inside").unwrap();
         fs::write(outside_dir.path().join("outside.txt"), "outside").unwrap();
-        let scope = Scope::open(scope_dir.path()).unwrap();
+        let host = Host::open(workspace_dir.path()).unwrap();
 
-        let resolved = scope.resolve_app_server_existing("inside.txt").unwrap();
+        let resolved = host.resolve_app_server_existing("inside.txt").unwrap();
         assert_eq!(
             std::path::Path::new(&resolved).canonicalize().unwrap(),
-            scope_dir.path().join("inside.txt").canonicalize().unwrap()
+            workspace_dir
+                .path()
+                .join("inside.txt")
+                .canonicalize()
+                .unwrap()
         );
-        let outside = scope
+        let outside = host
             .resolve_app_server_existing(outside_dir.path().join("outside.txt").to_str().unwrap())
             .unwrap();
         assert_eq!(
@@ -1132,13 +1136,13 @@ mod tests {
         {
             return;
         }
-        let scope = Scope::open(workspace.path()).unwrap();
+        let host = Host::open(workspace.path()).unwrap();
         let target = destination.path().join("cross-device.txt");
         let patch = format!(
             "*** Begin Patch\n*** Add File: {}\n+cross-device\n*** End Patch\n",
             target.display()
         );
-        scope.apply_patch(&patch, None).unwrap();
+        host.apply_patch(&patch, None).unwrap();
         assert_eq!(fs::read_to_string(target).unwrap(), "cross-device\n");
     }
 
@@ -1158,15 +1162,19 @@ mod tests {
     fn app_server_paths_forward_the_validated_canonical_target() {
         use std::os::unix::fs::symlink;
 
-        let scope_dir = tempfile::tempdir().unwrap();
-        fs::write(scope_dir.path().join("target.txt"), "inside").unwrap();
-        symlink("target.txt", scope_dir.path().join("link.txt")).unwrap();
-        let scope = Scope::open(scope_dir.path()).unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        fs::write(workspace_dir.path().join("target.txt"), "inside").unwrap();
+        symlink("target.txt", workspace_dir.path().join("link.txt")).unwrap();
+        let host = Host::open(workspace_dir.path()).unwrap();
 
-        let resolved = scope.resolve_app_server_existing("link.txt").unwrap();
+        let resolved = host.resolve_app_server_existing("link.txt").unwrap();
         assert_eq!(
             std::path::Path::new(&resolved),
-            scope_dir.path().join("target.txt").canonicalize().unwrap()
+            workspace_dir
+                .path()
+                .join("target.txt")
+                .canonicalize()
+                .unwrap()
         );
     }
 
@@ -1177,16 +1185,16 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::symlink;
 
-        let scope_dir = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
         let invalid_name = OsString::from_vec(b"invalid-\xff.txt".to_vec());
-        let target = scope_dir.path().join(invalid_name);
+        let target = workspace_dir.path().join(invalid_name);
         fs::write(&target, "inside").unwrap();
-        symlink(&target, scope_dir.path().join("alias.txt")).unwrap();
-        let scope = Scope::open(scope_dir.path()).unwrap();
+        symlink(&target, workspace_dir.path().join("alias.txt")).unwrap();
+        let host = Host::open(workspace_dir.path()).unwrap();
 
         assert!(matches!(
-            scope.resolve_app_server_existing("alias.txt"),
-            Err(ScopeError::NonUtf8Path)
+            host.resolve_app_server_existing("alias.txt"),
+            Err(HostError::NonUtf8Path)
         ));
     }
 
@@ -1195,18 +1203,18 @@ mod tests {
     fn app_server_mutations_reject_symlink_escape_paths() {
         use std::os::unix::fs::symlink;
 
-        let scope_dir = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
-        symlink(outside_dir.path(), scope_dir.path().join("escape")).unwrap();
-        let scope = Scope::open(scope_dir.path()).unwrap();
+        symlink(outside_dir.path(), workspace_dir.path().join("escape")).unwrap();
+        let host = Host::open(workspace_dir.path()).unwrap();
 
         assert!(matches!(
-            scope.resolve_mutation_path("escape/new.txt"),
-            Err(ScopeError::SymlinkMutation(_))
+            host.resolve_mutation_path("escape/new.txt"),
+            Err(HostError::SymlinkMutation(_))
         ));
         assert!(matches!(
-            scope.resolve_mutation_path("escape/../new.txt"),
-            Err(ScopeError::SymlinkMutation(_))
+            host.resolve_mutation_path("escape/../new.txt"),
+            Err(HostError::SymlinkMutation(_))
         ));
     }
 
@@ -1216,8 +1224,8 @@ mod tests {
         fs::write(temporary.path().join("visible.txt"), "needle").unwrap();
         fs::create_dir(temporary.path().join(".git")).unwrap();
         fs::write(temporary.path().join(".git/hidden"), "needle").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let matches = scope.search("needle", None, None).unwrap();
+        let host = Host::open(temporary.path()).unwrap();
+        let matches = host.search("needle", None, None).unwrap();
         assert_eq!(matches.matches.len(), 1);
         assert_eq!(matches.matches[0].path, "visible.txt");
     }
@@ -1226,8 +1234,8 @@ mod tests {
     fn single_file_search_keeps_a_usable_result_path() {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("needle.txt"), "find me\n").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let matches = scope.search("find me", Some("needle.txt"), None).unwrap();
+        let host = Host::open(temporary.path()).unwrap();
+        let matches = host.search("find me", Some("needle.txt"), None).unwrap();
         assert_eq!(matches.matches.len(), 1);
         assert_eq!(matches.matches[0].path, "needle.txt");
     }
@@ -1237,8 +1245,8 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         fs::create_dir(temporary.path().join("src")).unwrap();
         fs::write(temporary.path().join("src/lib.rs"), "find me\n").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let matches = scope.search("find me", Some("src"), None).unwrap();
+        let host = Host::open(temporary.path()).unwrap();
+        let matches = host.search("find me", Some("src"), None).unwrap();
         assert_eq!(matches.matches.len(), 1);
         assert_eq!(matches.matches[0].path, "src/lib.rs");
     }
@@ -1249,18 +1257,18 @@ mod tests {
         fs::write(temporary.path().join("visible.txt"), "needle").unwrap();
         fs::create_dir(temporary.path().join("target")).unwrap();
         fs::write(temporary.path().join("target/hidden"), "needle").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        assert_eq!(scope.search("needle", None, None).unwrap().matches.len(), 1);
+        let host = Host::open(temporary.path()).unwrap();
+        assert_eq!(host.search("needle", None, None).unwrap().matches.len(), 1);
     }
 
     #[test]
     fn content_search_honors_cancellation() {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("visible.txt"), "needle").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
+        let host = Host::open(temporary.path()).unwrap();
         assert!(matches!(
-            scope.search_with_cancel("needle", None, None, None, || true),
-            Err(ScopeError::Cancelled)
+            host.search_with_cancel("needle", None, None, None, || true),
+            Err(HostError::Cancelled)
         ));
     }
 
@@ -1273,10 +1281,9 @@ mod tests {
         let external = tempfile::NamedTempFile::new().unwrap();
         fs::write(external.path(), "needle").unwrap();
         symlink(external.path(), temporary.path().join("linked.txt")).unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
+        let host = Host::open(temporary.path()).unwrap();
         assert!(
-            scope
-                .search("needle", None, None)
+            host.search("needle", None, None)
                 .unwrap()
                 .matches
                 .is_empty()
@@ -1290,8 +1297,8 @@ mod tests {
             .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==")
             .unwrap();
         fs::write(temporary.path().join("image.png"), &png).unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let image = scope.image("image.png").unwrap();
+        let host = Host::open(temporary.path()).unwrap();
+        let image = host.image("image.png").unwrap();
         assert_eq!(image.path, "image.png");
         assert_eq!(image.mime_type, "image/png");
         assert_eq!(
@@ -1311,9 +1318,9 @@ mod tests {
         let mut encoded = Cursor::new(Vec::new());
         source.write_to(&mut encoded, ImageFormat::Png).unwrap();
         fs::write(temporary.path().join("large.png"), encoded.into_inner()).unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
+        let host = Host::open(temporary.path()).unwrap();
 
-        let high = scope.image_with_detail("large.png", Some("high")).unwrap();
+        let high = host.image_with_detail("large.png", Some("high")).unwrap();
         let high_bytes = base64::engine::general_purpose::STANDARD
             .decode(high.base64_data)
             .unwrap();
@@ -1322,7 +1329,7 @@ mod tests {
             (1600, 1600)
         );
 
-        let original = scope
+        let original = host
             .image_with_detail("large.png", Some("original"))
             .unwrap();
         let original_bytes = base64::engine::general_purpose::STANDARD
@@ -1339,8 +1346,8 @@ mod tests {
     #[test]
     fn explains_the_expected_patch_format() {
         let temporary = tempfile::tempdir().unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let error = scope
+        let host = Host::open(temporary.path()).unwrap();
+        let error = host
             .apply_patch("--- a/file\n+++ b/file\n", None)
             .unwrap_err();
         assert!(error.to_string().contains("official"));
@@ -1349,8 +1356,8 @@ mod tests {
     #[test]
     fn patch_tolerates_outer_whitespace_and_marker_padding() {
         let temporary = tempfile::tempdir().unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let changed = scope
+        let host = Host::open(temporary.path()).unwrap();
+        let changed = host
             .apply_patch(
                 "\n\n  *** Begin Patch  \n*** Add File: a.txt\n+a\n  *** End Patch  \n\n",
                 None,
@@ -1366,8 +1373,8 @@ mod tests {
     #[test]
     fn patch_rejects_blank_separator_in_added_file() {
         let temporary = tempfile::tempdir().unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let error = scope
+        let host = Host::open(temporary.path()).unwrap();
+        let error = host
             .apply_patch(
                 "*** Begin Patch\n*** Add File: a.txt\n+a\n\n*** End Patch\n",
                 None,
@@ -1380,8 +1387,8 @@ mod tests {
     fn patch_rejects_blank_separator_after_deleted_file() {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("a.txt"), "a\n").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let error = scope
+        let host = Host::open(temporary.path()).unwrap();
+        let error = host
             .apply_patch(
                 "*** Begin Patch\n*** Delete File: a.txt\n\n*** Add File: b.txt\n+b\n*** End Patch\n",
                 None,
@@ -1394,8 +1401,8 @@ mod tests {
     fn patch_tolerates_blank_lines_before_end_patch_in_update_hunk() {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("file.txt"), "before\nafter\n").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let changed = scope
+        let host = Host::open(temporary.path()).unwrap();
+        let changed = host
             .apply_patch(
                 "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n\n\n*** End Patch\n",
                 None,
@@ -1411,8 +1418,8 @@ mod tests {
     #[test]
     fn patch_rejects_unprefixed_blank_line_inside_added_content() {
         let temporary = tempfile::tempdir().unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let error = scope
+        let host = Host::open(temporary.path()).unwrap();
+        let error = host
             .apply_patch(
                 "*** Begin Patch\n*** Add File: a.txt\n+a\n\n+b\n*** End Patch\n",
                 None,
@@ -1425,8 +1432,8 @@ mod tests {
     fn patch_tolerates_blank_lines_before_end_of_file_marker() {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("file.txt"), "before\nafter\n").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        scope
+        let host = Host::open(temporary.path()).unwrap();
+        host
             .apply_patch(
                 "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n\n\n*** End of File\n*** End Patch\n",
                 None,
@@ -1442,8 +1449,8 @@ mod tests {
     fn patch_tolerates_blank_lines_after_end_of_file_marker() {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("file.txt"), "before\nafter\n").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let changed = scope
+        let host = Host::open(temporary.path()).unwrap();
+        let changed = host
             .apply_patch(
                 "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n*** End of File\n\n\n*** Add File: added.txt\n+added\n*** End Patch\n",
                 None,
@@ -1464,8 +1471,8 @@ mod tests {
     fn applies_the_official_patch_format() {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("file.txt"), "before\nafter\n").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let changed = scope
+        let host = Host::open(temporary.path()).unwrap();
+        let changed = host
             .apply_patch(
                 "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n*** End Patch\n", None
             )
@@ -1482,23 +1489,21 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
-        let scope = Scope::open(&workspace).unwrap();
-        scope
-            .apply_patch(
-                "*** Begin Patch\n*** Add File: ../outside.txt\n+outside\n*** End Patch\n",
-                None,
-            )
-            .unwrap();
+        let host = Host::open(&workspace).unwrap();
+        host.apply_patch(
+            "*** Begin Patch\n*** Add File: ../outside.txt\n+outside\n*** End Patch\n",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(temporary.path().join("outside.txt")).unwrap(),
             "outside\n"
         );
-        scope
-            .apply_patch(
-                "*** Begin Patch\n*** Add File: nested/file.txt\n+inside\n*** End Patch\n",
-                None,
-            )
-            .unwrap();
+        host.apply_patch(
+            "*** Begin Patch\n*** Add File: nested/file.txt\n+inside\n*** End Patch\n",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(workspace.join("nested/file.txt")).unwrap(),
             "inside\n"
@@ -1510,9 +1515,9 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("plain-file"), "not a directory\n").unwrap();
         fs::write(temporary.path().join("victim.txt"), "keep me\n").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
+        let host = Host::open(temporary.path()).unwrap();
 
-        let through_file = scope
+        let through_file = host
             .apply_patch(
                 "*** Begin Patch\n*** Delete File: plain-file/../victim.txt\n*** End Patch\n",
                 None,
@@ -1524,7 +1529,7 @@ mod tests {
             "keep me\n"
         );
 
-        let through_missing = scope
+        let through_missing = host
             .apply_patch(
                 "*** Begin Patch\n*** Delete File: missing/../victim.txt\n*** End Patch\n",
                 None,
@@ -1542,12 +1547,12 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         fs::create_dir(temporary.path().join("project")).unwrap();
         fs::write(temporary.path().join("project/local.txt"), "inside").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
+        let host = Host::open(temporary.path()).unwrap();
 
-        let cwd = scope.resolve_cwd(Some("project")).unwrap();
-        let local = Scope::path_from_cwd(&cwd, "local.txt").unwrap();
+        let cwd = host.resolve_cwd(Some("project")).unwrap();
+        let local = Host::path_from_cwd(&cwd, "local.txt").unwrap();
         assert_eq!(
-            std::path::Path::new(&scope.resolve_app_server_existing(&local).unwrap()),
+            std::path::Path::new(&host.resolve_app_server_existing(&local).unwrap()),
             temporary
                 .path()
                 .join("project/local.txt")
@@ -1555,22 +1560,20 @@ mod tests {
                 .unwrap()
         );
 
-        scope
-            .apply_patch(
-                "*** Begin Patch\n*** Add File: created.txt\n+created\n*** End Patch\n",
-                Some("project"),
-            )
-            .unwrap();
+        host.apply_patch(
+            "*** Begin Patch\n*** Add File: created.txt\n+created\n*** End Patch\n",
+            Some("project"),
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(temporary.path().join("project/created.txt")).unwrap(),
             "created\n"
         );
-        scope
-            .apply_patch(
-                "*** Begin Patch\n*** Add File: ../outside.txt\n+outside\n*** End Patch\n",
-                Some("project"),
-            )
-            .unwrap();
+        host.apply_patch(
+            "*** Begin Patch\n*** Add File: ../outside.txt\n+outside\n*** End Patch\n",
+            Some("project"),
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(temporary.path().join("outside.txt")).unwrap(),
             "outside\n"
@@ -1580,8 +1583,8 @@ mod tests {
     #[test]
     fn patch_preflight_prevents_partial_application() {
         let temporary = tempfile::tempdir().unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        let error = scope
+        let host = Host::open(temporary.path()).unwrap();
+        let error = host
             .apply_patch(
                 "*** Begin Patch\n*** Add File: first.txt\n+created\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch\n", None
             )
@@ -1594,8 +1597,8 @@ mod tests {
     fn patch_preserves_crlf_and_accepts_end_of_file_marker() {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("file.txt"), "before\r\nafter\r\n").unwrap();
-        let scope = Scope::open(temporary.path()).unwrap();
-        scope
+        let host = Host::open(temporary.path()).unwrap();
+        host
             .apply_patch(
                 "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+changed\n*** End of File\n*** End Patch\n", None
             )

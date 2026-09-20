@@ -1,5 +1,5 @@
 [package]
-name = "codex-connect-scope"
+name = "codex-connect-host"
 publish = false
 version.workspace = true
 edition.workspace = true

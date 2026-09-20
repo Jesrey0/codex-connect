@@ -13,21 +13,21 @@ pub const BACKEND_SERVICE: &str = "codex-connect.service";
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
-    pub scope: ScopeSettings,
+    pub workspace: WorkspaceSettings,
     #[serde(default)]
     pub backend: BackendConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct ScopeSettings {
-    pub root: String,
+pub struct WorkspaceSettings {
+    pub default_cwd: String,
 }
 
-impl Default for ScopeSettings {
+impl Default for WorkspaceSettings {
     fn default() -> Self {
         Self {
-            root: "~/projects".to_string(),
+            default_cwd: "~/projects".to_string(),
         }
     }
 }
@@ -51,14 +51,14 @@ impl Default for BackendConfig {
 impl Config {
     pub fn new() -> Self {
         Self {
-            scope: ScopeSettings::default(),
+            workspace: WorkspaceSettings::default(),
             backend: BackendConfig::default(),
         }
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.scope.root.trim().is_empty() {
-            bail!("scope.root must not be empty");
+        if self.workspace.default_cwd.trim().is_empty() {
+            bail!("workspace.default_cwd must not be empty");
         }
         self.backend.validate()
     }
@@ -220,8 +220,18 @@ mod tests {
     use super::*;
     #[test]
     fn parses_single_backend_configuration() {
-        let config: Config = toml::from_str("[scope]\nroot = \"~/projects\"\n[backend]\nlisten = \"127.0.0.1:8767\"\ncodex_bin = \"codex\"\n").unwrap();
+        let config: Config = toml::from_str("[workspace]\ndefault_cwd = \"~/projects\"\n[backend]\nlisten = \"127.0.0.1:8767\"\ncodex_bin = \"codex\"\n").unwrap();
         config.validate().unwrap();
-        assert!(toml::to_string_pretty(&config).unwrap().contains("[scope]"));
+        assert!(
+            toml::to_string_pretty(&config)
+                .unwrap()
+                .contains("[workspace]")
+        );
+    }
+
+    #[test]
+    fn retired_scope_configuration_is_rejected() {
+        let legacy = "[scope]\nroot = \"~/projects\"\n[backend]\nlisten = \"127.0.0.1:8767\"\ncodex_bin = \"codex\"\n";
+        assert!(toml::from_str::<Config>(legacy).is_err());
     }
 }

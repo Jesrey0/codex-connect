@@ -13,14 +13,14 @@ flowchart TD
         MCP[Codex Connect<br/>ChatGPT-native MCP surface]
         ADAPTER[Relay<br/>composition + event journal + typed actions]
         APP[Official Codex App Server<br/>JSON-RPC authority]
-        SCOPE[Durable host scope<br/>inspect · patch · image]
+        HOSTOPS[Host operations<br/>inspect · patch · image]
         STATE[Workspaces · files · processes]
 
         MCP --> ADAPTER
-        MCP --> SCOPE
+        MCP --> HOSTOPS
         ADAPTER --> APP
         APP --> STATE
-        SCOPE --> STATE
+        HOSTOPS --> STATE
     end
 
     CHAT <-->|remote MCP| TUNNEL
@@ -51,12 +51,12 @@ The public surface therefore falls into three implementation classes:
 | Class | Public surface | App Server authority / justification |
 | --- | --- | --- |
 | Projection | `codex.info` | Batched narrow projections of `model/list`, `skills/list`, and `account/rateLimits/read`. |
-| Adapter | `command.exec`, `command.start/read/control` | Official sandboxed `command/exec` and its streaming write/resize/terminate RPCs; Connect adds scope normalization, bounded journals, and MCP lifecycle projection. |
+| Adapter | `command.exec`, `command.start/read/control` | Official sandboxed `command/exec` and its streaming write/resize/terminate RPCs; Connect adds default-cwd resolution, bounded journals, and MCP lifecycle projection. |
 | Adapter | `codex.start/wait/control` | Official `thread/*`, `turn/*`, and `review/start` state remains authoritative; Connect composes one start/read-control workflow and quiet-join journal. |
 | Adapter | `codex.action.respond` | Official approval, permission, and user-input server requests remain authoritative; Connect keeps only the pending-response routing needed to answer these three public collaboration categories over MCP. |
-| Adapter | `inspect.readText/readDirectory/metadata/fuzzyFileSearch` | Official `fs/readFile`, `fs/readDirectory`, `fs/getMetadata`, and `fuzzyFileSearch`; Connect adds durable-scope fencing and presentation bounds. |
+| Adapter | `inspect.readText/readDirectory/metadata/fuzzyFileSearch` | Official `fs/readFile`, `fs/readDirectory`, `fs/getMetadata`, and `fuzzyFileSearch`; Connect adds request-path resolution, transport preflight, and presentation bounds. |
 | Adapter | `view_image` | Image bytes come from official `fs/readFile`; Connect only validates/resizes them and emits an MCP image content block. |
-| Bridge | `inspect.searchContent` | The pinned App Server has no workspace-content-search RPC. The bridge is bounded, scope-fenced, cancellation-aware, and skips known build/cache trees. |
+| Bridge | `inspect.searchContent` | The pinned App Server has no workspace-content-search RPC. The bridge is bounded, cancellation-aware, does not follow symlinks, and skips known build/cache trees. |
 | Bridge | `apply_patch` | The pinned App Server exposes byte-level filesystem mutations but no deterministic patch semantic RPC. Connect owns patch parsing/preflight/rollback semantics. |
 | Bridge | `status` | Operator/runtime health, content-addressed build identity, global Codex configuration provenance, App Server launch context, and the compact operator-contract marker are Connect deployment concerns, not Codex thread state. |
 

@@ -22,7 +22,7 @@ use codex_connect_app_server::{
     MAX_WIRE_BYTES,
 };
 pub use codex_connect_app_server::{PendingActionKind, PendingServerRequest};
-use codex_connect_scope::{MAX_IMAGE_BYTES, Scope, ScopeError};
+use codex_connect_host::{Host, HostError, MAX_IMAGE_BYTES};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -109,8 +109,8 @@ impl Drop for CommandStartCleanup {
 pub enum RelayError {
     #[error("Codex app-server failed: {0}")]
     AppServer(#[from] AppServerError),
-    #[error("scope policy failed: {0}")]
-    Scope(#[from] ScopeError),
+    #[error("host operation failed: {0}")]
+    Host(#[from] HostError),
     #[error("host I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("unable to encode Codex response: {0}")]
@@ -122,7 +122,7 @@ pub enum RelayError {
 #[derive(Clone)]
 pub struct Relay {
     app_server: Arc<AppServerClient>,
-    scope: Scope,
+    host: Host,
     journal: event_journal::EventJournal,
     live_turns: Arc<Mutex<LiveTurns>>,
     observer_usage: Arc<Mutex<Option<(Instant, Value)>>>,
@@ -227,11 +227,11 @@ pub struct TextRead {
 
 impl Relay {
     pub async fn start(config: RelayConfig) -> Result<Self, RelayError> {
-        let scope = Scope::open(config.default_cwd)?;
+        let host = Host::open(config.default_cwd)?;
         let app_server = Arc::new(
             AppServerClient::start(AppServerConfig {
                 codex_bin: config.codex_bin,
-                working_directory: scope.root().to_path_buf(),
+                working_directory: host.default_cwd().to_path_buf(),
                 client_name: "codex-connect".into(),
                 request_timeout: DEFAULT_REQUEST_TIMEOUT,
             })
@@ -239,7 +239,7 @@ impl Relay {
         );
         let relay = Self {
             app_server,
-            scope,
+            host,
             journal: event_journal::EventJournal::default(),
             live_turns: Arc::new(Mutex::new(LiveTurns::default())),
             observer_usage: Arc::new(Mutex::new(None)),
@@ -293,7 +293,7 @@ impl Relay {
         self.app_server.is_available()
     }
     pub fn default_cwd(&self) -> String {
-        self.scope.root().display().to_string()
+        self.host.default_cwd().display().to_string()
     }
     pub fn app_server_user_agent(&self) -> String {
         self.app_server.user_agent().to_string()
@@ -310,7 +310,7 @@ impl Relay {
         start_line: Option<usize>,
         end_line: Option<usize>,
     ) -> Result<TextRead, RelayError> {
-        let path = self.scope.resolve_app_server_existing(requested)?;
+        let path = self.host.resolve_app_server_existing(requested)?;
         let file_size = std::fs::metadata(&path)?.len();
         if file_size > MAX_FS_READ_FILE_BYTES {
             return Err(RelayError::Invalid(format!(
@@ -346,12 +346,12 @@ impl Relay {
     }
 
     /// Image bytes still come from App Server's authoritative fs/readFile
-    /// primitive; Connect only adds scope fencing, transport preflight, and
+    /// primitive; Connect only adds transport preflight and
     /// prompt-oriented image presentation after this read.
     pub async fn inspect_image_bytes(&self, requested: &str) -> Result<Vec<u8>, RelayError> {
-        let path = self.scope.resolve_app_server_existing(requested)?;
+        let path = self.host.resolve_app_server_existing(requested)?;
         if std::fs::metadata(&path)?.len() > MAX_IMAGE_BYTES as u64 {
-            return Err(ScopeError::LargeImage.into());
+            return Err(HostError::LargeImage.into());
         }
         let response = self.app_server.request(FsReadFile { path }).await?;
         let bytes = base64::engine::general_purpose::STANDARD
@@ -360,7 +360,7 @@ impl Relay {
                 RelayError::Invalid(format!("fs/readFile returned invalid base64: {error}"))
             })?;
         if bytes.len() > MAX_IMAGE_BYTES {
-            return Err(ScopeError::LargeImage.into());
+            return Err(HostError::LargeImage.into());
         }
         Ok(bytes)
     }
@@ -369,7 +369,7 @@ impl Relay {
         &self,
         requested: &str,
     ) -> Result<FsReadDirectoryResponse, RelayError> {
-        let path = self.scope.resolve_app_server_directory(requested)?;
+        let path = self.host.resolve_app_server_directory(requested)?;
         ensure_directory_response_fits(&path)?;
         Ok(self.app_server.request(FsReadDirectory { path }).await?)
     }
@@ -378,7 +378,7 @@ impl Relay {
         &self,
         requested: &str,
     ) -> Result<FsGetMetadataResponse, RelayError> {
-        let path = self.scope.resolve_app_server_existing(requested)?;
+        let path = self.host.resolve_app_server_existing(requested)?;
         Ok(self.app_server.request(FsGetMetadata { path }).await?)
     }
 
@@ -393,7 +393,7 @@ impl Relay {
             ));
         }
         let root = self
-            .scope
+            .host
             .resolve_app_server_directory(requested.unwrap_or("."))?;
         let canonical_root = Path::new(&root).canonicalize().map_err(|error| {
             RelayError::Invalid(format!("unable to canonicalize fuzzy search root: {error}"))
@@ -431,7 +431,7 @@ impl Relay {
     ) -> Result<CommandExecResult, RelayError> {
         validate_command(&request)?;
         request.cwd = Some(
-            self.scope
+            self.host
                 .resolve_app_server_directory(request.cwd.as_deref().unwrap_or("."))?,
         );
         request.timeout_ms = Some(request.timeout_ms.unwrap_or(DEFAULT_COMMAND_MS));
@@ -481,7 +481,7 @@ impl Relay {
             validate_terminal_size(size)?;
         }
         let cwd = self
-            .scope
+            .host
             .resolve_app_server_directory(cwd.as_deref().unwrap_or("."))?;
         let process_id = format!(
             "cc-command-{}",
@@ -730,7 +730,7 @@ impl Relay {
         new_thread_developer_instructions: Option<String>,
     ) -> Result<(String, String), RelayError> {
         let cwd = cwd
-            .map(|v| self.scope.resolve_app_server_directory(&v))
+            .map(|v| self.host.resolve_app_server_directory(&v))
             .transpose()?;
         let response = if let Some(id) = thread_id {
             // Verify the stored cwd before resume can load hooks or tools for it.
@@ -757,7 +757,7 @@ impl Relay {
                 })
                 .await?
         };
-        let cwd = self.scope.resolve_app_server_directory(&response.cwd)?;
+        let cwd = self.host.resolve_app_server_directory(&response.cwd)?;
         Ok((response.thread.id, cwd))
     }
 
@@ -769,7 +769,7 @@ impl Relay {
                 include_turns: false,
             })
             .await?;
-        self.scope
+        self.host
             .resolve_app_server_directory(&response.thread.cwd)?;
         Ok(response.thread)
     }
@@ -1091,7 +1091,7 @@ impl Relay {
             vec![self.default_cwd()]
         } else {
             cwds.into_iter()
-                .map(|v| self.scope.resolve_app_server_directory(&v))
+                .map(|v| self.host.resolve_app_server_directory(&v))
                 .collect::<Result<Vec<_>, _>>()?
         };
         Ok(self

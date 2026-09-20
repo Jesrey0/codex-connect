@@ -154,7 +154,7 @@ fn streaming_command_control_matches_the_pinned_wire_shape() {
         disable_output_cap: true,
         tty: true,
         size: Some(CommandExecTerminalSize { rows: 24, cols: 80 }),
-        cwd: Some("/scope".into()),
+        cwd: Some("/workspace".into()),
         env: None,
         sandbox_policy: Some(SandboxPolicy::ReadOnly {
             network_access: false,
@@ -171,7 +171,7 @@ fn streaming_command_control_matches_the_pinned_wire_shape() {
             "disableOutputCap":true,
             "tty":true,
             "size":{"rows":24,"cols":80},
-            "cwd":"/scope",
+            "cwd":"/workspace",
             "sandboxPolicy":{"type":"readOnly","networkAccess":false}
         })
     );
@@ -208,24 +208,24 @@ fn streaming_command_control_matches_the_pinned_wire_shape() {
 fn filesystem_requests_match_the_pinned_wire_shapes() {
     assert_eq!(
         serde_json::to_value(FsReadFile {
-            path: "/scope/file.txt".into(),
+            path: "/workspace/file.txt".into(),
         })
         .unwrap(),
-        json!({"path":"/scope/file.txt"})
+        json!({"path":"/workspace/file.txt"})
     );
     assert_eq!(
         serde_json::to_value(FsReadDirectory {
-            path: "/scope".into(),
+            path: "/workspace".into(),
         })
         .unwrap(),
-        json!({"path":"/scope"})
+        json!({"path":"/workspace"})
     );
     assert_eq!(
         serde_json::to_value(FsGetMetadata {
-            path: "/scope/file.txt".into(),
+            path: "/workspace/file.txt".into(),
         })
         .unwrap(),
-        json!({"path":"/scope/file.txt"})
+        json!({"path":"/workspace/file.txt"})
     );
     let directory: FsReadDirectoryResponse = serde_json::from_value(json!({"entries":[{
         "fileName":"file.txt", "isDirectory":false, "isFile":true
@@ -242,13 +242,13 @@ fn filesystem_requests_match_the_pinned_wire_shapes() {
     assert_eq!(
         serde_json::to_value(FuzzyFileSearch {
             query: "proto".into(),
-            roots: vec!["/scope".into()],
+            roots: vec!["/workspace".into()],
         })
         .unwrap(),
-        json!({"query":"proto","roots":["/scope"]})
+        json!({"query":"proto","roots":["/workspace"]})
     );
     let fuzzy: FuzzyFileSearchResponse = serde_json::from_value(json!({"files":[{
-        "root":"/scope",
+        "root":"/workspace",
         "path":"src/protocol.rs",
         "match_type":"file",
         "file_name":"protocol.rs",

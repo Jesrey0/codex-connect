@@ -807,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_ids_are_scope_safe() {
+    fn deployment_ids_are_path_safe() {
         validate_operation_id("0123456789abcdef01234567").unwrap();
         for invalid in [
             "",

@@ -31,15 +31,15 @@ class OperatorProtocolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory(prefix="codex-connect-integration-")
-        cls.scope = pathlib.Path(cls.directory.name)
+        cls.workspace = pathlib.Path(cls.directory.name)
         cls.outside = tempfile.TemporaryDirectory(prefix="codex-connect-outside-")
         cls.outside_path = pathlib.Path(cls.outside.name)
         (cls.outside_path / "external_secret.txt").write_text("secret\n")
-        (cls.scope / "escape").symlink_to(cls.outside_path, target_is_directory=True)
-        (cls.scope / "sample.txt").write_text("one\ntwo\nthree\n")
-        cls.project = cls.scope / "project"
+        (cls.workspace / "escape").symlink_to(cls.outside_path, target_is_directory=True)
+        (cls.workspace / "sample.txt").write_text("one\ntwo\nthree\n")
+        cls.project = cls.workspace / "project"
         cls.project.mkdir()
-        cls.coverage_path = cls.scope / "fake-app-server-coverage.jsonl"
+        cls.coverage_path = cls.workspace / "fake-app-server-coverage.jsonl"
         (cls.project / "local.txt").write_text("project-local\n")
         (cls.project / "pixel.png").write_bytes(base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
@@ -50,7 +50,7 @@ class OperatorProtocolTests(unittest.TestCase):
         cls.url = f"http://127.0.0.1:{port}"
         cls.log = tempfile.TemporaryFile(mode="w+")
         cls.process = subprocess.Popen([
-            str(ROOT / "target/debug/codex-connect"), "serve", "--scope-root", str(cls.scope),
+            str(ROOT / "target/debug/codex-connect"), "serve", "--default-cwd", str(cls.workspace),
             "--codex-bin", str(ROOT / "tests/support/fake_codex.py"), "--listen", f"127.0.0.1:{port}",
         ], stdout=cls.log, stderr=cls.log, env={
             **os.environ,
@@ -158,7 +158,7 @@ class OperatorProtocolTests(unittest.TestCase):
             "commandDefaultTimeoutMs": 60000,
             "commandMaxTimeoutMs": 60 * 60 * 1000,
         })
-        self.assertEqual(status["defaultCwd"], str(self.scope))
+        self.assertEqual(status["defaultCwd"], str(self.workspace))
         self.assertEqual(set(status["codex"]), {
             "binary", "release", "home", "homeSource", "globalConfig",
         })
@@ -184,13 +184,9 @@ class OperatorProtocolTests(unittest.TestCase):
             "pendingActions", "cursor", "historyLost", "events",
         })
         self.assertTrue(projection["workerAvailable"])
-        self.assertEqual(projection["defaultCwd"], str(self.scope))
+        self.assertEqual(projection["defaultCwd"], str(self.workspace))
         self.assertEqual(projection["usageRefreshMs"], 5000)
         self.assertIn("rateLimits", projection["usage"])
-        with self.assertRaises(urllib.error.HTTPError) as error:
-            urllib.request.urlopen(self.url + "/scope-info")
-        self.assertEqual(error.exception.code, 404)
-
     def test_inspection_uses_default_cwd_and_accepts_absolute_host_paths(self):
         result = self.client.call("inspect", {"operations": [
             {"type": "readText", "path": "sample.txt", "startLine": 2, "endLine": 2},
@@ -216,14 +212,14 @@ class OperatorProtocolTests(unittest.TestCase):
             {"type": "fuzzyFileSearch", "query": "external", "path": "."},
         ]})
         self.assertEqual(escaped["results"][0]["result"]["files"], [])
-        large = self.scope / "large.txt"
+        large = self.workspace / "large.txt"
         large.write_bytes(b"x" * (7 * 1024 * 1024))
         large_result = self.client.call("inspect", {"operations": [
             {"type": "readText", "path": "large.txt", "startLine": 1, "endLine": 1},
         ]})
         self.assertEqual(large_result["results"][0]["index"], 0)
         self.assertIn("safe fs/readFile transport limit", large_result["results"][0]["error"])
-        large_directory = self.scope / "large-directory"
+        large_directory = self.workspace / "large-directory"
         large_directory.mkdir()
         suffix = "x" * 240
         for index in range(28_000):
@@ -282,7 +278,7 @@ class OperatorProtocolTests(unittest.TestCase):
             "cwd":cwd,
             "patch":"*** Begin Patch\n*** Add File: ../escape.txt\n+outside-cwd\n*** End Patch",
         })
-        self.assertEqual((self.scope / "escape.txt").read_text(), "outside-cwd\n")
+        self.assertEqual((self.workspace / "escape.txt").read_text(), "outside-cwd\n")
 
     def test_command_boundaries(self):
         schema = self.client.tools["command.exec"]["inputSchema"]["properties"]

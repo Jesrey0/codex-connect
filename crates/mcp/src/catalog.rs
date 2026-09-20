@@ -26,7 +26,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "status",
                 "Read Operator Status",
-                "Use first to orient to Codex Connect health, workspace scope, build identity, global Codex configuration provenance, and App Server launch context.",
+                "Use first to orient to Codex Connect health, default workspace, build identity, global Codex configuration provenance, and App Server launch context.",
                 true,
                 false,
                 false,
@@ -215,7 +215,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.info",
                 "Read Codex Information",
-                "Batch read-only Codex discovery/account queries in one call. Use type=models for model and reasoning-effort discovery, type=skills for skills available to scope-fenced working directories, and type=usage for authoritative account usage/rate-limit telemetry. Independent query failures are returned per result without discarding successful siblings.",
+                "Batch read-only Codex discovery/account queries in one call. Use type=models for model and reasoning-effort discovery, type=skills for skills available to selected working directories, and type=usage for authoritative account usage/rate-limit telemetry. Independent query failures are returned per result without discarding successful siblings.",
                 true,
                 false,
                 true,

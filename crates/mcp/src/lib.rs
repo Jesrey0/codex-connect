@@ -6,11 +6,11 @@ use catalog::tool_catalog;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::response::Json;
+use codex_connect_host::Host;
 use codex_connect_relay::{
     ApprovalDecision, ApprovalPolicy, CommandExec, CommandExecTerminalSize, MAX_WAIT_MS, ModelList,
     PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
 };
-use codex_connect_scope::Scope;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -154,10 +154,10 @@ enum CommandControlArgs {
     },
 }
 
-pub fn router(relay: Relay, scope: Scope, runtime: RuntimeIdentity) -> Router {
+pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
     let handler = McpHandler {
         relay,
-        scope,
+        host,
         runtime,
     };
     let operator_status = handler.clone();
@@ -212,7 +212,7 @@ pub async fn serve_router(listener: TcpListener, router: Router) -> anyhow::Resu
 #[derive(Clone)]
 struct McpHandler {
     relay: Relay,
-    scope: Scope,
+    host: Host,
     runtime: RuntimeIdentity,
 }
 
@@ -303,11 +303,11 @@ impl ServerHandler for McpHandler {
         let name = request.name.as_ref();
         let arguments = request.arguments.unwrap_or_default();
         if name == "view_image" {
-            return image_response(&self.relay, &self.scope, arguments).await;
+            return image_response(&self.relay, &self.host, arguments).await;
         }
         match dispatch(
             &self.relay,
-            &self.scope,
+            &self.host,
             &self.runtime,
             name,
             arguments,
@@ -493,7 +493,7 @@ enum CodexInfoQuery {
 
 async fn dispatch(
     relay: &Relay,
-    scope: &Scope,
+    host: &Host,
     runtime: &RuntimeIdentity,
     name: &str,
     arguments: JsonObject,
@@ -504,10 +504,10 @@ async fn dispatch(
             ensure_empty(arguments)?;
             Ok(serde_json::to_value(OperatorStatus::read(relay, runtime))?)
         }
-        "inspect" => inspect(relay, scope, parse(arguments)?, context).await,
+        "inspect" => inspect(relay, host, parse(arguments)?, context).await,
         "apply_patch" => {
             let args: PatchArgs = parse(arguments)?;
-            Ok(json!({"applied": scope.apply_patch(&args.patch, args.cwd.as_deref())?}))
+            Ok(json!({"applied": host.apply_patch(&args.patch, args.cwd.as_deref())?}))
         }
         "command.exec" => {
             let a: HostCommandExecArgs = parse(arguments)?;
@@ -691,14 +691,14 @@ async fn dispatch(
 
 async fn inspect(
     relay: &Relay,
-    scope: &Scope,
+    host: &Host,
     args: InspectArgs,
     context: &RequestContext<RoleServer>,
 ) -> anyhow::Result<Value> {
     if args.operations.is_empty() || args.operations.len() > MAX_INSPECT_OPERATIONS {
         anyhow::bail!("inspect requires 1 to {MAX_INSPECT_OPERATIONS} operations");
     }
-    let cwd = scope.resolve_cwd(args.cwd.as_deref())?;
+    let cwd = host.resolve_cwd(args.cwd.as_deref())?;
     let mut results = Vec::with_capacity(args.operations.len());
     let mut output_bytes = 0usize;
     for (index, operation) in args.operations.into_iter().enumerate() {
@@ -713,7 +713,7 @@ async fn inspect(
                 InspectOperation::SearchContent { path, .. }
                 | InspectOperation::FuzzyFileSearch { path, .. } => path.as_deref().unwrap_or("."),
             };
-            let path = Scope::path_from_cwd(&cwd, requested)?;
+            let path = Host::path_from_cwd(&cwd, requested)?;
             Ok(match &operation {
                 InspectOperation::ReadText {
                     start_line,
@@ -732,7 +732,7 @@ async fn inspect(
                 }
                 InspectOperation::SearchContent {
                     query, max_results, ..
-                } => serde_json::to_value(scope.search_with_cancel(
+                } => serde_json::to_value(host.search_with_cancel(
                     query,
                     Some(&path),
                     Some(&cwd),
@@ -837,15 +837,15 @@ fn summary_for(name: &str, value: &Value) -> String {
 
 async fn image_response(
     relay: &Relay,
-    scope: &Scope,
+    host: &Host,
     arguments: JsonObject,
 ) -> Result<rmcp::model::CallToolResponse, McpError> {
     let result = async {
         let args: ViewImageArgs = parse(arguments)?;
-        let cwd = scope.resolve_cwd(args.cwd.as_deref())?;
-        let path = Scope::path_from_cwd(&cwd, &args.path)?;
+        let cwd = host.resolve_cwd(args.cwd.as_deref())?;
+        let path = Host::path_from_cwd(&cwd, &args.path)?;
         let bytes = relay.inspect_image_bytes(&path).await?;
-        Ok::<_, anyhow::Error>(scope.image_from_bytes(&path, bytes, args.detail.as_deref())?)
+        Ok::<_, anyhow::Error>(host.image_from_bytes(&path, bytes, args.detail.as_deref())?)
     }
     .await;
     match result {

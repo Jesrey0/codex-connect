@@ -15,13 +15,13 @@ use codex_connect_app_server::AppServerConfig;
 use codex_connect_app_server::DEFAULT_REQUEST_TIMEOUT;
 use codex_connect_app_server::ServerRequestMethod;
 use codex_connect_app_server::verify_codex_pin;
+use codex_connect_host::Host;
 use codex_connect_mcp::CodexGlobalConfigSummary;
 use codex_connect_mcp::RuntimeIdentity;
 use codex_connect_mcp::router as mcp_router;
 use codex_connect_mcp::serve_router;
 use codex_connect_relay::Relay;
 use codex_connect_relay::RelayConfig;
-use codex_connect_scope::Scope;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
@@ -111,7 +111,6 @@ enum CommandName {
     /// Run end-to-end deployment diagnostics.
     Doctor,
     /// Watch the local read-only Codex Connect observability console.
-    #[command(alias = "tui")]
     Console,
     /// Probe the pinned Codex App Server directly without managed-service checks.
     Probe {
@@ -155,7 +154,7 @@ enum CommandName {
 
         /// Default working directory for relative host paths and App Server startup.
         #[arg(long, default_value = "~/projects")]
-        scope_root: PathBuf,
+        default_cwd: PathBuf,
 
         /// Local TCP address for the Streamable HTTP MCP endpoint.
         #[arg(long, default_value = "127.0.0.1:8767")]
@@ -211,12 +210,12 @@ async fn main() -> Result<()> {
         } => management::activate_deployment(&operation_id, &expected_sha256, no_start).await,
         CommandName::Serve {
             codex_bin,
-            scope_root,
+            default_cwd,
             listen,
         } => {
             serve_mcp(ServeConfig {
                 codex_bin,
-                default_cwd: scope_root,
+                default_cwd,
                 listen,
             })
             .await
@@ -249,7 +248,7 @@ async fn serve_mcp(config: ServeConfig) -> Result<()> {
     })
     .await
     .context("unable to start Codex Connect relay")?;
-    let scope = Scope::open(&default_cwd).context("unable to open default cwd")?;
+    let host = Host::open(&default_cwd).context("unable to open default cwd")?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("unable to listen on {listen}"))?;
@@ -275,7 +274,7 @@ async fn serve_mcp(config: ServeConfig) -> Result<()> {
             .collect(),
     };
     let mut changes = relay.changes();
-    let router = mcp_router(relay.clone(), scope, runtime);
+    let router = mcp_router(relay.clone(), host, runtime);
     println!("Codex Connect MCP listening at http://{listen}/mcp");
     println!("default cwd: {}", default_cwd.display());
     tokio::select! {
@@ -410,13 +409,13 @@ bearer_token = "must-not-surface"
     }
 
     #[test]
-    fn serve_uses_per_thread_sandbox_selection() {
+    fn serve_defaults_parse_cleanly() {
         let cli =
             Cli::try_parse_from(["codex-connect", "serve"]).expect("serve arguments should parse");
 
         let CommandName::Serve {
             codex_bin,
-            scope_root,
+            default_cwd,
             listen,
         } = cli.command
         else {
@@ -424,8 +423,17 @@ bearer_token = "must-not-surface"
         };
 
         assert_eq!(codex_bin, PathBuf::from("codex"));
-        assert_eq!(scope_root, PathBuf::from("~/projects"));
+        assert_eq!(default_cwd, PathBuf::from("~/projects"));
         assert_eq!(listen, "127.0.0.1:8767".parse().unwrap());
+    }
+
+    #[test]
+    fn retired_cli_names_are_rejected() {
+        assert!(Cli::try_parse_from(["codex-connect", "tui"]).is_err());
+        assert!(
+            Cli::try_parse_from(["codex-connect", "serve", "--scope-root", "/tmp/retired"])
+                .is_err()
+        );
     }
 
     #[test]

@@ -7,3 +7,4 @@
 .env.*
 /config/tunnel-client/codex-connect.yaml
 /target/
+/AGENTS.md

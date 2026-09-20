@@ -1,6 +1,6 @@
 # Contributing
 
-Codex Connect is a deliberately narrow bridge between ChatGPT, the official OpenAI Secure MCP Tunnel, a single durable host scope, and the official Codex App Server API. Contributions should preserve those ownership boundaries rather than add parallel lifecycle managers or alternate protocol paths.
+Codex Connect is a deliberately narrow bridge between ChatGPT, the official OpenAI Secure MCP Tunnel, the operator host, and the official Codex App Server API. Contributions should preserve those ownership boundaries rather than add parallel lifecycle managers or alternate protocol paths.
 
 ## Development prerequisites
 
@@ -30,6 +30,7 @@ The schema check intentionally fails if your installed Codex CLI does not match 
 - Keep the public MCP catalog small, goal-oriented, explicitly annotated, and covered by deterministic selection tests.
 - Preserve the loopback-only backend and single-user self-hosted trust model.
 - Do not add tunnel supervision, tunnel credentials, active-project state, hidden profiles, or abandoned historical compatibility paths.
+- When a pre-release concept is replaced, rename it end-to-end. Do not keep aliases, fallback readers, migration shims, deprecated config keys, stale test names, or documentation for the superseded shape unless compatibility is an explicit requirement.
 - Do not introduce Git branches, commits, tags, or repository initialization as application workflow; version control is an operator concern.
 - Keep required dependencies and compilation cost proportionate to the capability being added.
 

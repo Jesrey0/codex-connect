@@ -23,10 +23,11 @@ const HEALTH_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 pub async fn run_backend() -> Result<()> {
     let config = ConfigStore::default()?.load()?;
-    let scope_root = resolve_required_directory(&config.scope.root, "default workspace")?;
+    let default_cwd =
+        resolve_required_directory(&config.workspace.default_cwd, "default workspace")?;
     serve_mcp(ServeConfig {
         codex_bin: resolve_executable(&config.backend.codex_bin)?,
-        default_cwd: scope_root,
+        default_cwd,
         listen: config.backend.listen_addr()?,
     })
     .await
@@ -435,7 +436,7 @@ pub async fn setup(no_start: bool) -> Result<()> {
     } else {
         Config::new()
     };
-    let root = expand_path(&config.scope.root)?;
+    let root = expand_path(&config.workspace.default_cwd)?;
     if !root.exists() {
         fs::create_dir_all(&root)
             .with_context(|| format!("unable to create default workspace {}", root.display()))?;
@@ -444,7 +445,7 @@ pub async fn setup(no_start: bool) -> Result<()> {
     if !root.is_dir() {
         bail!("default workspace is not a directory: {}", root.display());
     }
-    config.scope.root = display_path(&root);
+    config.workspace.default_cwd = display_path(&root);
     let workspace_root = default_workspace_root()?;
     let codex =
         resolve_executable(&config.backend.codex_bin).or_else(|_| find_executable("codex"))?;
@@ -527,7 +528,7 @@ pub async fn status() -> Result<()> {
         state.unit_file_state
     );
     println!("Endpoint: http://{}/mcp", config.backend.listen);
-    println!("Default workspace: {}", config.scope.root);
+    println!("Default workspace: {}", config.workspace.default_cwd);
     match backend_status_once(&config.backend).await {
         Ok(runtime) => {
             println!(
@@ -615,7 +616,7 @@ pub async fn doctor() -> Result<()> {
     check(
         &mut failures,
         "default workspace",
-        resolve_required_directory(&config.scope.root, "default workspace"),
+        resolve_required_directory(&config.workspace.default_cwd, "default workspace"),
         |path| display_path(path),
     );
     match resolve_executable(&config.backend.codex_bin).map(|path| (path.clone(), path)) {
@@ -855,11 +856,14 @@ async fn wait_for_backend_health(
     config: &Config,
     expected_sha256: Option<&str>,
 ) -> Result<OperatorStatus> {
-    let expected_scope = resolve_required_directory(&config.scope.root, "default workspace")?;
+    let expected_default_cwd =
+        resolve_required_directory(&config.workspace.default_cwd, "default workspace")?;
     let mut last_error = None;
     for _ in 0..40 {
         match backend_status_once(&config.backend).await {
-            Ok(status) if PathBuf::from(&status.default_cwd).canonicalize()? != expected_scope => {
+            Ok(status)
+                if PathBuf::from(&status.default_cwd).canonicalize()? != expected_default_cwd =>
+            {
                 last_error = Some(anyhow::anyhow!("backend reports a different default cwd"))
             }
             Ok(status) if expected_sha256.is_some_and(|hash| status.binary_sha256 != hash) => {

@@ -118,8 +118,8 @@ Do not add a per-client backend or systemd tunnel unit. The only persistent Code
 The configuration at `~/projects/.config/codex-connect/config.toml` is deliberately small:
 
 ```toml
-[scope]
-root = "~/projects"
+[workspace]
+default_cwd = "~/projects"
 
 [backend]
 listen = "127.0.0.1:8767"
@@ -130,7 +130,7 @@ codex_bin = "/home/you/.local/bin/codex"
 
 ### Host and delegated authority
 
-**Operational invariant:** Codex Connect launches its dedicated App Server with the process-local override `sandbox_mode="danger-full-access"`. Public host commands expose no `sandboxPolicy`; deterministic host execution therefore runs with primary-operator authority, subject to the OS account. The `[scope].root` configuration key is retained as the default workspace for relative paths and App Server startup, not as a filesystem authorization boundary.
+**Operational invariant:** Codex Connect launches its dedicated App Server with the process-local override `sandbox_mode="danger-full-access"`. Public host commands expose no `sandboxPolicy`; deterministic host execution therefore runs with primary-operator authority, subject to the OS account. `[workspace].default_cwd` selects the default workspace for relative paths and App Server startup; it is not a filesystem authorization boundary.
 
 The user-global `$CODEX_HOME/config.toml` should remain generic rather than carrying Codex Connect routing or sandbox defaults. `codex.start(mode=work)` is different by design: its public MCP contract requires an explicit `sandboxPolicy` for every delegated turn and offers `readOnly`, `workspaceWrite`, and `dangerFullAccess`. New official review threads are read-only and may select a model; existing thread IDs retain their established model and sandbox settings.
 

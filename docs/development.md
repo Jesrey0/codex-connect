@@ -109,7 +109,7 @@ Server-request response shapes must come from the pinned generated schemas. Publ
 Before implementing or retaining a public MCP behavior, generate or inspect the protocol schema from the pinned Codex CLI and search for an equivalent App Server method. Prefer, in order:
 
 1. a narrow projection of the official method;
-2. a scope/bounds/transport adapter around the official method;
+2. a path/bounds/transport adapter around the official method;
 3. a Connect-only bridge only when the pinned App Server lacks the semantic operation.
 
 A bridge needs an explicit architectural justification and should be reconsidered whenever the Codex pin changes. Do not keep parallel implementations for convenience alone. In particular, file/directory name discovery belongs to App Server `fuzzyFileSearch`; `inspect.searchContent` remains Connect-owned only because the current pin has no workspace-content-search RPC.

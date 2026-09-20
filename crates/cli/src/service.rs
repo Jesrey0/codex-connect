@@ -264,9 +264,9 @@ impl ServiceManager for SystemdManager {
     }
 }
 
-pub fn backend_unit(binary: &Path, scope_root: &Path) -> Result<String> {
+pub fn backend_unit(binary: &Path, workspace_root: &Path) -> Result<String> {
     let path = std::env::var_os("PATH").context("PATH is not set")?;
-    backend_unit_with_path(binary, scope_root, &path)
+    backend_unit_with_path(binary, workspace_root, &path)
 }
 
 fn sanitized_path(path: &std::ffi::OsStr) -> Result<String> {
@@ -292,11 +292,14 @@ fn sanitized_path(path: &std::ffi::OsStr) -> Result<String> {
 
 fn backend_unit_with_path(
     binary: &Path,
-    scope_root: &Path,
+    workspace_root: &Path,
     path: &std::ffi::OsStr,
 ) -> Result<String> {
     let inherited_path = sanitized_path(path)?;
-    let mut path_entries = vec![scope_root.join(".tools/bin"), scope_root.join(".local/bin")];
+    let mut path_entries = vec![
+        workspace_root.join(".tools/bin"),
+        workspace_root.join(".local/bin"),
+    ];
     for entry in std::env::split_paths(std::ffi::OsStr::new(&inherited_path)) {
         if !path_entries.contains(&entry) {
             path_entries.push(entry);
@@ -462,7 +465,7 @@ mod tests {
         }
         let unit = backend_unit(&binary, directory.path()).unwrap();
         assert!(unit.contains("run-backend"));
-        assert!(!unit.contains("--scope-root"));
+        assert!(!unit.contains("--default-cwd"));
         assert!(!unit.contains("127.0.0.1:8767"));
         assert!(!unit.contains("/opt/codex"));
     }

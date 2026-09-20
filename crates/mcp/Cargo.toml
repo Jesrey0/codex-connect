@@ -13,7 +13,7 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 codex-connect-relay = { path = "../relay" }
-codex-connect-scope = { path = "../scope" }
+codex-connect-host = { path = "../host" }
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true

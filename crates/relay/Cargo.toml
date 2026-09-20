@@ -12,7 +12,7 @@ repository.workspace = true
 [dependencies]
 base64.workspace = true
 codex-connect-app-server = { path = "../app-server" }
-codex-connect-scope = { path = "../scope" }
+codex-connect-host = { path = "../host" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
