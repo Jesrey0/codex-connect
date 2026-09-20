@@ -3,6 +3,7 @@
 mod actions;
 mod command_sessions;
 mod event_journal;
+mod operator_inbox;
 
 pub use actions::{ApprovalDecision, PermissionGrant, PermissionScope};
 use base64::Engine;
@@ -46,7 +47,7 @@ pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_COMMAND_READ_MS: u64 = 120_000;
 pub const DEFAULT_COMMAND_READ_MS: u64 = 30_000;
 pub const MAX_COMMAND_WRITE_BYTES: usize = 64 * 1024;
-const WORKSPACE_POLICY: &str = "Workspace policy: treat the working directory as a general filesystem workspace. Version control is optional. Do not initialize repositories, create branches, commits, or tags, or use Git as a checkpoint/workflow mechanism unless the task explicitly requests version-control operations. Existing VCS metadata may be read only when it is materially required by the task.";
+const WORKSPACE_POLICY: &str = "Workspace policy: treat the working directory as a general filesystem workspace. Version control is optional. Do not initialize repositories, create branches, commits, or tags, or use Git as a checkpoint/workflow mechanism unless the task explicitly requests version-control operations. Existing VCS metadata may be read only when it is materially required by the task. Approval discipline: stay within the granted sandbox whenever possible. Do not request approval or additional permissions merely for convenience, broader discovery, cache writes, or optional tooling. Try a sandbox-safe alternative first. Request additional authority only when it is necessary to complete the explicit task, and state the concrete blocker.";
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
 const MAX_APP_SERVER_RESPONSE_BYTES: usize = MAX_WIRE_BYTES - APP_SERVER_RESPONSE_HEADROOM_BYTES;
 const MAX_FS_READ_FILE_BYTES: u64 = ((MAX_APP_SERVER_RESPONSE_BYTES / 4) * 3) as u64;
@@ -124,6 +125,7 @@ pub struct Relay {
     app_server: Arc<AppServerClient>,
     host: Host,
     journal: event_journal::EventJournal,
+    operator_inbox: operator_inbox::OperatorInbox,
     live_turns: Arc<Mutex<LiveTurns>>,
     observer_usage: Arc<Mutex<Option<(Instant, Value)>>>,
     command_sessions: command_sessions::CommandSessions,
@@ -241,6 +243,7 @@ impl Relay {
             app_server,
             host,
             journal: event_journal::EventJournal::default(),
+            operator_inbox: operator_inbox::OperatorInbox::default(),
             live_turns: Arc::new(Mutex::new(LiveTurns::default())),
             observer_usage: Arc::new(Mutex::new(None)),
             command_sessions: command_sessions::CommandSessions::default(),
@@ -267,14 +270,17 @@ impl Relay {
         effort: Option<String>,
         service_tier: Option<String>,
     ) {
-        self.live_turns.lock().await.annotate(
-            thread_id,
-            turn_id,
-            mode,
-            model,
-            effort,
-            service_tier,
-        );
+        let terminal = {
+            let mut live = self.live_turns.lock().await;
+            live.annotate(thread_id, turn_id, mode, model, effort, service_tier);
+            live.turns
+                .get(&(thread_id.to_string(), turn_id.to_string()))
+                .cloned()
+                .filter(|observed| observed.turn.status.is_terminal())
+        };
+        if let Some(observed) = terminal {
+            self.push_terminal_worker_event(thread_id, &observed).await;
+        }
     }
 
     async fn live_turn(
@@ -660,7 +666,6 @@ impl Relay {
         model: Option<String>,
         effort: Option<String>,
         service_tier: Option<String>,
-        approval_policy: Option<ApprovalPolicy>,
         sandbox_policy: SandboxPolicy,
     ) -> Result<Value, RelayError> {
         if task.trim().is_empty() {
@@ -699,7 +704,7 @@ impl Relay {
                 thread_id: thread_id.clone(),
                 input: vec![TextInput::Text { text: task }],
                 cwd,
-                approval_policy,
+                approval_policy: Some(ApprovalPolicy::OnRequest),
                 sandbox_policy: Some(sandbox_policy),
                 model: model.clone(),
                 effort: effort.clone(),
@@ -926,20 +931,24 @@ impl Relay {
                 .map_err(RelayError::Invalid)?;
             if let Some((state, wake_reason)) = wait_wake(turn.as_ref().map(|t| t.status), &pending)
             {
-                return Ok(json!({
+                let result = json!({
                     "threadId":thread_id,"turnId":selected_id,"state":state,"wakeReason":wake_reason,
                     "turn":turn.as_ref().map(turn_snapshot), "cursor":batch.cursor,
                     "historyLost":batch.history_lost,"events":batch.events,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
-                }));
+                });
+                self.acknowledge_wait_result(&result).await;
+                return Ok(result);
             }
             if Instant::now() >= deadline {
-                return Ok(json!({
+                let result = json!({
                     "threadId":thread_id,"turnId":selected_id,"state":"active","wakeReason":"timeout",
                     "turn":turn.as_ref().map(turn_snapshot), "cursor":batch.cursor,
                     "historyLost":batch.history_lost,"events":batch.events,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
-                }));
+                });
+                self.acknowledge_wait_result(&result).await;
+                return Ok(result);
             }
 
             // Ordinary worker notifications remain journaled but do not end the operator wait
@@ -981,6 +990,35 @@ impl Relay {
                 }
             }
         }
+    }
+
+    async fn acknowledge_wait_result(&self, result: &Value) {
+        let thread_id = result.get("threadId").and_then(Value::as_str);
+        let terminal_turn = result
+            .get("turn")
+            .and_then(Value::as_object)
+            .filter(|turn| {
+                matches!(
+                    turn.get("status").and_then(Value::as_str),
+                    Some("completed" | "failed" | "interrupted")
+                )
+            })
+            .and_then(|turn| turn.get("id").and_then(Value::as_str));
+        if let (Some(thread_id), Some(turn_id)) = (thread_id, terminal_turn) {
+            self.operator_inbox
+                .acknowledge_terminal(format!("turn:{thread_id}:{turn_id}"))
+                .await;
+        }
+
+        let actions = result
+            .get("pendingActions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|action| action.get("requestId"))
+            .map(|request_id| format!("action:{request_id}"))
+            .collect::<Vec<_>>();
+        self.operator_inbox.acknowledge_actions(actions).await;
     }
 
     pub async fn work_steer(
@@ -1076,6 +1114,64 @@ impl Relay {
             .collect()
     }
 
+    async fn push_terminal_worker_event(&self, thread_id: &str, observed: &ObservedTurn) {
+        let Some(mode) = observed.mode.as_deref() else {
+            return;
+        };
+        if !observed.turn.status.is_terminal() {
+            return;
+        }
+        let turn_id = observed.turn.id.clone();
+        self.operator_inbox
+            .push_terminal(
+                format!("turn:{thread_id}:{turn_id}"),
+                json!({
+                    "kind":"turnTerminal",
+                    "threadId":thread_id,
+                    "turnId":turn_id,
+                    "mode":mode,
+                    "status":observed.turn.status,
+                }),
+            )
+            .await;
+    }
+
+    pub async fn take_worker_events(&self) -> Vec<Value> {
+        let pending = self.app_server.pending_requests(None);
+        let delegated = self.live_turns.lock().await;
+        let actions = pending
+            .into_iter()
+            .filter(|request| {
+                delegated.order.iter().any(|(thread_id, turn_id)| {
+                    thread_id == &request.thread_id
+                        && request.turn_id.as_deref().is_none_or(|id| id == turn_id)
+                        && delegated
+                            .turns
+                            .get(&(thread_id.clone(), turn_id.clone()))
+                            .is_some_and(|observed| observed.mode.is_some())
+                })
+            })
+            .map(|request| {
+                let request_id = serde_json::to_value(&request.request_id).unwrap();
+                let action_kind = serde_json::to_value(request.kind).unwrap();
+                (
+                    format!("action:{request_id}"),
+                    json!({
+                        "kind":"actionRequired",
+                        "threadId":request.thread_id,
+                        "turnId":request.turn_id,
+                        "actionKind":action_kind,
+                        "requestId":request_id,
+                        "blocking":request.is_blocking,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(delegated);
+        self.operator_inbox.sync_actions(actions).await;
+        self.operator_inbox.take().await
+    }
+
     pub async fn model_list(&self, request: ModelList) -> Result<Value, RelayError> {
         Ok(serde_json::to_value(
             self.app_server.request(request).await?,
@@ -1166,6 +1262,7 @@ impl Relay {
     fn start_event_loop(&self) {
         let journal = self.journal.clone();
         let live_turns = self.live_turns.clone();
+        let operator_inbox = self.operator_inbox.clone();
         let mut events = self.app_server.subscribe();
         tokio::spawn(async move {
             loop {
@@ -1174,6 +1271,7 @@ impl Relay {
                         if let Some(method) = event.get("method").and_then(Value::as_str) {
                             if method == "codexConnect/appServerHistoryGap" {
                                 journal.mark_gap().await;
+                                operator_inbox.mark_history_lost().await;
                                 continue;
                             }
                             if method == "command/exec/outputDelta" {
@@ -1189,7 +1287,33 @@ impl Relay {
                                         codex_connect_app_server::protocol::Turn,
                                     >(turn)
                                     {
-                                        live_turns.lock().await.insert(thread_id, turn);
+                                        let turn_id = turn.id.clone();
+                                        let terminal = {
+                                            let mut live = live_turns.lock().await;
+                                            live.insert(thread_id, turn);
+                                            live.turns
+                                                .get(&(thread_id.to_string(), turn_id))
+                                                .cloned()
+                                                .filter(|observed| {
+                                                    observed.mode.is_some()
+                                                        && observed.turn.status.is_terminal()
+                                                })
+                                        };
+                                        if let Some(observed) = terminal {
+                                            let turn_id = observed.turn.id.clone();
+                                            operator_inbox
+                                                .push_terminal(
+                                                    format!("turn:{thread_id}:{turn_id}"),
+                                                    json!({
+                                                        "kind":"turnTerminal",
+                                                        "threadId":thread_id,
+                                                        "turnId":turn_id,
+                                                        "mode":observed.mode,
+                                                        "status":observed.turn.status,
+                                                    }),
+                                                )
+                                                .await;
+                                        }
                                     }
                                 }
                             }
@@ -1203,6 +1327,7 @@ impl Relay {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         journal.mark_gap().await;
+                        operator_inbox.mark_history_lost().await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }

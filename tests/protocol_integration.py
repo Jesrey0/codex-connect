@@ -107,6 +107,16 @@ class OperatorProtocolTests(unittest.TestCase):
             if entry["kind"] == "method" and entry["name"] == method and "params" in entry
         ]
 
+    def wait_for_worker_event(self, predicate, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status = self.client.call("status")
+            for event in status.get("workerEvents", []):
+                if predicate(event):
+                    return event
+            time.sleep(0.025)
+        self.fail("worker event was not delivered on the host plane")
+
     def test_catalog_and_status_are_canonical(self):
         self.assertEqual(len(self.client.catalog), 13)
         self.assertEqual(set(self.client.tools), EXPECTED)
@@ -124,6 +134,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(resize["cols"]["minimum"], 1)
         work_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][0]
         review_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][1]
+        self.assertNotIn("approvalPolicy", work_start["properties"])
         self.assertIn("sandboxPolicy", work_start["required"])
         self.assertIn('"readOnly"', json.dumps(work_start["properties"]["sandboxPolicy"]))
         for host_tool in ("command.exec", "command.start"):
@@ -142,6 +153,9 @@ class OperatorProtocolTests(unittest.TestCase):
             validate_input=False,
         )
         status = self.client.call("status")
+        worker_events = status.pop("workerEvents", [])
+        for event in worker_events:
+            self.assertIn(event["kind"], {"turnTerminal", "actionRequired", "historyLost"})
         self.assertTrue(status["healthy"])
         self.assertTrue(status["experimentalApi"])
         self.assertEqual(set(status), {
@@ -153,7 +167,7 @@ class OperatorProtocolTests(unittest.TestCase):
             "codexAccess": "mcp",
             "workerContext": "isolated",
             "hostAccess": "dangerFullAccess",
-            "codexPolicy": "perCall",
+            "workerApprovalPolicy": "on-request",
             "reviewPolicy": "readOnlyNewThread",
             "commandDefaultTimeoutMs": 60000,
             "commandMaxTimeoutMs": 60 * 60 * 1000,
@@ -604,6 +618,65 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"], "terminal")
         self.assertEqual(result["turn"]["status"], "completed")
 
+    def test_host_plane_delivers_terminal_and_action_worker_events_once(self):
+        self.client.call("status")  # discard events from earlier tests
+        complete_work = self.start("complete")
+        terminal = self.wait_for_worker_event(
+            lambda event: event.get("kind") == "turnTerminal"
+            and event.get("turnId") == complete_work["turnId"]
+        )
+        self.assertEqual(terminal["mode"], "work")
+        self.assertEqual(terminal["status"], "completed")
+        self.assertFalse(any(
+            event.get("turnId") == complete_work["turnId"]
+            for event in self.client.call("status").get("workerEvents", [])
+        ))
+        self.assertEqual(self.wait(complete_work)["state"], "terminal")
+
+        self.client.call("status")
+        approval_work = self.start("approval")
+        action_event = self.wait_for_worker_event(
+            lambda event: event.get("kind") == "actionRequired"
+            and event.get("turnId") == approval_work["turnId"]
+        )
+        self.assertEqual(action_event["actionKind"], "approval")
+        self.assertTrue(action_event["blocking"])
+        self.assertFalse(any(
+            event.get("requestId") == action_event["requestId"]
+            for event in self.client.call("status").get("workerEvents", [])
+        ))
+        pending = self.wait(approval_work, timeout=0)["pendingActions"][0]
+        self.assertEqual(pending["requestId"], action_event["requestId"])
+        self.client.call("codex.action.respond", {
+            "type": "approval",
+            "requestId": pending["requestId"],
+            "decision": "approve",
+        })
+        self.assertEqual(self.wait(approval_work)["state"], "terminal")
+
+    def test_explicit_wait_acknowledges_passive_worker_events(self):
+        self.client.call("status")
+        complete_work = self.start("complete")
+        self.assertEqual(self.wait(complete_work)["state"], "terminal")
+        time.sleep(0.05)
+        self.assertFalse(any(
+            event.get("turnId") == complete_work["turnId"]
+            for event in self.client.call("status").get("workerEvents", [])
+        ))
+
+        approval_work = self.start("approval")
+        pending = self.wait(approval_work, timeout=0)["pendingActions"][0]
+        self.assertFalse(any(
+            event.get("requestId") == pending["requestId"]
+            for event in self.client.call("status").get("workerEvents", [])
+        ))
+        self.client.call("codex.action.respond", {
+            "type": "approval",
+            "requestId": pending["requestId"],
+            "decision": "approve",
+        })
+        self.assertEqual(self.wait(approval_work)["state"], "terminal")
+
     def test_observer_hides_unannotated_review_auxiliary_turn(self):
         review = self.client.call("codex.start", {
             "mode": "review",
@@ -643,11 +716,16 @@ class OperatorProtocolTests(unittest.TestCase):
             self.assertEqual(interrupted["turn"]["status"],"interrupted")
 
     def test_oversized_wire_messages_are_contained(self):
+        self.client.call("status")
         notification = self.start("wire_oversized")
         notification_result = self.wait(notification, timeout=5000)
         self.assertEqual(notification_result["state"], "terminal")
         self.assertEqual(notification_result["wakeReason"], "terminal")
         self.assertTrue(notification_result["historyLost"])
+        self.assertTrue(any(
+            event.get("kind") == "historyLost"
+            for event in self.client.call("status").get("workerEvents", [])
+        ))
 
         request = self.start("oversized_question")
         request_result = self.wait(request, timeout=5000)
@@ -766,6 +844,7 @@ class OperatorProtocolTests(unittest.TestCase):
                 thread_start = self.method_params("thread/start")[before]
                 self.assertEqual(thread_start["sandbox"], expected_mode)
                 turn_start = self.method_params("turn/start")[-1]
+                self.assertEqual(turn_start["approvalPolicy"], "on-request")
                 self.assertEqual(turn_start["sandboxPolicy"]["type"], policy["type"])
                 if "networkAccess" in policy:
                     self.assertEqual(
@@ -781,6 +860,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(self.wait(instructed)["state"], "terminal")
         instructed_start = self.method_params("thread/start")[before]
         self.assertTrue(instructed_start["developerInstructions"].startswith("Workspace policy:"))
+        self.assertIn("Approval discipline:", instructed_start["developerInstructions"])
         self.assertIn(
             "Operator-supplied developer instructions:\nPrefer evidence over assumptions.",
             instructed_start["developerInstructions"],

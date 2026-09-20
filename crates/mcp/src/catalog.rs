@@ -261,9 +261,86 @@ fn tool(metadata: ToolMetadata, input: Value, output: Option<Value>) -> Tool {
             .idempotent(metadata.idempotent),
     );
     match output {
-        Some(schema) => tool.with_raw_output_schema(json_schema(schema)),
+        Some(schema) => {
+            let schema = if host_plane_reports_worker_events(metadata.name) {
+                with_worker_events(schema)
+            } else {
+                schema
+            };
+            tool.with_raw_output_schema(json_schema(schema))
+        }
         None => tool,
     }
+}
+
+fn host_plane_reports_worker_events(name: &str) -> bool {
+    matches!(
+        name,
+        "status"
+            | "inspect"
+            | "apply_patch"
+            | "command.exec"
+            | "command.start"
+            | "command.read"
+            | "command.control"
+            | "view_image"
+    )
+}
+
+fn with_worker_events(mut schema: Value) -> Value {
+    fn add(schema: &mut Value) {
+        if schema.get("type").and_then(Value::as_str) == Some("object") {
+            if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                properties.insert("workerEvents".into(), worker_events_schema());
+            }
+            return;
+        }
+        if let Some(one_of) = schema.get_mut("oneOf").and_then(Value::as_array_mut) {
+            for branch in one_of {
+                add(branch);
+            }
+        }
+    }
+    add(&mut schema);
+    schema
+}
+
+fn worker_events_schema() -> Value {
+    let terminal = object_schema(
+        json!({
+            "kind":{"const":"turnTerminal"},
+            "threadId":{"type":"string"},
+            "turnId":{"type":"string"},
+            "mode":{"enum":["work","review"]},
+            "status":{"enum":["completed","failed","interrupted"]}
+        }),
+        &["kind", "threadId", "turnId", "mode", "status"],
+    );
+    let action = object_schema(
+        json!({
+            "kind":{"const":"actionRequired"},
+            "threadId":{"type":"string"},
+            "turnId":{"type":["string","null"]},
+            "actionKind":{"enum":["approval","permissions","elicitation","userInput"]},
+            "requestId":rpc_id_schema(),
+            "blocking":{"type":"boolean"}
+        }),
+        &[
+            "kind",
+            "threadId",
+            "turnId",
+            "actionKind",
+            "requestId",
+            "blocking",
+        ],
+    );
+    let lost = object_schema(json!({"kind":{"const":"historyLost"}}), &["kind"]);
+    json!({
+        "type":"array",
+        "maxItems":8,
+        "description":"Unread semantic worker events delivered opportunistically on host-plane calls. Use codex.wait for detailed worker state; do not poll when this field is absent.",
+        "items":{"oneOf":[terminal,action,lost]}
+    })
 }
 fn json_schema(value: Value) -> Arc<JsonObject> {
     match value {
@@ -374,11 +451,11 @@ fn status_schema() -> Value {
                 "codexAccess":{"const":"mcp"},
                 "workerContext":{"const":"isolated"},
                 "hostAccess":{"const":"dangerFullAccess"},
-                "codexPolicy":{"const":"perCall"},
+                "workerApprovalPolicy":{"const":"on-request"},
                 "reviewPolicy":{"const":"readOnlyNewThread"},
                 "commandDefaultTimeoutMs":{"type":"integer","minimum":1},
                 "commandMaxTimeoutMs":{"type":"integer","minimum":1}
-            }), &["controlPlane","codexAccess","workerContext","hostAccess","codexPolicy","reviewPolicy","commandDefaultTimeoutMs","commandMaxTimeoutMs"]),
+            }), &["controlPlane","codexAccess","workerContext","hostAccess","workerApprovalPolicy","reviewPolicy","commandDefaultTimeoutMs","commandMaxTimeoutMs"]),
             "defaultCwd":{"type":"string"},
             "endpoint":{"type":"string"},
             "buildId":{"type":"string"},
@@ -614,7 +691,6 @@ fn codex_start_schema() -> Value {
                 "model":{"type":"string"},
                 "effort":{"type":"string"},
                 "serviceTier":{"type":"string"},
-                "approvalPolicy":approval_policy_schema(),
                 "sandboxPolicy":work_sandbox_schema()
             }),
             &["mode","task","sandboxPolicy"],
@@ -778,10 +854,6 @@ fn pending_schema() -> Value {
     )
 }
 
-fn approval_policy_schema() -> Value {
-    json!({"enum":["untrusted","on-request","never"]})
-}
-
 fn permissions_schema() -> Value {
     let special = json!({"oneOf":[
         object_schema(json!({"kind":{"enum":["root","minimal","tmpdir","slash_tmp"]}}), &["kind"]),
@@ -824,6 +896,10 @@ mod tests {
         assert_eq!(
             properties["operatorContract"]["properties"]["workerContext"]["const"],
             "isolated"
+        );
+        assert_eq!(
+            properties["operatorContract"]["properties"]["workerApprovalPolicy"]["const"],
+            "on-request"
         );
         assert_eq!(properties["codex"]["type"], "object");
         assert_eq!(properties["appServer"]["type"], "object");
@@ -910,11 +986,55 @@ mod tests {
             "string"
         );
         assert_eq!(work["properties"]["developerInstructions"]["minLength"], 1);
+        assert!(work["properties"].get("approvalPolicy").is_none());
         assert!(review["properties"].get("developerInstructions").is_none());
         assert!(review["properties"].get("sandboxPolicy").is_none());
         assert!(review["properties"].get("effort").is_none());
         assert!(review["properties"].get("serviceTier").is_none());
         assert_eq!(review["properties"]["model"]["type"], "string");
+    }
+
+    #[test]
+    fn host_plane_outputs_can_deliver_compact_worker_events() {
+        let tools = tool_catalog();
+        for name in [
+            "status",
+            "inspect",
+            "apply_patch",
+            "view_image",
+            "command.exec",
+            "command.start",
+            "command.read",
+            "command.control",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap();
+            let output = tool.output_schema.as_ref().unwrap();
+            let encoded = serde_json::to_string(output).unwrap();
+            assert!(encoded.contains("workerEvents"), "{name}");
+            assert!(encoded.contains("turnTerminal"), "{name}");
+            assert!(encoded.contains("actionRequired"), "{name}");
+        }
+        for name in [
+            "codex.start",
+            "codex.wait",
+            "codex.control",
+            "codex.action.respond",
+            "codex.info",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap();
+            assert!(
+                !serde_json::to_string(tool.output_schema.as_ref().unwrap())
+                    .unwrap()
+                    .contains("workerEvents"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

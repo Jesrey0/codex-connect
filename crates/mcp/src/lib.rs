@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use codex_connect_host::Host;
 use codex_connect_relay::{
-    ApprovalDecision, ApprovalPolicy, CommandExec, CommandExecTerminalSize, MAX_WAIT_MS, ModelList,
+    ApprovalDecision, CommandExec, CommandExecTerminalSize, MAX_WAIT_MS, ModelList,
     PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
 };
 use rmcp::ErrorData as McpError;
@@ -30,7 +30,7 @@ use tokio::net::TcpListener;
 const DEFAULT_WAIT_MS: u64 = 60_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Deterministic host tools operate with the host user's authority through a dedicated App Server launched in danger-full-access; defaultCwd is only the navigation base for relative paths, not an authorization fence. Use codex.* for Codex threads, turns, reviews, discovery, usage, approvals, permissions, and user input; do not invoke the Codex CLI through host command tools as an alternate control plane when the semantic operation is available here. Prefer inspect for batched read-only host exploration, command.exec for bounded deterministic host commands, command.start/read/control for persistent or interactive deterministic commands, and apply_patch for exact known text edits. Delegated codex.start(mode=work) always requires an explicit per-task sandboxPolicy. New work threads may also carry developerInstructions for a concise worker operating contract; keep task self-contained, and do not send developerInstructions when resuming with threadId because resumed threads keep their established instructions. New official review threads are read-only and may select a model; resumed threads keep their established settings. Use codex.start followed by codex.wait only when delegated autonomous reasoning or iteration materially improves the critical path or quality; delegation is an optimization, not the default. Codex workers do not inherit the ChatGPT conversation, so every delegated task must include its own relevant context, constraints, paths, decisions, and acceptance criteria. Minimize unnecessary Codex turns and discovery calls because model usage is constrained; batch independent discovery with codex.info. Preserve ownership boundaries: Codex CLI/App Server and tunnel-client are independently owned upstream dependencies, and Codex Connect must not install, relocate, duplicate, upgrade, delete, or supervise their owned state. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect projects those capabilities without inventing a second execution model.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Deterministic host tools operate with the host user's authority through a dedicated App Server launched in danger-full-access; defaultCwd is only the navigation base for relative paths, not an authorization fence. Use codex.* for Codex threads, turns, reviews, discovery, usage, approvals, permissions, and user input; do not invoke the Codex CLI through host command tools as an alternate control plane when the semantic operation is available here. Prefer inspect for batched read-only host exploration, command.exec for bounded deterministic host commands, command.start/read/control for persistent or interactive deterministic commands, and apply_patch for exact known text edits. Delegated codex.start(mode=work) always requires an explicit per-task sandboxPolicy and runs with the server-owned on-request approval policy. New work threads may also carry developerInstructions for a concise worker operating contract; keep task self-contained, and do not send developerInstructions when resuming with threadId because resumed threads keep their established instructions. New official review threads are read-only and may select a model; resumed threads keep their established settings. Use codex.start followed by codex.wait only when delegated autonomous reasoning or iteration materially improves the critical path or quality; delegation is an optimization, not the default. After starting a worker, continue independent critical-path work instead of blocking on it. Successful host-plane tool results may include workerEvents when delegated work becomes terminal or requires operator action; treat those as semantic interrupts and use codex.wait for the detailed worker state rather than polling routinely. Codex workers do not inherit the ChatGPT conversation, so every delegated task must include its own relevant context, constraints, paths, decisions, and acceptance criteria. Minimize unnecessary Codex turns and discovery calls because model usage is constrained; batch independent discovery with codex.info. Preserve ownership boundaries: Codex CLI/App Server and tunnel-client are independently owned upstream dependencies, and Codex Connect must not install, relocate, duplicate, upgrade, delete, or supervise their owned state. Do not initialize repositories, create branches, commits, or tags, or use Git as a workflow mechanism unless the user explicitly requests version-control work. Official App Server filesystem, command, review, thread, turn, and action lifecycles remain authoritative; Codex Connect projects those capabilities without inventing a second execution model.";
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +48,29 @@ pub struct RuntimeIdentity {
     pub app_server_launch_overrides: Vec<String>,
 }
 
+fn host_plane_reports_worker_events(name: &str) -> bool {
+    matches!(
+        name,
+        "status"
+            | "inspect"
+            | "apply_patch"
+            | "command.exec"
+            | "command.start"
+            | "command.read"
+            | "command.control"
+            | "view_image"
+    )
+}
+
+fn attach_worker_events(value: &mut Value, events: Vec<Value>) {
+    if events.is_empty() {
+        return;
+    }
+    if let Value::Object(object) = value {
+        object.insert("workerEvents".into(), Value::Array(events));
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperatorContract {
@@ -55,7 +78,7 @@ pub struct OperatorContract {
     pub codex_access: String,
     pub worker_context: String,
     pub host_access: String,
-    pub codex_policy: String,
+    pub worker_approval_policy: String,
     pub review_policy: String,
     pub command_default_timeout_ms: u64,
     pub command_max_timeout_ms: u64,
@@ -241,7 +264,7 @@ impl OperatorStatus {
                 codex_access: "mcp".into(),
                 worker_context: "isolated".into(),
                 host_access: "dangerFullAccess".into(),
-                codex_policy: "perCall".into(),
+                worker_approval_policy: "on-request".into(),
                 review_policy: "readOnlyNewThread".into(),
                 command_default_timeout_ms: codex_connect_relay::DEFAULT_COMMAND_MS,
                 command_max_timeout_ms: codex_connect_relay::MAX_COMMAND_MS,
@@ -315,7 +338,10 @@ impl ServerHandler for McpHandler {
         )
         .await
         {
-            Ok(value) => {
+            Ok(mut value) => {
+                if host_plane_reports_worker_events(name) {
+                    attach_worker_events(&mut value, self.relay.take_worker_events().await);
+                }
                 let summary = summary_for(name, &value);
                 let mut result = CallToolResult::success(vec![ContentBlock::text(summary)]);
                 result.structured_content = Some(value);
@@ -396,7 +422,6 @@ enum CodexStartArgs {
         model: Option<String>,
         effort: Option<String>,
         service_tier: Option<String>,
-        approval_policy: Option<ApprovalPolicy>,
         sandbox_policy: SandboxPolicy,
     },
     Review {
@@ -569,7 +594,6 @@ async fn dispatch(
                 model,
                 effort,
                 service_tier,
-                approval_policy,
                 sandbox_policy,
             } => relay
                 .work_start(
@@ -580,7 +604,6 @@ async fn dispatch(
                     model,
                     effort,
                     service_tier,
-                    approval_policy,
                     sandbox_policy,
                 )
                 .await
@@ -783,7 +806,7 @@ fn ensure_empty(arguments: JsonObject) -> anyhow::Result<()> {
 }
 
 fn summary_for(name: &str, value: &Value) -> String {
-    match name {
+    let mut summary = match name {
         "command.exec" => {
             let exit_code = value.get("exitCode").and_then(Value::as_i64).unwrap_or(-1);
             let duration_ms = value.get("durationMs").and_then(Value::as_u64).unwrap_or(0);
@@ -832,7 +855,17 @@ fn summary_for(name: &str, value: &Value) -> String {
         ),
         "inspect" => "Inspection completed.".into(),
         _ => "Operation completed.".into(),
+    };
+    let worker_events = value
+        .get("workerEvents")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if worker_events > 0 {
+        summary.push_str(&format!(
+            " {worker_events} worker event(s) require attention."
+        ));
     }
+    summary
 }
 
 async fn image_response(
@@ -850,8 +883,9 @@ async fn image_response(
     .await;
     match result {
         Ok(image) => {
-            let metadata =
+            let mut metadata =
                 json!({"path":image.path,"mimeType":image.mime_type,"detail":image.detail});
+            attach_worker_events(&mut metadata, relay.take_worker_events().await);
             let mut image_meta = MetaObject::new();
             image_meta
                 .0
@@ -882,6 +916,9 @@ mod tests {
         );
         assert!(SERVER_INSTRUCTIONS.contains("do not inherit the ChatGPT conversation"));
         assert!(SERVER_INSTRUCTIONS.contains("delegation is an optimization, not the default"));
+        assert!(SERVER_INSTRUCTIONS.contains("server-owned on-request approval policy"));
+        assert!(SERVER_INSTRUCTIONS.contains("continue independent critical-path work"));
+        assert!(SERVER_INSTRUCTIONS.contains("workerEvents"));
         assert!(SERVER_INSTRUCTIONS.contains("model usage is constrained"));
         assert!(SERVER_INSTRUCTIONS.contains("batch independent discovery with codex.info"));
     }
