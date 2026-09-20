@@ -70,6 +70,8 @@ lock = threading.RLock()
 threads = {}
 subscriptions = set()
 unsubscribe_failures = set()
+slow_turn_list_at = {}
+turn_list_counts = {}
 pending = {}
 command_sessions = {}
 initialized = False
@@ -244,12 +246,29 @@ for line in sys.stdin:
         result["nextCursor"] = str(start + limit) if start + limit < len(entries) else None
     elif method == "thread/turns/list":
         turns = copy.deepcopy(threads[params["threadId"]]["turns"])
+        if params.get("itemsView") == "notLoaded":
+            for turn in turns:
+                turn["items"] = []
         if params.get("sortDirection", "desc") == "desc":
             turns.reverse()
         start = int(params.get("cursor") or 0)
         limit = params.get("limit") or 50
         result["data"] = turns[start:start + limit]
         result["nextCursor"] = str(start + limit) if start + limit < len(turns) else None
+        thread_id = params["threadId"]
+        if thread_id in slow_turn_list_at:
+            count = turn_list_counts.get(thread_id, 0) + 1
+            turn_list_counts[thread_id] = count
+            if count == slow_turn_list_at[thread_id]:
+                slow_turn_list_at.pop(thread_id)
+                timer = threading.Timer(
+                    2.0,
+                    respond,
+                    (copy.deepcopy(message), copy.deepcopy(result)),
+                )
+                timer.daemon = True
+                timer.start()
+                continue
     elif method == "turn/start":
         assert "sandboxPolicy" in params
         assert "serviceTier" not in params
@@ -283,6 +302,14 @@ for line in sys.stdin:
             complete(thread_id, turn_id)
         elif scenario == "idle":
             pass
+        elif scenario == "slow_reconcile":
+            slow_turn_list_at[thread_id] = 2
+        elif scenario == "slow_initial_reconcile":
+            slow_turn_list_at[thread_id] = 1
+        elif scenario == "delayed_complete":
+            timer = threading.Timer(1.25, complete, (thread_id, turn_id))
+            timer.daemon = True
+            timer.start()
         elif scenario == "inflate_history":
             for index in range(60):
                 filler = copy.deepcopy(turn)

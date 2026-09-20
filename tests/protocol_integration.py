@@ -604,6 +604,20 @@ class OperatorProtocolTests(unittest.TestCase):
         })
         self.assertEqual(snapshot["turn"]["id"], next_work["turnId"])
 
+    def test_wait_rejects_timeout_above_server_limit(self):
+        work = self.start("idle")
+        reads_before = len(self.method_params("thread/read"))
+        self.client.call("codex.wait", {
+            "threadId": work["threadId"],
+            "turnId": work["turnId"],
+            "timeoutMs": 120001,
+        }, error=True, validate_input=False)
+        self.assertEqual(len(self.method_params("thread/read")), reads_before)
+        self.client.call("codex.control", {
+            "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
+        })
+        self.assertEqual(self.wait(work)["state"], "terminal")
+
     def test_observer_does_not_regress_early_completed_turn_to_in_progress(self):
         unsubscribes_before = len(self.method_params("thread/unsubscribe"))
         work = self.start(
@@ -831,6 +845,58 @@ class OperatorProtocolTests(unittest.TestCase):
             self.assertEqual(interrupted["state"],"terminal")
             self.assertEqual(interrupted["wakeReason"],"terminal")
             self.assertEqual(interrupted["turn"]["status"],"interrupted")
+
+    def test_quiet_wait_reconciles_status_without_rehydrating_items(self):
+        work = self.start("idle")
+        turns_before = len(self.method_params("thread/turns/list"))
+        items_before = len(self.method_params("thread/items/list"))
+        result = self.wait(work, timeout=2500)
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["wakeReason"], "timeout")
+        self.assertGreaterEqual(len(self.method_params("thread/turns/list")) - turns_before, 2)
+        self.assertEqual(len(self.method_params("thread/items/list")) - items_before, 0)
+        self.client.call("codex.control", {
+            "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
+        })
+        self.assertEqual(self.wait(work)["state"], "terminal")
+
+    def test_terminal_wait_hydrates_items_once_after_nonterminal_reconciliation(self):
+        work = self.start("delayed_complete")
+        turns_before = len(self.method_params("thread/turns/list"))
+        items_before = len(self.method_params("thread/items/list"))
+        result = self.wait(work, timeout=3000)
+        self.assertEqual(result["state"], "terminal")
+        self.assertEqual(result["wakeReason"], "terminal")
+        self.assertEqual(result["turn"]["output"][0]["text"], "fixture complete")
+        self.assertGreaterEqual(len(self.method_params("thread/turns/list")) - turns_before, 2)
+        self.assertEqual(len(self.method_params("thread/items/list")) - items_before, 1)
+
+    def test_slow_reconciliation_does_not_overrun_wait_lease(self):
+        work = self.start("slow_reconcile")
+        started = time.monotonic()
+        result = self.wait(work, timeout=1100)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["wakeReason"], "timeout")
+        self.assertLess(elapsed, 1.8)
+        self.client.call("codex.control", {
+            "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
+        })
+        self.assertEqual(self.wait(work)["state"], "terminal")
+
+    def test_slow_initial_reconciliation_uses_live_turn_at_lease_expiry(self):
+        work = self.start("slow_initial_reconcile")
+        started = time.monotonic()
+        result = self.wait(work, timeout=200)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["wakeReason"], "timeout")
+        self.assertEqual(result["turn"]["id"], work["turnId"])
+        self.assertLess(elapsed, 0.9)
+        self.client.call("codex.control", {
+            "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
+        })
+        self.assertEqual(self.wait(work)["state"], "terminal")
 
     def test_oversized_wire_messages_are_contained(self):
         self.client.call("status")

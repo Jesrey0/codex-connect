@@ -1038,7 +1038,7 @@ impl Relay {
         Ok(())
     }
 
-    async fn find_stored_turn(
+    async fn find_stored_turn_metadata(
         &self,
         thread_id: &str,
         turn_id: &str,
@@ -1055,8 +1055,7 @@ impl Relay {
                     items_view: Some(TurnItemsView::NotLoaded),
                 })
                 .await?;
-            if let Some(mut turn) = response.data.into_iter().find(|turn| turn.id == turn_id) {
-                self.hydrate_turn_items(thread_id, &mut turn).await?;
+            if let Some(turn) = response.data.into_iter().find(|turn| turn.id == turn_id) {
                 return Ok(Some(turn));
             }
             match response.next_cursor {
@@ -1073,22 +1072,40 @@ impl Relay {
         after_cursor: u64,
         timeout_ms: u64,
     ) -> Result<Value, RelayError> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(MAX_WAIT_MS));
+        if timeout_ms > MAX_WAIT_MS {
+            return Err(RelayError::Invalid(format!(
+                "timeoutMs must be less than or equal to {MAX_WAIT_MS}"
+            )));
+        }
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         // Subscribe before the authoritative read so actionable requests and terminal
         // notifications cannot race the wait setup.
         let mut transport_changes = self.app_server.changes();
         let mut journal_changes = self.journal.changes();
-        self.read_thread_metadata(thread_id.clone()).await?;
+        let initial_live = self.live_turn(&thread_id, &turn_id).await;
+        let initial_reconcile = async {
+            self.read_thread_metadata(thread_id.clone()).await?;
+            self.find_stored_turn_metadata(&thread_id, &turn_id).await
+        };
+        let mut stored = if timeout_ms == 0 || initial_live.is_none() {
+            // A zero-duration snapshot, or a turn that predates this relay process, needs the
+            // minimum authoritative read required to establish trustworthy state.
+            initial_reconcile.await?
+        } else {
+            match tokio::time::timeout_at(deadline, initial_reconcile).await {
+                Ok(result) => result?,
+                Err(_) => None,
+            }
+        };
         loop {
             if !self.worker_available() {
                 return Err(AppServerError::Disconnected.into());
             }
-            let stored = self.find_stored_turn(&thread_id, &turn_id).await?;
             let stored_terminal = stored
                 .as_ref()
                 .is_some_and(|turn| turn.status.is_terminal());
             let live = self.live_turn(&thread_id, &turn_id).await;
-            let selected = match (stored, live) {
+            let mut selected = match (stored.clone(), live) {
                 (Some(stored), Some(live))
                     if live.status.is_terminal() && !stored.status.is_terminal() =>
                 {
@@ -1102,6 +1119,9 @@ impl Relay {
                     )));
                 }
             };
+            if selected.status.is_terminal() && stored_terminal {
+                self.hydrate_turn_items(&thread_id, &mut selected).await?;
+            }
             let selected_id = Some(selected.id.as_str());
             let pending = self
                 .app_server
@@ -1151,7 +1171,7 @@ impl Relay {
             let selected_id = selected_id.map(str::to_owned);
             let reconcile_at =
                 deadline.min(Instant::now() + Duration::from_millis(WAIT_RECONCILE_MS));
-            loop {
+            let needs_reconcile = loop {
                 tokio::select! {
                     changed = transport_changes.changed() => {
                         if changed.is_err() || !self.worker_available() {
@@ -1164,7 +1184,7 @@ impl Relay {
                             .filter(|r| r.turn_id.as_deref().is_none_or(|id| selected_id.as_deref() == Some(id)))
                             .collect::<Vec<_>>();
                         if wait_wake(None, &pending).is_some() {
-                            break;
+                            break false;
                         }
                     }
                     changed = journal_changes.changed() => {
@@ -1177,10 +1197,25 @@ impl Relay {
                             .await
                             .map_err(RelayError::Invalid)?;
                         if batch.history_lost || batch.events.iter().any(|event| event.method == "turn/completed") {
-                            break;
+                            break true;
                         }
                     }
-                    _ = tokio::time::sleep_until(reconcile_at) => break,
+                    _ = tokio::time::sleep_until(reconcile_at) => break true,
+                }
+            };
+            if needs_reconcile && Instant::now() < deadline {
+                match tokio::time::timeout_at(
+                    deadline,
+                    self.find_stored_turn_metadata(&thread_id, &turn_id),
+                )
+                .await
+                {
+                    Ok(result) => stored = result?,
+                    Err(_) => {
+                        // The join lease bounds reconciliation, not the worker lifetime. A
+                        // slow authoritative status read must not extend an otherwise expired
+                        // wait or cancel the underlying Codex turn.
+                    }
                 }
             }
         }
