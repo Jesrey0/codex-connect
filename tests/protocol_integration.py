@@ -710,6 +710,21 @@ class OperatorProtocolTests(unittest.TestCase):
             {"threadId": work["threadId"]},
         )
         self.assertEqual(len(self.method_params("thread/unsubscribe")), unsubscribes_before + 1)
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            with urllib.request.urlopen(self.url + "/observe") as response:
+                observer = json.load(response)
+            successes = [
+                event for event in observer["projection"]["events"]
+                if event["method"] == "codexConnect/threadUnsubscribed"
+                and event["threadId"] == work["threadId"]
+            ]
+            if successes:
+                self.assertEqual(successes[-1]["params"]["status"], "unsubscribed")
+                break
+            time.sleep(0.025)
+        else:
+            self.fail("unsubscribe success was not exposed through the observer journal")
 
     def test_start_failure_after_thread_load_releases_subscription(self):
         unsubscribes_before = len(self.method_params("thread/unsubscribe"))

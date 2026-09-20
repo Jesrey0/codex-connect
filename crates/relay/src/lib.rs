@@ -449,7 +449,6 @@ impl Relay {
                 })
                 .await;
             let success = result.is_ok();
-            let error = result.err().map(|error| error.to_string());
             let notify = subscriptions
                 .lock()
                 .await
@@ -457,13 +456,23 @@ impl Relay {
             if let Some(notify) = notify {
                 notify.notify_waiters();
             }
-            if let Some(error) = error {
-                journal
-                    .push(
-                        "codexConnect/threadUnsubscribeFailed",
-                        &json!({"threadId":thread_id,"error":error}),
-                    )
-                    .await;
+            match result {
+                Ok(response) => {
+                    journal
+                        .push(
+                            "codexConnect/threadUnsubscribed",
+                            &json!({"threadId":thread_id,"status":response.status}),
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    journal
+                        .push(
+                            "codexConnect/threadUnsubscribeFailed",
+                            &json!({"threadId":thread_id,"error":error.to_string()}),
+                        )
+                        .await;
+                }
             }
         });
     }
