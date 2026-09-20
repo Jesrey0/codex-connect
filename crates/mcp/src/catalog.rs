@@ -84,7 +84,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.read",
                 "Read Persistent Command",
-                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. Use afterCursor from the previous start/read result to consume incrementally. Process state and output consumption are independent: state=exited/failed can be returned while newer retained output still exists. hasMoreOutput reports whether a newer retained chunk was withheld by the per-read response bound; drained=true means the command is terminal and all currently retained output has been consumed by this read. historyLost=true independently means older output was already evicted.",
+                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. The default lease is 30 seconds and callers may extend it to 120 seconds when a quieter persistent command warrants fewer polling turns. Use afterCursor from the previous start/read result to consume incrementally. Process state and output consumption are independent: state=exited/failed can be returned while newer retained output still exists. hasMoreOutput reports whether a newer retained chunk was withheld by the per-read response bound; drained=true means the command is terminal and all currently retained output has been consumed by this read. historyLost=true independently means older output was already evicted.",
                 true,
                 false,
                 false,
@@ -129,7 +129,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for one known bounded deterministic host command, including a shell command that composes several related repository/tool queries into one result. This is the App Server command/exec path, not a separate executor; Codex Connect's dedicated App Server is launched with danger-full-access for the primary operator plane. Non-interactive, with a 60-second default process timeout (60-minute maximum) and 64 KiB per-stream default output cap (256 KiB maximum). timeoutMs is not an end-to-end API latency ceiling because final App Server response delivery gets a finite allowance. stdoutMayBeTruncated/stderrMayBeTruncated conservatively report when the returned byte count exactly reached outputBytesCap; the upstream buffered response does not prove whether additional bytes existed. durationMs is Connect-observed App Server request wall time. For long-running or interactive commands use command.start; for delegated autonomous investigation/coding use codex.start.",
+                "Use for one known bounded deterministic host command, including a shell command that composes several related repository/tool queries into one result. This is the App Server command/exec path, not a separate executor; Codex Connect's dedicated App Server is launched with danger-full-access for the primary operator plane. Non-interactive, with a 60-second default process timeout and a 5-minute maximum. The 60-second default fits normal repository/build/test work observed on this workspace; use command.start/read for persistent, interactive, or unusually long-running commands rather than stretching one synchronous call indefinitely. The relay gives App Server a small finite allowance to deliver its final buffered response. Any outer tunnel response deadline is independently owned by tunnel-client/control-plane metadata. stdoutMayBeTruncated/stderrMayBeTruncated conservatively report when the returned byte count exactly reached outputBytesCap; the upstream buffered response does not prove whether additional bytes existed. durationMs is Connect-observed App Server request wall time. For delegated autonomous investigation/coding use codex.start.",
                 false,
                 true,
                 true,
@@ -175,8 +175,8 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         tool(
             meta(
                 "codex.wait",
-                "Read or Wait for Codex Turn",
-                "Read or quietly join a delegated Codex turn. timeoutMs=0 is a non-blocking authoritative snapshot; positive values are short leases capped at 45 seconds to leave headroom beneath the observed outer connector response deadline. Routine tool calls, file changes, and worker commentary remain journaled but do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required; pendingActions are returned directly for codex.action.respond. Lease timeout means the worker is still active, not stalled. If delegated work owns the remaining critical path, repeat bounded joins rather than duplicating or taking over the same scope.",
+                "Wait for Codex Turn",
+                "Quietly join a delegated Codex turn. The default lease is 60 seconds and callers may extend it to 120 seconds. Routine tool calls, file changes, worker commentary, and token updates do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required. The result includes compact currentActivity and pendingActions but never the raw event journal. Lease timeout means the worker is still active, not stalled; repeat bounded joins when the worker still owns the remaining critical path. Use codex.inspect when you need worker activity/history or raw forensic events. Any outer tunnel response deadline is independently owned by tunnel-client/control-plane metadata.",
                 true,
                 false,
                 false,
@@ -184,6 +184,19 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             ),
             codex_wait_schema(),
             Some(work_wait_output_schema()),
+        ),
+        tool(
+            meta(
+                "codex.inspect",
+                "Inspect Codex Turn",
+                "Read worker activity without joining or mutating the turn. detail=semantic is the default operator view: compact meaningful activity transitions with a bounded response and continuation cursor. Use detail=raw only for explicit forensic inspection of original App Server notifications. afterCursor consumes either view incrementally; codex.start returns a cursor suitable for beginning inspection at delegation time.",
+                true,
+                false,
+                false,
+                true,
+            ),
+            codex_inspect_schema(),
+            Some(codex_inspect_output_schema()),
         ),
         tool(
             meta(
@@ -337,7 +350,7 @@ fn worker_events_schema() -> Value {
     json!({
         "type":"array",
         "maxItems":8,
-        "description":"Unread semantic worker events delivered opportunistically on host-plane calls. Use codex.wait for detailed worker state; do not poll when this field is absent.",
+        "description":"Unread semantic worker interrupts delivered opportunistically on host-plane calls. Use codex.wait to synchronize with the turn and codex.inspect for activity/history; do not poll when this field is absent.",
         "items":{"oneOf":[terminal,action,lost]}
     })
 }
@@ -471,16 +484,74 @@ fn work_started_schema() -> Value {
 }
 fn work_wait_output_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnId":{"type":["string","null"]},"state":{"type":"string","enum":["active","terminal"]},"wakeReason":{"type":"string","enum":["terminal","actionRequired","inputRequired","timeout"]},"cursor":{"type":"integer"},"turn":nullable(turn_schema()),"historyLost":{"type":"boolean"},"events":{"type":"array","items":event_schema()},"pendingActions":{"type":"array","items":pending_schema()}}),
+        json!({"threadId":{"type":"string"},"turnId":{"type":["string","null"]},"state":{"type":"string","enum":["active","terminal"]},"wakeReason":{"type":"string","enum":["terminal","actionRequired","inputRequired","timeout"]},"turn":nullable(turn_schema()),"currentActivity":nullable(current_activity_schema()),"pendingActions":{"type":"array","items":pending_schema()}}),
         &[
             "threadId",
             "state",
             "wakeReason",
-            "cursor",
-            "events",
+            "currentActivity",
             "pendingActions",
         ],
     )
+}
+fn current_activity_schema() -> Value {
+    object_schema(
+        json!({
+            "kind":{"type":"string"},
+            "summary":{"type":["string","null"]},
+            "lastActivityAtMs":{"type":"integer","minimum":0},
+            "tokenUsage":object_schema(json!({
+                "totalTokens":{"type":["integer","null"],"minimum":0},
+                "modelContextWindow":{"type":["integer","null"],"minimum":0}
+            }), &["totalTokens","modelContextWindow"])
+        }),
+        &["kind", "summary", "lastActivityAtMs", "tokenUsage"],
+    )
+}
+fn semantic_event_schema() -> Value {
+    object_schema(
+        json!({
+            "cursor":{"type":"integer","minimum":0},
+            "threadId":{"type":["string","null"]},
+            "turnId":{"type":["string","null"]},
+            "kind":{"type":"string"},
+            "summary":{"type":["string","null"]},
+            "phase":{"type":["string","null"]}
+        }),
+        &["cursor", "threadId", "turnId", "kind", "summary", "phase"],
+    )
+}
+fn codex_inspect_output_schema() -> Value {
+    let base = |detail: &str, event: Value| {
+        object_schema(
+            json!({
+                "threadId":{"type":"string"},
+                "turnId":{"type":"string"},
+                "status":{"enum":["inProgress","completed","failed","interrupted"]},
+                "detail":{"const":detail},
+                "currentActivity":nullable(current_activity_schema()),
+                "cursor":{"type":"integer","minimum":0},
+                "historyLost":{"type":"boolean"},
+                "hasMore":{"type":"boolean"},
+                "events":{"type":"array","items":event}
+            }),
+            &[
+                "threadId",
+                "turnId",
+                "status",
+                "detail",
+                "currentActivity",
+                "cursor",
+                "historyLost",
+                "hasMore",
+                "events",
+            ],
+        )
+    };
+    union_object_schema(vec![
+        base("semantic", semantic_event_schema()),
+        base("raw", event_schema()),
+    ])
 }
 fn inspect_schema() -> Value {
     object_schema(
@@ -524,7 +595,7 @@ fn work_sandbox_schema() -> Value {
 }
 fn command_schema() -> Value {
     object_schema(
-        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Process execution timeout in milliseconds. App Server enforces the process timeout; the MCP call may complete later while the final response is delivered."},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Per-stream stdout/stderr capture cap in bytes. The pinned App Server buffered response has no truncation flag; if a returned stream is exactly this many bytes, treat it as potentially incomplete."},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}}}),
+        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Child-process timeout in milliseconds. Defaults to 60000 and may be extended to 300000 for bounded deterministic work. Use command.start/read for persistent, interactive, or unusually long-running commands. Tunnel-client independently enforces any outer per-command response deadline supplied by the control plane."},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Per-stream stdout/stderr capture cap in bytes. The pinned App Server buffered response has no truncation flag; if a returned stream is exactly this many bytes, treat it as potentially incomplete."},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}}}),
         &["command"],
     )
 }
@@ -565,7 +636,7 @@ fn command_read_schema() -> Value {
         json!({
             "processId":{"type":"string","minLength":1},
             "afterCursor":{"type":"integer","minimum":0,"default":0},
-            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS}
+            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Bounded output/exit wait in milliseconds. Defaults to 30000 and may be extended to 120000. The process itself may outlive any number of reads; tunnel-client independently enforces any outer per-command response deadline."}
         }),
         &["processId"],
     )
@@ -687,7 +758,18 @@ fn codex_start_schema() -> Value {
 }
 fn codex_wait_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by codex.start/codex.wait. Matching events after this cursor are returned when the quiet join ends but do not wake it by themselves."},"timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Short quiet-join lease in milliseconds. Set to 0 for a non-blocking state/journal pull. Lease expiry means the worker remains active; repeat the join when it still owns the remaining critical path."}}),
+        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet join lease in milliseconds. Defaults to 60000 and may be extended to 120000. Lease expiry means the worker remains active; repeat the join when it still owns the remaining critical path. Tunnel-client independently enforces any outer per-command response deadline."}}),
+        &["threadId", "turnId"],
+    )
+}
+fn codex_inspect_schema() -> Value {
+    object_schema(
+        json!({
+            "threadId":{"type":"string"},
+            "turnId":{"type":"string"},
+            "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by codex.start or codex.inspect. Use the returned cursor to continue incrementally."},
+            "detail":{"type":"string","enum":["semantic","raw"],"default":"semantic","description":"semantic returns compact meaningful activity; raw returns original App Server notifications for explicit forensic inspection."}
+        }),
         &["threadId", "turnId"],
     )
 }
@@ -920,7 +1002,7 @@ mod tests {
             properties["timeoutMs"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("may complete later")
+                .contains("Tunnel-client independently enforces")
         );
         assert_eq!(
             properties["outputBytesCap"]["default"],
@@ -1002,6 +1084,7 @@ mod tests {
         for name in [
             "codex.start",
             "codex.wait",
+            "codex.inspect",
             "codex.control",
             "codex.action.respond",
             "codex.info",
@@ -1058,7 +1141,10 @@ mod tests {
             .find(|tool| tool.name.as_ref() == "command.exec")
             .unwrap();
         let exec_description = exec.description.as_deref().unwrap();
-        assert!(exec_description.contains("not an end-to-end API latency ceiling"));
+        assert!(exec_description.contains("60-second default process timeout"));
+        assert!(exec_description.contains("5-minute maximum"));
+        assert!(exec_description.contains("command.start/read"));
+        assert!(exec_description.contains("independently owned by tunnel-client"));
         assert!(exec_description.contains("stdoutMayBeTruncated"));
         assert!(exec_description.contains("durationMs"));
         let exec_output = exec.output_schema.as_ref().unwrap();
@@ -1085,6 +1171,8 @@ mod tests {
             json!(["terminal", "actionRequired", "inputRequired", "timeout"])
         );
         assert!(!output.to_string().contains("progress"));
+        assert!(!output.to_string().contains("events"));
+        assert!(output.to_string().contains("currentActivity"));
 
         let input = codex_wait_schema();
         assert!(
@@ -1093,13 +1181,24 @@ mod tests {
                 .unwrap()
                 .contains(&json!("turnId"))
         );
-        assert_eq!(input["properties"]["timeoutMs"]["minimum"], 0);
-        assert!(
-            input["properties"]["timeoutMs"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("non-blocking")
+        assert_eq!(input["properties"]["timeoutMs"]["minimum"], 1);
+        assert_eq!(input["properties"]["timeoutMs"]["default"], 60_000);
+        assert_eq!(input["properties"]["timeoutMs"]["maximum"], 120_000);
+        assert!(input["properties"].get("afterCursor").is_none());
+    }
+
+    #[test]
+    fn codex_inspect_schema_separates_semantic_and_raw_observation() {
+        let input = codex_inspect_schema();
+        assert_eq!(input["properties"]["detail"]["default"], "semantic");
+        assert_eq!(
+            input["properties"]["detail"]["enum"],
+            json!(["semantic", "raw"])
         );
+        let output = codex_inspect_output_schema().to_string();
+        assert!(output.contains("currentActivity"));
+        assert!(output.contains("hasMore"));
+        assert!(output.contains("Original official notification data"));
     }
 
     #[test]
@@ -1113,6 +1212,7 @@ mod tests {
             "codex.action.respond",
             "codex.control",
             "codex.info",
+            "codex.inspect",
             "codex.start",
             "codex.wait",
             "command.control",
@@ -1249,6 +1349,10 @@ mod tests {
                 Some("codex.start"),
             ),
             ("wait for the coding agent to finish", Some("codex.wait")),
+            (
+                "show me what the coding agent has been doing",
+                Some("codex.inspect"),
+            ),
             ("review my uncommitted changes", Some("codex.start")),
             ("show me this png", Some("view_image")),
             (
@@ -1258,7 +1362,7 @@ mod tests {
             ("show models, skills, and usage", Some("codex.info")),
             ("what is the weather", None),
         ];
-        assert_eq!(cases.len(), 15);
+        assert_eq!(cases.len(), 16);
         assert!(cases.iter().all(|(_, tool)| {
             tool.is_none_or(|name| tool_catalog().iter().any(|t| t.name.as_ref() == name))
         }));

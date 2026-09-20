@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from support.mcp_client import McpClient
@@ -23,7 +24,7 @@ CONTRACT = json.loads((ROOT / "config/app-server-tool-schemas.json").read_text()
 EXPECTED = {
     "status", "inspect", "apply_patch", "view_image", "command.exec",
     "command.start", "command.read", "command.control",
-    "codex.start", "codex.wait", "codex.control", "codex.action.respond", "codex.info",
+    "codex.start", "codex.wait", "codex.inspect", "codex.control", "codex.action.respond", "codex.info",
 }
 
 
@@ -94,9 +95,25 @@ class OperatorProtocolTests(unittest.TestCase):
 
     def wait(self, work, timeout=1000, **arguments):
         return self.client.call("codex.wait", {
-            "threadId": work["threadId"], "turnId": work["turnId"], "afterCursor": work["cursor"],
+            "threadId": work["threadId"], "turnId": work["turnId"],
             "timeoutMs": timeout, **arguments,
         })
+
+    def inspect_turn(self, work, detail="semantic", after_cursor=None):
+        return self.client.call("codex.inspect", {
+            "threadId": work["threadId"],
+            "turnId": work["turnId"],
+            "afterCursor": work["cursor"] if after_cursor is None else after_cursor,
+            "detail": detail,
+        })
+
+    def transcript(self, work):
+        thread_id = urllib.parse.quote(work["threadId"], safe="")
+        turn_id = urllib.parse.quote(work["turnId"], safe="")
+        with urllib.request.urlopen(
+            f"{self.url}/observe/transcript/{thread_id}/{turn_id}"
+        ) as response:
+            return json.load(response)
 
     def method_params(self, method):
         return [
@@ -127,14 +144,23 @@ class OperatorProtocolTests(unittest.TestCase):
         self.fail("worker event was not delivered on the host plane")
 
     def test_catalog_and_status_are_canonical(self):
-        self.assertEqual(len(self.client.catalog), 13)
+        self.assertEqual(len(self.client.catalog), 14)
         self.assertEqual(set(self.client.tools), EXPECTED)
         wait_timeout = self.client.tools["codex.wait"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(wait_timeout["default"], 45000)
-        self.assertEqual(wait_timeout["maximum"], 45000)
+        self.assertEqual(wait_timeout["default"], 60000)
+        self.assertEqual(wait_timeout["maximum"], 120000)
+        self.assertEqual(wait_timeout["minimum"], 1)
+        self.assertNotIn("afterCursor", self.client.tools["codex.wait"]["inputSchema"]["properties"])
+        self.assertEqual(
+            self.client.tools["codex.inspect"]["inputSchema"]["properties"]["detail"]["default"],
+            "semantic",
+        )
         exec_timeout = self.client.tools["command.exec"]["inputSchema"]["properties"]["timeoutMs"]
         self.assertEqual(exec_timeout["default"], 60000)
-        self.assertEqual(exec_timeout["maximum"], 60 * 60 * 1000)
+        self.assertEqual(exec_timeout["maximum"], 300000)
+        read_timeout = self.client.tools["command.read"]["inputSchema"]["properties"]["timeoutMs"]
+        self.assertEqual(read_timeout["default"], 30000)
+        self.assertEqual(read_timeout["maximum"], 120000)
         start_size = self.client.tools["command.start"]["inputSchema"]["properties"]["size"]["anyOf"][0]
         resize = self.client.tools["command.control"]["inputSchema"]["oneOf"][1]["properties"]
         self.assertEqual(start_size["properties"]["rows"]["minimum"], 1)
@@ -299,7 +325,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertNotIn("disableTimeout", schema)
         self.assertNotIn("disableOutputCap", schema)
         self.assertEqual(schema["timeoutMs"]["default"], 60000)
-        self.assertEqual(schema["timeoutMs"]["maximum"], 3600000)
+        self.assertEqual(schema["timeoutMs"]["maximum"], 300000)
         self.assertEqual(schema["outputBytesCap"]["default"], 65536)
         inherited = self.client.call("command.exec", {"command":["fixture-policy"]})
         self.assertIsNone(json.loads(inherited["stdout"]))
@@ -311,7 +337,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertFalse(result["stderrMayBeTruncated"])
         self.assertGreaterEqual(result["durationMs"], 0)
         self.assertEqual(self.client.call("command.exec", {
-            "command":["echo","fixture"], "timeoutMs":3600000,
+            "command":["echo","fixture"], "timeoutMs":300000,
         })["exitCode"], 0)
         self.assertEqual(self.client.call("command.exec", {
             "command":["echo","fixture"], "cwd":"/etc",
@@ -320,7 +346,7 @@ class OperatorProtocolTests(unittest.TestCase):
             {"command":[]}, {"command":["echo"],"tty":True},
             {"command":["echo"],"disableTimeout":True},
             {"command":["echo"],"disableOutputCap":True},
-            {"command":["echo"],"timeoutMs":3600001},
+            {"command":["echo"],"timeoutMs":300001},
             {"command":["echo"],"sandboxPolicy":{"type":"externalSandbox"}},
             {"command":["echo"],"sandboxPolicy":{"type":"workspaceWrite","writableRoots":["project"]}},
         ]:
@@ -357,6 +383,9 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(exited["state"], "exited")
         self.assertEqual(exited["wakeReason"], "exit")
         self.assertEqual(exited["exitCode"], 143)
+        self.client.call("command.read", {
+            "processId": started["processId"], "timeoutMs": 120001,
+        }, error=True, validate_input=False)
 
         self.client.call("command.start", {
             "command": ["fixture-sandbox"],
@@ -577,7 +606,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"],"terminal")
         self.assertEqual(result["wakeReason"],"terminal")
         self.assertEqual(result["turn"]["output"][0]["text"],"fixture complete")
-        self.client.call("codex.wait",{"threadId":work["threadId"],"turnId":"missing","timeoutMs":0},error=True)
+        self.client.call("codex.inspect",{"threadId":work["threadId"],"turnId":"missing"},error=True)
         next_work = self.start(
             "idle",
             threadId=work["threadId"],
@@ -586,9 +615,8 @@ class OperatorProtocolTests(unittest.TestCase):
             serviceTier="priority",
         )
         self.assertFalse(next_work["createdThread"])
-        idle = self.wait(next_work,timeout=0)
-        self.assertEqual(idle["state"],"active")
-        self.assertEqual(idle["wakeReason"],"timeout")
+        idle = self.inspect_turn(next_work)
+        self.assertEqual(idle["status"],"inProgress")
         with urllib.request.urlopen(self.url + "/observe") as response:
             observer = json.load(response)
         observed = next(
@@ -603,10 +631,39 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIn(observed["activityKind"], {"turn", "think", "message", "tool", "file", "search", "item", "waiting"})
         self.assertIn("activitySummary", observed)
         self.assertEqual(set(observed["tokenUsage"]), {"totalTokens", "modelContextWindow"})
-        snapshot = self.client.call("codex.wait",{
-            "threadId": work["threadId"], "turnId": next_work["turnId"], "timeoutMs": 0,
+        snapshot = self.inspect_turn(next_work)
+        self.assertEqual(snapshot["turnId"], next_work["turnId"])
+        self.assertEqual(snapshot["detail"], "semantic")
+
+    def test_observer_transcript_is_live_and_survives_terminal_cleanup(self):
+        work = self.start("progress")
+        active = self.transcript(work)
+        self.assertEqual(active["threadId"], work["threadId"])
+        self.assertEqual(active["turnId"], work["turnId"])
+        self.assertEqual(active["status"], "inProgress")
+        self.assertEqual(active["activity"]["kind"], "message")
+        self.assertIn("Working", active["activity"]["summary"])
+
+        self.client.call("codex.control", {
+            "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })
-        self.assertEqual(snapshot["turn"]["id"], next_work["turnId"])
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        terminal = self.transcript(work)
+        self.assertEqual(terminal["status"], "interrupted")
+        self.assertTrue(any(
+            entry["kind"] == "agent" and entry.get("text") == "fixture complete"
+            for entry in terminal["entries"]
+        ))
+
+    def test_observer_transcript_stops_hydrating_after_the_entry_cap(self):
+        work = self.start("long_transcript")
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        before = len(self.method_params("thread/items/list"))
+        transcript = self.transcript(work)
+        calls = self.method_params("thread/items/list")[before:]
+        self.assertTrue(transcript["truncated"])
+        self.assertEqual(len(transcript["entries"]), 512)
+        self.assertIn(13, [call["limit"] for call in calls])
 
     def test_wait_rejects_timeout_above_server_limit(self):
         work = self.start("idle")
@@ -614,9 +671,14 @@ class OperatorProtocolTests(unittest.TestCase):
         self.client.call("codex.wait", {
             "threadId": work["threadId"],
             "turnId": work["turnId"],
-            "timeoutMs": 45001,
+            "timeoutMs": 120001,
         }, error=True, validate_input=False)
         self.assertEqual(len(self.method_params("thread/read")), reads_before)
+        self.client.call("codex.wait", {
+            "threadId": work["threadId"],
+            "turnId": work["turnId"],
+            "timeoutMs": 0,
+        }, error=True, validate_input=False)
         self.client.call("codex.control", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })
@@ -684,7 +746,7 @@ class OperatorProtocolTests(unittest.TestCase):
             event.get("requestId") == action_event["requestId"]
             for event in self.client.call("status").get("workerEvents", [])
         ))
-        pending = self.wait(approval_work, timeout=0)["pendingActions"][0]
+        pending = self.wait(approval_work, timeout=1)["pendingActions"][0]
         self.assertEqual(pending["requestId"], action_event["requestId"])
         self.client.call("codex.action.respond", {
             "type": "approval",
@@ -704,7 +766,7 @@ class OperatorProtocolTests(unittest.TestCase):
         ))
 
         approval_work = self.start("approval")
-        pending = self.wait(approval_work, timeout=0)["pendingActions"][0]
+        pending = self.wait(approval_work, timeout=1000)["pendingActions"][0]
         self.assertFalse(any(
             event.get("requestId") == pending["requestId"]
             for event in self.client.call("status").get("workerEvents", [])
@@ -734,11 +796,12 @@ class OperatorProtocolTests(unittest.TestCase):
                 observer = json.load(response)
             successes = [
                 event for event in observer["projection"]["events"]
-                if event["method"] == "codexConnect/threadUnsubscribed"
+                if event["kind"] == "system"
                 and event["threadId"] == work["threadId"]
+                and "thread unsubscribed" in (event["summary"] or "")
             ]
             if successes:
-                self.assertEqual(successes[-1]["params"]["status"], "unsubscribed")
+                self.assertIn("unsubscribed", successes[-1]["summary"])
                 break
             time.sleep(0.025)
         else:
@@ -768,8 +831,9 @@ class OperatorProtocolTests(unittest.TestCase):
                 observer = json.load(response)
             failures = [
                 event for event in observer["projection"]["events"]
-                if event["method"] == "codexConnect/threadUnsubscribeFailed"
+                if event["kind"] == "error"
                 and event["threadId"] == work["threadId"]
+                and "thread unsubscribe failed" in (event["summary"] or "")
             ]
             if failures:
                 break
@@ -832,17 +896,25 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"], "terminal")
         self.assertEqual(result["turnId"], work["turnId"])
 
-    def test_wait_ignores_progress_until_lease_expiry_and_preserves_journal(self):
+    def test_wait_ignores_progress_and_inspect_owns_worker_history(self):
         for scenario in ("idle","progress","oversized"):
             work = self.start(scenario)
             result = self.wait(work,timeout=100)
             self.assertEqual(result["state"],"active")
             self.assertEqual(result["wakeReason"],"timeout")
+            self.assertNotIn("events", result)
+            self.assertNotIn("cursor", result)
+            self.assertIn("currentActivity", result)
             if scenario == "progress":
-                self.assertIn("turn/started", [event["method"] for event in result["events"]])
-                self.assertIn("item/agentMessage/delta", [event["method"] for event in result["events"]])
+                semantic = self.inspect_turn(work)
+                self.assertEqual(semantic["detail"], "semantic")
+                self.assertIn("turn", [event["kind"] for event in semantic["events"]])
+                self.assertNotIn("delta", json.dumps(semantic["events"]))
+                raw = self.inspect_turn(work, detail="raw")
+                self.assertIn("item/agentMessage/delta", [event["method"] for event in raw["events"]])
             if scenario == "oversized":
-                self.assertTrue(any(event["truncated"] for event in result["events"]))
+                raw = self.inspect_turn(work, detail="raw")
+                self.assertTrue(any(event["truncated"] for event in raw["events"]))
             self.client.call("codex.control",{"action":"steer","threadId":work["threadId"],"expectedTurnId":work["turnId"],"instruction":"continue"})
             self.client.call("codex.control",{"action":"interrupt","threadId":work["threadId"],"turnId":work["turnId"]})
             interrupted = self.wait(work)
@@ -908,7 +980,7 @@ class OperatorProtocolTests(unittest.TestCase):
         notification_result = self.wait(notification, timeout=5000)
         self.assertEqual(notification_result["state"], "terminal")
         self.assertEqual(notification_result["wakeReason"], "terminal")
-        self.assertTrue(notification_result["historyLost"])
+        self.assertTrue(self.inspect_turn(notification)["historyLost"])
         self.assertTrue(any(
             event.get("kind") == "historyLost"
             for event in self.client.call("status").get("workerEvents", [])
@@ -917,11 +989,7 @@ class OperatorProtocolTests(unittest.TestCase):
         request = self.start("oversized_question")
         request_result = self.wait(request, timeout=5000)
         if request_result["state"] != "terminal":
-            request_result = self.wait(
-                request,
-                timeout=5000,
-                afterCursor=request_result["cursor"],
-            )
+            request_result = self.wait(request, timeout=5000)
         self.assertEqual(request_result["state"], "terminal")
         self.assertEqual(request_result["pendingActions"], [])
 
@@ -945,7 +1013,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(completed["wakeReason"],"terminal")
         self.client.call("codex.action.respond",{"type":"userInput","requestId":request_id,"answers":{"format":["JSON"]}},error=True)
         self.assertEqual(self.client.call("codex.wait",{
-            "threadId": work["threadId"], "turnId": work["turnId"], "timeoutMs": 0,
+            "threadId": work["threadId"], "turnId": work["turnId"], "timeoutMs": 1,
         })["pendingActions"], [])
 
     def test_nonblocking_question_does_not_wake_join_and_interrupt_cleans_up(self):
@@ -956,7 +1024,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertFalse(result["pendingActions"][0]["isBlocking"])
         self.client.call("codex.control",{"action":"interrupt","threadId":work["threadId"],"turnId":work["turnId"]})
         self.assertEqual(self.client.call("codex.wait",{
-            "threadId": work["threadId"], "turnId": work["turnId"], "timeoutMs": 0,
+            "threadId": work["threadId"], "turnId": work["turnId"], "timeoutMs": 1,
         })["pendingActions"], [])
 
     def test_typed_approval_permission_and_elicitation_paths(self):
@@ -1139,8 +1207,8 @@ class OperatorProtocolTests(unittest.TestCase):
 
         source = self.start("complete")
         self.assertEqual(self.wait(source)["state"], "terminal")
-        self.client.call("codex.wait", {
-            "threadId": source["threadId"], "turnId": source["turnId"], "timeoutMs": 0,
+        self.client.call("codex.inspect", {
+            "threadId": source["threadId"], "turnId": source["turnId"], "detail": "semantic",
         })
 
         resumed = self.start("idle", threadId=source["threadId"])

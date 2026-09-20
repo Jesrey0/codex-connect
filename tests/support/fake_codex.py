@@ -321,6 +321,13 @@ for line in sys.stdin:
                 )
                 thread["turns"].append(filler)
             complete(thread_id, turn_id)
+        elif scenario == "long_transcript":
+            turn["status"] = "completed"
+            turn["items"] = [
+                {"type": "agentMessage", "id": f"entry-{index}", "text": f"entry {index}"}
+                for index in range(700)
+            ]
+            notify("turn/completed", {"threadId": thread_id, "turn": turn})
         elif scenario == "unsubscribe_error":
             unsubscribe_failures.add(thread_id)
             complete(thread_id, turn_id)

@@ -905,6 +905,37 @@ pub(crate) async fn backend_observer_once(config: &BackendConfig) -> Result<serd
     Ok(serde_json::from_slice(&body)?)
 }
 
+pub(crate) async fn backend_transcript_once(
+    config: &BackendConfig,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<serde_json::Value> {
+    let addr = config.listen_addr()?;
+    let path = format!(
+        "/observe/transcript/{}/{}",
+        percent_encode_path_segment(thread_id),
+        percent_encode_path_segment(turn_id)
+    );
+    let (status, body) = http_get(addr, &path).await?;
+    if status != 200 {
+        bail!("transcript endpoint returned HTTP {status}");
+    }
+    Ok(serde_json::from_slice(&body)?)
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
 async fn http_get(addr: SocketAddr, path: &str) -> Result<(u16, Vec<u8>)> {
     let mut stream = timeout(HEALTH_TIMEOUT, TcpStream::connect(addr)).await??;
     let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");

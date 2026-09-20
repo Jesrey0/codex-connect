@@ -1,11 +1,13 @@
 //! ChatGPT-oriented composition over the pinned official App Server.
 
 mod actions;
+mod activity;
 mod command_sessions;
 mod event_journal;
 mod operator_inbox;
 
 pub use actions::{ApprovalDecision, ElicitationAction, PermissionGrant, PermissionScope};
+use activity::{activity, compact_text};
 use base64::Engine;
 pub use codex_connect_app_server::protocol::{
     ApprovalPolicy, CommandExec, CommandExecTerminalSize, ModelList, ReviewTarget, RpcId,
@@ -37,15 +39,20 @@ use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, Instant};
 
-pub const MAX_WAIT_MS: u64 = 45_000;
+pub const MAX_WAIT_MS: u64 = 120_000;
 const WAIT_RECONCILE_MS: u64 = 1_000;
 const OBSERVER_USAGE_REFRESH_MS: u64 = 5_000;
+const MAX_SEMANTIC_EVENTS: usize = 16;
+const MAX_TRANSCRIPT_TEXT_CHARS: usize = 32 * 1024;
+const MAX_TRANSCRIPT_TOTAL_CHARS: usize = 192 * 1024;
+const MAX_TRANSCRIPT_ENTRIES: usize = 512;
 const MAX_LIVE_TURNS: usize = 256;
 const TURN_PAGE_SIZE: u32 = 50;
 const ITEM_PAGE_SIZE: u32 = 100;
+pub const COMMAND_EXEC_RESPONSE_ALLOWANCE_MS: u64 = 5_000;
 pub const DEFAULT_COMMAND_MS: u64 = 60_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
-pub const MAX_COMMAND_MS: u64 = 60 * 60 * 1_000;
+pub const MAX_COMMAND_MS: u64 = 5 * 60 * 1_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_COMMAND_READ_MS: u64 = 120_000;
 pub const DEFAULT_COMMAND_READ_MS: u64 = 30_000;
@@ -352,19 +359,9 @@ impl LiveTurns {
             return;
         }
 
-        observed.last_activity_at_ms = now_epoch_ms();
-        match method {
-            "turn/started" => {
-                observed.activity_kind = "turn".into();
-                observed.activity_summary = Some("started".into());
-            }
-            "turn/completed" => {
-                observed.activity_kind = "turn".into();
-                observed.activity_summary = params["turn"]["status"]
-                    .as_str()
-                    .map(|status| format!("turn {status}"));
-            }
-            "item/agentMessage/delta" => {
+        if method == "item/agentMessage/delta" {
+            observed.last_activity_at_ms = now_epoch_ms();
+            {
                 let item_id = params["itemId"].as_str().unwrap_or_default();
                 if observed.message_item_id.as_deref() != Some(item_id) {
                     observed.message_item_id = Some(item_id.to_string());
@@ -378,55 +375,13 @@ impl LiveTurns {
                 observed.activity_summary = (!observed.message_excerpt.is_empty())
                     .then(|| observed.message_excerpt.clone());
             }
-            "item/started" | "item/completed" => {
-                let item = &params["item"];
-                let item_type = item["type"].as_str().unwrap_or("item");
-                match item_type {
-                    "reasoning" => {
-                        // The observer intentionally exposes only the phase, never hidden
-                        // reasoning content or summaries.
-                        observed.activity_kind = "think".into();
-                        observed.activity_summary = None;
-                    }
-                    "commandExecution" => {
-                        observed.activity_kind = "tool".into();
-                        observed.activity_summary = item["command"]
-                            .as_str()
-                            .map(|command| compact_text(command, 320));
-                    }
-                    "agentMessage" => {
-                        observed.activity_kind = "message".into();
-                        observed.activity_summary = item["text"]
-                            .as_str()
-                            .map(|message| compact_text(message, 240));
-                    }
-                    "fileChange" => {
-                        observed.activity_kind = "file".into();
-                        observed.activity_summary = Some("filesystem change".into());
-                    }
-                    "mcpToolCall" => {
-                        observed.activity_kind = "tool".into();
-                        observed.activity_summary = item["tool"]
-                            .as_str()
-                            .or_else(|| item["name"].as_str())
-                            .map(|tool| compact_text(tool, 160));
-                    }
-                    "webSearch" => {
-                        observed.activity_kind = "search".into();
-                        observed.activity_summary =
-                            item["query"].as_str().map(|query| compact_text(query, 200));
-                    }
-                    other => {
-                        observed.activity_kind = "item".into();
-                        observed.activity_summary = Some(other.to_string());
-                    }
-                }
-            }
-            method if method.contains("requestApproval") || method.contains("requestUserInput") => {
-                observed.activity_kind = "waiting".into();
-                observed.activity_summary = Some("operator action required".into());
-            }
-            _ => {}
+            return;
+        }
+
+        if let Some(next) = activity(method, params) {
+            observed.last_activity_at_ms = now_epoch_ms();
+            observed.activity_kind = next.kind;
+            observed.activity_summary = next.summary;
         }
     }
 
@@ -443,17 +398,6 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
-}
-
-fn compact_text(value: &str, max_chars: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = compact.chars();
-    let clipped = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{clipped}…")
-    } else {
-        clipped
-    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -623,6 +567,25 @@ impl Relay {
         self.live_turns.lock().await.get(thread_id, turn_id)
     }
 
+    async fn current_activity_value(&self, thread_id: &str, turn_id: &str) -> Value {
+        let live = self.live_turns.lock().await;
+        let Some(observed) = live
+            .turns
+            .get(&(thread_id.to_string(), turn_id.to_string()))
+        else {
+            return Value::Null;
+        };
+        json!({
+            "kind": observed.activity_kind,
+            "summary": observed.activity_summary,
+            "lastActivityAtMs": observed.last_activity_at_ms,
+            "tokenUsage": {
+                "totalTokens": observed.token_usage_total,
+                "modelContextWindow": observed.model_context_window,
+            }
+        })
+    }
+
     async fn forget_live_turn(&self, thread_id: &str, turn_id: &str) {
         self.live_turns.lock().await.remove(thread_id, turn_id);
     }
@@ -780,8 +743,11 @@ impl Relay {
         );
         let output_bytes_cap = request.output_bytes_cap.unwrap();
         request.sandbox_policy = None;
-        // App Server enforces process timeout; transport adds a small finite delivery allowance.
-        let duration = Duration::from_millis(request.timeout_ms.unwrap() + 5_000);
+        // App Server owns the child-process timeout. Keep a small local allowance for its final
+        // response delivery; any outer tunnel command deadline is independently owned and enforced
+        // by tunnel-client/control-plane metadata rather than duplicated here.
+        let duration =
+            Duration::from_millis(request.timeout_ms.unwrap() + COMMAND_EXEC_RESPONSE_ALLOWANCE_MS);
         let started = Instant::now();
         let response = self
             .app_server
@@ -875,7 +841,11 @@ impl Relay {
         after_cursor: u64,
         timeout_ms: u64,
     ) -> Result<Value, RelayError> {
-        let timeout_ms = timeout_ms.min(MAX_COMMAND_READ_MS);
+        if timeout_ms > MAX_COMMAND_READ_MS {
+            return Err(RelayError::Invalid(format!(
+                "timeoutMs must be less than or equal to {MAX_COMMAND_READ_MS}"
+            )));
+        }
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut changes = self.command_sessions.changes();
         loop {
@@ -1153,27 +1123,53 @@ impl Relay {
         thread_id: &str,
         turn: &mut codex_connect_app_server::protocol::Turn,
     ) -> Result<(), RelayError> {
+        turn.items = self.read_turn_items(thread_id, &turn.id).await?;
+        Ok(())
+    }
+
+    async fn read_turn_items(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<Value>, RelayError> {
+        self.read_turn_items_limited(thread_id, turn_id, None).await
+    }
+
+    async fn read_turn_items_limited(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        max_items: Option<usize>,
+    ) -> Result<Vec<Value>, RelayError> {
         let mut cursor = None;
         let mut items = Vec::new();
         loop {
+            let page_limit = max_items
+                .map(|max| max.saturating_sub(items.len()).min(ITEM_PAGE_SIZE as usize) as u32)
+                .unwrap_or(ITEM_PAGE_SIZE);
+            if page_limit == 0 {
+                break;
+            }
             let response = self
                 .app_server
                 .request(ThreadItemsList {
                     thread_id: thread_id.to_string(),
-                    turn_id: Some(turn.id.clone()),
+                    turn_id: Some(turn_id.to_string()),
                     cursor,
-                    limit: Some(ITEM_PAGE_SIZE),
+                    limit: Some(page_limit),
                     sort_direction: Some(SortDirection::Asc),
                 })
                 .await?;
             items.extend(response.data.into_iter().map(|entry| entry.item));
+            if max_items.is_some_and(|max| items.len() >= max) {
+                break;
+            }
             match response.next_cursor {
                 Some(next) => cursor = Some(next),
                 None => break,
             }
         }
-        turn.items = items;
-        Ok(())
+        Ok(items)
     }
 
     async fn find_stored_turn_metadata(
@@ -1207,12 +1203,11 @@ impl Relay {
         &self,
         thread_id: String,
         turn_id: String,
-        after_cursor: u64,
         timeout_ms: u64,
     ) -> Result<Value, RelayError> {
-        if timeout_ms > MAX_WAIT_MS {
+        if timeout_ms == 0 || timeout_ms > MAX_WAIT_MS {
             return Err(RelayError::Invalid(format!(
-                "timeoutMs must be less than or equal to {MAX_WAIT_MS}"
+                "timeoutMs must be between 1 and {MAX_WAIT_MS}"
             )));
         }
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -1225,9 +1220,9 @@ impl Relay {
             self.read_thread_metadata(thread_id.clone()).await?;
             self.find_stored_turn_metadata(&thread_id, &turn_id).await
         };
-        let mut stored = if timeout_ms == 0 || initial_live.is_none() {
-            // A zero-duration snapshot, or a turn that predates this relay process, needs the
-            // minimum authoritative read required to establish trustworthy state.
+        let mut stored = if initial_live.is_none() {
+            // A turn that predates this relay process needs the minimum authoritative read
+            // required to establish trustworthy state.
             initial_reconcile.await?
         } else {
             match tokio::time::timeout_at(deadline, initial_reconcile).await {
@@ -1271,16 +1266,11 @@ impl Relay {
                         .is_none_or(|id| Some(id) == selected_id)
                 })
                 .collect::<Vec<_>>();
-            let batch = self
-                .journal
-                .read_after(after_cursor, &thread_id, selected_id)
-                .await
-                .map_err(RelayError::Invalid)?;
+            let activity = self.current_activity_value(&thread_id, &turn_id).await;
             if let Some((state, wake_reason)) = wait_wake(Some(selected.status), &pending) {
                 let result = json!({
                     "threadId":thread_id,"turnId":selected_id,"state":state,"wakeReason":wake_reason,
-                    "turn":turn_snapshot(&selected), "cursor":batch.cursor,
-                    "historyLost":batch.history_lost,"events":batch.events,
+                    "turn":turn_snapshot(&selected), "currentActivity":activity,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 });
                 self.acknowledge_wait_result(&result).await;
@@ -1295,8 +1285,7 @@ impl Relay {
             if Instant::now() >= deadline {
                 let result = json!({
                     "threadId":thread_id,"turnId":selected_id,"state":"active","wakeReason":"timeout",
-                    "turn":turn_snapshot(&selected), "cursor":batch.cursor,
-                    "historyLost":batch.history_lost,"events":batch.events,
+                    "turn":turn_snapshot(&selected), "currentActivity":activity,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 });
                 self.acknowledge_wait_result(&result).await;
@@ -1329,12 +1318,11 @@ impl Relay {
                         if changed.is_err() {
                             return Err(AppServerError::Disconnected.into());
                         }
-                        let batch = self
-                            .journal
-                            .read_after(after_cursor, &thread_id, selected_id.as_deref())
+                        if self
+                            .live_turn(&thread_id, &turn_id)
                             .await
-                            .map_err(RelayError::Invalid)?;
-                        if batch.history_lost || batch.events.iter().any(|event| event.method == "turn/completed") {
+                            .is_some_and(|turn| turn.status.is_terminal())
+                        {
                             break true;
                         }
                     }
@@ -1356,6 +1344,73 @@ impl Relay {
                     }
                 }
             }
+        }
+    }
+
+    pub async fn work_inspect(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        after_cursor: u64,
+        raw: bool,
+    ) -> Result<Value, RelayError> {
+        self.read_thread_metadata(thread_id.clone()).await?;
+        let live = self.live_turn(&thread_id, &turn_id).await;
+        let stored = self.find_stored_turn_metadata(&thread_id, &turn_id).await?;
+        let selected = match (stored, live) {
+            (Some(stored), Some(live))
+                if live.status.is_terminal() && !stored.status.is_terminal() =>
+            {
+                live
+            }
+            (Some(stored), _) => stored,
+            (None, Some(live)) => live,
+            (None, None) => {
+                return Err(RelayError::Invalid(format!(
+                    "turn {turn_id} does not exist in thread {thread_id}"
+                )));
+            }
+        };
+        let activity = self.current_activity_value(&thread_id, &turn_id).await;
+        if raw {
+            let batch = self
+                .journal
+                .read_after(after_cursor, &thread_id, Some(&turn_id))
+                .await
+                .map_err(RelayError::Invalid)?;
+            Ok(json!({
+                "threadId":thread_id,
+                "turnId":turn_id,
+                "status":selected.status,
+                "detail":"raw",
+                "currentActivity":activity,
+                "cursor":batch.cursor,
+                "historyLost":batch.history_lost,
+                "hasMore":batch.has_more,
+                "events":batch.events,
+            }))
+        } else {
+            let batch = self
+                .journal
+                .read_semantic_after(
+                    after_cursor,
+                    &thread_id,
+                    Some(&turn_id),
+                    MAX_SEMANTIC_EVENTS,
+                )
+                .await
+                .map_err(RelayError::Invalid)?;
+            Ok(json!({
+                "threadId":thread_id,
+                "turnId":turn_id,
+                "status":selected.status,
+                "detail":"semantic",
+                "currentActivity":activity,
+                "cursor":batch.cursor,
+                "historyLost":batch.history_lost,
+                "hasMore":batch.has_more,
+                "events":batch.events,
+            }))
         }
     }
 
@@ -1628,7 +1683,7 @@ impl Relay {
                 .collect::<Vec<_>>()
         };
         let pending_actions = self.pending_actions(None).await;
-        let recent = self.journal.tail(64).await;
+        let recent = self.journal.semantic_tail(64).await;
         Ok(json!({
             "cwd": self.default_cwd(),
             "usage": usage,
@@ -1638,6 +1693,48 @@ impl Relay {
             "cursor": recent.cursor,
             "historyLost": recent.history_lost,
             "events": recent.events,
+        }))
+    }
+
+    pub async fn observer_transcript(
+        &self,
+        thread_id: String,
+        turn_id: String,
+    ) -> Result<Value, RelayError> {
+        self.read_thread_metadata(thread_id.clone()).await?;
+        let live = self.live_turn(&thread_id, &turn_id).await;
+        let stored = self.find_stored_turn_metadata(&thread_id, &turn_id).await?;
+        let selected = match (stored, live) {
+            (Some(stored), Some(live))
+                if live.status.is_terminal() && !stored.status.is_terminal() =>
+            {
+                live
+            }
+            (Some(stored), _) => stored,
+            (None, Some(live)) => live,
+            (None, None) => {
+                return Err(RelayError::Invalid(format!(
+                    "turn {turn_id} does not exist in thread {thread_id}"
+                )));
+            }
+        };
+        let items = self
+            .read_turn_items_limited(&thread_id, &turn_id, Some(MAX_TRANSCRIPT_ENTRIES + 1))
+            .await?;
+        let mut truncated = items.len() > MAX_TRANSCRIPT_ENTRIES;
+        let mut remaining_chars = MAX_TRANSCRIPT_TOTAL_CHARS;
+        let entries = items
+            .iter()
+            .take(MAX_TRANSCRIPT_ENTRIES)
+            .filter_map(|item| transcript_entry(item, &mut remaining_chars, &mut truncated))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "status": selected.status,
+            "activity": self.current_activity_value(&thread_id, &turn_id).await,
+            "entries": entries,
+            "truncated": truncated,
         }))
     }
 
@@ -1887,6 +1984,127 @@ fn turn_snapshot(turn: &codex_connect_app_server::protocol::Turn) -> Value {
     json!({"id":turn.id,"status":turn.status,"error":turn.error,"output":output})
 }
 
+fn transcript_entry(
+    item: &Value,
+    remaining_chars: &mut usize,
+    truncated: &mut bool,
+) -> Option<Value> {
+    let item_type = item.get("type")?.as_str()?;
+    let status = item.get("status").cloned().unwrap_or(Value::Null);
+    match item_type {
+        "reasoning" => Some(json!({
+            "kind":"think",
+            "title":"THINK",
+            "text":Value::Null,
+            "status":status,
+        })),
+        "userMessage" => Some(json!({
+            "kind":"user",
+            "title":"USER",
+            "text":transcript_clip(&message_item_text(item).unwrap_or_default(), remaining_chars, truncated),
+            "status":status,
+        })),
+        "agentMessage" => Some(json!({
+            "kind":"agent",
+            "title":match item.get("phase").and_then(Value::as_str) {
+                Some("final_answer") => "AGENT · FINAL",
+                _ => "AGENT",
+            },
+            "text":transcript_clip(item.get("text").and_then(Value::as_str).unwrap_or_default(), remaining_chars, truncated),
+            "status":status,
+        })),
+        "exitedReviewMode" => Some(json!({
+            "kind":"agent",
+            "title":"AGENT · REVIEW",
+            "text":transcript_clip(item.get("review").and_then(Value::as_str).unwrap_or_default(), remaining_chars, truncated),
+            "status":status,
+        })),
+        "commandExecution" => Some(json!({
+            "kind":"command",
+            "title":transcript_clip(item.get("command").and_then(Value::as_str).unwrap_or("command"), remaining_chars, truncated),
+            "text":transcript_clip(item.get("aggregatedOutput").and_then(Value::as_str).unwrap_or_default(), remaining_chars, truncated),
+            "status":status,
+        })),
+        "fileChange" => Some(json!({
+            "kind":"file",
+            "title":"FILESYSTEM CHANGE",
+            "text":transcript_json(item.get("changes"), remaining_chars, truncated),
+            "status":status,
+        })),
+        "webSearch" => Some(json!({
+            "kind":"search",
+            "title":"WEB SEARCH",
+            "text":transcript_clip(item.get("query").and_then(Value::as_str).unwrap_or_default(), remaining_chars, truncated),
+            "status":status,
+        })),
+        "mcpToolCall" => {
+            let title = item
+                .get("tool")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("name").and_then(Value::as_str))
+                .unwrap_or("MCP TOOL");
+            Some(json!({
+                "kind":"tool",
+                "title":transcript_clip(title, remaining_chars, truncated),
+                "text":transcript_json(item.get("result"), remaining_chars, truncated),
+                "status":status,
+            }))
+        }
+        other => Some(json!({
+            "kind":"item",
+            "title":other,
+            "text":Value::Null,
+            "status":status,
+        })),
+    }
+}
+
+fn message_item_text(item: &Value) -> Option<String> {
+    if let Some(text) = item.get("text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    let parts = item.get("content")?.as_array()?;
+    let text = parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(text)
+}
+
+fn transcript_json(
+    value: Option<&Value>,
+    remaining_chars: &mut usize,
+    truncated: &mut bool,
+) -> Value {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Value::Null;
+    };
+    let rendered = serde_json::to_string_pretty(value).unwrap_or_default();
+    transcript_clip(&rendered, remaining_chars, truncated)
+}
+
+fn transcript_clip(value: &str, remaining_chars: &mut usize, truncated: &mut bool) -> Value {
+    if value.is_empty() {
+        return Value::Null;
+    }
+    if *remaining_chars == 0 {
+        *truncated = true;
+        return Value::String("… [observer transcript limit reached]".into());
+    }
+    let limit = MAX_TRANSCRIPT_TEXT_CHARS.min(*remaining_chars);
+    let mut chars = value.chars();
+    let clipped = chars.by_ref().take(limit).collect::<String>();
+    let consumed = clipped.chars().count();
+    *remaining_chars = remaining_chars.saturating_sub(consumed);
+    if chars.next().is_some() {
+        *truncated = true;
+        Value::String(format!("{clipped}\n… [entry truncated]"))
+    } else {
+        Value::String(clipped)
+    }
+}
+
 fn wait_wake(
     status: Option<codex_connect_app_server::protocol::TurnStatus>,
     pending: &[Arc<PendingServerRequest>],
@@ -1927,4 +2145,77 @@ fn validate_command(command: &CommandExec) -> Result<(), RelayError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_reasoning_is_phase_only() {
+        let mut remaining = MAX_TRANSCRIPT_TOTAL_CHARS;
+        let mut truncated = false;
+        let entry = transcript_entry(
+            &json!({
+                "type":"reasoning",
+                "summary":"private reasoning",
+                "content":[{"text":"hidden"}]
+            }),
+            &mut remaining,
+            &mut truncated,
+        )
+        .unwrap();
+        assert_eq!(entry["kind"], "think");
+        assert_eq!(entry["title"], "THINK");
+        assert!(entry["text"].is_null());
+        assert!(!entry.to_string().contains("private reasoning"));
+        assert!(!entry.to_string().contains("hidden"));
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn transcript_preserves_message_newlines_and_bounds_large_tool_output() {
+        let mut remaining = MAX_TRANSCRIPT_TOTAL_CHARS;
+        let mut truncated = false;
+        let message = transcript_entry(
+            &json!({"type":"agentMessage","text":"one\ntwo","phase":"commentary"}),
+            &mut remaining,
+            &mut truncated,
+        )
+        .unwrap();
+        assert_eq!(message["text"], "one\ntwo");
+        assert!(!truncated);
+
+        let mut remaining = MAX_TRANSCRIPT_TOTAL_CHARS;
+        let mut truncated = false;
+        let command = transcript_entry(
+            &json!({
+                "type":"commandExecution",
+                "command":"cargo test",
+                "aggregatedOutput":"x".repeat(MAX_TRANSCRIPT_TEXT_CHARS + 1),
+            }),
+            &mut remaining,
+            &mut truncated,
+        )
+        .unwrap();
+        assert!(truncated);
+        assert!(
+            command["text"]
+                .as_str()
+                .unwrap()
+                .contains("entry truncated")
+        );
+
+        let mut remaining = MAX_TRANSCRIPT_TOTAL_CHARS;
+        let mut truncated = false;
+        let review = transcript_entry(
+            &json!({"type":"exitedReviewMode","review":"review finding"}),
+            &mut remaining,
+            &mut truncated,
+        )
+        .unwrap();
+        assert_eq!(review["title"], "AGENT · REVIEW");
+        assert_eq!(review["text"], "review finding");
+        assert!(!truncated);
+    }
 }

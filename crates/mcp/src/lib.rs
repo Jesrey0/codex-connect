@@ -4,6 +4,7 @@ mod catalog;
 use catalog::{host_plane_reports_worker_events, tool_catalog};
 
 use axum::Router;
+use axum::extract::Path;
 use axum::http::StatusCode;
 use axum::response::Json;
 use codex_connect_host::Host;
@@ -27,10 +28,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-const DEFAULT_WAIT_MS: u64 = 45_000;
+const DEFAULT_WAIT_MS: u64 = 60_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Host tools run with host-user authority; the configured cwd is navigation only. Use codex.* for Codex semantics rather than invoking the Codex CLI through host commands. Delegated work requires an explicit sandboxPolicy, uses the server-owned on-request approval policy, and does not inherit the ChatGPT conversation; provide self-contained worker context. Delegate only when autonomous reasoning materially improves progress or verification. Once delegated, the worker owns its assigned scope until it becomes terminal, blocks for operator action, or is explicitly interrupted; continue only non-overlapping operator work and do not redo the delegated task because a codex.wait lease expired. codex.wait is a short bounded join, and timeout means the worker is still active rather than stalled; when delegated work owns the remaining critical path, repeat bounded joins instead of taking over the same scope. Treat workerEvents as semantic interrupts and codex.wait as the authoritative detailed join. Codex CLI/App Server and tunnel-client are upstream-owned. Do not create Git workflow state unless the user requests version-control work. Official App Server state is authoritative for Codex lifecycles.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Host tools run with host-user authority; the configured cwd is navigation only. Use codex.* for Codex semantics rather than invoking the Codex CLI through host commands. Tool timeouts express operation semantics; tunnel-client independently enforces any per-command upstream response deadline and that transport deadline must not be duplicated as a fixed Codex Connect invariant. Use command.exec for bounded deterministic host work and command.start/read for persistent, interactive, or unusually long-running commands. Delegated work requires an explicit sandboxPolicy, uses the server-owned on-request approval policy, and does not inherit the ChatGPT conversation; provide self-contained worker context. Delegate only when autonomous reasoning materially improves progress or verification. Once delegated, the worker owns its assigned scope until it becomes terminal, blocks for operator action, or is explicitly interrupted; continue only non-overlapping operator work and do not redo the delegated task because a codex.wait lease expired. codex.wait is synchronization-only: it quietly joins the selected turn until terminal state, operator action, or lease expiry. If delegated work still owns the remaining critical path after a timeout, repeat bounded joins rather than taking over its scope. Use codex.inspect for worker activity/history and raw forensic events. Treat workerEvents as sparse semantic interrupts, not a progress feed. Codex CLI/App Server and tunnel-client are upstream-owned. Do not create Git workflow state unless the user requests version-control work. Official App Server state is authoritative for Codex lifecycles.";
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,6 +159,7 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
     };
     let runtime_status = handler.clone();
     let observer = handler.clone();
+    let transcript = handler.clone();
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -191,6 +193,20 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
                                 "projection": projection,
                             }))
                         })
+                        .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))
+                }
+            }),
+        )
+        .route(
+            "/observe/transcript/{thread_id}/{turn_id}",
+            axum::routing::get(move |Path((thread_id, turn_id)): Path<(String, String)>| {
+                let handler = transcript.clone();
+                async move {
+                    handler
+                        .relay
+                        .observer_transcript(thread_id, turn_id)
+                        .await
+                        .map(Json)
                         .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))
                 }
             }),
@@ -452,13 +468,30 @@ enum CodexStartArgs {
 struct CodexWaitArgs {
     thread_id: String,
     turn_id: String,
-    #[serde(default)]
-    after_cursor: u64,
     #[serde(default = "default_wait_ms")]
     timeout_ms: u64,
 }
 fn default_wait_ms() -> u64 {
     DEFAULT_WAIT_MS
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CodexInspectDetail {
+    #[default]
+    Semantic,
+    Raw,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexInspectArgs {
+    thread_id: String,
+    turn_id: String,
+    #[serde(default)]
+    after_cursor: u64,
+    #[serde(default)]
+    detail: CodexInspectDetail,
 }
 
 #[derive(Deserialize)]
@@ -641,7 +674,19 @@ async fn dispatch(
         "codex.wait" => {
             let a: CodexWaitArgs = parse(arguments)?;
             relay
-                .work_wait(a.thread_id, a.turn_id, a.after_cursor, a.timeout_ms)
+                .work_wait(a.thread_id, a.turn_id, a.timeout_ms)
+                .await
+                .map_err(Into::into)
+        }
+        "codex.inspect" => {
+            let a: CodexInspectArgs = parse(arguments)?;
+            relay
+                .work_inspect(
+                    a.thread_id,
+                    a.turn_id,
+                    a.after_cursor,
+                    matches!(a.detail, CodexInspectDetail::Raw),
+                )
                 .await
                 .map_err(Into::into)
         }
@@ -881,6 +926,7 @@ fn summary_for(name: &str, value: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
         ),
+        "codex.inspect" => "Codex activity inspected.".into(),
         "inspect" => "Inspection completed.".into(),
         _ => "Operation completed.".into(),
     };
@@ -944,6 +990,8 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("server-owned on-request approval policy"));
         assert!(SERVER_INSTRUCTIONS.contains("worker owns its assigned scope"));
         assert!(SERVER_INSTRUCTIONS.contains("repeat bounded joins"));
+        assert!(SERVER_INSTRUCTIONS.contains("codex.inspect"));
+        assert!(SERVER_INSTRUCTIONS.contains("synchronization-only"));
         assert!(SERVER_INSTRUCTIONS.contains("workerEvents"));
         assert!(SERVER_INSTRUCTIONS.contains("upstream-owned"));
         assert!(SERVER_INSTRUCTIONS.contains("Official App Server state is authoritative"));

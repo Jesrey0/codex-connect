@@ -1,3 +1,4 @@
+use crate::activity::{SemanticEvent, semantic_event};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -45,6 +46,14 @@ pub struct JournalBatch {
     pub events: Vec<JournalEvent>,
     pub cursor: u64,
     pub history_lost: bool,
+    pub has_more: bool,
+}
+
+pub struct SemanticBatch {
+    pub events: Vec<SemanticEvent>,
+    pub cursor: u64,
+    pub history_lost: bool,
+    pub has_more: bool,
 }
 
 impl EventJournal {
@@ -106,6 +115,7 @@ impl EventJournal {
             events: Vec::new(),
             cursor: after,
             history_lost: after < state.dropped_through,
+            has_more: false,
         };
         let mut bytes = 0;
         for (event, size) in &state.events {
@@ -116,6 +126,7 @@ impl EventJournal {
                 && turn_id.is_none_or(|id| event.turn_id.as_deref() == Some(id));
             if matches {
                 if !batch.events.is_empty() && bytes + size > MAX_BATCH_BYTES {
+                    batch.has_more = true;
                     return Ok(batch);
                 }
                 bytes += size;
@@ -127,25 +138,78 @@ impl EventJournal {
         Ok(batch)
     }
 
-    pub async fn tail(&self, max_events: usize) -> JournalBatch {
+    pub async fn read_semantic_after(
+        &self,
+        after: u64,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        max_events: usize,
+    ) -> Result<SemanticBatch, String> {
         let state = self.state.lock().await;
-        let mut events = Vec::new();
-        let mut bytes = 0usize;
-        for (event, size) in state.events.iter().rev() {
-            if events.len() >= max_events {
-                break;
-            }
-            if !events.is_empty() && bytes + size > MAX_BATCH_BYTES {
-                break;
-            }
-            bytes += size;
-            events.push(event.clone());
+        if after > state.cursor {
+            return Err("cursor is ahead of this backend; after a backend restart, read again with afterCursor: 0".into());
         }
-        events.reverse();
-        JournalBatch {
-            events,
+        let mut batch = SemanticBatch {
+            events: Vec::new(),
+            cursor: after,
+            history_lost: after < state.dropped_through,
+            has_more: false,
+        };
+        let mut processed_cursor = after;
+        for (event, _) in &state.events {
+            if event.cursor <= after {
+                continue;
+            }
+            let matches = event.thread_id.as_deref() == Some(thread_id)
+                && turn_id.is_none_or(|id| event.turn_id.as_deref() == Some(id));
+            if matches
+                && let Some(reduced) = semantic_event(event.cursor, &event.method, &event.params)
+            {
+                let duplicate = batch.events.last().is_some_and(|previous| {
+                    previous.thread_id == reduced.thread_id
+                        && previous.turn_id == reduced.turn_id
+                        && previous.kind == reduced.kind
+                        && previous.summary == reduced.summary
+                        && previous.phase == reduced.phase
+                });
+                if !duplicate {
+                    if batch.events.len() >= max_events {
+                        batch.cursor = processed_cursor;
+                        batch.has_more = true;
+                        return Ok(batch);
+                    }
+                    batch.events.push(reduced);
+                }
+            }
+            processed_cursor = event.cursor;
+        }
+        batch.cursor = state.cursor;
+        Ok(batch)
+    }
+
+    pub async fn semantic_tail(&self, max_events: usize) -> SemanticBatch {
+        let state = self.state.lock().await;
+        let mut reduced = Vec::new();
+        for (event, _) in &state.events {
+            if let Some(entry) = semantic_event(event.cursor, &event.method, &event.params) {
+                let duplicate = reduced.last().is_some_and(|previous: &SemanticEvent| {
+                    previous.thread_id == entry.thread_id
+                        && previous.turn_id == entry.turn_id
+                        && previous.kind == entry.kind
+                        && previous.summary == entry.summary
+                        && previous.phase == entry.phase
+                });
+                if !duplicate {
+                    reduced.push(entry);
+                }
+            }
+        }
+        let start = reduced.len().saturating_sub(max_events);
+        SemanticBatch {
+            events: reduced.into_iter().skip(start).collect(),
             cursor: state.cursor,
             history_lost: state.dropped_through > 0,
+            has_more: false,
         }
     }
 }
@@ -173,6 +237,7 @@ mod tests {
         assert!(batch.history_lost);
         assert_eq!(batch.events.len(), MAX_EVENTS);
         assert_eq!(batch.cursor, (MAX_EVENTS + 20) as u64);
+        assert!(!batch.has_more);
         journal
             .push(
                 "turn/completed",
@@ -243,17 +308,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tail_returns_the_newest_events_in_order() {
+    async fn semantic_reads_drop_deltas_and_preserve_continuation() {
         let journal = EventJournal::default();
-        for n in 0..5 {
+        journal
+            .push(
+                "item/agentMessage/delta",
+                &json!({"threadId":"a","turnId":"one","delta":"noise"}),
+            )
+            .await;
+        for command in ["one", "two", "three"] {
             journal
-                .push("item/completed", &json!({"threadId":"a","n":n}))
+                .push(
+                    "item/started",
+                    &json!({"threadId":"a","turnId":"one","item":{"type":"commandExecution","command":command}}),
+                )
                 .await;
         }
-        let batch = journal.tail(3).await;
-        assert_eq!(batch.cursor, 5);
-        assert_eq!(batch.events.len(), 3);
-        assert_eq!(batch.events[0].params["n"], 2);
-        assert_eq!(batch.events[2].params["n"], 4);
+        let first = journal
+            .read_semantic_after(0, "a", Some("one"), 2)
+            .await
+            .unwrap();
+        assert_eq!(first.events.len(), 2);
+        assert!(first.has_more);
+        let second = journal
+            .read_semantic_after(first.cursor, "a", Some("one"), 2)
+            .await
+            .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert!(!second.has_more);
+        assert_eq!(second.events[0].summary.as_deref(), Some("three"));
+    }
+
+    #[tokio::test]
+    async fn semantic_tail_does_not_deduplicate_different_workers() {
+        let journal = EventJournal::default();
+        journal
+            .push("turn/started", &json!({"threadId":"a","turn":{"id":"one"}}))
+            .await;
+        journal
+            .push("turn/started", &json!({"threadId":"b","turn":{"id":"two"}}))
+            .await;
+        let tail = journal.semantic_tail(10).await;
+        assert_eq!(tail.events.len(), 2);
+        assert_eq!(tail.events[0].thread_id.as_deref(), Some("a"));
+        assert_eq!(tail.events[1].thread_id.as_deref(), Some("b"));
     }
 }
