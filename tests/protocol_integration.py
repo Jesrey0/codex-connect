@@ -144,7 +144,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(set(self.client.tools), EXPECTED)
         wait_timeout = self.client.tools["codex.wait"]["inputSchema"]["properties"]["timeoutMs"]
         self.assertEqual(wait_timeout["default"], 20000)
-        self.assertEqual(wait_timeout["maximum"], 30000)
+        self.assertEqual(wait_timeout["maximum"], 300000)
         self.assertEqual(wait_timeout["minimum"], 1)
         self.assertNotIn("afterCursor", self.client.tools["codex.wait"]["inputSchema"]["properties"])
         self.assertEqual(
@@ -735,12 +735,20 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertTrue(all(len(entry["text"]) == 32 * 1024 for entry in transcript["entries"]))
 
     def test_wait_rejects_timeout_above_server_limit(self):
+        complete = self.start("complete")
+        longest = self.client.call("codex.wait", {
+            "threadId": complete["threadId"],
+            "turnId": complete["turnId"],
+            "timeoutMs": 300000,
+        })
+        self.assertEqual(longest["state"], "terminal")
+
         work = self.start("idle")
         reads_before = len(self.method_params("thread/read"))
         self.client.call("codex.wait", {
             "threadId": work["threadId"],
             "turnId": work["turnId"],
-            "timeoutMs": 120001,
+            "timeoutMs": 300001,
         }, error=True, validate_input=False)
         self.assertEqual(len(self.method_params("thread/read")), reads_before)
         self.client.call("codex.wait", {

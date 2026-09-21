@@ -10,7 +10,8 @@ use axum::response::Json;
 use codex_connect_host::Host;
 use codex_connect_relay::{
     ApprovalDecision, CommandExec, CommandExecTerminalSize, ElicitationAction, MAX_WAIT_MS,
-    PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
+    MAX_WAIT_OPERATION_MS, PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId,
+    SandboxPolicy,
 };
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
@@ -33,6 +34,8 @@ use tokio::net::TcpListener;
 const DEFAULT_WAIT_MS: u64 = 20_000;
 const SYNCHRONOUS_TOOL_TARGET_MS: u64 = 40_000;
 const SYNCHRONOUS_TOOL_GUARD_MS: u64 = 45_000;
+const CODEX_WAIT_GUARD_ALLOWANCE_MS: u64 = 15_000;
+const CODEX_WAIT_GUARD_MS: u64 = MAX_WAIT_OPERATION_MS + 5_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_CONCURRENCY: usize = 4;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -398,8 +401,9 @@ impl ServerHandler for McpHandler {
             };
         }
         let operation_cancelled = Arc::new(AtomicBool::new(false));
+        let guard_ms = tool_guard_ms(name, &arguments);
         let dispatched = tokio::time::timeout(
-            Duration::from_millis(SYNCHRONOUS_TOOL_GUARD_MS),
+            Duration::from_millis(guard_ms),
             dispatch(
                 &self.relay,
                 &self.host,
@@ -415,7 +419,7 @@ impl ServerHandler for McpHandler {
             Err(_) => {
                 operation_cancelled.store(true, Ordering::Release);
                 Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "synchronous MCP operation exceeded the {SYNCHRONOUS_TOOL_GUARD_MS} ms guard (normal target {SYNCHRONOUS_TOOL_TARGET_MS} ms); use an asynchronous/persistent path when the operation can outlive one ChatGPT tool call"
+                    "MCP operation exceeded its {guard_ms} ms local guard; tunnel-client independently owns and may enforce a shorter outer response deadline"
                 ))])
                 .into())
             }
@@ -433,6 +437,20 @@ impl ServerHandler for McpHandler {
             }
         }
     }
+}
+
+fn tool_guard_ms(name: &str, arguments: &JsonObject) -> u64 {
+    if name != "codex.wait" {
+        return SYNCHRONOUS_TOOL_GUARD_MS;
+    }
+    let requested = arguments
+        .get("timeoutMs")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_WAIT_MS)
+        .min(MAX_WAIT_MS);
+    requested
+        .saturating_add(CODEX_WAIT_GUARD_ALLOWANCE_MS)
+        .min(CODEX_WAIT_GUARD_MS)
 }
 
 #[derive(Deserialize)]
@@ -1075,7 +1093,10 @@ async fn image_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{SERVER_INSTRUCTIONS, SYNCHRONOUS_TOOL_GUARD_MS, SYNCHRONOUS_TOOL_TARGET_MS};
+    use super::{
+        CODEX_WAIT_GUARD_MS, SERVER_INSTRUCTIONS, SYNCHRONOUS_TOOL_GUARD_MS,
+        SYNCHRONOUS_TOOL_TARGET_MS, tool_guard_ms,
+    };
 
     #[test]
     fn server_instructions_define_compact_execution_domain_invariants() {
@@ -1099,5 +1120,14 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("Do not create Git workflow state unless requested"));
         assert_eq!(SYNCHRONOUS_TOOL_TARGET_MS, 40_000);
         assert_eq!(SYNCHRONOUS_TOOL_GUARD_MS, 45_000);
+        assert_eq!(CODEX_WAIT_GUARD_MS, 315_000);
+        let default_wait = serde_json::Map::new();
+        assert_eq!(tool_guard_ms("codex.wait", &default_wait), 35_000);
+        let max_wait = serde_json::json!({"timeoutMs":300_000});
+        assert_eq!(
+            tool_guard_ms("codex.wait", max_wait.as_object().unwrap()),
+            315_000
+        );
+        assert_eq!(tool_guard_ms("command.read", &default_wait), 45_000);
     }
 }

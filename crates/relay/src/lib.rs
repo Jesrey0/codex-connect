@@ -39,9 +39,9 @@ use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, Instant};
 
-pub const MAX_WAIT_MS: u64 = 30_000;
+pub const MAX_WAIT_MS: u64 = 300_000;
 const WAIT_FINALIZATION_RESERVE_MS: u64 = 10_000;
-const MAX_WAIT_OPERATION_MS: u64 = 40_000;
+pub const MAX_WAIT_OPERATION_MS: u64 = MAX_WAIT_MS + WAIT_FINALIZATION_RESERVE_MS;
 const WAIT_FINAL_RECONCILE_MS: u64 = 500;
 const WAIT_STORAGE_RETRY_MS: u64 = 25;
 const WAIT_STORAGE_RETRY_MAX_MS: u64 = 500;

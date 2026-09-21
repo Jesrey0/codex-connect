@@ -773,7 +773,7 @@ fn codex_wait_schema() -> Value {
         json!({
             "threadId":{"type":"string","description":"Codex thread ID returned by codex.start."},
             "turnId":{"type":"string","description":"Specific delegated turn ID returned by codex.start."},
-            "timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet synchronization lease. Defaults to 20000 and may extend to 30000; Codex Connect may spend additional bounded time reconciling terminal state while remaining inside its 40000 ms target/45000 ms guard. Lease expiry means the worker remains active, not stalled. tunnel-client independently owns any outer response deadline."}
+            "timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet event-driven synchronization lease. Defaults to 20000 and may extend to 300000 (5 minutes). For long delegated or review work, prefer one generous lease instead of repeatedly renewing short waits. Returns early on terminal state or required operator input/action. Lease expiry means the worker remains active, not stalled. Codex Connect may spend up to 10 seconds of bounded terminal/reconciliation finalization beyond the requested lease; tunnel-client independently owns and may enforce a shorter outer response deadline."}
         }),
         &["threadId", "turnId"],
     )
@@ -1170,7 +1170,7 @@ mod tests {
         );
         assert_eq!(input["properties"]["timeoutMs"]["minimum"], 1);
         assert_eq!(input["properties"]["timeoutMs"]["default"], 20_000);
-        assert_eq!(input["properties"]["timeoutMs"]["maximum"], 30_000);
+        assert_eq!(input["properties"]["timeoutMs"]["maximum"], 300_000);
         assert!(
             input
                 .to_string()

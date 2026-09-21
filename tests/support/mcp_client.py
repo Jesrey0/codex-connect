@@ -8,8 +8,9 @@ import jsonschema
 
 
 class McpClient:
-    def __init__(self, url):
+    def __init__(self, url, request_timeout=40):
         self.url = url.rstrip("/")
+        self.request_timeout = request_timeout
         self.ids = itertools.count(1)
         self.session = None
         self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "codex-connect-smoke", "version": ""}})
@@ -27,7 +28,7 @@ class McpClient:
         if self.session:
             headers["Mcp-Session-Id"] = self.session
         request = urllib.request.Request(self.url + "/mcp", json.dumps(value).encode(), headers)
-        with urllib.request.urlopen(request, timeout=40) as response:
+        with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
             self.session = response.headers.get("Mcp-Session-Id", self.session)
             raw = response.read().decode()
         if not raw:
