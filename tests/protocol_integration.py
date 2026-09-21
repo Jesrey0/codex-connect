@@ -639,11 +639,13 @@ class OperatorProtocolTests(unittest.TestCase):
         self.client.call("command.control", {"action": "terminate", "processId": started["processId"]})
 
     def test_authoritative_completion_without_events_and_unknown_turn(self):
+        turns_before = len(self.method_params("thread/turns/list"))
         work = self.start("no_event")
         result = self.wait(work)
         self.assertEqual(result["state"],"terminal")
         self.assertEqual(result["wakeReason"],"terminal")
         self.assertEqual(result["turn"]["output"][0]["text"],"fixture complete")
+        self.assertEqual(len(self.method_params("thread/turns/list")) - turns_before, 1)
         self.client.call("codex.inspect",{"threadId":work["threadId"],"turnId":"missing"},error=True)
         next_work = self.start(
             "idle",
@@ -998,21 +1000,21 @@ class OperatorProtocolTests(unittest.TestCase):
             self.assertEqual(interrupted["wakeReason"],"terminal")
             self.assertEqual(interrupted["turn"]["status"],"interrupted")
 
-    def test_quiet_wait_reconciles_status_without_rehydrating_items(self):
+    def test_quiet_wait_reconciles_once_at_lease_expiry_without_rehydrating_items(self):
         work = self.start("idle")
         turns_before = len(self.method_params("thread/turns/list"))
         items_before = len(self.method_params("thread/items/list"))
         result = self.wait(work, timeout=2500)
         self.assertEqual(result["state"], "active")
         self.assertEqual(result["wakeReason"], "timeout")
-        self.assertGreaterEqual(len(self.method_params("thread/turns/list")) - turns_before, 2)
+        self.assertEqual(len(self.method_params("thread/turns/list")) - turns_before, 1)
         self.assertEqual(len(self.method_params("thread/items/list")) - items_before, 0)
         self.client.call("codex.control", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })
         self.assertEqual(self.wait(work)["state"], "terminal")
 
-    def test_terminal_wait_hydrates_items_once_after_nonterminal_reconciliation(self):
+    def test_terminal_notification_hydrates_items_without_status_polling(self):
         work = self.start("delayed_complete")
         turns_before = len(self.method_params("thread/turns/list"))
         items_before = len(self.method_params("thread/items/list"))
@@ -1020,7 +1022,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"], "terminal")
         self.assertEqual(result["wakeReason"], "terminal")
         self.assertEqual(result["turn"]["output"][0]["text"], "fixture complete")
-        self.assertGreaterEqual(len(self.method_params("thread/turns/list")) - turns_before, 2)
+        self.assertEqual(len(self.method_params("thread/turns/list")) - turns_before, 0)
         self.assertEqual(len(self.method_params("thread/items/list")) - items_before, 1)
 
     def test_slow_reconciliation_does_not_overrun_wait_lease(self):
@@ -1059,7 +1061,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"], "active")
         self.assertEqual(result["wakeReason"], "timeout")
         self.assertEqual(result["turn"]["id"], work["turnId"])
-        self.assertGreater(len(self.method_params("thread/turns/list")), turns_before)
+        self.assertEqual(len(self.method_params("thread/turns/list")) - turns_before, 1)
         self.client.call("codex.control", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })

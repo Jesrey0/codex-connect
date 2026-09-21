@@ -559,13 +559,40 @@ async fn write_loop<W: AsyncWrite + Unpin>(
 }
 
 async fn expire_actions(connection: Arc<Connection>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
     let mut changes = connection.changes();
     loop {
         if !connection.available() {
             break;
         }
-        tokio::select! { _ = interval.tick() => {}, _ = changes.changed() => continue }
+        let next_deadline = connection
+            .actions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|action| action.deadline)
+            .min();
+        match next_deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    changed = changes.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {}
+                }
+            }
+            None => {
+                if changes.changed().await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
+        if !connection.available() {
+            break;
+        }
         let expired: Vec<_> = connection
             .actions
             .lock()
@@ -574,11 +601,17 @@ async fn expire_actions(connection: Arc<Connection>) {
             .filter(|a| a.deadline <= Instant::now())
             .map(|a| a.request.clone())
             .collect();
+        let mut retry_failed = false;
         for action in expired {
             let response = json!({"id": action.request_id, "error": {
                 "code": -32000, "message": "Operator response deadline exceeded (30 minutes)"
             }});
-            let _ = connection.send(response, Some(action)).await;
+            retry_failed |= connection.send(response, Some(action)).await.is_err();
+        }
+        if retry_failed && connection.available() {
+            // A zero-byte write failure leaves the action retryable. Back off before retrying a
+            // deadline that is already in the past so transport failure cannot create a hot loop.
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 }
@@ -910,6 +943,7 @@ mod tests {
             .get_mut(&RpcId::Integer(1))
             .unwrap()
             .deadline = Instant::now();
+        connection.wake();
         let mut changes = connection.changes();
         timeout(Duration::from_secs(2), async {
             while !connection.actions(None).is_empty() {
@@ -921,6 +955,40 @@ mod tests {
         let response: Value = serde_json::from_slice(&writer.bytes.lock().unwrap()).unwrap();
         assert_eq!(response["id"], 1);
         assert_eq!(response["error"]["code"], -32000);
+        connection.disconnect();
+    }
+
+    #[tokio::test]
+    async fn expired_action_retry_backoff_is_not_bypassed_by_transport_changes() {
+        let writer = TestWriter::default();
+        let (connection, _peer) = setup(writer.clone());
+        question(&connection, json!(2)).await;
+        writer.fail.store(true, Ordering::Release);
+        connection
+            .actions
+            .lock()
+            .unwrap()
+            .get_mut(&RpcId::Integer(2))
+            .unwrap()
+            .deadline = Instant::now();
+        connection.wake();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(connection.actions(None).len(), 1);
+        for _ in 0..16 {
+            connection.wake();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(connection.actions(None).len(), 1);
+
+        let mut changes = connection.changes();
+        timeout(Duration::from_secs(2), async {
+            while !connection.actions(None).is_empty() {
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
         connection.disconnect();
     }
 

@@ -47,7 +47,9 @@ codex.start → codex.wait ─┬─ terminal
                          └─ active → codex.inspect or another bounded wait
 ```
 
-The worker owns its delegated scope from successful start until terminal, semantic block/action, interrupt, or user redirect. A `codex.wait` timeout is only lease expiry: it is not worker failure, stall evidence, or permission to take over. The operator may continue non-overlapping work. A Scheduled Task may monitor through Codex Connect when available, but does not inherit HostPlane authority or transfer scope ownership.
+The worker owns its delegated scope from successful start until terminal, semantic block/action, interrupt, or user redirect. App Server lifecycle notifications drive live worker state. `codex.wait` performs no periodic status read: it hydrates a turn that predates the current relay, resumes that thread's official notification subscription when needed, reconciles explicit history loss, and performs one final authoritative check when the lease expires. A `codex.wait` timeout is only lease expiry: it is not worker failure, stall evidence, or permission to take over. The operator may continue non-overlapping work. A Scheduled Task may monitor through Codex Connect when available, but does not inherit HostPlane authority or transfer scope ownership.
+
+The general runtime invariant is: **events drive live state; reads hydrate or reconcile state; deadlines bound operations; retries recover unavailable event sources or transient persistence races.** No periodic App Server read may exist merely to observe progress. Secure MCP Tunnel is a separate transport plane: `tunnel-client` owns its upstream long-poll lifecycle and Codex Connect neither duplicates nor supervises it.
 
 ## Public surface
 

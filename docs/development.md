@@ -22,7 +22,7 @@ Connect sends no `thread/start.developerInstructions`. Worker cognition comes fr
 
 For work, omitted `access` maps to the writable workspace sandbox with network access; `access="full"` maps to `danger-full-access`. Work turns send `approvalPolicy="never"`; this avoids mechanical approval stalls and does not widen the sandbox. New reviews are read-only.
 
-Delegation is exclusive scope ownership until terminal, semantic action/input block, interrupt, or user redirect. A `codex.wait` timeout is only a bounded lease expiry, never failure, stall evidence, or takeover permission. `codex.wait` synchronizes; `codex.inspect` owns activity/history observation; the console is a human-oriented read-only projection. App Server state remains authoritative; Connect's journals/reducers/caches are bounded observations.
+Delegation is exclusive scope ownership until terminal, semantic action/input block, interrupt, or user redirect. A `codex.wait` timeout is only a bounded lease expiry, never failure, stall evidence, or takeover permission. Live state is notification-driven: reads establish pre-existing state, reconcile explicit history loss, hydrate terminal output, or perform one final lease-expiry check; they do not periodically observe progress. `codex.wait` synchronizes; `codex.inspect` owns activity/history observation; the console is a human-oriented read-only projection. App Server state remains authoritative; Connect's journals/reducers/caches are bounded observations.
 
 ## Validation
 

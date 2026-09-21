@@ -42,8 +42,9 @@ use tokio::time::{Duration, Instant};
 pub const MAX_WAIT_MS: u64 = 30_000;
 const WAIT_FINALIZATION_RESERVE_MS: u64 = 10_000;
 const MAX_WAIT_OPERATION_MS: u64 = 40_000;
-const WAIT_RECONCILE_MS: u64 = 1_000;
+const WAIT_FINAL_RECONCILE_MS: u64 = 500;
 const WAIT_STORAGE_RETRY_MS: u64 = 25;
+const WAIT_STORAGE_RETRY_MAX_MS: u64 = 500;
 const MAX_SEMANTIC_EVENTS: usize = 16;
 const MAX_TRANSCRIPT_TEXT_CHARS: usize = 32 * 1024;
 const MAX_TRANSCRIPT_TOTAL_CHARS: usize = 192 * 1024;
@@ -247,6 +248,12 @@ impl Default for ThreadSubscription {
 }
 
 impl ThreadSubscriptions {
+    fn is_subscribed(&self, thread_id: &str) -> bool {
+        self.threads
+            .get(thread_id)
+            .is_some_and(|state| state.subscribed && !state.unsubscribing)
+    }
+
     fn begin_start(&mut self, thread_id: &str) -> Option<OwnedNotified> {
         let state = self.threads.entry(thread_id.to_string()).or_default();
         if state.unsubscribing {
@@ -724,6 +731,63 @@ impl Relay {
             .finish_turn(thread_id, turn_id);
         if should_unsubscribe {
             self.spawn_thread_unsubscribe(thread_id.to_string());
+        }
+    }
+
+    async fn ensure_wait_subscription(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        operation_deadline: Instant,
+    ) -> Result<(), RelayError> {
+        if tokio::time::timeout_at(operation_deadline, self.begin_thread_start(thread_id))
+            .await
+            .is_err()
+        {
+            return Err(RelayError::BudgetExceeded(
+                "codex.wait could not acquire thread subscription ownership before its operation deadline"
+                    .into(),
+            ));
+        }
+        if self
+            .thread_subscriptions
+            .lock()
+            .await
+            .is_subscribed(thread_id)
+        {
+            self.finish_thread_start(thread_id, Some(turn_id)).await;
+            return Ok(());
+        }
+        let remaining = operation_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.finish_thread_start(thread_id, None).await;
+            return Err(RelayError::BudgetExceeded(
+                "codex.wait reached its operation deadline before thread subscription recovery"
+                    .into(),
+            ));
+        }
+        let resumed = self
+            .app_server
+            .request_with_timeout(
+                ThreadResume {
+                    thread_id: thread_id.to_string(),
+                    cwd: None,
+                    developer_instructions: None,
+                    exclude_turns: true,
+                },
+                remaining,
+            )
+            .await;
+        match resumed {
+            Ok(_) => {
+                self.mark_thread_subscribed(thread_id).await;
+                self.finish_thread_start(thread_id, Some(turn_id)).await;
+                Ok(())
+            }
+            Err(error) => {
+                self.finish_thread_start(thread_id, None).await;
+                Err(error.into())
+            }
         }
     }
 
@@ -1341,11 +1405,13 @@ impl Relay {
         thread_id: &str,
         turn: &mut codex_connect_app_server::protocol::Turn,
     ) -> Result<(), RelayError> {
+        let mut retry_ms = WAIT_STORAGE_RETRY_MS;
         loop {
             match self.hydrate_turn_items(thread_id, turn).await {
                 Ok(()) => return Ok(()),
                 Err(error) if is_unflushed_thread_store(&error) => {
-                    tokio::time::sleep(Duration::from_millis(WAIT_STORAGE_RETRY_MS)).await;
+                    tokio::time::sleep(Duration::from_millis(retry_ms)).await;
+                    retry_ms = retry_ms.saturating_mul(2).min(WAIT_STORAGE_RETRY_MAX_MS);
                 }
                 Err(error) => return Err(error),
             }
@@ -1519,6 +1585,7 @@ impl Relay {
         // notifications cannot race the wait setup.
         let mut transport_changes = self.app_server.changes();
         let mut journal_changes = self.journal.changes();
+        let mut journal_cursor = self.journal.cursor().await;
         let initial_live = self.live_turn(&thread_id, &turn_id).await;
         let mut stored = if initial_live.is_none() {
             // A turn that predates this relay process needs the minimum authoritative read
@@ -1541,23 +1608,22 @@ impl Relay {
             }
         } else {
             // A turn started by this relay is already represented by the official turn/start
-            // response and live lifecycle notifications, and its thread cwd was validated during
-            // thread/start or thread/resume. Avoid an immediate thread/read here: upstream may
-            // acknowledge a new turn before its rollout metadata has been flushed to disk. Keep
-            // the turn-list reconciliation so terminal state remains authoritative even when an
-            // upstream lifecycle notification is absent.
-            match tokio::time::timeout_at(
-                deadline,
-                self.find_stored_turn_metadata(&thread_id, &turn_id),
-            )
-            .await
-            {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) if is_unflushed_thread_store(&error) => None,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => None,
-            }
+            // response and the subscribed lifecycle stream. Reads are reserved for explicit
+            // reconciliation boundaries rather than used to observe ordinary progress.
+            None
         };
+        if initial_live.is_none()
+            && stored
+                .as_ref()
+                .is_some_and(|turn| !turn.status.is_terminal())
+        {
+            // A turn that predates this relay cannot rely on a subscription owned by the prior
+            // App Server process. Resume the thread once so subsequent lifecycle state arrives on
+            // the official notification stream instead of requiring periodic status reads.
+            self.ensure_wait_subscription(&thread_id, &turn_id, operation_deadline)
+                .await?;
+        }
+        let mut final_reconciled = false;
         loop {
             if !self.worker_available() {
                 return Err(AppServerError::Disconnected.into());
@@ -1630,6 +1696,25 @@ impl Relay {
                 return Ok(result);
             }
             if Instant::now() >= deadline {
+                if !final_reconciled {
+                    final_reconciled = true;
+                    let reconcile_deadline = operation_deadline
+                        .min(Instant::now() + Duration::from_millis(WAIT_FINAL_RECONCILE_MS));
+                    match tokio::time::timeout_at(
+                        reconcile_deadline,
+                        self.find_stored_turn_metadata(&thread_id, &turn_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) => {
+                            stored = result;
+                            continue;
+                        }
+                        Ok(Err(error)) if is_unflushed_thread_store(&error) => {}
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {}
+                    }
+                }
                 let result = json!({
                     "threadId":thread_id,"turnId":selected_id,"state":"active","wakeReason":"timeout",
                     "turn":turn_snapshot(&selected), "currentActivity":activity,
@@ -1640,11 +1725,10 @@ impl Relay {
             }
 
             // Ordinary worker notifications remain journaled but do not end the operator wait
-            // or force an App Server thread/read. Pending server requests are checked locally;
-            // terminal notifications and history gaps trigger an authoritative reconciliation.
+            // or force an App Server read. Pending requests and lifecycle notifications wake the
+            // join directly. An explicit journal history gap is the only mid-lease condition that
+            // requires authoritative persistence reconciliation.
             let selected_id = selected_id.map(str::to_owned);
-            let reconcile_at =
-                deadline.min(Instant::now() + Duration::from_millis(WAIT_RECONCILE_MS));
             let needs_reconcile = loop {
                 tokio::select! {
                     changed = transport_changes.changed() => {
@@ -1665,15 +1749,24 @@ impl Relay {
                         if changed.is_err() {
                             return Err(AppServerError::Disconnected.into());
                         }
+                        let batch = self
+                            .journal
+                            .read_after(journal_cursor, &thread_id, Some(&turn_id))
+                            .await
+                            .map_err(RelayError::Invalid)?;
+                        journal_cursor = batch.cursor;
+                        if batch.history_lost {
+                            break true;
+                        }
                         if self
                             .live_turn(&thread_id, &turn_id)
                             .await
                             .is_some_and(|turn| turn.status.is_terminal())
                         {
-                            break true;
+                            break false;
                         }
                     }
-                    _ = tokio::time::sleep_until(reconcile_at) => break true,
+                    _ = tokio::time::sleep_until(deadline) => break false,
                 }
             };
             if needs_reconcile && Instant::now() < deadline {

@@ -35,7 +35,7 @@ Preserve PTY support. Do not expose raw sandbox policy, service tier, developer 
 - Keep Codex CLI/App Server and `tunnel-client` independently owned; do not add tunnel supervision.
 - Keep `default_cwd` as navigation, never authorization.
 - Keep worker tasks self-contained and preserve delegated scope ownership until terminal/action/interrupt/redirect. A `codex.wait` timeout is not permission to take over.
-- Keep the event journal and console observational and event-driven; App Server remains authoritative. Do not reintroduce timer-based observer, transcript, or quota polling.
+- Keep live state event-driven; App Server remains authoritative. Reads may hydrate or reconcile state at explicit boundaries but must not periodically observe progress. Do not reintroduce timer-based worker, observer, transcript, or quota polling. Keep `tunnel-client` long-poll transport independent rather than mirroring its cadence inside Codex Connect.
 - Git actions are operator workflow, not application workflow.
 - Remove superseded terminology and compatibility baggage end-to-end; this pre-release repository represents the current canonical implementation only.
 

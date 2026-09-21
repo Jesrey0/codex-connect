@@ -3,11 +3,14 @@ use crate::management;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::io::{self, IsTerminal, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::io::unix::AsyncFd;
+use tokio::time::{Instant, MissedTickBehavior, interval};
 
 const UI_TICK_MS: u64 = 750;
 const RECONNECT_MS: u64 = 500;
+const ESCAPE_SEQUENCE_MS: u64 = 50;
 const MAX_ACTION_TEXT_CHARS: usize = 2 * 1024;
 const MAX_ACTION_ROW_CHARS: usize = 512;
 const RESET: &str = "\x1b[0m";
@@ -27,8 +30,6 @@ pub async fn run() -> Result<()> {
     let mut input = TerminalInput::enter()?;
     let mut ticker = interval(Duration::from_millis(UI_TICK_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut input_ticker = interval(Duration::from_millis(50));
-    input_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let initial = management::backend_observer_once(&config.backend).await;
     let (mut snapshot, mut observer_cursor, mut last_error) = match initial {
         Ok(value) => {
@@ -76,9 +77,9 @@ pub async fn run() -> Result<()> {
                 draw(snapshot.as_ref(), last_error.as_deref(), &mut state, frame)?;
                 frame = frame.wrapping_add(1);
             }
-            _ = input_ticker.tick() => {
+            keys = input.next_keys() => {
                 let mut changed = false;
-                for key in input.read_keys()? {
+                for key in keys? {
                     changed |= state.handle_key(key, snapshot.as_ref());
                 }
                 if changed {
@@ -129,7 +130,18 @@ impl Drop for ScreenGuard {
 
 struct TerminalInput {
     original: libc::termios,
+    original_flags: libc::c_int,
+    readiness: AsyncFd<StdinFd>,
     decoder: InputDecoder,
+    escape_deadline: Option<Instant>,
+}
+
+struct StdinFd;
+
+impl AsRawFd for StdinFd {
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDIN_FILENO
+    }
 }
 
 impl TerminalInput {
@@ -141,41 +153,115 @@ impl TerminalInput {
         let mut raw = original;
         raw.c_lflag &= !(libc::ICANON | libc::ECHO);
         // Keep ISIG enabled: Ctrl-C must continue to be delivered as SIGINT.
-        raw.c_cc[libc::VMIN] = 0;
+        raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
         if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error()).context("unable to configure terminal input");
         }
+        let original_flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
+        if original_flags < 0 {
+            let _ = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original) };
+            return Err(io::Error::last_os_error()).context("unable to read terminal flags");
+        }
+        if unsafe {
+            libc::fcntl(
+                libc::STDIN_FILENO,
+                libc::F_SETFL,
+                original_flags | libc::O_NONBLOCK,
+            )
+        } < 0
+        {
+            let _ = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original) };
+            return Err(io::Error::last_os_error()).context("unable to configure terminal flags");
+        }
+        let readiness = match AsyncFd::new(StdinFd) {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                let _ = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, original_flags) };
+                let _ = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original) };
+                return Err(error).context("unable to register terminal input readiness");
+            }
+        };
         Ok(Self {
             original,
+            original_flags,
+            readiness,
             decoder: InputDecoder::default(),
+            escape_deadline: None,
         })
     }
 
-    fn read_keys(&mut self) -> Result<Vec<InputKey>> {
-        let mut bytes = [0_u8; 64];
-        let read = unsafe {
-            libc::read(
-                libc::STDIN_FILENO,
-                bytes.as_mut_ptr().cast::<libc::c_void>(),
-                bytes.len(),
-            )
-        };
-        if read < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::WouldBlock
-                && error.kind() != io::ErrorKind::Interrupted
-            {
+    async fn next_keys(&mut self) -> Result<Vec<InputKey>> {
+        loop {
+            if let Some(deadline) = self.escape_deadline {
+                tokio::select! {
+                    ready = self.readiness.readable() => {
+                        let mut guard = ready.context("unable to wait for terminal input")?;
+                        let keys = Self::read_keys_now(
+                            &mut self.decoder,
+                            &mut self.escape_deadline,
+                        )?;
+                        guard.clear_ready();
+                        if !keys.is_empty() {
+                            return Ok(keys);
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        self.escape_deadline = None;
+                        return Ok(self.decoder.flush_escape().into_iter().collect());
+                    }
+                }
+            } else {
+                let mut guard = self
+                    .readiness
+                    .readable()
+                    .await
+                    .context("unable to wait for terminal input")?;
+                let keys = Self::read_keys_now(&mut self.decoder, &mut self.escape_deadline)?;
+                guard.clear_ready();
+                if !keys.is_empty() {
+                    return Ok(keys);
+                }
+            }
+        }
+    }
+
+    fn read_keys_now(
+        decoder: &mut InputDecoder,
+        escape_deadline: &mut Option<Instant>,
+    ) -> Result<Vec<InputKey>> {
+        let mut keys = Vec::new();
+        loop {
+            let mut bytes = [0_u8; 64];
+            let read = unsafe {
+                libc::read(
+                    libc::STDIN_FILENO,
+                    bytes.as_mut_ptr().cast::<libc::c_void>(),
+                    bytes.len(),
+                )
+            };
+            if read < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
                 return Err(error).context("unable to read terminal input");
             }
-            return Ok(self.decoder.flush_escape().into_iter().collect());
+            if read == 0 {
+                bail!("terminal input closed");
+            }
+            for byte in &bytes[..read as usize] {
+                keys.extend(decoder.push(*byte));
+            }
         }
-        if read == 0 {
-            return Ok(self.decoder.flush_escape().into_iter().collect());
-        }
-        let mut keys = Vec::new();
-        for byte in &bytes[..read as usize] {
-            keys.extend(self.decoder.push(*byte));
+        if decoder.has_pending_escape() {
+            escape_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_millis(ESCAPE_SEQUENCE_MS));
+        } else {
+            *escape_deadline = None;
         }
         Ok(keys)
     }
@@ -183,6 +269,7 @@ impl TerminalInput {
 
 impl Drop for TerminalInput {
     fn drop(&mut self) {
+        let _ = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, self.original_flags) };
         let _ = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original) };
     }
 }
@@ -204,6 +291,10 @@ struct InputDecoder {
 }
 
 impl InputDecoder {
+    fn has_pending_escape(&self) -> bool {
+        !self.escape.is_empty()
+    }
+
     fn push(&mut self, byte: u8) -> Vec<InputKey> {
         match self.escape.as_slice() {
             [] if byte == b'\x1b' => {
