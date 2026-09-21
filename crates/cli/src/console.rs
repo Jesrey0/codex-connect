@@ -640,16 +640,6 @@ fn render_transcript(
                 body.push(styled(row(" TASK", width), &format!("{BOLD}{CYAN}")));
                 body.extend(render_wrapped_text(prompt, "   ", width, CYAN));
             }
-            if let Some(instructions) =
-                context.and_then(|value| value["developerInstructions"].as_str())
-            {
-                body.push(styled(
-                    row(" DEVELOPER INSTRUCTIONS", width),
-                    &format!("{BOLD}{CYAN}"),
-                ));
-                body.extend(render_wrapped_text(instructions, "   ", width, DIM));
-            }
-
             let pending = transcript["pendingActions"]
                 .as_array()
                 .map(Vec::as_slice)
@@ -877,7 +867,6 @@ fn worker_rows(
     let mode = text(&worker["mode"], "worker").to_ascii_uppercase();
     let model = worker["model"].as_str().unwrap_or("default/inherited");
     let effort = worker["effort"].as_str().unwrap_or("default/inherited");
-    let tier = worker["serviceTier"].as_str().unwrap_or("default");
     let status = text(&worker["status"], "unknown");
     let kind = worker["activityKind"].as_str().unwrap_or("working");
     let age = worker["lastActivityAtMs"]
@@ -904,14 +893,8 @@ fn worker_rows(
         }
     };
     let marker = if selected { "›" } else { " " };
-    let tier = if tier == "default" {
-        String::new()
-    } else {
-        format!(" · {tier}")
-    };
-    let line = format!(
-        " {marker} {glyph} {mode} · {model} · {effort}{tier} · {state_label} · {age}{tokens}"
-    );
+    let line =
+        format!(" {marker} {glyph} {mode} · {model} · {effort} · {state_label} · {age}{tokens}");
     let style = if status == "failed" {
         format!("{BOLD}{RED}")
     } else if waiting {
@@ -1368,7 +1351,6 @@ mod tests {
             "mode": "work",
             "model": "gpt-5.6-sol",
             "effort": "high",
-            "serviceTier": "priority",
             "lastActivityAtMs": 0,
             "activityKind": "think",
             "activitySummary": "private chain of thought",

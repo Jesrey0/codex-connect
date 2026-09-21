@@ -87,10 +87,6 @@ class OperatorProtocolTests(unittest.TestCase):
         cls.outside.cleanup()
 
     def start(self, scenario, **arguments):
-        arguments.setdefault(
-            "sandboxPolicy",
-            {"type": "workspaceWrite", "networkAccess": True},
-        )
         return self.client.call("codex.start", {"mode": "work", "task": scenario, **arguments})
 
     def wait(self, work, timeout=1000, **arguments):
@@ -155,9 +151,9 @@ class OperatorProtocolTests(unittest.TestCase):
             self.client.tools["codex.inspect"]["inputSchema"]["properties"]["detail"]["default"],
             "semantic",
         )
-        exec_timeout = self.client.tools["command.exec"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(exec_timeout["default"], 30000)
-        self.assertEqual(exec_timeout["maximum"], 35000)
+        exec_properties = self.client.tools["command.exec"]["inputSchema"]["properties"]
+        self.assertNotIn("timeoutMs", exec_properties)
+        self.assertNotIn("outputBytesCap", exec_properties)
         read_timeout = self.client.tools["command.read"]["inputSchema"]["properties"]["timeoutMs"]
         self.assertEqual(read_timeout["default"], 20000)
         self.assertEqual(read_timeout["maximum"], 40000)
@@ -170,8 +166,11 @@ class OperatorProtocolTests(unittest.TestCase):
         work_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][0]
         review_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][1]
         self.assertNotIn("approvalPolicy", work_start["properties"])
-        self.assertIn("sandboxPolicy", work_start["required"])
-        self.assertIn('"readOnly"', json.dumps(work_start["properties"]["sandboxPolicy"]))
+        self.assertEqual(work_start["properties"]["access"]["default"], "workspace")
+        self.assertEqual(work_start["properties"]["access"]["enum"], ["workspace", "full"])
+        for hidden in ("sandboxPolicy", "developerInstructions", "serviceTier"):
+            self.assertNotIn(hidden, work_start["properties"])
+        self.assertNotIn("access", work_start["required"])
         for host_tool in ("command.exec", "command.start"):
             self.assertNotIn(
                 "sandboxPolicy",
@@ -183,7 +182,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertNotIn("serviceTier", review_start["properties"])
         self.client.call(
             "codex.start",
-            {"mode": "work", "task": "no_event"},
+            {"mode": "work", "task": "no_event", "sandboxPolicy": {"type": "readOnly"}},
             error=True,
             validate_input=False,
         )
@@ -323,9 +322,8 @@ class OperatorProtocolTests(unittest.TestCase):
         schema = self.client.tools["command.exec"]["inputSchema"]["properties"]
         self.assertNotIn("disableTimeout", schema)
         self.assertNotIn("disableOutputCap", schema)
-        self.assertEqual(schema["timeoutMs"]["default"], 30000)
-        self.assertEqual(schema["timeoutMs"]["maximum"], 35000)
-        self.assertEqual(schema["outputBytesCap"]["default"], 65536)
+        self.assertNotIn("timeoutMs", schema)
+        self.assertNotIn("outputBytesCap", schema)
         inherited = self.client.call("command.exec", {"command":["fixture-policy"]})
         self.assertIsNone(json.loads(inherited["stdout"]))
         result = self.client.call("command.exec", {"command":["echo","fixture"]})
@@ -335,9 +333,10 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertFalse(result["stdoutMayBeTruncated"])
         self.assertFalse(result["stderrMayBeTruncated"])
         self.assertGreaterEqual(result["durationMs"], 0)
-        self.assertEqual(self.client.call("command.exec", {
-            "command":["echo","fixture"], "timeoutMs":35000,
-        })["exitCode"], 0)
+        command_params = self.method_params("command/exec")[-1]
+        self.assertEqual(command_params["timeoutMs"], 30000)
+        self.assertEqual(command_params["outputBytesCap"], 65536)
+        self.assertNotIn("sandboxPolicy", command_params)
         self.assertEqual(self.client.call("command.exec", {
             "command":["echo","fixture"], "cwd":"/etc",
         })["exitCode"], 0)
@@ -346,6 +345,7 @@ class OperatorProtocolTests(unittest.TestCase):
             {"command":["echo"],"disableTimeout":True},
             {"command":["echo"],"disableOutputCap":True},
             {"command":["echo"],"timeoutMs":35001},
+            {"command":["echo"],"outputBytesCap":1},
             {"command":["echo"],"sandboxPolicy":{"type":"externalSandbox"}},
             {"command":["echo"],"sandboxPolicy":{"type":"workspaceWrite","writableRoots":["project"]}},
         ]:
@@ -611,7 +611,6 @@ class OperatorProtocolTests(unittest.TestCase):
             threadId=work["threadId"],
             model="gpt-6-astra",
             effort="high",
-            serviceTier="priority",
         )
         self.assertFalse(next_work["createdThread"])
         idle = self.inspect_turn(next_work)
@@ -625,7 +624,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(observed["mode"], "work")
         self.assertEqual(observed["model"], "gpt-6-astra")
         self.assertEqual(observed["effort"], "high")
-        self.assertEqual(observed["serviceTier"], "priority")
+        self.assertNotIn("serviceTier", observed)
         self.assertEqual(observed["prompt"], "idle")
         self.assertGreater(observed["lastActivityAtMs"], 0)
         self.assertIn(observed["activityKind"], {"turn", "think", "message", "tool", "file", "search", "item", "waiting"})
@@ -636,16 +635,13 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["detail"], "semantic")
 
     def test_observer_transcript_is_live_and_survives_terminal_cleanup(self):
-        work = self.start("progress", developerInstructions="Prefer concise operator-facing output")
+        work = self.start("progress")
         active = self.transcript(work)
         self.assertEqual(active["threadId"], work["threadId"])
         self.assertEqual(active["turnId"], work["turnId"])
         self.assertEqual(active["status"], "inProgress")
         self.assertEqual(active["context"]["prompt"], "progress")
-        self.assertEqual(
-            active["context"]["developerInstructions"],
-            "Prefer concise operator-facing output",
-        )
+        self.assertNotIn("developerInstructions", active["context"])
         self.assertEqual(active["pendingActions"], [])
         self.assertEqual(active["activity"]["kind"], "message")
         self.assertIn("Working", active["activity"]["summary"])
@@ -853,7 +849,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.client.call("codex.start", {
             "mode": "work",
             "task": "start_error",
-            "sandboxPolicy": {"type": "dangerFullAccess"},
+            "access": "full",
         }, error=True)
         unsubscribes = self.wait_for_method_count(
             "thread/unsubscribe", unsubscribes_before + 1,
@@ -1120,6 +1116,11 @@ class OperatorProtocolTests(unittest.TestCase):
             {"type":"models"}, {"type":"skills"}, {"type":"usage"},
         ]})
         self.assertEqual([entry["type"] for entry in info["results"]], ["models", "skills", "usage"])
+        self.assertEqual(
+            [model["id"] for model in info["results"][0]["result"]["data"]],
+            ["fixture-model-1", "fixture-model-2", "fixture-model-3"],
+        )
+        self.assertIsNone(info["results"][0]["result"]["nextCursor"])
         usage = info["results"][2]["result"]
         self.assertFalse(usage["ordinaryUsageAllowed"])
         self.assertEqual(usage["rateLimitResetCredits"]["availableCount"], 2)
@@ -1133,38 +1134,44 @@ class OperatorProtocolTests(unittest.TestCase):
         )
 
     def test_new_thread_policy_projection_and_review_model_routing(self):
-        for policy, expected_mode in [
-            ({"type": "readOnly", "networkAccess": False}, "read-only"),
-            ({"type": "workspaceWrite", "networkAccess": True}, "workspace-write"),
-            ({"type": "dangerFullAccess"}, "danger-full-access"),
-        ]:
-            with self.subTest(policy=policy["type"]):
-                before = len(self.method_params("thread/start"))
-                work = self.start("complete", sandboxPolicy=policy)
-                self.assertEqual(self.wait(work)["state"], "terminal")
-                thread_start = self.method_params("thread/start")[before]
-                self.assertEqual(thread_start["sandbox"], expected_mode)
-                turn_start = self.method_params("turn/start")[-1]
-                self.assertEqual(turn_start["approvalPolicy"], "on-request")
-                self.assertEqual(turn_start["sandboxPolicy"]["type"], policy["type"])
-                if "networkAccess" in policy:
-                    self.assertEqual(
-                        turn_start["sandboxPolicy"]["networkAccess"],
-                        policy["networkAccess"],
-                    )
+        before = len(self.method_params("thread/start"))
+        work = self.start("complete")
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        thread_start = self.method_params("thread/start")[before]
+        self.assertEqual(thread_start["sandbox"], "workspace-write")
+        self.assertTrue(thread_start["developerInstructions"].startswith("Workspace policy:"))
+        self.assertIn("Stay within the granted sandbox", thread_start["developerInstructions"])
+        turn_start = self.method_params("turn/start")[-1]
+        self.assertEqual(turn_start["approvalPolicy"], "never")
+        self.assertEqual(turn_start["sandboxPolicy"]["type"], "workspaceWrite")
+        self.assertTrue(turn_start["sandboxPolicy"]["networkAccess"])
+        self.assertEqual(turn_start["sandboxPolicy"]["writableRoots"], [])
 
         before = len(self.method_params("thread/start"))
-        instructed = self.start(
-            "complete",
-            developerInstructions="Prefer evidence over assumptions.",
-        )
-        self.assertEqual(self.wait(instructed)["state"], "terminal")
-        instructed_start = self.method_params("thread/start")[before]
-        self.assertTrue(instructed_start["developerInstructions"].startswith("Workspace policy:"))
-        self.assertIn("Approval discipline:", instructed_start["developerInstructions"])
-        self.assertIn(
-            "Operator-supplied developer instructions:\nPrefer evidence over assumptions.",
-            instructed_start["developerInstructions"],
+        unrestricted = self.start("complete", access="full")
+        self.assertEqual(self.wait(unrestricted)["state"], "terminal")
+        full_thread_start = self.method_params("thread/start")[before]
+        self.assertEqual(full_thread_start["sandbox"], "danger-full-access")
+        full_turn_start = self.method_params("turn/start")[-1]
+        self.assertEqual(full_turn_start["approvalPolicy"], "never")
+        self.assertEqual(full_turn_start["sandboxPolicy"]["type"], "dangerFullAccess")
+
+        for hidden in [
+            {"sandboxPolicy": {"type": "readOnly"}},
+            {"developerInstructions": "Do something different."},
+            {"serviceTier": "priority"},
+        ]:
+            self.client.call(
+                "codex.start",
+                {"mode": "work", "task": "complete", **hidden},
+                error=True,
+                validate_input=False,
+            )
+        self.client.call(
+            "codex.start",
+            {"mode": "work", "task": "complete", "access": "invalid"},
+            error=True,
+            validate_input=False,
         )
 
         source = self.start("complete")
@@ -1173,22 +1180,15 @@ class OperatorProtocolTests(unittest.TestCase):
         resumed = self.start(
             "complete",
             threadId=source["threadId"],
-            sandboxPolicy={"type": "dangerFullAccess"},
+            access="full",
         )
         self.assertEqual(self.wait(resumed)["state"], "terminal")
         self.assertEqual(len(self.method_params("thread/resume")), resume_count + 1)
         self.assertNotIn("sandbox", self.method_params("thread/resume")[-1])
         self.assertNotIn("developerInstructions", self.method_params("thread/resume")[-1])
-
-        resumes_before_rejection = len(self.method_params("thread/resume"))
-        self.client.call("codex.start", {
-            "mode": "work",
-            "task": "complete",
-            "threadId": source["threadId"],
-            "developerInstructions": "Do something different.",
-            "sandboxPolicy": {"type": "dangerFullAccess"},
-        }, error=True)
-        self.assertEqual(len(self.method_params("thread/resume")), resumes_before_rejection)
+        resumed_turn_start = self.method_params("turn/start")[-1]
+        self.assertEqual(resumed_turn_start["approvalPolicy"], "never")
+        self.assertEqual(resumed_turn_start["sandboxPolicy"]["type"], "dangerFullAccess")
 
         before_threads = len(self.method_params("thread/start"))
         before_reviews = len(self.method_params("review/start"))

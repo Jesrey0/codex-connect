@@ -10,7 +10,7 @@ use axum::response::Json;
 use codex_connect_host::Host;
 use codex_connect_relay::{
     ApprovalDecision, CommandExec, CommandExecTerminalSize, ElicitationAction, MAX_WAIT_MS,
-    ModelList, PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
+    PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
 };
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
@@ -36,7 +36,7 @@ const SYNCHRONOUS_TOOL_GUARD_MS: u64 = 45_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_CONCURRENCY: usize = 4;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect is the authoritative host/Codex control plane for its host workspace. It is NOT ChatGPT's native sandbox: never assume /mnt/data, uploaded or Project files, browser/plugin state, or native-tool paths exist on the Codex Connect host. Use Codex Connect host tools for host files/processes and ChatGPT-native tools for their own data; bridge content only deliberately. Use codex.* for Codex lifecycle semantics, never the Codex CLI through host commands. The configured cwd is navigation only, not authorization. Host operations run with host-user authority; delegated Codex work always uses an explicit sandboxPolicy and self-contained context. Prefer deterministic host tools when the action is known; delegate only when autonomous reasoning or independent review materially helps. A delegated worker owns its scope until terminal, blocked for operator action, or interrupted; continue only non-overlapping work. Do not create Git workflow state unless requested. tunnel-client owns its transport lifecycle and outer deadlines; Codex Connect owns its bounded MCP operations.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect is the authoritative host/Codex control plane for its host workspace. It is NOT ChatGPT's native sandbox: never assume /mnt/data, uploaded or Project files, browser/plugin state, or native-tool paths exist on the Codex Connect host. Use host tools for host files/processes and codex.* for Codex lifecycle semantics; never invoke the Codex CLI through host commands. cwd is navigation, not authorization. Direct host operations use host-user authority. Delegated work defaults to a server-owned writable workspace sandbox with network access and non-blocking approvals; access=full explicitly requests danger-full-access. Reviews remain read-only. ApprovalPolicy=never removes mechanical approval stalls but does not enlarge the selected sandbox. Workers need self-contained context and own delegated scope until terminal, blocked for semantic input, or interrupted. Preserve PTY tools for interactive processes. Do not create Git workflow state unless requested.";
 
 struct CancelOnDrop(Arc<AtomicBool>);
 
@@ -120,8 +120,6 @@ struct CommandStartArgs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HostCommandExecArgs {
     command: Vec<String>,
-    timeout_ms: Option<u64>,
-    output_bytes_cap: Option<usize>,
     cwd: Option<String>,
     env: Option<std::collections::BTreeMap<String, Option<String>>>,
 }
@@ -485,11 +483,10 @@ enum CodexStartArgs {
         task: String,
         cwd: Option<String>,
         thread_id: Option<String>,
-        developer_instructions: Option<String>,
         model: Option<String>,
         effort: Option<String>,
-        service_tier: Option<String>,
-        sandbox_policy: SandboxPolicy,
+        #[serde(default)]
+        access: WorkAccess,
     },
     Review {
         cwd: Option<String>,
@@ -497,6 +494,26 @@ enum CodexStartArgs {
         target: ReviewTarget,
         model: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum WorkAccess {
+    #[default]
+    Workspace,
+    Full,
+}
+
+fn work_sandbox_policy(access: WorkAccess) -> SandboxPolicy {
+    match access {
+        WorkAccess::Workspace => SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+            network_access: true,
+            exclude_slash_tmp: false,
+            exclude_tmpdir_env_var: false,
+        },
+        WorkAccess::Full => SandboxPolicy::DangerFullAccess,
+    }
 }
 
 #[derive(Deserialize)]
@@ -591,16 +608,10 @@ struct CodexInfoArgs {
     deny_unknown_fields
 )]
 enum CodexInfoQuery {
-    Models {
-        cursor: Option<String>,
-        include_hidden: Option<bool>,
-        limit: Option<u32>,
-    },
+    Models,
     Skills {
         #[serde(default)]
         cwds: Vec<String>,
-        #[serde(default)]
-        force_reload: bool,
     },
     Usage,
 }
@@ -629,8 +640,8 @@ async fn dispatch(
             relay
                 .command_exec(CommandExec {
                     command: a.command,
-                    timeout_ms: a.timeout_ms,
-                    output_bytes_cap: a.output_bytes_cap,
+                    timeout_ms: None,
+                    output_bytes_cap: None,
                     cwd: a.cwd,
                     env: a.env,
                     sandbox_policy: None,
@@ -680,21 +691,17 @@ async fn dispatch(
                 task,
                 cwd,
                 thread_id,
-                developer_instructions,
                 model,
                 effort,
-                service_tier,
-                sandbox_policy,
+                access,
             } => relay
                 .work_start(
                     task,
                     cwd,
                     thread_id,
-                    developer_instructions,
                     model,
                     effort,
-                    service_tier,
-                    sandbox_policy,
+                    work_sandbox_policy(access),
                 )
                 .await
                 .map_err(Into::into),
@@ -784,22 +791,9 @@ async fn dispatch(
                 let relay = relay.clone();
                 pending.spawn(async move {
                     let (kind, result) = match query {
-                        CodexInfoQuery::Models {
-                            cursor,
-                            include_hidden,
-                            limit,
-                        } => (
-                            "models",
-                            relay
-                                .model_list(ModelList {
-                                    include_hidden,
-                                    cursor,
-                                    limit,
-                                })
-                                .await,
-                        ),
-                        CodexInfoQuery::Skills { cwds, force_reload } => {
-                            ("skills", relay.skills_list(cwds, force_reload).await)
+                        CodexInfoQuery::Models => ("models", relay.model_list().await),
+                        CodexInfoQuery::Skills { cwds } => {
+                            ("skills", relay.skills_list(cwds, false).await)
                         }
                         CodexInfoQuery::Usage => ("usage", relay.usage().await),
                     };
@@ -1079,13 +1073,14 @@ mod tests {
         assert!(first_512.contains("NOT ChatGPT's native sandbox"));
         assert!(first_512.contains("/mnt/data"));
         assert!(first_512.contains("Codex Connect host"));
-        assert!(SERVER_INSTRUCTIONS.contains("Use codex.* for Codex lifecycle semantics"));
-        assert!(SERVER_INSTRUCTIONS.contains("never the Codex CLI through host commands"));
-        assert!(SERVER_INSTRUCTIONS.contains("cwd is navigation only"));
-        assert!(SERVER_INSTRUCTIONS.contains("explicit sandboxPolicy"));
-        assert!(SERVER_INSTRUCTIONS.contains("worker owns its scope"));
+        assert!(SERVER_INSTRUCTIONS.contains("codex.* for Codex lifecycle semantics"));
+        assert!(SERVER_INSTRUCTIONS.contains("never invoke the Codex CLI through host commands"));
+        assert!(SERVER_INSTRUCTIONS.contains("cwd is navigation, not authorization"));
+        assert!(SERVER_INSTRUCTIONS.contains("access=full"));
+        assert!(SERVER_INSTRUCTIONS.contains("ApprovalPolicy=never"));
+        assert!(SERVER_INSTRUCTIONS.contains("own delegated scope"));
+        assert!(SERVER_INSTRUCTIONS.contains("Preserve PTY tools"));
         assert!(SERVER_INSTRUCTIONS.contains("Do not create Git workflow state unless requested"));
-        assert!(SERVER_INSTRUCTIONS.contains("tunnel-client owns"));
         assert_eq!(SYNCHRONOUS_TOOL_TARGET_MS, 40_000);
         assert_eq!(SYNCHRONOUS_TOOL_GUARD_MS, 45_000);
     }

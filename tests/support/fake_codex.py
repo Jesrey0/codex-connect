@@ -269,6 +269,23 @@ for line in sys.stdin:
                 timer.daemon = True
                 timer.start()
                 continue
+    elif method == "model/list":
+        model_list_schema = resolve(CONTRACT["methods"]["model/list"]["outputSchema"])
+        model_schema = model_list_schema["properties"]["data"]["items"]
+        models = []
+        for index in range(1, 4):
+            model = sample(model_schema)
+            model.update(
+                id=f"fixture-model-{index}",
+                model=f"fixture-model-{index}",
+                displayName=f"Fixture Model {index}",
+                description=f"Fixture model {index}",
+            )
+            models.append(model)
+        start = int(params.get("cursor") or 0)
+        page_size = 2
+        result["data"] = models[start:start + page_size]
+        result["nextCursor"] = str(start + page_size) if start + page_size < len(models) else None
     elif method == "turn/start":
         assert "sandboxPolicy" in params
         assert "serviceTier" not in params

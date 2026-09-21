@@ -51,7 +51,6 @@ const MAX_TRANSCRIPT_ENTRIES: usize = 512;
 const MAX_TRANSCRIPT_SCAN_ITEMS: usize = 4_096;
 const MAX_LIVE_MESSAGE_CHARS: usize = 8 * 1024;
 const MAX_OBSERVER_PROMPT_CHARS: usize = 8 * 1024;
-const MAX_OBSERVER_DEVELOPER_INSTRUCTIONS_CHARS: usize = 16 * 1024;
 const MAX_OBSERVER_SUMMARY_PROMPT_CHARS: usize = 512;
 const MAX_LIVE_TURNS: usize = 256;
 const MAX_RECENT_WORKERS: usize = 8;
@@ -65,7 +64,7 @@ pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_COMMAND_READ_MS: u64 = 40_000;
 pub const DEFAULT_COMMAND_READ_MS: u64 = 20_000;
 pub const MAX_COMMAND_WRITE_BYTES: usize = 64 * 1024;
-const WORKSPACE_POLICY: &str = "Workspace policy: treat the working directory as a general filesystem workspace. Version control is optional. Do not initialize repositories, create branches, commits, or tags, or use Git as a checkpoint/workflow mechanism unless the task explicitly requests version-control operations. Existing VCS metadata may be read only when it is materially required by the task. Approval discipline: stay within the granted sandbox whenever possible. Do not request approval or additional permissions merely for convenience, broader discovery, cache writes, or optional tooling. Try a sandbox-safe alternative first. Request additional authority only when it is necessary to complete the explicit task, and state the concrete blocker.";
+const WORKSPACE_POLICY: &str = "Workspace policy: treat the working directory as a general filesystem workspace. Version control is optional. Do not initialize repositories, create branches, commits, or tags, or use Git as a checkpoint/workflow mechanism unless the task explicitly requests version-control operations. Existing VCS metadata may be read only when materially required. Stay within the granted sandbox; if required authority is unavailable, report the concrete blocker rather than treating mechanical approval as an escalation path.";
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
 const MAX_APP_SERVER_RESPONSE_BYTES: usize = MAX_WIRE_BYTES - APP_SERVER_RESPONSE_HEADROOM_BYTES;
 const MAX_FS_READ_FILE_BYTES: u64 = ((MAX_APP_SERVER_RESPONSE_BYTES / 4) * 3) as u64;
@@ -76,13 +75,8 @@ pub struct RelayConfig {
     pub default_cwd: PathBuf,
 }
 
-fn compose_developer_instructions(additional: Option<&str>) -> String {
-    match additional {
-        Some(additional) => {
-            format!("{WORKSPACE_POLICY}\n\nOperator-supplied developer instructions:\n{additional}")
-        }
-        None => WORKSPACE_POLICY.into(),
-    }
+fn workspace_developer_instructions() -> String {
+    WORKSPACE_POLICY.into()
 }
 
 fn review_target_prompt(target: &ReviewTarget) -> String {
@@ -194,9 +188,7 @@ struct ObservedTurn {
     mode: Option<String>,
     model: Option<String>,
     effort: Option<String>,
-    service_tier: Option<String>,
     prompt: Option<String>,
-    developer_instructions: Option<String>,
     terminal_at_ms: Option<u64>,
     last_activity_at_ms: u64,
     activity_kind: String,
@@ -211,9 +203,7 @@ struct WorkerAnnotation {
     mode: String,
     model: Option<String>,
     effort: Option<String>,
-    service_tier: Option<String>,
     prompt: Option<String>,
-    developer_instructions: Option<String>,
 }
 
 #[derive(Default)]
@@ -343,9 +333,7 @@ impl LiveTurns {
                 mode: None,
                 model: None,
                 effort: None,
-                service_tier: None,
                 prompt: None,
-                developer_instructions: None,
                 terminal_at_ms,
                 last_activity_at_ms: now_epoch_ms(),
                 activity_kind: "turn".into(),
@@ -381,13 +369,9 @@ impl LiveTurns {
             observed.mode = Some(annotation.mode);
             observed.model = annotation.model;
             observed.effort = annotation.effort;
-            observed.service_tier = annotation.service_tier;
             observed.prompt = annotation
                 .prompt
                 .map(|value| observer_clip(&value, MAX_OBSERVER_PROMPT_CHARS));
-            observed.developer_instructions = annotation
-                .developer_instructions
-                .map(|value| observer_clip(&value, MAX_OBSERVER_DEVELOPER_INSTRUCTIONS_CHARS));
         }
     }
 
@@ -549,9 +533,7 @@ fn observer_worker_value(thread_id: &str, observed: &ObservedTurn) -> Value {
         "mode": observed.mode,
         "model": observed.model,
         "effort": observed.effort,
-        "serviceTier": observed.service_tier,
         "prompt": observed.prompt,
-        "developerInstructions": observed.developer_instructions,
         "terminalAtMs": observed.terminal_at_ms,
         "lastActivityAtMs": observed.last_activity_at_ms,
         "activityKind": observed.activity_kind,
@@ -571,7 +553,6 @@ fn observer_worker_summary_value(thread_id: &str, observed: &ObservedTurn) -> Va
         "mode": observed.mode,
         "model": observed.model,
         "effort": observed.effort,
-        "serviceTier": observed.service_tier,
         "prompt": observed.prompt.as_deref().map(|value| observer_clip(value, MAX_OBSERVER_SUMMARY_PROMPT_CHARS)),
         "terminalAtMs": observed.terminal_at_ms,
         "lastActivityAtMs": observed.last_activity_at_ms,
@@ -1181,43 +1162,20 @@ impl Relay {
         task: String,
         cwd: Option<String>,
         thread_id: Option<String>,
-        developer_instructions: Option<String>,
         model: Option<String>,
         effort: Option<String>,
-        service_tier: Option<String>,
         sandbox_policy: SandboxPolicy,
     ) -> Result<Value, RelayError> {
         if task.trim().is_empty() {
             return Err(RelayError::Invalid("task must not be empty".into()));
         }
-        if developer_instructions
-            .as_ref()
-            .is_some_and(|instructions| instructions.trim().is_empty())
-        {
-            return Err(RelayError::Invalid(
-                "developerInstructions must not be empty".into(),
-            ));
-        }
-        if thread_id.is_some() && developer_instructions.is_some() {
-            return Err(RelayError::Invalid(
-                "developerInstructions applies to new work threads only; omit threadId or omit developerInstructions"
-                    .into(),
-            ));
-        }
         validate_work_sandbox_policy(&sandbox_policy)?;
         let observer_prompt = task.clone();
-        let observer_developer_instructions = developer_instructions.clone();
         let thread_sandbox = sandbox_mode(&sandbox_policy);
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
         let (thread_id, cwd) = self
-            .prepare_thread(
-                cwd,
-                thread_id,
-                None,
-                Some(thread_sandbox),
-                developer_instructions,
-            )
+            .prepare_thread(cwd, thread_id, None, Some(thread_sandbox))
             .await?;
         let response = match self
             .app_server
@@ -1225,11 +1183,11 @@ impl Relay {
                 thread_id: thread_id.clone(),
                 input: vec![TextInput::Text { text: task }],
                 cwd,
-                approval_policy: Some(ApprovalPolicy::OnRequest),
+                approval_policy: Some(ApprovalPolicy::Never),
                 sandbox_policy: Some(sandbox_policy),
                 model: model.clone(),
                 effort: effort.clone(),
-                service_tier_for_turn: service_tier.clone(),
+                service_tier_for_turn: None,
             })
             .await
         {
@@ -1249,9 +1207,7 @@ impl Relay {
                 mode: "work".into(),
                 model,
                 effort,
-                service_tier,
                 prompt: Some(observer_prompt),
-                developer_instructions: observer_developer_instructions,
             },
         )
         .await;
@@ -1266,7 +1222,6 @@ impl Relay {
         thread_id: Option<String>,
         new_thread_model: Option<String>,
         new_thread_sandbox: Option<SandboxMode>,
-        new_thread_developer_instructions: Option<String>,
     ) -> Result<(String, String), RelayError> {
         let cwd = cwd
             .map(|v| self.host.resolve_app_server_directory(&v))
@@ -1306,9 +1261,7 @@ impl Relay {
                     sandbox: new_thread_sandbox,
                     cwd: Some(cwd.unwrap_or_else(|| self.default_cwd())),
                     service_name: Some("codex-connect".into()),
-                    developer_instructions: Some(compose_developer_instructions(
-                        new_thread_developer_instructions.as_deref(),
-                    )),
+                    developer_instructions: Some(workspace_developer_instructions()),
                     ..ThreadStart::default()
                 })
                 .await?;
@@ -1832,7 +1785,6 @@ impl Relay {
                 thread_id,
                 model,
                 created.then_some(SandboxMode::ReadOnly),
-                None,
             )
             .await?;
         let response = match self
@@ -1860,9 +1812,7 @@ impl Relay {
                 mode: "review".into(),
                 model: observer_model,
                 effort: None,
-                service_tier: None,
                 prompt: Some(observer_prompt),
-                developer_instructions: None,
             },
         )
         .await;
@@ -1939,10 +1889,30 @@ impl Relay {
         self.operator_inbox.take().await
     }
 
-    pub async fn model_list(&self, request: ModelList) -> Result<Value, RelayError> {
-        Ok(serde_json::to_value(
-            self.app_server.request(request).await?,
-        )?)
+    pub async fn model_list(&self) -> Result<Value, RelayError> {
+        let mut cursor = None;
+        let mut data = Vec::new();
+        let mut seen_cursors = HashSet::new();
+        loop {
+            let response = self
+                .app_server
+                .request(ModelList {
+                    include_hidden: None,
+                    cursor,
+                    limit: None,
+                })
+                .await?;
+            data.extend(response.data);
+            let Some(next_cursor) = response.next_cursor else {
+                return Ok(json!({"data":data,"nextCursor":null}));
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(RelayError::Invalid(
+                    "model/list returned a repeated pagination cursor".into(),
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
     }
 
     pub async fn skills_list(
@@ -2511,11 +2481,7 @@ mod tests {
                 mode: "work".into(),
                 model: None,
                 effort: None,
-                service_tier: None,
                 prompt: Some("x".repeat(MAX_OBSERVER_PROMPT_CHARS + 10)),
-                developer_instructions: Some(
-                    "y".repeat(MAX_OBSERVER_DEVELOPER_INSTRUCTIONS_CHARS + 10),
-                ),
             },
         );
         let observed = live
@@ -2523,18 +2489,12 @@ mod tests {
             .get(&("thread".to_string(), "turn".to_string()))
             .unwrap();
         let prompt = observed.prompt.as_ref().unwrap();
-        let instructions = observed.developer_instructions.as_ref().unwrap();
         assert_eq!(prompt.chars().count(), MAX_OBSERVER_PROMPT_CHARS);
-        assert_eq!(
-            instructions.chars().count(),
-            MAX_OBSERVER_DEVELOPER_INSTRUCTIONS_CHARS
-        );
         assert!(prompt.ends_with('…'));
-        assert!(instructions.ends_with('…'));
     }
 
     #[test]
-    fn observer_worker_summary_omits_large_developer_context() {
+    fn observer_worker_summary_bounds_prompt_context() {
         let mut live = LiveTurns::default();
         live.insert("thread", test_turn("turn", TurnStatus::InProgress));
         live.annotate(
@@ -2544,13 +2504,10 @@ mod tests {
                 mode: "work".into(),
                 model: Some("gpt-5.6-sol".into()),
                 effort: Some("high".into()),
-                service_tier: None,
                 prompt: Some("x".repeat(MAX_OBSERVER_PROMPT_CHARS)),
-                developer_instructions: Some("y".repeat(MAX_OBSERVER_DEVELOPER_INSTRUCTIONS_CHARS)),
             },
         );
         let worker = live.observer_workers().pop().unwrap();
-        assert!(worker.get("developerInstructions").is_none());
         assert!(
             worker["prompt"].as_str().unwrap().chars().count() <= MAX_OBSERVER_SUMMARY_PROMPT_CHARS
         );
@@ -2591,9 +2548,7 @@ mod tests {
                 mode: "work".into(),
                 model: None,
                 effort: None,
-                service_tier: None,
                 prompt: None,
-                developer_instructions: None,
             },
         );
         live.observe_event(
@@ -2624,9 +2579,7 @@ mod tests {
                 mode: "work".into(),
                 model: None,
                 effort: None,
-                service_tier: None,
                 prompt: Some("turn-0".into()),
-                developer_instructions: None,
             },
         );
         for index in 1..10 {
@@ -2639,9 +2592,7 @@ mod tests {
                     mode: "work".into(),
                     model: None,
                     effort: None,
-                    service_tier: None,
                     prompt: Some(turn_id.clone()),
-                    developer_instructions: None,
                 },
             );
             live.record_recent("thread", &turn_id);
@@ -2669,9 +2620,7 @@ mod tests {
                 mode: "work".into(),
                 model: None,
                 effort: None,
-                service_tier: None,
                 prompt: Some("task".into()),
-                developer_instructions: None,
             },
         );
         live.record_recent("thread", "turn");

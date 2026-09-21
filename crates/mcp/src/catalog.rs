@@ -1,9 +1,6 @@
 //! Public operator catalog and compact MCP schemas.
 use super::{DEFAULT_WAIT_MS, MAX_INSPECT_OPERATIONS, MAX_WAIT_MS};
-use codex_connect_relay::{
-    DEFAULT_COMMAND_MS, DEFAULT_COMMAND_OUTPUT_BYTES, DEFAULT_COMMAND_READ_MS, MAX_COMMAND_MS,
-    MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_READ_MS, MAX_COMMAND_WRITE_BYTES,
-};
+use codex_connect_relay::{DEFAULT_COMMAND_READ_MS, MAX_COMMAND_READ_MS, MAX_COMMAND_WRITE_BYTES};
 use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -133,7 +130,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Run one known, bounded, non-interactive command on the Codex Connect host. Prefer this for deterministic repository, test, build, Git, or system commands that fit one synchronous call. Use command.start for persistent or interactive processes and codex.start for autonomous investigation or coding.",
+                "Run one known, bounded, non-interactive command on the Codex Connect host using server-owned timeout and output limits. Prefer this for deterministic repository, test, build, Git, or system commands that fit one synchronous call. Use command.start for persistent or interactive processes and codex.start for autonomous investigation or coding.",
                 false,
                 true,
                 true,
@@ -147,8 +144,8 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
                     "stderr":{"type":"string"},
                     "stdoutBytes":{"type":"integer","minimum":0},
                     "stderrBytes":{"type":"integer","minimum":0},
-                    "stdoutMayBeTruncated":{"type":"boolean","description":"True when stdout byte length exactly reached outputBytesCap. Upstream does not expose a definitive truncation flag."},
-                    "stderrMayBeTruncated":{"type":"boolean","description":"True when stderr byte length exactly reached outputBytesCap. Upstream does not expose a definitive truncation flag."},
+                    "stdoutMayBeTruncated":{"type":"boolean","description":"True when stdout byte length exactly reached the server-owned output cap. Upstream does not expose a definitive truncation flag."},
+                    "stderrMayBeTruncated":{"type":"boolean","description":"True when stderr byte length exactly reached the server-owned output cap. Upstream does not expose a definitive truncation flag."},
                     "durationMs":{"type":"integer","minimum":0,"description":"Codex Connect-observed wall time for the App Server command request, in milliseconds."}
                 }),
                 &[
@@ -167,7 +164,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Delegate autonomous work or start an official Codex review. Use work mode when reasoning, iteration, or independent implementation materially improves the task; use review mode for the official review lifecycle. Workers do not inherit the ChatGPT conversation, native tools, uploads, or sandbox, so supply self-contained context. Once started, the worker owns its assigned scope until terminal, blocked, or interrupted; continue only non-overlapping operator work.",
+                "Delegate autonomous work or start an official Codex review. Work defaults to a writable workspace sandbox with network access and non-blocking approvals; set access=full only when unrestricted host authority is required. Reviews are read-only. Workers do not inherit the ChatGPT conversation, native tools, uploads, or sandbox, so supply self-contained context. Once started, the worker owns its assigned scope until terminal, blocked, or interrupted; continue only non-overlapping operator work.",
                 false,
                 true,
                 true,
@@ -606,41 +603,11 @@ fn inspect_schema() -> Value {
 fn cwd_schema() -> Value {
     json!({"type":["string","null"],"description":"Working directory on the Codex Connect host. This is not ChatGPT's native sandbox or /mnt/data. Absolute host paths are accepted; relative cwd resolves from the configured navigation cwd, and omitted/null uses that default."})
 }
-fn network_access_schema() -> Value {
-    json!({"type":"boolean","default":false,"description":"Network access for an explicitly supplied sandbox policy. false may block sockets, including socket-based localhost tests. true enables broader network access, not only loopback. No automatic escalation or retry."})
-}
-fn workspace_write_policy_schema() -> Value {
-    object_schema(
-        json!({
-            "type":{"const":"workspaceWrite"},
-            "writableRoots":{"type":"array","description":"Additional absolute writable directory paths for the delegated Codex workspace-write policy, as required by the pinned upstream contract. They are not an exclusive allowlist. The requested task sandbox remains explicit even though the primary host-operator plane runs with danger-full-access.","items":{"type":"string","pattern":"^/"}},
-            "networkAccess":network_access_schema(),
-            "excludeSlashTmp":{"type":"boolean","description":"Forward the upstream workspace-write option that excludes /tmp from writable roots."},
-            "excludeTmpdirEnvVar":{"type":"boolean","description":"Forward the upstream workspace-write option that excludes the TMPDIR environment path from writable roots."}
-        }),
-        &["type"],
-    )
-}
-fn danger_full_access_schema() -> Value {
-    object_schema(
-        json!({"type":{"const":"dangerFullAccess","description":"Run the delegated Codex worker without a filesystem/network sandbox. Select only when the task actually requires unrestricted host authority."}}),
-        &["type"],
-    )
-}
-fn work_sandbox_schema() -> Value {
-    json!({"description":"Explicit sandbox for delegated Codex work. This policy applies to the worker only; it is independent of the primary host-operator plane.","oneOf":[
-        object_schema(json!({"type":{"const":"readOnly"},"networkAccess":network_access_schema()}), &["type"]),
-        workspace_write_policy_schema(),
-        danger_full_access_schema()
-    ]})
-}
 fn command_schema() -> Value {
     object_schema(
         json!({
             "command":{"type":"array","minItems":1,"description":"Exact argv to execute on the Codex Connect host. Prefer direct argv; use a shell explicitly only when shell composition is the intended command.","items":{"type":"string"}},
             "cwd":cwd_schema(),
-            "timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Child-process timeout in milliseconds. Defaults to 30000 and may be extended to 35000. A separate 5000 ms response allowance keeps command.exec within the 40000 ms normal synchronous target and below the server's 45000 ms guard. Use command.start/read for persistent, interactive, or longer-running commands. tunnel-client independently enforces any outer response deadline supplied by the control plane."},
-            "outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Maximum captured bytes per stdout/stderr stream. If a returned stream exactly reaches this cap, stdoutMayBeTruncated/stderrMayBeTruncated reports that the result may be incomplete."},
             "env":{"type":["object","null"],"description":"Optional environment overrides for this host command. Null values remove variables from the child environment.","additionalProperties":{"type":["string","null"]}}
         }),
         &["command"],
@@ -782,14 +749,12 @@ fn codex_start_schema() -> Value {
                 "mode":{"const":"work"},
                 "task":{"type":"string","minLength":1,"description":"Self-contained delegated task. Include relevant host paths, constraints, decisions, and acceptance criteria because the worker does not inherit the ChatGPT conversation or native-tool context."},
                 "cwd":{"type":"string","description":"Codex Connect host working directory for the delegated turn. Omit to use the configured navigation cwd."},
-                "threadId":{"type":"string","description":"Existing Codex thread to resume. Omit to create a new thread. When resuming, omit developerInstructions and keep the thread's established settings."},
-                "developerInstructions":{"type":"string","minLength":1,"description":"Additional developer instructions for a new work thread. Codex Connect appends them after its server-owned workspace policy. Not valid with threadId; resumed threads keep their established developer instructions."},
+                "threadId":{"type":"string","description":"Existing Codex thread to resume. Omit to create a new thread; resumed threads keep their established settings."},
                 "model":{"type":"string","description":"Optional exact Codex model ID for this new thread/turn. Prefer a supported ID returned by codex.info(type=models); omit to use the configured/upstream default."},
                 "effort":{"type":"string","description":"Optional reasoning effort for work mode. Prefer a value supported by the selected model from codex.info(type=models); omit to use the configured/upstream default."},
-                "serviceTier":{"type":"string","description":"Optional Codex service tier override. Omit unless intentionally overriding the configured/upstream default."},
-                "sandboxPolicy":work_sandbox_schema()
+                "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Worker authority. workspace is the normal writable workspace sandbox with network access and non-blocking approvals; full explicitly requests danger-full-access."}
             }),
-            &["mode", "task", "sandboxPolicy"],
+            &["mode", "task"],
         ),
         object_schema(
             json!({
@@ -894,16 +859,10 @@ fn codex_action_respond_schema() -> Value {
 }
 fn codex_info_schema() -> Value {
     let query = json!({"oneOf":[
-        object_schema(json!({
-            "type":{"const":"models"},
-            "cursor":{"type":["string","null"],"description":"Optional upstream model-list pagination cursor."},
-            "includeHidden":{"type":["boolean","null"],"description":"Include hidden upstream models only when explicitly needed."},
-            "limit":{"type":["integer","null"],"minimum":0,"description":"Optional upstream model-list page size."}
-        }), &["type"]),
+        object_schema(json!({"type":{"const":"models"}}), &["type"]),
         object_schema(json!({
             "type":{"const":"skills"},
-            "cwds":{"type":"array","description":"Codex Connect host working directories whose available Codex skills should be discovered.","items":{"type":"string"}},
-            "forceReload":{"type":"boolean","default":false,"description":"Force upstream skill discovery to refresh rather than use its normal cache."}
+            "cwds":{"type":"array","description":"Codex Connect host working directories whose available Codex skills should be discovered.","items":{"type":"string"}}
         }), &["type"]),
         object_schema(json!({"type":{"const":"usage"}}), &["type"])
     ]});
@@ -1041,40 +1000,15 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_contract_separates_host_inheritance_from_explicit_work_policy() {
+    fn public_contract_hides_mechanical_execution_policy() {
         let schema = command_schema();
         let properties = schema["properties"].as_object().unwrap();
         assert!(!properties.contains_key("disableTimeout"));
         assert!(!properties.contains_key("disableOutputCap"));
-        assert_eq!(properties["timeoutMs"]["default"], DEFAULT_COMMAND_MS);
-        assert_eq!(properties["timeoutMs"]["minimum"], 1);
-        assert_eq!(properties["timeoutMs"]["maximum"], MAX_COMMAND_MS);
-        assert!(
-            properties["timeoutMs"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("tunnel-client independently")
-        );
-        assert_eq!(
-            properties["outputBytesCap"]["default"],
-            DEFAULT_COMMAND_OUTPUT_BYTES
-        );
-        assert_eq!(
-            properties["outputBytesCap"]["maximum"],
-            MAX_COMMAND_OUTPUT_BYTES
-        );
-        assert!(
-            properties["outputBytesCap"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("may be incomplete")
-        );
+        assert!(!properties.contains_key("timeoutMs"));
+        assert!(!properties.contains_key("outputBytesCap"));
         assert_eq!(schema["additionalProperties"], false);
-        assert!(
-            command_schema()["properties"]
-                .get("sandboxPolicy")
-                .is_none()
-        );
+        assert!(properties.get("sandboxPolicy").is_none());
         assert!(
             command_start_schema()["properties"]
                 .get("sandboxPolicy")
@@ -1083,24 +1017,26 @@ mod tests {
         let start = codex_start_schema();
         let work = &start["oneOf"][0];
         let review = &start["oneOf"][1];
-        assert_eq!(work["properties"]["sandboxPolicy"], work_sandbox_schema());
-        assert!(
-            work["properties"]["sandboxPolicy"]
-                .to_string()
-                .contains("readOnly")
+        assert_eq!(work["properties"]["access"]["default"], "workspace");
+        assert_eq!(
+            work["properties"]["access"]["enum"],
+            json!(["workspace", "full"])
         );
+        for hidden in [
+            "sandboxPolicy",
+            "developerInstructions",
+            "serviceTier",
+            "approvalPolicy",
+        ] {
+            assert!(work["properties"].get(hidden).is_none(), "{hidden}");
+        }
         assert!(
-            work["required"]
+            !work["required"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|value| value == "sandboxPolicy")
+                .any(|value| value == "access")
         );
-        assert_eq!(
-            work["properties"]["developerInstructions"]["type"],
-            "string"
-        );
-        assert_eq!(work["properties"]["developerInstructions"]["minLength"], 1);
         assert!(work["properties"].get("approvalPolicy").is_none());
         assert!(review["properties"].get("developerInstructions").is_none());
         assert!(review["properties"].get("sandboxPolicy").is_none());
@@ -1192,27 +1128,12 @@ mod tests {
             .unwrap();
         let exec_description = exec.description.as_deref().unwrap();
         assert!(exec_description.contains("bounded, non-interactive"));
+        assert!(exec_description.contains("server-owned timeout and output limits"));
         assert!(exec_description.contains("command.start"));
         assert!(exec_description.contains("codex.start"));
         let exec_input = command_schema();
-        assert!(
-            exec_input["properties"]["timeoutMs"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("40000 ms normal synchronous target")
-        );
-        assert!(
-            exec_input["properties"]["timeoutMs"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("45000 ms guard")
-        );
-        assert!(
-            exec_input["properties"]["timeoutMs"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("tunnel-client independently")
-        );
+        assert!(exec_input["properties"].get("timeoutMs").is_none());
+        assert!(exec_input["properties"].get("outputBytesCap").is_none());
         let exec_output = exec.output_schema.as_ref().unwrap();
         for field in [
             "stdoutBytes",
@@ -1430,10 +1351,10 @@ mod tests {
                 .contains("codex.info(type=models)")
         );
         assert!(
-            work["threadId"]["description"]
+            work["access"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("omit developerInstructions")
+                .contains("danger-full-access")
         );
     }
 
