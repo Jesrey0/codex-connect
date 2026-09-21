@@ -1,4 +1,4 @@
-use crate::config::ConfigStore;
+use crate::config::{BackendConfig, ConfigStore};
 use crate::management;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -6,8 +6,8 @@ use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{MissedTickBehavior, interval};
 
-const REFRESH_MS: u64 = 750;
-const STALE_AFTER: Duration = Duration::from_secs(3);
+const UI_TICK_MS: u64 = 750;
+const RECONNECT_MS: u64 = 500;
 const MAX_ACTION_TEXT_CHARS: usize = 2 * 1024;
 const MAX_ACTION_ROW_CHARS: usize = 512;
 const RESET: &str = "\x1b[0m";
@@ -25,13 +25,19 @@ pub async fn run() -> Result<()> {
     let config = ConfigStore::default()?.load()?;
     let _screen = ScreenGuard::enter()?;
     let mut input = TerminalInput::enter()?;
-    let mut ticker = interval(Duration::from_millis(REFRESH_MS));
+    let mut ticker = interval(Duration::from_millis(UI_TICK_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut input_ticker = interval(Duration::from_millis(50));
     input_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut snapshot = None;
-    let mut last_success = None;
-    let mut last_error = None;
+    let initial = management::backend_observer_once(&config.backend).await;
+    let (mut snapshot, mut observer_cursor, mut last_error) = match initial {
+        Ok(value) => {
+            let cursor = value["cursor"].as_u64();
+            (Some(value), cursor, None)
+        }
+        Err(error) => (None, None, Some(error.to_string())),
+    };
+    let mut observer_task = spawn_observer_task(config.backend.clone(), observer_cursor);
     let mut state = ConsoleState::default();
     let mut frame = 0usize;
 
@@ -41,29 +47,33 @@ pub async fn run() -> Result<()> {
                 signal.context("unable to listen for Ctrl-C")?;
                 break;
             }
-            _ = ticker.tick() => {
-                match management::backend_observer_once(&config.backend).await {
-                    Ok(value) => {
-                        snapshot = Some(value);
-                        last_success = Some(SystemTime::now());
+            result = &mut observer_task => {
+                match result {
+                    Ok(Ok(value)) => {
+                        let rehydrated = observer_cursor.is_none();
+                        observer_cursor = value["cursor"].as_u64();
                         last_error = None;
-                    }
-                    Err(error) => last_error = Some(error.to_string()),
-                }
-                if let Some(target) = state.transcript_target() {
-                    match management::backend_transcript_once(
-                        &config.backend,
-                        &target.thread_id,
-                        &target.turn_id,
-                    ).await {
-                        Ok(value) => {
-                            state.transcript = Some(value);
-                            state.transcript_error = None;
+                        let refresh_transcript = (rehydrated && state.transcript_target().is_some())
+                            || sync_transcript_from_snapshot(&mut state, &value);
+                        snapshot = Some(value);
+                        if refresh_transcript {
+                            hydrate_transcript(&config.backend, &mut state, snapshot.as_ref()).await;
                         }
-                        Err(error) => state.transcript_error = Some(error.to_string()),
+                    }
+                    Ok(Err(error)) => {
+                        last_error = Some(error.to_string());
+                        observer_cursor = None;
+                    }
+                    Err(error) => {
+                        last_error = Some(format!("observer task failed: {error}"));
+                        observer_cursor = None;
                     }
                 }
-                draw(snapshot.as_ref(), last_success, last_error.as_deref(), &mut state, frame)?;
+                observer_task = spawn_observer_task(config.backend.clone(), observer_cursor);
+                draw(snapshot.as_ref(), last_error.as_deref(), &mut state, frame)?;
+            }
+            _ = ticker.tick() => {
+                draw(snapshot.as_ref(), last_error.as_deref(), &mut state, frame)?;
                 frame = frame.wrapping_add(1);
             }
             _ = input_ticker.tick() => {
@@ -72,12 +82,30 @@ pub async fn run() -> Result<()> {
                     changed |= state.handle_key(key, snapshot.as_ref());
                 }
                 if changed {
-                    draw(snapshot.as_ref(), last_success, last_error.as_deref(), &mut state, frame)?;
+                    if state.transcript_target().is_some() && state.transcript.is_none() {
+                        hydrate_transcript(&config.backend, &mut state, snapshot.as_ref()).await;
+                    }
+                    draw(snapshot.as_ref(), last_error.as_deref(), &mut state, frame)?;
                 }
             }
         }
     }
     Ok(())
+}
+
+fn spawn_observer_task(
+    backend: BackendConfig,
+    cursor: Option<u64>,
+) -> tokio::task::JoinHandle<Result<Value>> {
+    tokio::spawn(async move {
+        match cursor {
+            Some(cursor) => management::backend_observer_wait(&backend, cursor).await,
+            None => {
+                tokio::time::sleep(Duration::from_millis(RECONNECT_MS)).await;
+                management::backend_observer_once(&backend).await
+            }
+        }
+    })
 }
 
 struct ScreenGuard;
@@ -243,6 +271,7 @@ struct ConsoleState {
     view: View,
     transcript: Option<Value>,
     transcript_error: Option<String>,
+    transcript_revision: u64,
     scroll: usize,
     follow: bool,
     selected_worker: usize,
@@ -255,6 +284,7 @@ impl Default for ConsoleState {
             view: View::Dashboard,
             transcript: None,
             transcript_error: None,
+            transcript_revision: 0,
             scroll: 0,
             follow: true,
             selected_worker: 0,
@@ -310,6 +340,7 @@ impl ConsoleState {
                     self.view = View::Transcript(target);
                     self.transcript = None;
                     self.transcript_error = None;
+                    self.transcript_revision = 0;
                     self.scroll = 0;
                     self.follow = true;
                     true
@@ -320,6 +351,7 @@ impl ConsoleState {
                 InputKey::Escape | InputKey::Left | InputKey::Character('b') => {
                     self.view = View::Dashboard;
                     self.transcript_error = None;
+                    self.transcript_revision = 0;
                     true
                 }
                 InputKey::Character('j') | InputKey::Down => {
@@ -345,6 +377,75 @@ impl ConsoleState {
             },
         }
     }
+}
+
+async fn hydrate_transcript(
+    backend: &BackendConfig,
+    state: &mut ConsoleState,
+    snapshot: Option<&Value>,
+) {
+    let Some(target) = state.transcript_target().cloned() else {
+        return;
+    };
+    match management::backend_transcript_once(backend, &target.thread_id, &target.turn_id).await {
+        Ok(value) => {
+            state.transcript = Some(value);
+            state.transcript_error = None;
+            state.transcript_revision = snapshot
+                .and_then(|snapshot| worker_for_target(snapshot, &target))
+                .and_then(|worker| worker["transcriptRevision"].as_u64())
+                .unwrap_or_default();
+            if let Some(snapshot) = snapshot {
+                let _ = sync_transcript_from_snapshot(state, snapshot);
+            }
+        }
+        Err(error) => state.transcript_error = Some(error.to_string()),
+    }
+}
+
+fn worker_for_target<'a>(snapshot: &'a Value, target: &TranscriptTarget) -> Option<&'a Value> {
+    workers(snapshot)?
+        .iter()
+        .find(|worker| same_worker(worker, target))
+}
+
+fn sync_transcript_from_snapshot(state: &mut ConsoleState, snapshot: &Value) -> bool {
+    let Some(target) = state.transcript_target().cloned() else {
+        return false;
+    };
+    let Some(worker) = worker_for_target(snapshot, &target) else {
+        return false;
+    };
+    let transcript_revision = worker["transcriptRevision"].as_u64().unwrap_or_default();
+    let transcript_changed = transcript_revision > state.transcript_revision;
+
+    let pending_actions = snapshot["projection"]["pendingActions"]
+        .as_array()
+        .map(|actions| {
+            actions
+                .iter()
+                .filter(|action| {
+                    action["threadId"].as_str() == Some(target.thread_id.as_str())
+                        && action["turnId"]
+                            .as_str()
+                            .is_none_or(|turn_id| turn_id == target.turn_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if let Some(transcript) = state.transcript.as_mut() {
+        transcript["status"] = worker["status"].clone();
+        transcript["pendingActions"] = Value::Array(pending_actions);
+        transcript["activity"] = serde_json::json!({
+            "kind": worker["activityKind"],
+            "summary": worker["activitySummary"],
+            "lastActivityAtMs": worker["lastActivityAtMs"],
+            "tokenUsage": worker["tokenUsage"],
+        });
+    }
+    transcript_changed
 }
 
 fn workers(snapshot: &Value) -> Option<&Vec<Value>> {
@@ -389,7 +490,6 @@ fn sync_worker_selection(state: &mut ConsoleState, workers: &[Value]) {
 
 fn draw(
     snapshot: Option<&Value>,
-    last_success: Option<SystemTime>,
     last_error: Option<&str>,
     state: &mut ConsoleState,
     frame: usize,
@@ -413,7 +513,11 @@ fn draw(
             " CODEX CONNECT // CONSOLE",
             &format!(
                 "{pulse} {} ",
-                freshness_label(last_success, SystemTime::now())
+                if snapshot.is_some() && last_error.is_none() {
+                    "LIVE EVENTS"
+                } else {
+                    "RECONNECTING"
+                }
             ),
             width,
         ),
@@ -500,7 +604,7 @@ fn render_snapshot(
     lines.push(styled(
         row_lr(
             &format!(" ⌂ {}", text(&projection["cwd"], "unknown")),
-            &format!("refresh {}ms ", REFRESH_MS),
+            "event-driven ",
             width,
         ),
         DIM,
@@ -1213,13 +1317,6 @@ fn reset_in(epoch_seconds: u64) -> String {
     }
 }
 
-fn freshness_label(last_success: Option<SystemTime>, now: SystemTime) -> &'static str {
-    match last_success.and_then(|time| now.duration_since(time).ok()) {
-        Some(age) if age <= STALE_AFTER => "LIVE",
-        _ => "STALE",
-    }
-}
-
 fn worker_capacity(height: usize, pending: usize) -> usize {
     let pending_rows = if pending == 0 { 0 } else { pending.min(2) + 2 };
     (height.saturating_sub(10 + pending_rows) / 2).clamp(1, 12)
@@ -1426,17 +1523,6 @@ mod tests {
     }
 
     #[test]
-    fn freshness_is_live_only_after_a_recent_successful_refresh() {
-        let now = SystemTime::now();
-        assert_eq!(freshness_label(Some(now), now), "LIVE");
-        assert_eq!(
-            freshness_label(Some(now - STALE_AFTER - Duration::from_secs(1)), now),
-            "STALE"
-        );
-        assert_eq!(freshness_label(None, now), "STALE");
-    }
-
-    #[test]
     fn account_line_preserves_compact_quota_telemetry() {
         let projection = serde_json::json!({
             "usage": {
@@ -1506,6 +1592,61 @@ mod tests {
                 turn_id: "turn-two".into(),
             })
         );
+    }
+
+    #[test]
+    fn transcript_refreshes_only_when_worker_revision_advances() {
+        let target = TranscriptTarget {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        let mut state = ConsoleState {
+            view: View::Transcript(target.clone()),
+            transcript: Some(serde_json::json!({
+                "status":"inProgress",
+                "pendingActions":[],
+                "activity":null,
+                "entries":[]
+            })),
+            transcript_revision: 3,
+            ..ConsoleState::default()
+        };
+        let snapshot = serde_json::json!({
+            "projection": {
+                "workers": [{
+                    "threadId":"thread",
+                    "turnId":"turn",
+                    "status":"inProgress",
+                    "activityKind":"message",
+                    "activitySummary":"hello",
+                    "lastActivityAtMs":10,
+                    "transcriptRevision":4,
+                    "tokenUsage":{"totalTokens":12,"modelContextWindow":100}
+                }],
+                "pendingActions": [{
+                    "threadId":"thread",
+                    "turnId":"turn",
+                    "kind":"userInput"
+                }]
+            }
+        });
+
+        assert!(sync_transcript_from_snapshot(&mut state, &snapshot));
+        assert_eq!(
+            state.transcript.as_ref().unwrap()["activity"]["summary"],
+            "hello"
+        );
+        assert_eq!(
+            state.transcript.as_ref().unwrap()["pendingActions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        state.transcript_revision = 4;
+        assert!(!sync_transcript_from_snapshot(&mut state, &snapshot));
+        assert_eq!(state.transcript_target(), Some(&target));
     }
 
     #[test]

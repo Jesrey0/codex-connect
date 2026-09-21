@@ -44,7 +44,6 @@ const WAIT_FINALIZATION_RESERVE_MS: u64 = 10_000;
 const MAX_WAIT_OPERATION_MS: u64 = 40_000;
 const WAIT_RECONCILE_MS: u64 = 1_000;
 const WAIT_STORAGE_RETRY_MS: u64 = 25;
-const OBSERVER_USAGE_REFRESH_MS: u64 = 5_000;
 const MAX_SEMANTIC_EVENTS: usize = 16;
 const MAX_TRANSCRIPT_TEXT_CHARS: usize = 32 * 1024;
 const MAX_TRANSCRIPT_TOTAL_CHARS: usize = 192 * 1024;
@@ -176,7 +175,7 @@ pub struct Relay {
     operator_inbox: operator_inbox::OperatorInbox,
     live_turns: Arc<Mutex<LiveTurns>>,
     thread_subscriptions: Arc<Mutex<ThreadSubscriptions>>,
-    observer_usage: Arc<Mutex<Option<(Instant, Value)>>>,
+    observer_usage: Arc<Mutex<ObserverUsageState>>,
     command_sessions: command_sessions::CommandSessions,
     command_generation: Arc<str>,
     next_command_id: Arc<AtomicU64>,
@@ -200,10 +199,19 @@ struct ObservedTurn {
     last_activity_at_ms: u64,
     activity_kind: String,
     activity_summary: Option<String>,
+    transcript_revision: u64,
     message_item_id: Option<String>,
     message_excerpt: String,
     token_usage_total: Option<u64>,
     model_context_window: Option<u64>,
+}
+
+#[derive(Default)]
+struct ObserverUsageState {
+    value: Option<Value>,
+    error: Option<String>,
+    refresh_running: bool,
+    refresh_pending: bool,
 }
 
 struct WorkerAnnotation {
@@ -345,6 +353,7 @@ impl LiveTurns {
                 last_activity_at_ms: now_epoch_ms(),
                 activity_kind: "turn".into(),
                 activity_summary: Some("turn observed".into()),
+                transcript_revision: 0,
                 message_item_id: None,
                 message_excerpt: String::new(),
                 token_usage_total: None,
@@ -401,6 +410,16 @@ impl LiveTurns {
         else {
             return;
         };
+
+        if method == "turn/completed"
+            || (method == "item/completed"
+                && matches!(
+                    params["item"]["type"].as_str(),
+                    Some("agentMessage" | "exitedReviewMode")
+                ))
+        {
+            observed.transcript_revision = observed.transcript_revision.saturating_add(1);
+        }
 
         if method == "thread/tokenUsage/updated" {
             let usage = &params["tokenUsage"];
@@ -545,6 +564,7 @@ fn observer_worker_value(thread_id: &str, observed: &ObservedTurn) -> Value {
         "lastActivityAtMs": observed.last_activity_at_ms,
         "activityKind": observed.activity_kind,
         "activitySummary": observed.activity_summary,
+        "transcriptRevision": observed.transcript_revision,
         "tokenUsage": {
             "totalTokens": observed.token_usage_total,
             "modelContextWindow": observed.model_context_window,
@@ -565,6 +585,7 @@ fn observer_worker_summary_value(thread_id: &str, observed: &ObservedTurn) -> Va
         "lastActivityAtMs": observed.last_activity_at_ms,
         "activityKind": observed.activity_kind,
         "activitySummary": observed.activity_summary,
+        "transcriptRevision": observed.transcript_revision,
         "tokenUsage": {
             "totalTokens": observed.token_usage_total,
             "modelContextWindow": observed.model_context_window,
@@ -610,7 +631,7 @@ impl Relay {
             operator_inbox: operator_inbox::OperatorInbox::default(),
             live_turns: Arc::new(Mutex::new(LiveTurns::default())),
             thread_subscriptions: Arc::new(Mutex::new(ThreadSubscriptions::default())),
-            observer_usage: Arc::new(Mutex::new(None)),
+            observer_usage: Arc::new(Mutex::new(ObserverUsageState::default())),
             command_sessions: command_sessions::CommandSessions::default(),
             command_generation: format!(
                 "{:x}-{:x}",
@@ -654,6 +675,13 @@ impl Relay {
             self.push_terminal_worker_event(thread_id, &observed).await;
             self.observe_terminal_turn(thread_id, turn_id).await;
         }
+        self.journal
+            .push(
+                "codexConnect/observerWorkerChanged",
+                &json!({"threadId":thread_id,"turnId":turn_id}),
+            )
+            .await;
+        self.trigger_observer_usage_refresh().await;
     }
 
     async fn begin_thread_start(&self, thread_id: &str) {
@@ -1984,23 +2012,72 @@ impl Relay {
             .await?)
     }
 
-    pub async fn observer_snapshot(&self) -> Result<Value, RelayError> {
-        let usage = {
-            let cached = self.observer_usage.lock().await;
-            cached
-                .as_ref()
-                .filter(|(sampled, _)| {
-                    sampled.elapsed() < Duration::from_millis(OBSERVER_USAGE_REFRESH_MS)
-                })
-                .map(|(_, value)| value.clone())
-        };
-        let usage = match usage {
-            Some(value) => value,
-            None => {
-                let value = self.usage().await?;
-                *self.observer_usage.lock().await = Some((Instant::now(), value.clone()));
-                value
+    async fn store_observer_usage_result(&self, result: Result<Value, RelayError>) {
+        let (ok, error) = {
+            let mut state = self.observer_usage.lock().await;
+            match result {
+                Ok(value) => {
+                    state.value = Some(value);
+                    state.error = None;
+                    (true, None)
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    state.error = Some(message.clone());
+                    (false, Some(message))
+                }
             }
+        };
+        self.journal
+            .push(
+                "codexConnect/observerUsageUpdated",
+                &json!({"ok":ok,"error":error}),
+            )
+            .await;
+    }
+
+    async fn trigger_observer_usage_refresh(&self) {
+        let should_spawn = {
+            let mut state = self.observer_usage.lock().await;
+            if state.refresh_running {
+                state.refresh_pending = true;
+                false
+            } else {
+                state.refresh_running = true;
+                true
+            }
+        };
+
+        if should_spawn {
+            let relay = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    let result = relay.usage().await;
+                    relay.store_observer_usage_result(result).await;
+                    let continue_refreshing = {
+                        let mut state = relay.observer_usage.lock().await;
+                        let pending = state.refresh_pending;
+                        state.refresh_pending = false;
+                        if !pending {
+                            state.refresh_running = false;
+                        }
+                        pending
+                    };
+                    if !continue_refreshing {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    async fn observer_projection(&self) -> Value {
+        let (usage, usage_error) = {
+            let cached = self.observer_usage.lock().await;
+            (
+                cached.value.clone().unwrap_or(Value::Null),
+                cached.error.clone(),
+            )
         };
         let workers = {
             let live = self.live_turns.lock().await;
@@ -2008,13 +2085,41 @@ impl Relay {
         };
         let pending_actions = self.pending_actions(None).await;
         let notices = self.journal.observer_notices(8).await;
-        Ok(json!({
+        json!({
             "cwd": self.default_cwd(),
             "usage": usage,
-            "usageRefreshMs": OBSERVER_USAGE_REFRESH_MS,
+            "usageError": usage_error,
             "workers": workers,
             "pendingActions": pending_actions,
             "notices": notices,
+        })
+    }
+
+    pub async fn observer_snapshot(&self) -> Value {
+        self.trigger_observer_usage_refresh().await;
+        json!({
+            "cursor": self.journal.cursor().await,
+            "projection": self.observer_projection().await,
+        })
+    }
+
+    pub async fn observer_wait(&self, after_cursor: u64) -> Result<Value, RelayError> {
+        let mut changes = self.journal.changes();
+        let current = self.journal.cursor().await;
+        if after_cursor > current {
+            return Err(RelayError::Invalid(
+                "observer cursor is ahead of this backend; hydrate /observe again".into(),
+            ));
+        }
+        if current == after_cursor {
+            changes
+                .changed()
+                .await
+                .map_err(|_| AppServerError::Disconnected)?;
+        }
+        Ok(json!({
+            "cursor": self.journal.cursor().await,
+            "projection": self.observer_projection().await,
         }))
     }
 
@@ -2108,7 +2213,6 @@ impl Relay {
                                     let terminal = {
                                         let mut live = live_turns.lock().await;
                                         live.insert(thread_id, turn);
-                                        live.record_recent(thread_id, &turn_id);
                                         live.turns
                                             .get(&(thread_id.to_string(), turn_id))
                                             .cloned()
@@ -2139,9 +2243,20 @@ impl Relay {
                                 .lock()
                                 .await
                                 .observe_event(method, event.get("params").unwrap_or(&Value::Null));
-                            journal
-                                .push(method, event.get("params").unwrap_or(&Value::Null))
-                                .await;
+                            if let Some((thread_id, turn_id)) = terminal_turn.as_ref() {
+                                live_turns.lock().await.record_recent(thread_id, turn_id);
+                            }
+                            let params = event.get("params").unwrap_or(&Value::Null);
+                            journal.push(method, params).await;
+                            let refresh_usage = method == "turn/completed"
+                                || (method == "item/completed"
+                                    && matches!(
+                                        params["item"]["type"].as_str(),
+                                        Some("agentMessage" | "exitedReviewMode")
+                                    ));
+                            if refresh_usage {
+                                relay.trigger_observer_usage_refresh().await;
+                            }
                             if let Some((thread_id, turn_id)) = terminal_turn {
                                 relay.observe_terminal_turn(&thread_id, &turn_id).await;
                             }
@@ -2553,6 +2668,80 @@ mod tests {
             worker["prompt"].as_str().unwrap().chars().count() <= MAX_OBSERVER_SUMMARY_PROMPT_CHARS
         );
         assert!(serde_json::to_vec(&worker).unwrap().len() < 4 * 1024);
+    }
+
+    #[test]
+    fn transcript_revision_tracks_human_visible_completion_boundaries() {
+        let mut live = LiveTurns::default();
+        live.insert("thread", test_turn("turn", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "turn",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: None,
+                effort: None,
+                prompt: Some("task".into()),
+            },
+        );
+
+        live.observe_event(
+            "item/agentMessage/delta",
+            &json!({"threadId":"thread","turnId":"turn","delta":"hello"}),
+        );
+        assert_eq!(live.observer_workers()[0]["transcriptRevision"], 0);
+
+        live.observe_event(
+            "item/completed",
+            &json!({
+                "threadId":"thread",
+                "turnId":"turn",
+                "item":{"type":"reasoning"}
+            }),
+        );
+        assert_eq!(live.observer_workers()[0]["transcriptRevision"], 0);
+
+        live.observe_event(
+            "item/completed",
+            &json!({
+                "threadId":"thread",
+                "turnId":"turn",
+                "item":{"type":"agentMessage","text":"hello"}
+            }),
+        );
+        assert_eq!(live.observer_workers()[0]["transcriptRevision"], 1);
+
+        live.observe_event(
+            "turn/completed",
+            &json!({"threadId":"thread","turn":{"id":"turn","status":"completed"}}),
+        );
+        assert_eq!(live.observer_workers()[0]["transcriptRevision"], 2);
+    }
+
+    #[test]
+    fn terminal_recent_projection_keeps_reduced_transcript_revision() {
+        let mut live = LiveTurns::default();
+        live.insert("thread", test_turn("turn", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "turn",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: None,
+                effort: None,
+                prompt: Some("task".into()),
+            },
+        );
+        live.insert("thread", test_turn("turn", TurnStatus::Completed));
+        live.observe_event(
+            "turn/completed",
+            &json!({"threadId":"thread","turn":{"id":"turn","status":"completed"}}),
+        );
+        live.record_recent("thread", "turn");
+
+        let worker = live.observer_workers().pop().unwrap();
+        assert_eq!(worker["status"], "completed");
+        assert_eq!(worker["transcriptRevision"], 1);
     }
 
     #[test]

@@ -218,13 +218,52 @@ class OperatorProtocolTests(unittest.TestCase):
         with urllib.request.urlopen(self.url + "/observe") as response:
             observer = json.load(response)
         self.assertEqual(observer["runtime"], runtime)
+        self.assertIsInstance(observer["cursor"], int)
         projection = observer["projection"]
         self.assertEqual(set(projection), {
-            "cwd", "usage", "usageRefreshMs", "workers", "pendingActions", "notices",
+            "cwd", "usage", "usageError", "workers", "pendingActions", "notices",
         })
         self.assertEqual(projection["cwd"], str(self.workspace))
-        self.assertEqual(projection["usageRefreshMs"], 5000)
+        self.assertIsNone(projection["usageError"])
+        if projection["usage"] is None:
+            with urllib.request.urlopen(
+                f"{self.url}/observe/wait/{observer['cursor']}", timeout=2
+            ) as response:
+                observer = json.load(response)
+            self.assertGreater(observer["cursor"], 0)
+            projection = observer["projection"]
         self.assertIn("rateLimits", projection["usage"])
+
+    def test_observer_wait_is_event_driven_and_projects_live_worker_state(self):
+        with urllib.request.urlopen(self.url + "/observe") as response:
+            observer = json.load(response)
+        cursor = observer["cursor"]
+        work = self.start("progress")
+
+        observed_worker = None
+        for _ in range(6):
+            with urllib.request.urlopen(
+                f"{self.url}/observe/wait/{cursor}", timeout=2
+            ) as response:
+                update = json.load(response)
+            self.assertGreater(update["cursor"], cursor)
+            cursor = update["cursor"]
+            observed_worker = next((
+                worker for worker in update["projection"]["workers"]
+                if worker["turnId"] == work["turnId"]
+            ), None)
+            if observed_worker is not None and observed_worker["activityKind"] == "message":
+                break
+
+        self.assertIsNotNone(observed_worker)
+        self.assertEqual(observed_worker["threadId"], work["threadId"])
+        self.assertEqual(observed_worker["activityKind"], "message")
+        self.assertIn("Working", observed_worker["activitySummary"])
+        self.assertIn("transcriptRevision", observed_worker)
+        self.client.call("codex.control", {
+            "action":"interrupt", "threadId":work["threadId"], "turnId":work["turnId"]
+        })
+        self.assertEqual(self.wait(work)["state"], "terminal")
     def test_inspection_uses_default_cwd_and_accepts_absolute_host_paths(self):
         result = self.client.call("inspect", {"operations": [
             {"type": "readText", "path": "sample.txt", "startLine": 2, "endLine": 2},

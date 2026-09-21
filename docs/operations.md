@@ -21,7 +21,7 @@ codex-connect console
 codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-project
 ```
 
-`status` is concise runtime/readiness/orientation: readiness, live build identity, navigation cwd, and Codex default provenance. `console` is a read-only human projection of workers, quota, pending actions, and selected transcripts; it is not an event trace. `doctor` is the detailed local diagnostic. PTY command sessions are controlled through the MCP `command.start/read/control` tools.
+`status` is concise runtime/readiness/orientation: readiness, live build identity, navigation cwd, and Codex default provenance. `console` is a read-only event-driven human projection of workers, quota, pending actions, and selected transcripts; it hydrates once, then waits for observer changes rather than polling. Its local UI clock only redraws animation/countdowns. Quota refresh is triggered by observer launch and worker/message lifecycle boundaries and is independent from the worker projection. `doctor` is the detailed local diagnostic. PTY command sessions are controlled through the MCP `command.start/read/control` tools.
 
 ## Tunnel lifecycle
 

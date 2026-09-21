@@ -170,6 +170,7 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
     };
     let runtime_status = handler.clone();
     let observer = handler.clone();
+    let observer_wait = handler.clone();
     let transcript = handler.clone();
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
@@ -194,17 +195,32 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
             axum::routing::get(move || {
                 let handler = observer.clone();
                 async move {
+                    let observed = handler.relay.observer_snapshot().await;
+                    Json(json!({
+                        "runtime": handler.runtime_status_value(),
+                        "cursor": observed["cursor"],
+                        "projection": observed["projection"],
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/observe/wait/{cursor}",
+            axum::routing::get(move |Path(cursor): Path<u64>| {
+                let handler = observer_wait.clone();
+                async move {
                     handler
                         .relay
-                        .observer_snapshot()
+                        .observer_wait(cursor)
                         .await
-                        .map(|projection| {
+                        .map(|observed| {
                             Json(json!({
                                 "runtime": handler.runtime_status_value(),
-                                "projection": projection,
+                                "cursor": observed["cursor"],
+                                "projection": observed["projection"],
                             }))
                         })
-                        .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))
+                        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))
                 }
             }),
         )

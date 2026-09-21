@@ -35,7 +35,7 @@ App Server is the authority for official IDs and lifecycle. Connect adapts its m
 - `codex.control` steers or interrupts; `codex.action.respond` answers approvals, permissions, user input, and elicitation.
 - `command.start/read/control` preserve the official streaming command lifecycle, including PTY stdin, resize, and termination.
 
-Connect-owned event journals, reducers, pending-request registries, and observer caches are bounded projections, not authoritative Codex state. The human `codex-connect console` is read-only and human-oriented; it is not an event trace. Use `codex.inspect` for forensic activity.
+Connect-owned event journals, reducers, pending-request registries, and observer caches are bounded projections, not authoritative Codex state. The human `codex-connect console` is read-only and human-oriented; it hydrates once and then advances through cursor-based observer waits driven by App Server events. Message deltas update the live projection directly; completed human-visible messages advance a transcript revision that triggers one authoritative transcript rehydrate. Quota refresh is asynchronous, single-flight/coalesced, and cannot fail the worker projection. The local UI clock performs no observer or quota reads. Use `codex.inspect` for forensic activity.
 
 Before adding a capability, inspect the generated schema for pinned Codex CLI/App Server `0.155.1`. Use an official semantic method when one exists; keep a Connect bridge only when the pin has no equivalent (for example content search or deterministic patch semantics).
 

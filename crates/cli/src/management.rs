@@ -969,6 +969,19 @@ pub(crate) async fn backend_observer_once(config: &BackendConfig) -> Result<serd
     Ok(serde_json::from_slice(&body)?)
 }
 
+pub(crate) async fn backend_observer_wait(
+    config: &BackendConfig,
+    cursor: u64,
+) -> Result<serde_json::Value> {
+    let addr = config.listen_addr()?;
+    let path = format!("/observe/wait/{cursor}");
+    let (status, body) = http_get_wait(addr, &path).await?;
+    if status != 200 {
+        bail!("observer wait endpoint returned HTTP {status}");
+    }
+    Ok(serde_json::from_slice(&body)?)
+}
+
 pub(crate) async fn backend_transcript_once(
     config: &BackendConfig,
     thread_id: &str,
@@ -1001,6 +1014,18 @@ fn percent_encode_path_segment(value: &str) -> String {
 }
 
 async fn http_get(addr: SocketAddr, path: &str) -> Result<(u16, Vec<u8>)> {
+    http_get_inner(addr, path, Some(HEALTH_TIMEOUT)).await
+}
+
+async fn http_get_wait(addr: SocketAddr, path: &str) -> Result<(u16, Vec<u8>)> {
+    http_get_inner(addr, path, None).await
+}
+
+async fn http_get_inner(
+    addr: SocketAddr,
+    path: &str,
+    response_timeout: Option<Duration>,
+) -> Result<(u16, Vec<u8>)> {
     let mut stream = timeout(HEALTH_TIMEOUT, TcpStream::connect(addr)).await??;
     let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     timeout(HEALTH_TIMEOUT, stream.write_all(request.as_bytes()))
@@ -1009,9 +1034,12 @@ async fn http_get(addr: SocketAddr, path: &str) -> Result<(u16, Vec<u8>)> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 8 * 1024];
     loop {
-        let read = timeout(HEALTH_TIMEOUT, stream.read(&mut buffer))
-            .await
-            .context("backend response timed out")??;
+        let read = match response_timeout {
+            Some(duration) => timeout(duration, stream.read(&mut buffer))
+                .await
+                .context("backend response timed out")??,
+            None => stream.read(&mut buffer).await?,
+        };
         if read == 0 {
             break;
         }
