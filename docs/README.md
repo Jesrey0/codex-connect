@@ -1,22 +1,13 @@
 # Documentation
 
-## Start here
+Read these in order as needed:
 
-- [Getting started](getting-started.md) — fresh host to verified ChatGPT → Secure MCP Tunnel → Codex Connect → Codex App Server connectivity
+- [Getting Started](getting-started.md) — install the pinned dependencies, backend, tunnel, and ChatGPT app, then prove the complete path.
+- [Architecture](architecture/overview.md) — the HostPlane, WorkerPlane, PlatformPlane model, authority boundaries, delegation ownership, and public MCP contract.
+- [Operations](operations.md) — backend/tunnel lifecycle, deployment, reboot recovery, configuration, and uninstall.
+- [Development](development.md) — pinned App Server protocol governance, public-tool ownership, and validation.
 
-## Architecture
-
-- [Architecture overview](architecture/overview.md) — ChatGPT-native MCP surface, App Server authority, event journal, typed actions, host operations, and runtime boundaries
-
-## Operations
-
-- [Operations](operations.md) — installation, backend/tunnel lifecycle, recovery, configuration, and deployment behavior
-
-## Development
-
-- [Development](development.md) — pinned App Server schema validation, public tool governance, event-journal rules, and tool-selection calibration
-
-## Repository policy
+Policy and history:
 
 - [Security](../SECURITY.md)
 - [Contributing](../CONTRIBUTING.md)

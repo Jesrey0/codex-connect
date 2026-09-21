@@ -1,16 +1,16 @@
 # Contributing
 
-Codex Connect is a deliberately narrow bridge between ChatGPT, the official OpenAI Secure MCP Tunnel, the operator host, and the official Codex App Server API. Contributions should preserve those ownership boundaries rather than add parallel lifecycle managers or alternate protocol paths.
+Codex Connect is a narrow, canonical-only pre-release bridge. Contributions must preserve the ownership boundaries in [Architecture](docs/architecture/overview.md): ChatGPT is the primary operator, HostPlane owns deterministic host work, WorkerPlane owns delegated Codex work, and PlatformPlane is ChatGPT-native.
 
-## Development prerequisites
+## Prerequisites
 
-Use Linux with a working Rust toolchain (Rust 1.88 or newer), Python 3, and the exact Codex CLI release in `config/codex-cli-pin`. The protocol integration suite also requires the Python `jsonschema` package.
+Use Linux with systemd user services, Rust 1.88 or newer, Python 3, the exact Codex CLI/App Server pin in `config/codex-cli-pin` (currently 0.155.1), and Python `jsonschema` for protocol integration.
 
-For architecture and protocol invariants, read [docs/development.md](docs/development.md) and [docs/architecture/overview.md](docs/architecture/overview.md) before changing public MCP behavior, sandbox semantics, App Server integration, deployment, or service management.
+Read [Development](docs/development.md), [Architecture](docs/architecture/overview.md), and [Security](SECURITY.md) before changing public MCP behavior, authority, deployment, or service management.
 
 ## Validation
 
-Run the complete repository gate before submitting a change:
+Run the repository gate:
 
 ```bash
 ./scripts/generate-app-server-tool-schemas.py --check
@@ -22,18 +22,21 @@ cargo build --locked -p codex-connect
 python3 tests/protocol_integration.py
 ```
 
-The schema check intentionally fails if your installed Codex CLI does not match `config/codex-cli-pin`. Do not regenerate or loosen the protocol contract merely to accommodate a different local Codex release.
+The schema check must use the pinned Codex CLI. Do not loosen or regenerate the protocol contract for a different local release. For documentation-only changes, also verify Markdown links and search for retired terminology.
 
-## Scope of changes
+## Public-tool governance
 
-- Prefer official App Server semantics over Connect-owned reimplementations.
-- Keep the public MCP catalog small, goal-oriented, explicitly annotated, and covered by deterministic selection tests.
-- Preserve the loopback-only backend and single-user self-hosted trust model.
-- Do not add tunnel supervision, tunnel credentials, active-project state, hidden profiles, or abandoned historical compatibility paths.
-- When a pre-release concept is replaced, rename it end-to-end. Do not keep aliases, fallback readers, migration shims, deprecated config keys, stale test names, or documentation for the superseded shape unless compatibility is an explicit requirement.
-- Do not introduce Git branches, commits, tags, or repository initialization as application workflow; version control is an operator concern.
-- Keep required dependencies and compilation cost proportionate to the capability being added.
+The live catalog is exactly 14 intent-shaped tools. Prefer the official App Server semantic operation; add a Connect adapter or bridge only when the pinned App Server lacks the needed operation. New tools require distinct operator value, explicit safety annotations, compact schemas, and deterministic catalog/selection tests.
 
-## Issues and security reports
+Preserve PTY support. Do not expose raw sandbox policy, service tier, developer instructions, approval policy, or other server-owned mechanics. Do not invoke Codex CLI through host commands when a `codex.*` semantic operation exists.
 
-Normal bugs and feature requests can use GitHub Issues. Security vulnerabilities must follow [SECURITY.md](SECURITY.md); do not include secrets, exploit details, tunnel identifiers, account identifiers, or sensitive local paths in a public issue.
+## Operating rules
+
+- Keep Codex CLI/App Server and `tunnel-client` independently owned; do not add tunnel supervision.
+- Keep `default_cwd` as navigation, never authorization.
+- Keep worker tasks self-contained and preserve delegated scope ownership until terminal/action/interrupt/redirect. A `codex.wait` timeout is not permission to take over.
+- Keep the event journal and console observational; App Server remains authoritative.
+- Git actions are operator workflow, not application workflow.
+- Remove superseded terminology and compatibility baggage end-to-end; this pre-release repository represents the current canonical implementation only.
+
+For reporting, separate SourceChanged, Committed, Pushed, Deployed, Live, and CIGreen. Do not commit, push, deploy, or communicate externally as part of ordinary implementation without explicit authorization.

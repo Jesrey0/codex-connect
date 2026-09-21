@@ -1,6 +1,6 @@
 # Getting Started
 
-This is the shortest supported path from a fresh Linux host to a working Codex Connect app in ChatGPT.
+This is the supported path from a fresh Linux host to a working Codex Connect app in ChatGPT. Read [Architecture](architecture/overview.md) for the HostPlane/WorkerPlane/PlatformPlane model and [Operations](operations.md) after installation.
 
 The target success condition is simple:
 
@@ -12,16 +12,9 @@ Codex Connect's managed setup currently targets **Linux with systemd user servic
 
 The pre-release installation layout is intentionally opinionated: `~/projects` is the default workspace/cwd, and the managed operator symlink/build store live under `~/projects/.local`. Configuration and deployment state default to `~/projects/.config` and `~/projects/.local/state` respectively, while honoring explicit `XDG_CONFIG_HOME` / `XDG_STATE_HOME`. You can change the configured default workspace after setup; it is a navigation/startup default rather than a filesystem authorization boundary, and changing it does not relocate the managed operator/build store.
 
-### ChatGPT plan scope
+### ChatGPT availability
 
-This pre-release project currently documents **paid ChatGPT accounts only**.
-
-- The maintainer has verified the end-to-end Codex Connect flow on **ChatGPT Plus**.
-- Higher paid tiers are expected to work, but have not all been independently validated by this project.
-- The Free tier has not been tested, so this guide makes no claim about it.
-- OpenAI's public developer-mode documentation currently describes plan-specific MCP availability differently (including full MCP for Business/Enterprise/Edu and read/fetch MCP access for Pro). Feature availability and UI can therefore be account- or rollout-dependent. If Developer mode or custom app/connector creation is absent from your account, stop there rather than inventing a workaround.
-
-Treat the first bullet as this project's observed behavior, not as an official OpenAI entitlement statement.
+OpenAI currently documents full MCP support, including write/modify actions, for ChatGPT Business and Enterprise/Edu on web. Pro can use developer mode with custom MCP apps limited to read/fetch permissions, which is not sufficient for Codex Connect's full HostPlane command/mutation surface. Product availability and workspace permissions can change, so verify the current Developer mode documentation before installation. If the required full-MCP settings are unavailable, the installation cannot be completed through this path.
 
 ## What you need
 
@@ -33,7 +26,7 @@ Before obtaining the source tree, you need:
 - an authenticated Codex CLI session;
 - the official OpenAI `tunnel-client` for Secure MCP Tunnel;
 - access to OpenAI Tunnels management and a runtime API key with **Tunnels Read + Use** for the tunnel;
-- a paid ChatGPT account on which Developer mode/custom MCP app creation is available.
+- a ChatGPT account on which Developer mode/custom MCP app creation is available.
 
 The tunnel keeps the MCP backend on localhost. Do **not** expose port `8767` directly to the public internet.
 
@@ -80,7 +73,7 @@ Then authenticate interactively:
 codex
 ```
 
-Choose **Sign in with ChatGPT** when prompted. The official Codex project documents ChatGPT-plan login for Plus, Pro, Business, Edu, and Enterprise.
+Choose **Sign in with ChatGPT** when prompted. OpenAI currently documents Codex as included across ChatGPT plans, including Free and Go; usage limits vary by plan.
 
 ## 3. Install Secure MCP Tunnel
 
@@ -293,7 +286,7 @@ For backend problems, use `codex-connect logs --follow`. For tunnel problems, us
 
 ## Official references
 
-Research for this guide was checked against the current upstream documentation on 2026-09-14:
+Research for this guide was checked against the current upstream documentation on 2026-09-21:
 
 - Codex CLI: https://github.com/openai/codex
 - Codex installation/system requirements: https://github.com/openai/codex/blob/main/docs/install.md
@@ -301,5 +294,6 @@ Research for this guide was checked against the current upstream documentation o
 - Secure MCP Tunnel client: https://github.com/openai/tunnel-client
 - Tunnel permissions and ChatGPT connector setup: https://github.com/openai/tunnel-client/blob/master/docs/permissions.md
 - ChatGPT Developer mode and MCP apps: https://help.openai.com/en/articles/12584461
+- Codex with ChatGPT plans: https://help.openai.com/en/articles/11369540
 
 OpenAI product availability and UI labels can change. Prefer these upstream references over stale screenshots or copied setup instructions.

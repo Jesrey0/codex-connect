@@ -1,127 +1,69 @@
 # Operations
 
-For first-time installation, prerequisites, Secure MCP Tunnel, and ChatGPT custom app setup, start with [Getting Started](getting-started.md). This document covers steady-state operation after installation.
+Use [Getting Started](getting-started.md) for a fresh installation. This guide covers the steady-state owners, backend lifecycle, deployment, and recovery.
 
-## Ownership boundary
+## Ownership
 
-Codex Connect is downstream of both the user-global Codex CLI/App Server and the user-global OpenAI `tunnel-client`. Codex Connect owns only its own backend, workspace-scoped configuration, deployment state, and installed backend artifacts. It must not install, relocate, duplicate, upgrade, delete, or supervise either upstream dependency or its owned configuration/state.
+Codex Connect owns its backend service, workspace-local configuration, deployment records, and installed content-addressed artifacts. Codex CLI/App Server and OpenAI `tunnel-client` are independent upstream dependencies. Their binaries, credentials, profiles, state, and lifecycle remain user-global and are not installed, relocated, duplicated, upgraded, deleted, or supervised by Codex Connect.
 
-- Codex CLI remains outside `~/projects`, with Codex-owned state/configuration in the normal `~/.codex` home unless the user explicitly selects another global location.
-- `tunnel-client` remains outside `~/projects`; this guide uses `~/.config/tunnel-client` for profiles and `~/.local/state/tunnel-client` for native runtime state.
-- Workspace `XDG_CONFIG_HOME` / `XDG_STATE_HOME` overrides must not be used to relocate tunnel-client-owned state under `~/projects`.
+The backend listens on loopback at `127.0.0.1:8767/mcp`. It has no application-level authentication; Secure MCP Tunnel provides the remote path. Never expose the port directly.
 
-## Install
+## Backend lifecycle
+
+Initial setup is documented in [Getting Started](getting-started.md). Routine commands are:
 
 ```bash
-bootstrap_target=target/codex-connect-bootstrap
-rm -rf "$bootstrap_target"
-CARGO_TARGET_DIR="$bootstrap_target" cargo build --release -p codex-connect --locked
-"$bootstrap_target/release/codex-connect" setup
-rm -rf "$bootstrap_target"
-export PATH="$HOME/projects/.local/bin:$PATH"
+codex-connect status
 codex-connect doctor
-codex-connect status
-```
-
-`setup` converges the bootstrap binary into the canonical workspace-local runtime layout: one content-addressed artifact under `~/projects/.local/lib/codex-connect/builds/`, `~/projects/.local/bin/codex-connect` as the operator symlink, workspace configuration under `~/projects/.config/codex-connect/`, workspace deployment state under `~/projects/.local/state/codex-connect/`, and `codex-connect.service` pointing at that artifact. The temporary `target/codex-connect-bootstrap/` tree is build-only and should be deleted after setup. Steady-state deployments may retain `target/codex-connect-deploy/build/` as a compiler cache, but no executable under `target/` is runtime authority. The user systemd manager may retain its registration file under its native user-unit directory; that registration is not application-state authority.
-
-Configure the user-global official tunnel client separately to connect its long-lived runtime to `http://127.0.0.1:8767/mcp`. The ChatGPT custom app uses **no authentication**. The tunnel runtime authenticates to OpenAI with its own runtime API key; Codex Connect's MCP endpoint is deliberately loopback-only and has no application-level authentication. Use the tunnel client's native lifecycle commands:
-
-```bash
-tunnel-client runtimes connect ...
-tunnel-client runtimes status <alias>
-```
-
-The canonical tunnel-client profile for this guide is `~/.config/tunnel-client/codex-connect.yaml`, with native runtime state under `~/.local/state/tunnel-client`. It remains tunnel-client-owned; Codex Connect does not read or manage the tunnel ID or its runtime lifecycle.
-
-The exact connection parameters and credentials remain tunnel-client-owned. `codex-connect restart` restarts only the backend and intentionally leaves the native tunnel runtime alone.
-
-Do not mirror Codex Connect's ChatGPT-facing synchronous budgets into the tunnel profile. Current tunnel-client releases accept an optional per-command `response_timeout` from the OpenAI control plane and enforce it across the complete MCP request/response lifecycle; that deadline is transport-owned and may vary by command. Codex Connect therefore keeps its own public operations comfortably bounded (40-second target, 45-second server guard) without inventing a profile-level response deadline. The canonical profile should stay minimal unless a tunnel-owned operational need is demonstrated.
-
-For an organization-scoped tunnel, keep the runtime key and organization context available before connecting or repairing the native runtime:
-
-```bash
-export CONTROL_PLANE_API_KEY='...'
-export CONTROL_PLANE_ORGANIZATION_ID='org_...'
-```
-
-The organization variable is sent by `tunnel-client` as the `OpenAI-Organization` header. It is separate from the `--organization-id` lookup scope used by `tunnel-client runtimes connect`.
-
-## Backend commands
-
-`setup` is installation/configuration. Normal operation uses `status`, the read-only observer `console`, `restart`, `doctor`, and `logs`:
-
-```bash
-codex-connect status
-codex-connect console
 codex-connect restart
-codex-connect doctor
 codex-connect logs --follow
+codex-connect console
 codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/projects/example-project
 ```
 
-`codex-connect restart` also enables the backend service if it was installed but disabled, so a successful recovery restores the next-boot invariant.
+`status` is concise runtime/readiness/orientation: readiness, live build identity, navigation cwd, and Codex default provenance. `console` is a read-only human projection of workers, quota, pending actions, and selected transcripts; it is not an event trace. `doctor` is the detailed local diagnostic. PTY command sessions are controlled through the MCP `command.start/read/control` tools.
 
-`status` is the concise readiness/orientation view. `console` is the human-oriented read-only observability view for quota, workers, pending operator actions, observer errors, and on-demand worker transcripts. `doctor` remains the detailed local integration diagnostic.
+## Tunnel lifecycle
 
-`codex-connect console` connects only to the configured loopback backend and renders a presentation-only observer projection. It keeps a bounded list of currently active workers plus recent terminal workers so completed or failed results do not disappear immediately. For turns started through the current backend process, the projection retains a bounded presentation excerpt of the delegated task plus requested model and reasoning effort; missing values are shown as `default/inherited` rather than guessed. Server-owned worker policy is intentionally omitted from the human projection. Quota values are cached briefly to avoid polling the upstream account endpoint on every screen refresh.
-
-The dashboard deliberately omits routine tool, file, search, and MCP activity. Use ↑/↓ (or `j`/`k`) to select a worker and Enter/→ to open it. A worker view reads App Server-owned turn history on demand but projects only human-relevant user/agent text, keeping the newest material when observer bounds are reached. Live agent deltas are shown as a coherent current-message view, active reasoning is represented only by an animated `THINKING` indicator, and private reasoning text is never rendered. Pending approvals, permissions, user-input questions, and elicitations appear as read-only action cards with their useful request context and must still be resolved through ChatGPT. `g` jumps to the start, `G` resumes live tail-following, ↑/↓ scroll, and Esc/←/`b` returns to the dashboard. Press Ctrl-C to exit. Delegation, approval responses, steering, interruption, and permission/input responses remain exclusively on the ChatGPT/Codex Connect control path; use `codex.inspect` for semantic or raw worker forensics rather than turning the console back into an event log.
-
-## Uninstall
-
-Remove only the state owned by Codex Connect with:
+Manage the native tunnel independently:
 
 ```bash
-codex-connect uninstall
+tunnel-client runtimes status codex-connect --json
+# use the repair_command reported by tunnel-client when needed
 ```
 
-The command stops/disables and removes the persistent backend service, reloads the user systemd manager, removes Codex Connect configuration and deployment state, removes the workspace-local operator symlink, and removes installed content-addressed Codex Connect builds.
+The tunnel owns its runtime API key, organization context, profile, reconnect behavior, and native state. Do not create a second systemd tunnel service or duplicate profile. Backend `restart`, deployment, and uninstall do not manage the tunnel. Backend deployment is not connector refresh; rediscover/refresh the ChatGPT app separately when its tool catalog needs updating.
 
-The source tree, Codex CLI, and all `tunnel-client` state are intentionally left untouched. If the corresponding ChatGPT tunnel is no longer needed, stop/remove that runtime or profile separately with `tunnel-client`; backend uninstall must not become tunnel lifecycle orchestration.
+## Restart recovery
 
-## After a computer restart
-
-The backend and tunnel are separate failure domains. Do not rerun installation just because the machine restarted.
+After reboot, verify the two owners separately:
 
 ```bash
 codex-connect status
 codex-connect doctor
-```
-
-`codex-connect.service` should already be enabled. If the backend is stopped or not ready, run `codex-connect restart` and recheck it.
-
-For the tunnel, export the runtime API key required by the saved profile and inspect the existing alias:
-
-```bash
-export CONTROL_PLANE_API_KEY='...'
-export CONTROL_PLANE_ORGANIZATION_ID='org_...'
 tunnel-client runtimes status codex-connect --json
 ```
 
-If the native runtime is stopped, execute the `repair_command` returned by `runtimes status`, then run the status command again. The repair command is tunnel-client-owned and is derived from the saved alias/profile state, so it is preferable to reconstructing account-specific flags by hand.
+Restart the backend only if its checks fail. If the tunnel runtime is stopped, use its reported native repair command and recheck status. Do not rerun installation or recreate the profile merely because the computer restarted.
 
-The canonical profile remains `~/.config/tunnel-client/codex-connect.yaml`. Do not recreate the profile, invent a second alias, or add a systemd tunnel unit for routine reboot recovery.
+## Deployment
 
-## Recovery
-
-Check the backend and tunnel independently before changing anything:
+Deployment is a two-phase, backend-only workflow:
 
 ```bash
-codex-connect status
-codex-connect doctor
-tunnel-client runtimes status <alias> --json
+codex-connect deploy prepare
+codex-connect deploy status <operation-id>
+codex-connect deploy activate <operation-id>
+codex-connect deploy status <operation-id>
 ```
 
-For a failed backend, inspect `codex-connect logs`, then use `codex-connect restart` and rerun `doctor`.
+`prepare` queues a detached release build and records a durable operation. Wait for `prepared`; `activate` queues the backend restart; the final `status` verifies the exact prepared artifact is live. The persistent Cargo target is a compiler cache, not runtime authority. Deployment does not restart the tunnel or refresh the connector.
 
-For a native tunnel runtime that is stopped or not ready, use its `tunnel-client runtimes` lifecycle command and recheck its status.
+The states are deliberately distinct: `SourceChanged != Committed != Pushed != Deployed != Live != CIGreen`. Git commits/pushes are operator workflow and are never implied by deployment. Verify source, Git, deployment, service/build identity, connector discovery, and CI at their respective owners.
 
-Do not add a per-client backend or systemd tunnel unit. The only persistent Codex Connect unit is `codex-connect.service`; the official tunnel client owns its own runtime lifecycle.
+## Configuration and uninstall
 
-## Configuration
-
-The configuration at `~/projects/.config/codex-connect/config.toml` is deliberately small:
+The canonical configuration is small:
 
 ```toml
 [workspace]
@@ -132,29 +74,12 @@ listen = "127.0.0.1:8767"
 codex_bin = "/home/you/.local/bin/codex"
 ```
 
-`setup` persists an absolute executable path for the user-global Codex CLI. It first reuses a valid configured executable and otherwise resolves `codex` from `PATH`. The exact absolute path depends on the user's installation method (for example npm under NVM may live beneath `~/.nvm`). Codex Connect does not install or prefer a workspace-local Codex binary. This is the canonical configuration shape for the pre-release backend. Historical configuration forms are not retained.
-
-### Host and delegated authority
-
-**Operational invariant:** Codex Connect launches its dedicated App Server with the process-local override `sandbox_mode="danger-full-access"`. Public host commands expose no `sandboxPolicy`; deterministic host execution therefore runs with primary-operator authority, subject to the OS account. `[workspace].default_cwd` selects the default workspace for relative paths and App Server startup; it is not a filesystem authorization boundary.
-
-The user-global `$CODEX_HOME/config.toml` should remain generic rather than carrying Codex Connect routing or sandbox defaults. `codex.start(mode=work)` is different by design but intentionally compact: omitted `access` uses the server-owned writable workspace policy with network access, while `access="full"` selects unrestricted worker authority. Codex Connect always sends `approvalPolicy="never"` for work turns so autonomous and Scheduled Task coordination is not blocked by mechanical approval prompts; the sandbox remains the authority boundary. Low-level sandbox fields are not caller-configurable. While ChatGPT continues host work, successful host-plane tool responses may opportunistically include compact `workerEvents` when a delegated turn becomes terminal or needs semantic operator input. New official review threads are read-only and may select a model.
-
-## Deployment boundary
-
-Deployment is deliberately two-phase so an operator invoking the CLI through the running backend never has to interpret a self-inflicted transport disconnect as command failure.
+`default_cwd` is navigation/startup context only. Worker defaults may be reported by `status` with provenance `userConfig` or `upstream`; worker instruction sources remain the normal Codex config and AGENTS.md chain.
 
 ```bash
-codex-connect deploy prepare
-codex-connect deploy status <operation-id>
-codex-connect deploy activate <operation-id>
-codex-connect deploy status <operation-id>
+codex-connect uninstall
 ```
 
-`deploy prepare` is a short enqueue operation: it creates a versioned durable record under the user state directory, records the source tree, assigns an operation id, and hands the potentially long release build to a detached systemd unit. The build itself requires neither Git nor a clean working tree. Deployment builds are serialized by a deployment-wide build lock and reuse one persistent Cargo release target at `target/codex-connect-deploy/build`; that directory is only a compilation cache and is never deployment authority. The completed binary is installed as a content-addressed artifact, and the operation records `prepared` or `failed` without touching the running backend. `deploy activate` is also short: an operation-scoped OS lock serializes competing callers, the prepared artifact is validated, `activationQueued` is persisted, and the detached activation is handed to systemd before the foreground command returns. If handoff fails, the record is rolled back to `prepared`; if a detached worker later disappears without recording completion, `deploy status` reconciles that condition to `succeeded` only when the exact runtime and operator artifact prove activation completed, otherwise to `failed`. A `prepared` operation is likewise reconciled to `failed` if its recorded artifact is missing or no longer matches its SHA-256. Successful normal activation is not considered verified until the live backend reports the exact prepared SHA-256. Installed content-addressed artifacts are retained rather than automatically deleted, so activating one durable operation cannot invalidate another prepared operation.
+Uninstall removes Codex Connect's service, configuration, deployment state, operator symlink, and installed artifacts. It leaves the source tree, Codex CLI/App Server, and tunnel-client state untouched.
 
-That boundary is intentional. Backend deployment must not become tunnel lifecycle orchestration.
-
-## Security boundary
-
-Codex Connect is a high-trust host execution bridge. The primary operator plane deliberately has host-user filesystem/process authority; the configured default workspace is not a security fence. Delegated Codex work is separately bounded by its explicit per-task sandbox policy. Review [Security](../SECURITY.md) before changing ingress, command execution, delegated policy, or service privileges.
+For security implications, see [Security](../SECURITY.md).
