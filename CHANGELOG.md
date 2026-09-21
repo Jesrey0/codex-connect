@@ -20,5 +20,7 @@ Initial public alpha of the single-user, self-hosted Codex Connect architecture.
 
 - Managed installation targets Linux with systemd user services.
 - Installation is source-based; no prebuilt binary packages are distributed in this alpha.
+- Codex Connect uses user-global configuration, state, cache, installed builds, and executable locations; the source checkout location is arbitrary.
+- The default navigation cwd is `~`; Codex CLI/App Server and `tunnel-client` remain independently user-global.
 - The product is single-user/self-hosted and does not expose the MCP backend directly to the public internet.
 - ChatGPT Developer mode/custom MCP availability is account- and rollout-dependent; see [Getting Started](docs/getting-started.md).

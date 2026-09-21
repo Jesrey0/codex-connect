@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -27,7 +28,7 @@ pub struct WorkspaceSettings {
 impl Default for WorkspaceSettings {
     fn default() -> Self {
         Self {
-            default_cwd: "~/projects".to_string(),
+            default_cwd: "~".to_string(),
         }
     }
 }
@@ -149,30 +150,71 @@ pub fn systemd_user_dir() -> Result<PathBuf> {
 }
 pub fn systemd_registration_dir() -> Result<PathBuf> {
     // The user manager discovers registrations here. Canonical unit contents
-    // remain under the workspace-local XDG config root; this directory should
+    // remain under the effective user XDG config root; this directory should
     // contain only registration links for Codex Connect-managed units.
     Ok(home_dir()?.join(".config/systemd/user"))
 }
 pub fn config_root() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    Ok(default_workspace_root()?.join(".config"))
+    Ok(resolve_xdg_root(
+        env::var_os("XDG_CONFIG_HOME"),
+        home_dir()?.join(".config"),
+    ))
 }
 pub fn state_root() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    Ok(default_workspace_root()?.join(".local/state"))
+    Ok(resolve_xdg_root(
+        env::var_os("XDG_STATE_HOME"),
+        home_dir()?.join(".local/state"),
+    ))
 }
-pub fn default_workspace_root() -> Result<PathBuf> {
-    Ok(home_dir()?.join("projects"))
+pub fn cache_root() -> Result<PathBuf> {
+    Ok(resolve_xdg_root(
+        env::var_os("XDG_CACHE_HOME"),
+        home_dir()?.join(".cache"),
+    ))
+}
+fn resolve_xdg_root(value: Option<OsString>, fallback: PathBuf) -> PathBuf {
+    value
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or(fallback)
 }
 pub fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .context("HOME is not set; unable to resolve `~`")
+}
+pub(crate) fn runtime_path(home: &Path, path: &OsStr) -> Result<String> {
+    let mut directories = vec![home.join(".local/bin"), home.join(".cargo/bin")];
+    let transient_codex = home.join(".codex/tmp");
+
+    for directory in env::split_paths(path) {
+        if !directory.is_absolute() {
+            continue;
+        }
+        let text = directory
+            .to_str()
+            .context("PATH contains a non-UTF-8 directory")?;
+        if text.chars().any(char::is_control) {
+            bail!("PATH contains a control character");
+        }
+        if directory.starts_with(&transient_codex) {
+            continue;
+        }
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+
+    for directory in ["/usr/local/bin", "/usr/bin", "/bin", "/snap/bin"] {
+        let directory = PathBuf::from(directory);
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    std::env::join_paths(directories)?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("PATH is not UTF-8"))
 }
 pub fn expand_path(value: &str) -> Result<PathBuf> {
     let home = home_dir()?;
@@ -220,7 +262,7 @@ mod tests {
     use super::*;
     #[test]
     fn parses_single_backend_configuration() {
-        let config: Config = toml::from_str("[workspace]\ndefault_cwd = \"~/projects\"\n[backend]\nlisten = \"127.0.0.1:8767\"\ncodex_bin = \"codex\"\n").unwrap();
+        let config: Config = toml::from_str("[workspace]\ndefault_cwd = \"~\"\n[backend]\nlisten = \"127.0.0.1:8767\"\ncodex_bin = \"codex\"\n").unwrap();
         config.validate().unwrap();
         assert!(
             toml::to_string_pretty(&config)
@@ -231,7 +273,46 @@ mod tests {
 
     #[test]
     fn retired_scope_configuration_is_rejected() {
-        let legacy = "[scope]\nroot = \"~/projects\"\n[backend]\nlisten = \"127.0.0.1:8767\"\ncodex_bin = \"codex\"\n";
+        let legacy = "[scope]\nroot = \"~\"\n[backend]\nlisten = \"127.0.0.1:8767\"\ncodex_bin = \"codex\"\n";
         assert!(toml::from_str::<Config>(legacy).is_err());
+    }
+
+    #[test]
+    fn xdg_roots_ignore_empty_and_relative_values() {
+        let fallback = PathBuf::from("/home/operator/.config");
+        assert_eq!(resolve_xdg_root(None, fallback.clone()), fallback);
+        assert_eq!(
+            resolve_xdg_root(Some(OsString::from("")), fallback.clone()),
+            fallback
+        );
+        assert_eq!(
+            resolve_xdg_root(Some(OsString::from("relative/config")), fallback.clone()),
+            fallback
+        );
+        assert_eq!(
+            resolve_xdg_root(Some(OsString::from("/custom/config")), fallback),
+            PathBuf::from("/custom/config")
+        );
+    }
+
+    #[test]
+    fn runtime_path_is_global_and_drops_relative_or_transient_entries() {
+        let home = Path::new("/home/operator");
+        let input = OsStr::new(
+            "relative:/home/operator/.codex/tmp/arg0/run:/home/operator/.nvm/bin:/opt/custom/bin:/usr/bin",
+        );
+        let normalized = runtime_path(home, input).unwrap();
+        let entries = env::split_paths(OsStr::new(&normalized)).collect::<Vec<_>>();
+        assert_eq!(entries[0], home.join(".local/bin"));
+        assert_eq!(entries[1], home.join(".cargo/bin"));
+        assert!(entries.contains(&home.join(".nvm/bin")));
+        assert!(entries.contains(&PathBuf::from("/opt/custom/bin")));
+        assert!(entries.contains(&PathBuf::from("/usr/bin")));
+        assert!(
+            !entries
+                .iter()
+                .any(|path| path.starts_with(home.join(".codex/tmp")))
+        );
+        assert!(!entries.iter().any(|path| !path.is_absolute()));
     }
 }

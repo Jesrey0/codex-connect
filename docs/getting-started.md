@@ -10,7 +10,7 @@ The target success condition is simple:
 
 Codex Connect's managed setup currently targets **Linux with systemd user services**. The underlying Codex CLI and Secure MCP Tunnel support additional platforms, but `codex-connect setup` uses a systemd user service today.
 
-The pre-release installation layout is intentionally opinionated: `~/projects` is the default workspace/cwd, and the managed operator symlink/build store live under `~/projects/.local`. Configuration and deployment state default to `~/projects/.config` and `~/projects/.local/state` respectively, while honoring explicit `XDG_CONFIG_HOME` / `XDG_STATE_HOME`. You can change the configured default workspace after setup; it is a navigation/startup default rather than a filesystem authorization boundary, and changing it does not relocate the managed operator/build store.
+The pre-release installation layout is user-global and independent of the source checkout. Configuration uses `$XDG_CONFIG_HOME/codex-connect` or `~/.config/codex-connect`, state uses `$XDG_STATE_HOME/codex-connect` or `~/.local/state/codex-connect`, and cache uses `$XDG_CACHE_HOME/codex-connect` or `~/.cache/codex-connect`. Installed builds are stored under `~/.local/lib/codex-connect/builds/`, with the executable at `~/.local/bin/codex-connect`; the user unit is under the normal `~/.config/systemd/user/` location. The default navigation cwd is `~`, and is navigation/startup context rather than a filesystem authorization boundary.
 
 ### ChatGPT availability
 
@@ -30,7 +30,7 @@ Before obtaining the source tree, you need:
 
 The tunnel keeps the MCP backend on localhost. Do **not** expose port `8767` directly to the public internet.
 
-Codex CLI and Secure MCP Tunnel are **user-global prerequisites**, not Codex Connect workspace tools. Do not install either under `~/projects/.tools`, and do not place their owned configuration/state under `~/projects/.config` or `~/projects/.local/state`. Codex Connect is downstream of both and owns only its own backend/configuration/deployment state.
+Codex CLI and Secure MCP Tunnel are **user-global prerequisites**, not Codex Connect tools. Keep their binaries, configuration, credentials, and state in their own normal user-global locations. Codex Connect is downstream of both and owns only its own backend/configuration/deployment state.
 
 ## 1. Obtain the source and check the host
 
@@ -61,7 +61,7 @@ codex --version
 
 The release printed by `codex --version` must match `config/codex-cli-pin`.
 
-Keep this installation user-global. Do not copy or install the Codex binary under `~/projects/.tools`, and do not relocate Codex-owned state/configuration into the workspace. The normal Codex home remains `~/.codex` unless you explicitly choose another user-global `CODEX_HOME`.
+Keep this installation user-global. Do not relocate Codex-owned state/configuration into the source checkout. The normal Codex home remains `~/.codex` unless you explicitly choose another user-global `CODEX_HOME`.
 
 If you do not use npm, install the matching release from the official Codex releases page instead:
 
@@ -92,9 +92,9 @@ tunnel-client --version
 tunnel-client help quickstart
 ```
 
-Install `tunnel-client` into a user-global executable location outside `~/projects` (for example `~/.local/bin`). Its profiles, credentials, logs, health metadata, alias metadata, and native runtime state must also remain user-global; the normal locations used in this guide are `~/.config/tunnel-client` and `~/.local/state/tunnel-client`.
+Install `tunnel-client` into a user-global executable location (for example `~/.local/bin`). Its profiles, credentials, logs, health metadata, alias metadata, and native runtime state must also remain user-global; the normal locations used in this guide are `~/.config/tunnel-client` and `~/.local/state/tunnel-client`.
 
-The tunnel client is independently owned. Codex Connect does not install, relocate, duplicate, upgrade, delete, configure, or supervise it. If your current shell has workspace-scoped `XDG_CONFIG_HOME` or `XDG_STATE_HOME` values, do not use those values when managing `tunnel-client`; use your normal user-global XDG locations instead.
+The tunnel client is independently owned. Codex Connect does not install, relocate, duplicate, upgrade, delete, configure, or supervise it.
 
 ## 4. Build and install Codex Connect
 
@@ -104,11 +104,11 @@ rm -rf "$bootstrap_target"
 CARGO_TARGET_DIR="$bootstrap_target" cargo build --release -p codex-connect --locked
 "$bootstrap_target/release/codex-connect" setup
 rm -rf "$bootstrap_target"
-export PATH="$HOME/projects/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 codex-connect doctor
 ```
 
-`setup` is the one-time backend installer. It installs the running bootstrap binary into the content-addressed build store under `~/projects/.local/lib/codex-connect/builds/`, points `~/projects/.local/bin/codex-connect` at that artifact, creates the default workspace (`~/projects` if absent), writes configuration under `~/projects/.config/codex-connect/`, keeps deployment state under `~/projects/.local/state/codex-connect/`, installs and enables `codex-connect.service` as a user service, starts it, and waits for backend health. The one-time `target/codex-connect-bootstrap/` directory is disposable and should be removed after setup; it is never a runtime authority. Codex itself remains user-global: setup resolves the configured Codex executable, or falls back to `codex` from `PATH`, and persists that absolute path. It does not install a workspace copy of Codex or relocate Codex-owned state from the normal `~/.codex` home.
+`setup` is the one-time backend installer. It installs the running bootstrap binary into the content-addressed build store under `~/.local/lib/codex-connect/builds/`, points `~/.local/bin/codex-connect` at that artifact, uses `~` as the default navigation cwd, writes configuration under `$XDG_CONFIG_HOME/codex-connect` or `~/.config/codex-connect/`, keeps state under `$XDG_STATE_HOME/codex-connect` or `~/.local/state/codex-connect/`, uses `$XDG_CACHE_HOME/codex-connect` or `~/.cache/codex-connect/` for cache data, installs and enables `~/.config/systemd/user/codex-connect.service`, starts it, and waits for backend health. The one-time `target/codex-connect-bootstrap/` directory is disposable and should be removed after setup; it is never a runtime authority. Codex itself remains user-global: setup resolves the configured Codex executable, or falls back to `codex` from `PATH`, and persists that absolute path. It does not install a copy of Codex or relocate Codex-owned state from the normal `~/.codex` home.
 
 For later source updates, run:
 
@@ -122,7 +122,7 @@ codex-connect deploy activate <operation-id>
 codex-connect deploy status <operation-id>
 ```
 
-`deploy prepare` immediately writes a durable operation record and queues the release build as a detached user-systemd job, then returns without waiting for compilation. Deployment builds serialize through a deployment-wide build lock and reuse the persistent Cargo release target at `target/codex-connect-deploy/build`; that directory is only a compilation cache. The resulting binary is installed as a content-addressed artifact, and the operation moves from `building` to `prepared` (or `failed`) without changing the running backend. `deploy activate` validates that prepared artifact, serializes competing activation requests for that operation, queues detached activation, and returns before the backend restart begins. The detached activation restarts only the Codex Connect backend, verifies backend health, and records success or failure. `deploy status` is authoritative for the whole transaction: it converts an abandoned detached job into a terminal result, verifies that a `prepared` artifact still exists with its recorded SHA-256, and marks that operation failed if the artifact is unavailable or changed. After activation success it verifies that the live backend is running the exact prepared SHA-256. Installed content-addressed builds are retained so one prepared operation cannot be invalidated by activating another. Deployment never restarts or recreates the independent tunnel runtime.
+`deploy prepare` immediately writes a durable operation record and queues the release build as a detached user-systemd job, then returns without waiting for compilation. Deployment builds serialize through a deployment-wide build lock and reuse the deployment build cache at `~/.cache/codex-connect/deploy/build`; that directory is only a compilation cache. The resulting binary is installed as a content-addressed artifact, and the operation moves from `building` to `prepared` (or `failed`) without changing the running backend. `deploy activate` validates that prepared artifact, serializes competing activation requests for that operation, queues detached activation, and returns before the backend restart begins. The detached activation restarts only the Codex Connect backend, verifies backend health, and records success or failure. `deploy status` is authoritative for the whole transaction: it converts an abandoned detached job into a terminal result, verifies that a `prepared` artifact still exists with its recorded SHA-256, and marks that operation failed if the artifact is unavailable or changed. After activation success it verifies that the live backend is running the exact prepared SHA-256. Installed content-addressed builds are retained so one prepared operation cannot be invalidated by activating another. Deployment never restarts or recreates the independent tunnel runtime.
 
 Expected final state: `deploy status` reports `state=succeeded verified=true`, and `codex-connect status` reports the backend service running at `http://127.0.0.1:8767/mcp`.
 
@@ -257,7 +257,7 @@ To remove the managed backend from the host:
 codex-connect uninstall
 ```
 
-`uninstall` stops/disables and removes `codex-connect.service`, removes Codex Connect's managed configuration and deployment state, deletes the workspace-local operator symlink and installed content-addressed builds, and reloads the user systemd manager. It deliberately does **not** delete the source tree, Codex CLI, or `tunnel-client` state.
+`uninstall` stops/disables and removes `codex-connect.service`, removes Codex Connect's managed configuration, state, cache, operator symlink, and installed content-addressed builds, and reloads the user systemd manager. It deliberately does **not** delete the source tree, Codex CLI, or `tunnel-client` state.
 
 If the ChatGPT connection is no longer needed, stop/remove the corresponding tunnel-client runtime/profile separately using the tunnel client's own lifecycle commands. Do not delete tunnel credentials or profiles through Codex Connect.
 

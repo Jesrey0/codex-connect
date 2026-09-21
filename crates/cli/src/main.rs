@@ -153,7 +153,7 @@ enum CommandName {
         codex_bin: PathBuf,
 
         /// Default working directory for relative host paths and App Server startup.
-        #[arg(long, default_value = "~/projects")]
+        #[arg(long, default_value = "~")]
         default_cwd: PathBuf,
 
         /// Local TCP address for the Streamable HTTP MCP endpoint.
@@ -423,7 +423,7 @@ bearer_token = "must-not-surface"
         };
 
         assert_eq!(codex_bin, PathBuf::from("codex"));
-        assert_eq!(default_cwd, PathBuf::from("~/projects"));
+        assert_eq!(default_cwd, PathBuf::from("~"));
         assert_eq!(listen, "127.0.0.1:8767".parse().unwrap());
     }
 

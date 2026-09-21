@@ -234,8 +234,9 @@ pub(crate) fn queue_prepare(source: &Path) -> Result<DeploymentRecord> {
             &launcher,
             &environment.path,
             &environment.home,
-            environment.xdg_config_home.as_deref(),
-            environment.xdg_state_home.as_deref(),
+            environment.xdg_config_home.as_os_str(),
+            environment.xdg_state_home.as_os_str(),
+            environment.xdg_cache_home.as_os_str(),
         );
         let output = command
             .output()
@@ -403,8 +404,9 @@ pub(crate) fn queue_activation(
             no_start,
             &environment.path,
             &environment.home,
-            environment.xdg_config_home.as_deref(),
-            environment.xdg_state_home.as_deref(),
+            environment.xdg_config_home.as_os_str(),
+            environment.xdg_state_home.as_os_str(),
+            environment.xdg_cache_home.as_os_str(),
         )?;
         let output = command
             .output()
@@ -507,9 +509,9 @@ pub(crate) fn activation_delay() -> &'static str {
     ACTIVATION_HANDOFF_DELAY
 }
 
-pub(crate) fn build_target(operation_id: &str, source: &Path) -> Result<PathBuf> {
+pub(crate) fn build_target(operation_id: &str) -> Result<PathBuf> {
     validate_operation_id(operation_id)?;
-    Ok(source.join("target/codex-connect-deploy/build"))
+    Ok(crate::config::cache_root()?.join("codex-connect/deploy/build"))
 }
 
 fn verify_expected_sha(record: &DeploymentRecord, expected_sha256: &str) -> Result<()> {
@@ -542,8 +544,9 @@ fn prepare_command(
     launcher: &Path,
     path: &str,
     home: &Path,
-    xdg_config_home: Option<&OsStr>,
-    xdg_state_home: Option<&OsStr>,
+    xdg_config_home: &OsStr,
+    xdg_state_home: &OsStr,
+    xdg_cache_home: &OsStr,
 ) -> Command {
     let mut command = systemd_command(
         prepare_unit_name(&record.operation_id),
@@ -551,6 +554,7 @@ fn prepare_command(
         home,
         xdg_config_home,
         xdg_state_home,
+        xdg_cache_home,
     );
     command
         .arg(launcher)
@@ -567,8 +571,9 @@ fn activation_command(
     no_start: bool,
     path: &str,
     home: &Path,
-    xdg_config_home: Option<&OsStr>,
-    xdg_state_home: Option<&OsStr>,
+    xdg_config_home: &OsStr,
+    xdg_state_home: &OsStr,
+    xdg_cache_home: &OsStr,
 ) -> Result<Command> {
     let (sha256, executable) = prepared_artifact(record)?;
     let mut command = Command::new("systemd-run");
@@ -584,7 +589,12 @@ fn activation_command(
         "--setenv",
         &format!("HOME={}", home.display()),
     ]);
-    append_xdg_environment(&mut command, xdg_config_home, xdg_state_home);
+    append_xdg_environment(
+        &mut command,
+        xdg_config_home,
+        xdg_state_home,
+        xdg_cache_home,
+    );
     command
         .arg(executable)
         .arg("activate-deployment")
@@ -602,8 +612,9 @@ fn systemd_command(
     unit: String,
     path: &str,
     home: &Path,
-    xdg_config_home: Option<&OsStr>,
-    xdg_state_home: Option<&OsStr>,
+    xdg_config_home: &OsStr,
+    xdg_state_home: &OsStr,
+    xdg_cache_home: &OsStr,
 ) -> Command {
     let mut command = Command::new("systemd-run");
     command.args([
@@ -616,41 +627,50 @@ fn systemd_command(
         "--setenv",
         &format!("HOME={}", home.display()),
     ]);
-    append_xdg_environment(&mut command, xdg_config_home, xdg_state_home);
+    append_xdg_environment(
+        &mut command,
+        xdg_config_home,
+        xdg_state_home,
+        xdg_cache_home,
+    );
     command
 }
 
 fn append_xdg_environment(
     command: &mut Command,
-    xdg_config_home: Option<&OsStr>,
-    xdg_state_home: Option<&OsStr>,
+    xdg_config_home: &OsStr,
+    xdg_state_home: &OsStr,
+    xdg_cache_home: &OsStr,
 ) {
     for (name, value) in [
         ("XDG_CONFIG_HOME", xdg_config_home),
         ("XDG_STATE_HOME", xdg_state_home),
+        ("XDG_CACHE_HOME", xdg_cache_home),
     ] {
-        if let Some(value) = value {
-            command.arg("--setenv").arg(OsString::from(format!(
-                "{name}={}",
-                value.to_string_lossy()
-            )));
-        }
+        command.arg("--setenv").arg(OsString::from(format!(
+            "{name}={}",
+            value.to_string_lossy()
+        )));
     }
 }
 
 struct LaunchEnvironment {
     path: String,
     home: PathBuf,
-    xdg_config_home: Option<OsString>,
-    xdg_state_home: Option<OsString>,
+    xdg_config_home: OsString,
+    xdg_state_home: OsString,
+    xdg_cache_home: OsString,
 }
 
 fn launch_environment() -> Result<LaunchEnvironment> {
+    let home = crate::config::home_dir()?;
+    let path = std::env::var_os("PATH").context("PATH is not set")?;
     Ok(LaunchEnvironment {
-        path: std::env::var("PATH").context("PATH is not set")?,
-        home: crate::config::home_dir()?,
-        xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
-        xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+        path: crate::config::runtime_path(&home, &path)?,
+        home,
+        xdg_config_home: crate::config::config_root()?.into_os_string(),
+        xdg_state_home: crate::config::state_root()?.into_os_string(),
+        xdg_cache_home: crate::config::cache_root()?.into_os_string(),
     })
 }
 
@@ -847,13 +867,14 @@ mod tests {
 
     #[test]
     fn deployment_build_target_is_a_stable_shared_cache() {
-        let source = Path::new("/work/codex-connect");
-        let first = build_target("0123456789abcdef01234567", source).unwrap();
-        let second = build_target("fedcba9876543210fedcba98", source).unwrap();
+        let first = build_target("0123456789abcdef01234567").unwrap();
+        let second = build_target("fedcba9876543210fedcba98").unwrap();
         assert_eq!(first, second);
         assert_eq!(
             first,
-            PathBuf::from("/work/codex-connect/target/codex-connect-deploy/build")
+            crate::config::cache_root()
+                .unwrap()
+                .join("codex-connect/deploy/build")
         );
     }
 
@@ -869,8 +890,9 @@ mod tests {
             Path::new("/opt/codex-connect/operator"),
             "/usr/bin:/bin",
             Path::new("/home/operator"),
-            Some(OsStr::new("/tmp/config")),
-            Some(OsStr::new("/tmp/state")),
+            OsStr::new("/tmp/config"),
+            OsStr::new("/tmp/state"),
+            OsStr::new("/tmp/cache"),
         );
         assert_eq!(command.get_program(), OsStr::new("systemd-run"));
         let args = command
@@ -892,6 +914,8 @@ mod tests {
                 "XDG_CONFIG_HOME=/tmp/config",
                 "--setenv",
                 "XDG_STATE_HOME=/tmp/state",
+                "--setenv",
+                "XDG_CACHE_HOME=/tmp/cache",
                 "/opt/codex-connect/operator",
                 "prepare-deployment",
                 "--operation-id",
@@ -910,8 +934,9 @@ mod tests {
             true,
             "/usr/bin:/bin",
             Path::new("/home/operator"),
-            Some(OsStr::new("/tmp/config")),
-            Some(OsStr::new("/tmp/state")),
+            OsStr::new("/tmp/config"),
+            OsStr::new("/tmp/state"),
+            OsStr::new("/tmp/cache"),
         )
         .unwrap();
         assert_eq!(command.get_program(), OsStr::new("systemd-run"));
@@ -936,6 +961,8 @@ mod tests {
                 "XDG_CONFIG_HOME=/tmp/config",
                 "--setenv",
                 "XDG_STATE_HOME=/tmp/state",
+                "--setenv",
+                "XDG_CACHE_HOME=/tmp/cache",
                 "/opt/codex-connect/builds/aaaaaaaaaaaa/codex-connect",
                 "activate-deployment",
                 "--operation-id",

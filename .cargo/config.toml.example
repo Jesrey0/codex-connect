@@ -1,18 +1,18 @@
 # Fast-build config example (mold + sccache). The real .cargo/config.toml
 # is machine-local and gitignored. To opt in on any machine:
 #   sed "s|/home/<you>|$HOME|" .cargo/config.toml.example > .cargo/config.toml
-# (Standard layout: this repo at ~/projects/codex-connect, shared toolchain
-# at ~/projects/.tools. Adjust the paths if your layout differs.)
+# (The paths below use a user-global ~/.local toolchain and ~/.cache build
+# cache. Adjust them if your user-global toolchain differs.)
 
 [target.x86_64-unknown-linux-gnu]
 linker = "gcc"
 rustflags = [
-    "-C", "link-arg=-B/home/<you>/projects/.tools/bin",
+    "-C", "link-arg=-B/home/<you>/.local/bin",
     "-C", "link-arg=-fuse-ld=mold",
 ]
 
 [env]
-SCCACHE_DIR = { value = "/home/<you>/projects/.tools/sccache_cache", force = true }
+SCCACHE_DIR = { value = "/home/<you>/.cache/sccache", force = true }
 
 [build]
-rustc-wrapper = "/home/<you>/projects/.tools/bin/sccache"
+rustc-wrapper = "/home/<you>/.local/bin/sccache"

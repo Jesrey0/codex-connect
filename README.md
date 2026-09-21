@@ -16,7 +16,7 @@ ChatGPT is the primary technical operator and orchestrator. Keep these planes di
 
 HostPlane is authoritative for host work. WorkerPlane is authoritative for delegated Codex lifecycle and cognition. PlatformPlane does not acquire host authority, and host or worker tools do not acquire connected-account authority. Workers do not inherit ChatGPT conversation, files, native tools, plugins, or scheduled tasks; delegated tasks must carry their own context and acceptance criteria.
 
-Codex CLI/App Server and OpenAI `tunnel-client` are independently owned upstream dependencies. Codex Connect owns only its backend, workspace-local configuration/state, and installed artifacts. It does not install, relocate, duplicate, upgrade, delete, or supervise either upstream dependency.
+Codex CLI/App Server and OpenAI `tunnel-client` are independently owned, user-global upstream dependencies. Codex Connect owns its backend, user-global configuration/state/cache, and installed artifacts. It does not install, relocate, duplicate, upgrade, delete, or supervise either upstream dependency.
 
 ## Authority and delegation
 

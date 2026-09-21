@@ -4,7 +4,7 @@ Use [Getting Started](getting-started.md) for a fresh installation. This guide c
 
 ## Ownership
 
-Codex Connect owns its backend service, workspace-local configuration, deployment records, and installed content-addressed artifacts. Codex CLI/App Server and OpenAI `tunnel-client` are independent upstream dependencies. Their binaries, credentials, profiles, state, and lifecycle remain user-global and are not installed, relocated, duplicated, upgraded, deleted, or supervised by Codex Connect.
+Codex Connect owns its backend service, user-global configuration/state/cache, deployment records, and installed content-addressed artifacts. Codex CLI/App Server and OpenAI `tunnel-client` are independent upstream dependencies. Their binaries, credentials, profiles, state, and lifecycle remain user-global and are not installed, relocated, duplicated, upgraded, deleted, or supervised by Codex Connect.
 
 The backend listens on loopback at `127.0.0.1:8767/mcp`. It has no application-level authentication; Secure MCP Tunnel provides the remote path. Never expose the port directly.
 
@@ -18,7 +18,7 @@ codex-connect doctor
 codex-connect restart
 codex-connect logs --follow
 codex-connect console
-codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/projects/example-project
+codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-project
 ```
 
 `status` is concise runtime/readiness/orientation: readiness, live build identity, navigation cwd, and Codex default provenance. `console` is a read-only human projection of workers, quota, pending actions, and selected transcripts; it is not an event trace. `doctor` is the detailed local diagnostic. PTY command sessions are controlled through the MCP `command.start/read/control` tools.
@@ -57,7 +57,7 @@ codex-connect deploy activate <operation-id>
 codex-connect deploy status <operation-id>
 ```
 
-`prepare` queues a detached release build and records a durable operation. Wait for `prepared`; `activate` queues the backend restart; the final `status` verifies the exact prepared artifact is live. The persistent Cargo target is a compiler cache, not runtime authority. Deployment does not restart the tunnel or refresh the connector.
+`prepare` queues a detached release build and records a durable operation. Wait for `prepared`; `activate` queues the backend restart; the final `status` verifies the exact prepared artifact is live. The deployment build cache at `~/.cache/codex-connect/deploy/build` is a compiler cache, not runtime authority. Deployment does not restart the tunnel or refresh the connector.
 
 The states are deliberately distinct: `SourceChanged != Committed != Pushed != Deployed != Live != CIGreen`. Git commits/pushes are operator workflow and are never implied by deployment. Verify source, Git, deployment, service/build identity, connector discovery, and CI at their respective owners.
 
@@ -67,7 +67,7 @@ The canonical configuration is small:
 
 ```toml
 [workspace]
-default_cwd = "~/projects"
+default_cwd = "~"
 
 [backend]
 listen = "127.0.0.1:8767"
@@ -80,6 +80,6 @@ codex_bin = "/home/you/.local/bin/codex"
 codex-connect uninstall
 ```
 
-Uninstall removes Codex Connect's service, configuration, deployment state, operator symlink, and installed artifacts. It leaves the source tree, Codex CLI/App Server, and tunnel-client state untouched.
+Uninstall removes Codex Connect's service, configuration, state/cache, operator symlink, and installed artifacts. It leaves the source tree, Codex CLI/App Server, and tunnel-client state untouched.
 
 For security implications, see [Security](../SECURITY.md).

@@ -1,7 +1,7 @@
 use crate::artifact;
 use crate::config::{
-    BACKEND_SERVICE, BackendConfig, Config, ConfigStore, config_root, default_workspace_root,
-    display_path, expand_path, state_root,
+    BACKEND_SERVICE, BackendConfig, Config, ConfigStore, cache_root, config_root, display_path,
+    expand_path, home_dir, state_root,
 };
 use crate::deployment;
 use crate::service::{ServiceManager, SystemdManager, UnitState, backend_unit};
@@ -164,10 +164,18 @@ pub async fn uninstall() -> Result<()> {
     manager.remove_unit(BACKEND_SERVICE)?;
     manager.daemon_reload()?;
 
-    remove_file_if_present(&operator_path()?)?;
-    remove_tree_if_present(&workspace_local_root()?.join("lib/codex-connect"))?;
+    let operator = operator_path()?;
+    let build_root = managed_build_root()?;
+    if operator.symlink_metadata().is_ok() && !remove_operator_if_owned(&operator, &build_root)? {
+        println!(
+            "• Preserved unmanaged operator path at {}.",
+            operator.display()
+        );
+    }
+    remove_tree_if_present(&user_local_root()?.join("lib/codex-connect"))?;
     remove_tree_if_present(&config_root()?.join("codex-connect"))?;
     remove_tree_if_present(&state_root()?.join("codex-connect"))?;
+    remove_tree_if_present(&cache_root()?.join("codex-connect"))?;
 
     println!(
         "✓ Removed Codex Connect-managed backend service, configuration, state, and installed binaries."
@@ -217,7 +225,7 @@ async fn prepare_deployment_inner(operation_id: &str, source: &Path) -> Result<(
     }
 
     let _build_lock = deployment::BuildLock::acquire()?;
-    let build_root = deployment::build_target(operation_id, &source)?;
+    let build_root = deployment::build_target(operation_id)?;
     let build = (|| -> Result<_> {
         let cargo = find_executable("cargo").or_else(|_| {
             let candidate = crate::config::home_dir()?.join(".cargo/bin/cargo");
@@ -446,7 +454,6 @@ pub async fn setup(no_start: bool) -> Result<()> {
         bail!("default workspace is not a directory: {}", root.display());
     }
     config.workspace.default_cwd = display_path(&root);
-    let workspace_root = default_workspace_root()?;
     let codex =
         resolve_executable(&config.backend.codex_bin).or_else(|_| find_executable("codex"))?;
     config.backend.codex_bin = codex.display().to_string();
@@ -458,7 +465,7 @@ pub async fn setup(no_start: bool) -> Result<()> {
     let old_state = manager.unit_state(BACKEND_SERVICE)?;
     let installation = (|| -> Result<()> {
         store.save(&config)?;
-        manager.install_unit(BACKEND_SERVICE, &backend_unit(&binary, &workspace_root)?)?;
+        manager.install_unit(BACKEND_SERVICE, &backend_unit(&binary)?)?;
         manager.daemon_reload()
     })();
     if let Err(error) = installation {
@@ -718,19 +725,70 @@ fn source_tree() -> Result<PathBuf> {
     bail!("current directory is not inside the Codex Connect source tree")
 }
 
-fn workspace_local_root() -> Result<PathBuf> {
-    Ok(default_workspace_root()?.join(".local"))
+fn user_local_root() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".local"))
 }
 
 fn operator_path() -> Result<PathBuf> {
-    Ok(workspace_local_root()?.join("bin/codex-connect"))
+    Ok(user_local_root()?.join("bin/codex-connect"))
 }
 
-fn remove_file_if_present(path: &Path) -> Result<()> {
-    if path.symlink_metadata().is_ok() {
-        fs::remove_file(path).with_context(|| format!("unable to remove {}", path.display()))?;
+fn managed_build_root() -> Result<PathBuf> {
+    Ok(user_local_root()?.join("lib/codex-connect/builds"))
+}
+
+fn operator_path_is_owned(path: &Path, build_root: &Path) -> Result<bool> {
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("unable to inspect {}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(false);
     }
-    Ok(())
+    let target = fs::read_link(path)
+        .with_context(|| format!("unable to read operator symlink {}", path.display()))?;
+    let target = if target.is_absolute() {
+        target
+    } else {
+        path.parent().unwrap_or(Path::new("/")).join(target)
+    };
+    Ok(target.starts_with(build_root))
+}
+
+fn remove_operator_if_owned(path: &Path, build_root: &Path) -> Result<bool> {
+    if !operator_path_is_owned(path, build_root)? {
+        return Ok(false);
+    }
+    fs::remove_file(path).with_context(|| format!("unable to remove {}", path.display()))?;
+    Ok(true)
+}
+
+#[cfg(test)]
+#[test]
+fn operator_ownership_only_accepts_managed_symlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let build_root = directory.path().join(".local/lib/codex-connect/builds");
+    let managed = build_root.join("abc/codex-connect");
+    let bin = directory.path().join(".local/bin");
+    fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(&managed, b"managed").unwrap();
+
+    let operator = bin.join("codex-connect");
+    std::os::unix::fs::symlink(&managed, &operator).unwrap();
+    assert!(operator_path_is_owned(&operator, &build_root).unwrap());
+    assert!(remove_operator_if_owned(&operator, &build_root).unwrap());
+    assert!(!operator.exists());
+
+    let unmanaged = directory.path().join("unmanaged");
+    fs::write(&unmanaged, b"unmanaged").unwrap();
+    std::os::unix::fs::symlink(&unmanaged, &operator).unwrap();
+    assert!(!operator_path_is_owned(&operator, &build_root).unwrap());
+    assert!(!remove_operator_if_owned(&operator, &build_root).unwrap());
+    assert!(operator.symlink_metadata().is_ok());
 }
 
 fn remove_tree_if_present(path: &Path) -> Result<()> {
@@ -741,9 +799,7 @@ fn remove_tree_if_present(path: &Path) -> Result<()> {
 }
 
 fn install_artifact(built: &Path, sha256: &str) -> Result<PathBuf> {
-    let directory = workspace_local_root()?
-        .join("lib/codex-connect/builds")
-        .join(&sha256[..12]);
+    let directory = managed_build_root()?.join(&sha256[..12]);
     fs::create_dir_all(&directory)?;
     let destination = directory.join("codex-connect");
     if destination.is_file() {
@@ -773,9 +829,17 @@ fn install_artifact(built: &Path, sha256: &str) -> Result<PathBuf> {
     Ok(destination.canonicalize()?)
 }
 fn activate_operator_symlink(installed: &Path) -> Result<()> {
-    let directory = workspace_local_root()?.join("bin");
+    let directory = user_local_root()?.join("bin");
     fs::create_dir_all(&directory)?;
     let destination = directory.join("codex-connect");
+    let build_root = managed_build_root()?;
+    if destination.symlink_metadata().is_ok() && !operator_path_is_owned(&destination, &build_root)?
+    {
+        bail!(
+            "refusing to replace unmanaged operator path {}",
+            destination.display()
+        );
+    }
     let temporary = directory.join(format!(".codex-connect-link-{}", std::process::id()));
     if temporary.symlink_metadata().is_ok() {
         fs::remove_file(&temporary)?;
