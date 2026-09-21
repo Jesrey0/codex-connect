@@ -31,9 +31,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-const DEFAULT_WAIT_MS: u64 = 20_000;
-const SYNCHRONOUS_TOOL_TARGET_MS: u64 = 40_000;
-const SYNCHRONOUS_TOOL_GUARD_MS: u64 = 45_000;
+const DEFAULT_WAIT_MS: u64 = 80_000;
+const QUICK_TOOL_GUARD_MS: u64 = 45_000;
+const CODEX_START_GUARD_MS: u64 = 90_000;
+const COMMAND_EXEC_GUARD_MS: u64 = 75_000;
+const COMMAND_READ_GUARD_ALLOWANCE_MS: u64 = 5_000;
+const COMMAND_READ_GUARD_MS: u64 =
+    codex_connect_relay::MAX_COMMAND_READ_MS + COMMAND_READ_GUARD_ALLOWANCE_MS;
 const CODEX_WAIT_GUARD_ALLOWANCE_MS: u64 = 15_000;
 const CODEX_WAIT_GUARD_MS: u64 = MAX_WAIT_OPERATION_MS + 5_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
@@ -388,19 +392,23 @@ impl ServerHandler for McpHandler {
         let arguments = request.arguments.unwrap_or_default();
         if name == "view_image" {
             return match tokio::time::timeout(
-                Duration::from_millis(SYNCHRONOUS_TOOL_GUARD_MS),
+                Duration::from_millis(QUICK_TOOL_GUARD_MS),
                 image_response(&self.relay, &self.host, arguments),
             )
             .await
             {
                 Ok(response) => response,
                 Err(_) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "synchronous MCP operation exceeded the {SYNCHRONOUS_TOOL_GUARD_MS} ms guard (normal target {SYNCHRONOUS_TOOL_TARGET_MS} ms)"
+                    "image operation exceeded the {QUICK_TOOL_GUARD_MS} ms local guard"
                 ))])
                 .into()),
             };
         }
+        if name == "apply_patch" {
+            return apply_patch_response(&self.relay, &self.host, arguments).await;
+        }
         let operation_cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(operation_cancelled.clone());
         let guard_ms = tool_guard_ms(name, &arguments);
         let dispatched = tokio::time::timeout(
             Duration::from_millis(guard_ms),
@@ -440,17 +448,31 @@ impl ServerHandler for McpHandler {
 }
 
 fn tool_guard_ms(name: &str, arguments: &JsonObject) -> u64 {
-    if name != "codex.wait" {
-        return SYNCHRONOUS_TOOL_GUARD_MS;
+    match name {
+        "codex.wait" => {
+            let requested = arguments
+                .get("timeoutMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_WAIT_MS)
+                .min(MAX_WAIT_MS);
+            requested
+                .saturating_add(CODEX_WAIT_GUARD_ALLOWANCE_MS)
+                .min(CODEX_WAIT_GUARD_MS)
+        }
+        "command.read" => {
+            let requested = arguments
+                .get("timeoutMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(codex_connect_relay::DEFAULT_COMMAND_READ_MS)
+                .min(codex_connect_relay::MAX_COMMAND_READ_MS);
+            requested
+                .saturating_add(COMMAND_READ_GUARD_ALLOWANCE_MS)
+                .min(COMMAND_READ_GUARD_MS)
+        }
+        "command.exec" => COMMAND_EXEC_GUARD_MS,
+        "codex.start" => CODEX_START_GUARD_MS,
+        _ => QUICK_TOOL_GUARD_MS,
     }
-    let requested = arguments
-        .get("timeoutMs")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_WAIT_MS)
-        .min(MAX_WAIT_MS);
-    requested
-        .saturating_add(CODEX_WAIT_GUARD_ALLOWANCE_MS)
-        .min(CODEX_WAIT_GUARD_MS)
 }
 
 #[derive(Deserialize)]
@@ -665,10 +687,6 @@ async fn dispatch(
             Ok(serde_json::to_value(McpStatus::read(relay, runtime))?)
         }
         "inspect" => inspect(relay, host, parse(arguments)?, context, operation_cancelled).await,
-        "apply_patch" => {
-            let args: PatchArgs = parse(arguments)?;
-            Ok(json!({"applied": host.apply_patch(&args.patch, args.cwd.as_deref())?}))
-        }
         "command.exec" => {
             let a: HostCommandExecArgs = parse(arguments)?;
             relay
@@ -1048,11 +1066,56 @@ fn summary_for(name: &str, value: &Value) -> String {
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
     if worker_events > 0 {
-        summary.push_str(&format!(
-            " {worker_events} worker event(s) require attention."
-        ));
+        summary.push_str(&format!(" {worker_events} worker event(s) available."));
     }
     summary
+}
+
+async fn apply_patch_response(
+    relay: &Relay,
+    host: &Host,
+    arguments: JsonObject,
+) -> Result<rmcp::model::CallToolResponse, McpError> {
+    let result = async {
+        let args: PatchArgs = parse(arguments)?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+        let host = host.clone();
+        let task_cancelled = cancelled.clone();
+        let mut task = tokio::task::spawn_blocking(move || {
+            host.apply_patch_with_cancel(&args.patch, args.cwd.as_deref(), || {
+                task_cancelled.load(Ordering::Acquire)
+            })
+        });
+        match tokio::time::timeout(Duration::from_millis(QUICK_TOOL_GUARD_MS), &mut task).await {
+            Ok(joined) => joined
+                .map_err(|error| anyhow::anyhow!("apply_patch task failed: {error}"))?
+                .map_err(Into::into),
+            Err(_) => {
+                cancelled.store(true, Ordering::Release);
+                match task.await {
+                    Ok(Ok(applied)) => Ok(applied),
+                    Ok(Err(error)) => Err(anyhow::anyhow!(
+                        "patch operation exceeded the {QUICK_TOOL_GUARD_MS} ms local guard and was cancelled with rollback: {error}"
+                    )),
+                    Err(error) => Err(anyhow::anyhow!(
+                        "apply_patch cleanup task failed after timeout: {error}"
+                    )),
+                }
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(applied) => {
+            let mut value = json!({"applied":applied});
+            attach_worker_events(&mut value, relay.take_worker_events().await);
+            let mut response = CallToolResult::success(vec![ContentBlock::text("Patch applied.")]);
+            response.structured_content = Some(value);
+            Ok(response.into())
+        }
+        Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error.to_string())]).into()),
+    }
 }
 
 async fn image_response(
@@ -1065,7 +1128,14 @@ async fn image_response(
         let cwd = host.resolve_cwd(args.cwd.as_deref())?;
         let path = Host::path_from_cwd(&cwd, &args.path)?;
         let bytes = relay.inspect_image_bytes(&path).await?;
-        Ok::<_, anyhow::Error>(host.image_from_bytes(&path, bytes, args.detail.as_deref())?)
+        let host = host.clone();
+        let detail = args.detail;
+        let image = tokio::task::spawn_blocking(move || {
+            host.image_from_bytes(&path, bytes, detail.as_deref())
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("image decode task failed: {error}"))??;
+        Ok::<_, anyhow::Error>(image)
     }
     .await;
     match result {
@@ -1094,8 +1164,8 @@ async fn image_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        CODEX_WAIT_GUARD_MS, SERVER_INSTRUCTIONS, SYNCHRONOUS_TOOL_GUARD_MS,
-        SYNCHRONOUS_TOOL_TARGET_MS, tool_guard_ms,
+        CODEX_START_GUARD_MS, CODEX_WAIT_GUARD_MS, COMMAND_EXEC_GUARD_MS, COMMAND_READ_GUARD_MS,
+        QUICK_TOOL_GUARD_MS, SERVER_INSTRUCTIONS, tool_guard_ms,
     };
 
     #[test]
@@ -1118,16 +1188,26 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("own delegated scope"));
         assert!(SERVER_INSTRUCTIONS.contains("Preserve PTY tools"));
         assert!(SERVER_INSTRUCTIONS.contains("Do not create Git workflow state unless requested"));
-        assert_eq!(SYNCHRONOUS_TOOL_TARGET_MS, 40_000);
-        assert_eq!(SYNCHRONOUS_TOOL_GUARD_MS, 45_000);
+        assert_eq!(QUICK_TOOL_GUARD_MS, 45_000);
+        assert_eq!(CODEX_START_GUARD_MS, 90_000);
+        assert_eq!(COMMAND_EXEC_GUARD_MS, 75_000);
+        assert_eq!(COMMAND_READ_GUARD_MS, 85_000);
         assert_eq!(CODEX_WAIT_GUARD_MS, 315_000);
         let default_wait = serde_json::Map::new();
-        assert_eq!(tool_guard_ms("codex.wait", &default_wait), 35_000);
+        assert_eq!(tool_guard_ms("codex.wait", &default_wait), 95_000);
         let max_wait = serde_json::json!({"timeoutMs":300_000});
         assert_eq!(
             tool_guard_ms("codex.wait", max_wait.as_object().unwrap()),
             315_000
         );
-        assert_eq!(tool_guard_ms("command.read", &default_wait), 45_000);
+        assert_eq!(tool_guard_ms("command.read", &default_wait), 65_000);
+        let max_read = serde_json::json!({"timeoutMs":80_000});
+        assert_eq!(
+            tool_guard_ms("command.read", max_read.as_object().unwrap()),
+            85_000
+        );
+        assert_eq!(tool_guard_ms("command.exec", &default_wait), 75_000);
+        assert_eq!(tool_guard_ms("codex.start", &default_wait), 90_000);
+        assert_eq!(tool_guard_ms("status", &default_wait), 45_000);
     }
 }

@@ -143,7 +143,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.client.catalog), 14)
         self.assertEqual(set(self.client.tools), EXPECTED)
         wait_timeout = self.client.tools["codex.wait"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(wait_timeout["default"], 20000)
+        self.assertEqual(wait_timeout["default"], 80000)
         self.assertEqual(wait_timeout["maximum"], 300000)
         self.assertEqual(wait_timeout["minimum"], 1)
         self.assertNotIn("afterCursor", self.client.tools["codex.wait"]["inputSchema"]["properties"])
@@ -155,14 +155,15 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertNotIn("timeoutMs", exec_properties)
         self.assertNotIn("outputBytesCap", exec_properties)
         read_timeout = self.client.tools["command.read"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(read_timeout["default"], 20000)
-        self.assertEqual(read_timeout["maximum"], 40000)
+        self.assertEqual(read_timeout["default"], 60000)
+        self.assertEqual(read_timeout["maximum"], 80000)
         start_size = self.client.tools["command.start"]["inputSchema"]["properties"]["size"]["anyOf"][0]
         resize = self.client.tools["command.control"]["inputSchema"]["oneOf"][1]["properties"]
         self.assertEqual(start_size["properties"]["rows"]["minimum"], 1)
         self.assertEqual(start_size["properties"]["cols"]["minimum"], 1)
         self.assertEqual(resize["rows"]["minimum"], 1)
         self.assertEqual(resize["cols"]["minimum"], 1)
+
         work_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][0]
         review_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][1]
         self.assertNotIn("approvalPolicy", work_start["properties"])
@@ -189,7 +190,10 @@ class OperatorProtocolTests(unittest.TestCase):
         status = self.client.call("status")
         worker_events = status.pop("workerEvents", [])
         for event in worker_events:
-            self.assertIn(event["kind"], {"turnTerminal", "actionRequired", "historyLost"})
+            self.assertIn(
+                event["kind"],
+                {"workerStarted", "turnTerminal", "actionRequired", "historyLost"},
+            )
         self.assertTrue(status["ready"])
         self.assertEqual(set(status), {"ready", "cwd", "buildId", "codex"})
         self.assertEqual(status["cwd"], str(self.workspace))
@@ -233,6 +237,31 @@ class OperatorProtocolTests(unittest.TestCase):
             self.assertGreater(observer["cursor"], 0)
             projection = observer["projection"]
         self.assertIn("rateLimits", projection["usage"])
+
+    def test_cancelled_codex_start_is_recovered_as_worker_started_event(self):
+        # Drain unrelated at-least-once start receipts from earlier scenarios so this test binds
+        # to the handle created by the deliberately abandoned caller below.
+        self.client.call("status")
+        caller = McpClient(self.url)
+        caller.request_timeout = 0.1
+        with self.assertRaises((TimeoutError, socket.timeout)):
+            caller.call("codex.start", {
+                "mode":"work",
+                "task":"delayed_start_response",
+            })
+
+        event = self.wait_for_worker_event(
+            lambda event: event.get("kind") == "workerStarted" and event.get("mode") == "work",
+            timeout=2.0,
+        )
+        self.assertTrue(event["threadId"])
+        self.assertTrue(event["turnId"])
+        result = self.client.call("codex.wait", {
+            "threadId":event["threadId"],
+            "turnId":event["turnId"],
+            "timeoutMs":3000,
+        })
+        self.assertEqual(result["state"], "terminal")
 
     def test_observer_wait_is_event_driven_and_projects_live_worker_state(self):
         with urllib.request.urlopen(self.url + "/observe") as response:
@@ -373,7 +402,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertFalse(result["stderrMayBeTruncated"])
         self.assertGreaterEqual(result["durationMs"], 0)
         command_params = self.method_params("command/exec")[-1]
-        self.assertEqual(command_params["timeoutMs"], 30000)
+        self.assertEqual(command_params["timeoutMs"], 60000)
         self.assertEqual(command_params["outputBytesCap"], 65536)
         self.assertNotIn("sandboxPolicy", command_params)
         self.assertEqual(self.client.call("command.exec", {
@@ -383,7 +412,7 @@ class OperatorProtocolTests(unittest.TestCase):
             {"command":[]}, {"command":["echo"],"tty":True},
             {"command":["echo"],"disableTimeout":True},
             {"command":["echo"],"disableOutputCap":True},
-            {"command":["echo"],"timeoutMs":35001},
+            {"command":["echo"],"timeoutMs":70001},
             {"command":["echo"],"outputBytesCap":1},
             {"command":["echo"],"sandboxPolicy":{"type":"externalSandbox"}},
             {"command":["echo"],"sandboxPolicy":{"type":"workspaceWrite","writableRoots":["project"]}},

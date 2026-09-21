@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::futures::OwnedNotified;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::{Duration, Instant};
 
 pub const MAX_WAIT_MS: u64 = 300_000;
@@ -57,13 +57,13 @@ const MAX_LIVE_TURNS: usize = 256;
 const MAX_RECENT_WORKERS: usize = 8;
 const TURN_PAGE_SIZE: u32 = 50;
 const ITEM_PAGE_SIZE: u32 = 100;
-pub const COMMAND_EXEC_RESPONSE_ALLOWANCE_MS: u64 = 5_000;
-pub const DEFAULT_COMMAND_MS: u64 = 30_000;
+pub const COMMAND_EXEC_RESPONSE_ALLOWANCE_MS: u64 = 10_000;
+pub const DEFAULT_COMMAND_MS: u64 = 60_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
-pub const MAX_COMMAND_MS: u64 = 35_000;
+pub const MAX_COMMAND_MS: u64 = 70_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
-pub const MAX_COMMAND_READ_MS: u64 = 40_000;
-pub const DEFAULT_COMMAND_READ_MS: u64 = 20_000;
+pub const MAX_COMMAND_READ_MS: u64 = 80_000;
+pub const DEFAULT_COMMAND_READ_MS: u64 = 60_000;
 pub const MAX_COMMAND_WRITE_BYTES: usize = 64 * 1024;
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
 const MAX_APP_SERVER_RESPONSE_BYTES: usize = MAX_WIRE_BYTES - APP_SERVER_RESPONSE_HEADROOM_BYTES;
@@ -215,6 +215,7 @@ struct ObserverUsageState {
     refresh_pending: bool,
 }
 
+#[derive(Clone)]
 struct WorkerAnnotation {
     mode: String,
     model: Option<String>,
@@ -689,6 +690,34 @@ impl Relay {
             )
             .await;
         self.trigger_observer_usage_refresh().await;
+    }
+
+    async fn register_worker_turn(
+        &self,
+        thread_id: &str,
+        turn: &codex_connect_app_server::protocol::Turn,
+        annotation: WorkerAnnotation,
+    ) {
+        self.finish_thread_start(thread_id, Some(&turn.id)).await;
+        self.remember_live_turn(thread_id, turn).await;
+        self.push_started_worker_event(thread_id, &turn.id, &annotation.mode)
+            .await;
+        self.annotate_live_turn(thread_id, &turn.id, annotation)
+            .await;
+    }
+
+    async fn push_started_worker_event(&self, thread_id: &str, turn_id: &str, mode: &str) {
+        self.operator_inbox
+            .push_once(
+                format!("started:{thread_id}:{turn_id}"),
+                json!({
+                    "kind":"workerStarted",
+                    "threadId":thread_id,
+                    "turnId":turn_id,
+                    "mode":mode,
+                }),
+            )
+            .await;
     }
 
     async fn begin_thread_start(&self, thread_id: &str) {
@@ -1269,6 +1298,29 @@ impl Relay {
             return Err(RelayError::Invalid("task must not be empty".into()));
         }
         validate_work_sandbox_policy(&sandbox_policy)?;
+        let relay = self.clone();
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = relay
+                .work_start_owned(task, cwd, thread_id, model, effort, sandbox_policy)
+                .await;
+            let _ = sender.send(result);
+        });
+        receiver
+            .await
+            .map_err(|_| RelayError::AppServer(AppServerError::Disconnected))?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn work_start_owned(
+        &self,
+        task: String,
+        cwd: Option<String>,
+        thread_id: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        sandbox_policy: SandboxPolicy,
+    ) -> Result<Value, RelayError> {
         let observer_prompt = task.clone();
         let thread_sandbox = sandbox_mode(&sandbox_policy);
         let cursor = self.journal.cursor().await;
@@ -1276,43 +1328,48 @@ impl Relay {
         let (thread_id, cwd) = self
             .prepare_thread(cwd, thread_id, None, Some(thread_sandbox))
             .await?;
+        let annotation = WorkerAnnotation {
+            mode: "work".into(),
+            model,
+            effort,
+            prompt: Some(observer_prompt),
+        };
         let response = match self
             .app_server
-            .request(TurnStart {
+            .start_request(TurnStart {
                 thread_id: thread_id.clone(),
                 input: vec![TextInput::Text { text: task }],
                 cwd,
                 approval_policy: Some(ApprovalPolicy::Never),
                 sandbox_policy: Some(sandbox_policy),
-                model: model.clone(),
-                effort: effort.clone(),
+                model: annotation.model.clone(),
+                effort: annotation.effort.clone(),
                 service_tier_for_turn: None,
             })
             .await
         {
+            Ok(deferred) => deferred.wait().await,
+            Err(error) => {
+                self.finish_thread_start(&thread_id, None).await;
+                return Err(error.into());
+            }
+        };
+        let response = match response {
             Ok(response) => response,
             Err(error) => {
                 self.finish_thread_start(&thread_id, None).await;
                 return Err(error.into());
             }
         };
-        self.finish_thread_start(&thread_id, Some(&response.turn.id))
+        let turn_id = response.turn.id.clone();
+        self.register_worker_turn(&thread_id, &response.turn, annotation)
             .await;
-        self.remember_live_turn(&thread_id, &response.turn).await;
-        self.annotate_live_turn(
-            &thread_id,
-            &response.turn.id,
-            WorkerAnnotation {
-                mode: "work".into(),
-                model,
-                effort,
-                prompt: Some(observer_prompt),
-            },
-        )
-        .await;
-        Ok(
-            json!({"threadId":thread_id,"turnId":response.turn.id,"createdThread":created,"cursor":cursor}),
-        )
+        Ok(json!({
+            "threadId":thread_id,
+            "turnId":turn_id,
+            "createdThread":created,
+            "cursor":cursor,
+        }))
     }
 
     async fn prepare_thread(
@@ -1333,15 +1390,19 @@ impl Relay {
                 self.finish_thread_start(&id, None).await;
                 return Err(error);
             }
-            let response = self
+            let response = match self
                 .app_server
-                .request(ThreadResume {
+                .start_request(ThreadResume {
                     thread_id: id.clone(),
                     cwd,
                     developer_instructions: None,
                     exclude_turns: true,
                 })
-                .await;
+                .await
+            {
+                Ok(deferred) => deferred.wait().await,
+                Err(error) => Err(error),
+            };
             match response {
                 Ok(response) => {
                     self.mark_thread_subscribed(&id).await;
@@ -1353,9 +1414,9 @@ impl Relay {
                 }
             }
         } else {
-            let response = self
+            let deferred = self
                 .app_server
-                .request(ThreadStart {
+                .start_request(ThreadStart {
                     model: new_thread_model,
                     sandbox: new_thread_sandbox,
                     cwd: Some(cwd.unwrap_or_else(|| self.default_cwd())),
@@ -1363,6 +1424,7 @@ impl Relay {
                     ..ThreadStart::default()
                 })
                 .await?;
+            let response = deferred.wait().await?;
             self.begin_thread_start(&response.thread.id).await;
             self.mark_thread_subscribed(&response.thread.id).await;
             response
@@ -1818,6 +1880,7 @@ impl Relay {
             }
         };
         let activity = self.current_activity_value(&thread_id, &turn_id).await;
+        self.acknowledge_worker_started(&thread_id, &turn_id).await;
         if raw {
             let batch = self
                 .journal
@@ -1874,7 +1937,14 @@ impl Relay {
             .and_then(|turn| turn.get("id").and_then(Value::as_str));
         if let (Some(thread_id), Some(turn_id)) = (thread_id, terminal_turn) {
             self.operator_inbox
-                .acknowledge_terminal(format!("turn:{thread_id}:{turn_id}"))
+                .acknowledge_once(format!("turn:{thread_id}:{turn_id}"))
+                .await;
+        }
+        if let (Some(thread_id), Some(turn_id)) =
+            (thread_id, result.get("turnId").and_then(Value::as_str))
+        {
+            self.operator_inbox
+                .acknowledge_once(format!("started:{thread_id}:{turn_id}"))
                 .await;
         }
 
@@ -1887,6 +1957,12 @@ impl Relay {
             .map(|request_id| format!("action:{request_id}"))
             .collect::<Vec<_>>();
         self.operator_inbox.acknowledge_actions(actions).await;
+    }
+
+    async fn acknowledge_worker_started(&self, thread_id: &str, turn_id: &str) {
+        self.operator_inbox
+            .acknowledge_once(format!("started:{thread_id}:{turn_id}"))
+            .await;
     }
 
     pub async fn work_steer(
@@ -1902,11 +1978,13 @@ impl Relay {
         let response = self
             .app_server
             .request(TurnSteer {
-                thread_id,
-                expected_turn_id,
+                thread_id: thread_id.clone(),
+                expected_turn_id: expected_turn_id.clone(),
                 input: vec![TextInput::Text { text: instruction }],
             })
             .await?;
+        self.acknowledge_worker_started(&thread_id, &expected_turn_id)
+            .await;
         Ok(json!({"turnId":response.turn_id}))
     }
 
@@ -1918,10 +1996,11 @@ impl Relay {
         self.read_thread_metadata(thread_id.clone()).await?;
         self.app_server
             .request(TurnInterrupt {
-                thread_id,
+                thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
             })
             .await?;
+        self.acknowledge_worker_started(&thread_id, &turn_id).await;
         Ok(json!({"turnId":turn_id,"interrupted":true}))
     }
 
@@ -1937,6 +2016,24 @@ impl Relay {
                 "model applies to new review threads only; omit threadId or omit model".into(),
             ));
         }
+        let relay = self.clone();
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = relay.review_owned(cwd, thread_id, target, model).await;
+            let _ = sender.send(result);
+        });
+        receiver
+            .await
+            .map_err(|_| RelayError::AppServer(AppServerError::Disconnected))?
+    }
+
+    async fn review_owned(
+        &self,
+        cwd: Option<String>,
+        thread_id: Option<String>,
+        target: ReviewTarget,
+        model: Option<String>,
+    ) -> Result<Value, RelayError> {
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
         let observer_model = model.clone();
@@ -1949,40 +2046,45 @@ impl Relay {
                 created.then_some(SandboxMode::ReadOnly),
             )
             .await?;
+        let annotation = WorkerAnnotation {
+            mode: "review".into(),
+            model: observer_model,
+            effort: None,
+            prompt: Some(observer_prompt),
+        };
         let response = match self
             .app_server
-            .request(ReviewStart {
+            .start_request(ReviewStart {
                 thread_id: thread_id.clone(),
                 target,
                 delivery: "inline",
             })
             .await
         {
+            Ok(deferred) => deferred.wait().await,
+            Err(error) => {
+                self.finish_thread_start(&thread_id, None).await;
+                return Err(error.into());
+            }
+        };
+        let response = match response {
             Ok(response) => response,
             Err(error) => {
                 self.finish_thread_start(&thread_id, None).await;
                 return Err(error.into());
             }
         };
-        self.finish_thread_start(&thread_id, Some(&response.turn.id))
+        let turn_id = response.turn.id.clone();
+        self.register_worker_turn(&thread_id, &response.turn, annotation)
             .await;
-        self.remember_live_turn(&thread_id, &response.turn).await;
-        self.annotate_live_turn(
-            &thread_id,
-            &response.turn.id,
-            WorkerAnnotation {
-                mode: "review".into(),
-                model: observer_model,
-                effort: None,
-                prompt: Some(observer_prompt),
-            },
-        )
-        .await;
-        // The pinned App Server returns the inline review turn on the source thread even
-        // when reviewThreadId names the internal reviewer thread. work.wait needs that pair.
-        Ok(
-            json!({"threadId":thread_id,"turnId":response.turn.id,"createdThread":created,"cursor":cursor}),
-        )
+        // The pinned App Server returns the inline review turn on the source thread even when
+        // reviewThreadId names the internal reviewer thread. work.wait needs that pair.
+        Ok(json!({
+            "threadId":thread_id,
+            "turnId":turn_id,
+            "createdThread":created,
+            "cursor":cursor,
+        }))
     }
 
     pub async fn pending_actions(&self, thread_id: Option<&str>) -> Vec<Value> {
@@ -2002,7 +2104,7 @@ impl Relay {
         }
         let turn_id = observed.turn.id.clone();
         self.operator_inbox
-            .push_terminal(
+            .push_once(
                 format!("turn:{thread_id}:{turn_id}"),
                 json!({
                     "kind":"turnTerminal",
@@ -2317,7 +2419,7 @@ impl Relay {
                                     if let Some(observed) = terminal {
                                         let turn_id = observed.turn.id.clone();
                                         operator_inbox
-                                            .push_terminal(
+                                            .push_once(
                                                 format!("turn:{thread_id}:{turn_id}"),
                                                 json!({
                                                     "kind":"turnTerminal",

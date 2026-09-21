@@ -130,7 +130,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Run one known, bounded, non-interactive command on the Codex Connect host using server-owned timeout and output limits. Prefer this for deterministic repository, test, build, Git, or system commands that fit one synchronous call. Use command.start for persistent or interactive processes and codex.start for autonomous investigation or coding.",
+                "Run one known, bounded, non-interactive command on the Codex Connect host using a server-owned 60-second child timeout and bounded output. Prefer this for deterministic repository, test, build, Git, or system commands that fit one synchronous call. Use command.start when execution can exceed about a minute or needs persistence/interaction, and codex.start for autonomous investigation or coding.",
                 false,
                 true,
                 true,
@@ -164,7 +164,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Delegate autonomous work or start an official Codex review. Work defaults to a writable workspace sandbox with network access and non-blocking approvals; set access=full only when unrestricted host authority is required. Reviews are read-only. Workers do not inherit the ChatGPT conversation, native tools, uploads, or sandbox, so supply self-contained context. Once started, the worker owns its assigned scope until terminal, blocked, or interrupted; continue only non-overlapping operator work.",
+                "Delegate autonomous work or start an official Codex review. Work defaults to a writable workspace sandbox with network access and non-blocking approvals; set access=full only when unrestricted host authority is required. Reviews are read-only. Workers do not inherit the ChatGPT conversation, native tools, uploads, or sandbox, so supply self-contained context. Start completion is relay-owned: if the caller disappears after submission, worker creation continues and an unclaimed handle can be recovered through a one-shot workerStarted host event. Once started, the worker owns its assigned scope until terminal, blocked, or interrupted; continue only non-overlapping operator work.",
                 false,
                 true,
                 true,
@@ -353,6 +353,15 @@ fn with_worker_events(mut schema: Value) -> Value {
 }
 
 fn worker_events_schema() -> Value {
+    let started = object_schema(
+        json!({
+            "kind":{"const":"workerStarted"},
+            "threadId":{"type":"string"},
+            "turnId":{"type":"string"},
+            "mode":{"enum":["work","review"]}
+        }),
+        &["kind", "threadId", "turnId", "mode"],
+    );
     let terminal = object_schema(
         json!({
             "kind":{"const":"turnTerminal"},
@@ -385,8 +394,8 @@ fn worker_events_schema() -> Value {
     json!({
         "type":"array",
         "maxItems":8,
-        "description":"Unread semantic worker interrupts delivered opportunistically on host-plane calls. Use codex.wait to synchronize with the turn and codex.inspect for activity/history; do not poll when this field is absent.",
-        "items":{"oneOf":[terminal,action,lost]}
+        "description":"Unread semantic worker lifecycle/events delivered opportunistically on host-plane calls, including recovery handles, terminal state, required action, or history loss. Use codex.wait to synchronize with a known turn and codex.inspect for activity/history; do not poll when this field is absent.",
+        "items":{"oneOf":[started,terminal,action,lost]}
     })
 }
 fn json_schema(value: Value) -> Arc<JsonObject> {
@@ -650,7 +659,7 @@ fn command_read_schema() -> Value {
         json!({
             "processId":{"type":"string","minLength":1,"description":"Connection-scoped process handle returned by command.start."},
             "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Return output newer than this cursor. Use the cursor from the previous command.start/read result to consume incrementally."},
-            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Bounded wait for new output or process exit. Defaults to 20000 and may extend to 40000. Timeout does not terminate or imply a stalled process; the process may outlive any number of reads. tunnel-client independently owns any outer response deadline."}
+            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Event-driven wait for new output or process exit. Defaults to 60000 and may extend to 80000, leaving margin below the validated ChatGPT tool-runner ceiling. Returns early on output or exit. Timeout does not terminate or imply a stalled process; the process may outlive any number of reads. tunnel-client independently owns any outer response deadline."}
         }),
         &["processId"],
     )
@@ -773,7 +782,7 @@ fn codex_wait_schema() -> Value {
         json!({
             "threadId":{"type":"string","description":"Codex thread ID returned by codex.start."},
             "turnId":{"type":"string","description":"Specific delegated turn ID returned by codex.start."},
-            "timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet event-driven synchronization lease. Defaults to 20000 and may extend to 300000 (5 minutes). For long delegated or review work, prefer one generous lease instead of repeatedly renewing short waits. Returns early on terminal state or required operator input/action. Lease expiry means the worker remains active, not stalled. Codex Connect may spend up to 10 seconds of bounded terminal/reconciliation finalization beyond the requested lease; tunnel-client independently owns and may enforce a shorter outer response deadline."}
+            "timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet event-driven synchronization lease. Defaults to 80000 based on the validated ChatGPT operator envelope and may extend to 300000 (5 minutes) for other callers or explicit experiments. Returns early on terminal state or required operator input/action. On this ChatGPT frontend, prefer leases at or below roughly 80000 so bounded finalization can finish before the observed ~100-second tool-runner ceiling. Lease expiry means the worker remains active, not stalled. Codex Connect may spend up to 10 seconds of bounded terminal/reconciliation finalization beyond the requested lease; tunnel-client independently owns and may enforce a shorter outer response deadline."}
         }),
         &["threadId", "turnId"],
     )
@@ -1128,7 +1137,7 @@ mod tests {
             .unwrap();
         let exec_description = exec.description.as_deref().unwrap();
         assert!(exec_description.contains("bounded, non-interactive"));
-        assert!(exec_description.contains("server-owned timeout and output limits"));
+        assert!(exec_description.contains("server-owned 60-second child timeout"));
         assert!(exec_description.contains("command.start"));
         assert!(exec_description.contains("codex.start"));
         let exec_input = command_schema();
@@ -1169,7 +1178,7 @@ mod tests {
                 .contains(&json!("turnId"))
         );
         assert_eq!(input["properties"]["timeoutMs"]["minimum"], 1);
-        assert_eq!(input["properties"]["timeoutMs"]["default"], 20_000);
+        assert_eq!(input["properties"]["timeoutMs"]["default"], 80_000);
         assert_eq!(input["properties"]["timeoutMs"]["maximum"], 300_000);
         assert!(
             input

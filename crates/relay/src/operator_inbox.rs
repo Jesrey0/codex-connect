@@ -9,20 +9,20 @@ pub(crate) const MAX_DELIVERY: usize = 8;
 #[derive(Default)]
 struct InboxState {
     events: VecDeque<(String, Value)>,
-    terminal_seen: HashSet<String>,
-    terminal_order: VecDeque<String>,
+    once_seen: HashSet<String>,
+    once_order: VecDeque<String>,
     pending_seen: HashSet<String>,
     overflowed: bool,
 }
 
-fn remember_terminal(state: &mut InboxState, key: &str) {
-    if !state.terminal_seen.insert(key.to_string()) {
+fn remember_once(state: &mut InboxState, key: &str) {
+    if !state.once_seen.insert(key.to_string()) {
         return;
     }
-    state.terminal_order.push_back(key.to_string());
-    while state.terminal_order.len() > MAX_EVENTS * 2 {
-        if let Some(oldest) = state.terminal_order.pop_front() {
-            state.terminal_seen.remove(&oldest);
+    state.once_order.push_back(key.to_string());
+    while state.once_order.len() > MAX_EVENTS * 2 {
+        if let Some(oldest) = state.once_order.pop_front() {
+            state.once_seen.remove(&oldest);
         }
     }
 }
@@ -33,12 +33,12 @@ pub(crate) struct OperatorInbox {
 }
 
 impl OperatorInbox {
-    pub async fn push_terminal(&self, key: String, event: Value) {
+    pub async fn push_once(&self, key: String, event: Value) {
         let mut state = self.state.lock().await;
-        if state.terminal_seen.contains(&key) {
+        if state.once_seen.contains(&key) {
             return;
         }
-        remember_terminal(&mut state, &key);
+        remember_once(&mut state, &key);
         push(&mut state, key, event);
     }
 
@@ -60,9 +60,9 @@ impl OperatorInbox {
         }
     }
 
-    pub async fn acknowledge_terminal(&self, key: String) {
+    pub async fn acknowledge_once(&self, key: String) {
         let mut state = self.state.lock().await;
-        remember_terminal(&mut state, &key);
+        remember_once(&mut state, &key);
         state.events.retain(|(candidate, _)| candidate != &key);
     }
 
@@ -114,13 +114,13 @@ mod tests {
     async fn terminal_events_are_delivered_once() {
         let inbox = OperatorInbox::default();
         inbox
-            .push_terminal(
+            .push_once(
                 "turn:a:b".into(),
                 json!({"kind":"turnTerminal","turnId":"b"}),
             )
             .await;
         inbox
-            .push_terminal(
+            .push_once(
                 "turn:a:b".into(),
                 json!({"kind":"turnTerminal","turnId":"b"}),
             )
@@ -152,7 +152,7 @@ mod tests {
         let inbox = OperatorInbox::default();
         for index in 0..MAX_DELIVERY {
             inbox
-                .push_terminal(
+                .push_once(
                     format!("turn:a:{index}"),
                     json!({"kind":"turnTerminal","turnId":index.to_string()}),
                 )
@@ -174,7 +174,7 @@ mod tests {
     async fn explicit_join_acknowledges_terminal_and_pending_events() {
         let inbox = OperatorInbox::default();
         inbox
-            .push_terminal(
+            .push_once(
                 "turn:a:b".into(),
                 json!({"kind":"turnTerminal","turnId":"b"}),
             )
@@ -186,12 +186,12 @@ mod tests {
             )])
             .await;
 
-        inbox.acknowledge_terminal("turn:a:b".into()).await;
+        inbox.acknowledge_once("turn:a:b".into()).await;
         inbox.acknowledge_actions(vec!["action:1".into()]).await;
         assert!(inbox.take().await.is_empty());
 
         inbox
-            .push_terminal(
+            .push_once(
                 "turn:a:b".into(),
                 json!({"kind":"turnTerminal","turnId":"b"}),
             )

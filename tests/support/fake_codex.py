@@ -344,6 +344,19 @@ for line in sys.stdin:
             complete(thread_id, turn_id)
             respond(message, stale_result)
             continue
+        if scenario == "delayed_start_response":
+            notify("turn/started", {"threadId": thread_id, "turn": turn})
+            response_timer = threading.Timer(
+                0.5,
+                respond,
+                (copy.deepcopy(message), copy.deepcopy(result)),
+            )
+            response_timer.daemon = True
+            response_timer.start()
+            completion_timer = threading.Timer(0.8, complete, (thread_id, turn_id))
+            completion_timer.daemon = True
+            completion_timer.start()
+            continue
         respond(message, result)
         notify("turn/started", {"threadId": thread_id, "turn": turn})
         if scenario == "no_event":

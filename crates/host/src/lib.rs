@@ -50,6 +50,8 @@ pub enum HostError {
     Cancelled,
     #[error("patch command failed: {0}")]
     PatchFailed(String),
+    #[error("patch operation was cancelled")]
+    PatchCancelled,
     #[error("unsupported image type for {0}")]
     UnsupportedImage(String),
     #[error("image data is invalid for {0}")]
@@ -275,22 +277,42 @@ impl Host {
     }
 
     pub fn apply_patch(&self, patch: &str, cwd: Option<&str>) -> Result<Vec<String>, HostError> {
+        self.apply_patch_with_cancel(patch, cwd, || false)
+    }
+
+    pub fn apply_patch_with_cancel(
+        &self,
+        patch: &str,
+        cwd: Option<&str>,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<Vec<String>, HostError> {
         let document = parse_patch(patch)?;
         if document.environment_id.is_some() {
             return Err(HostError::PatchFailed(
                 "apply_patch environment selection is unavailable for this host".to_string(),
             ));
         }
+        if is_cancelled() {
+            return Err(HostError::PatchCancelled);
+        }
         let cwd = self.resolve_cwd(cwd)?;
-        let plan = self.plan_patch(document.changes, &cwd)?;
-        self.apply_patch_plan(plan)
+        let plan = self.plan_patch(document.changes, &cwd, &is_cancelled)?;
+        self.apply_patch_plan(plan, &is_cancelled)
     }
 
-    fn plan_patch(&self, changes: Vec<PatchChange>, cwd: &str) -> Result<PatchPlan, HostError> {
+    fn plan_patch(
+        &self,
+        changes: Vec<PatchChange>,
+        cwd: &str,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Result<PatchPlan, HostError> {
         let mut actions = Vec::with_capacity(changes.len());
         let mut applied = Vec::with_capacity(changes.len());
         let mut touched = HashSet::new();
         for change in changes {
+            if is_cancelled() {
+                return Err(HostError::PatchCancelled);
+            }
             match change {
                 PatchChange::Add { path, content } => {
                     let path = self.resolve_mutation_path(&Self::path_from_cwd(cwd, &path)?)?;
@@ -352,11 +374,18 @@ impl Host {
         Ok(PatchPlan { actions, applied })
     }
 
-    fn apply_patch_plan(&self, plan: PatchPlan) -> Result<Vec<String>, HostError> {
+    fn apply_patch_plan(
+        &self,
+        plan: PatchPlan,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Result<Vec<String>, HostError> {
         let mut completed = Vec::with_capacity(plan.actions.len());
         let mut created_directories = Vec::new();
         let result = (|| -> Result<(), HostError> {
             for action in &plan.actions {
+                if is_cancelled() {
+                    return Err(HostError::PatchCancelled);
+                }
                 let path = action.path();
                 match action {
                     PatchAction::Write {
@@ -398,6 +427,9 @@ impl Host {
                             backup,
                         });
                     }
+                }
+                if is_cancelled() {
+                    return Err(HostError::PatchCancelled);
                 }
             }
             Ok(())
@@ -1661,6 +1693,29 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("host operation failed"));
         assert!(!temporary.path().join("first.txt").exists());
+    }
+
+    #[test]
+    fn cancelled_patch_rolls_back_completed_actions() {
+        use std::cell::Cell;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let host = Host::open(temporary.path()).unwrap();
+        let checks = Cell::new(0usize);
+        let error = host
+            .apply_patch_with_cancel(
+                "*** Begin Patch\n*** Add File: first.txt\n+first\n*** Add File: second.txt\n+second\n*** End Patch\n",
+                None,
+                || {
+                    let next = checks.get() + 1;
+                    checks.set(next);
+                    next >= 5
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, HostError::PatchCancelled));
+        assert!(!temporary.path().join("first.txt").exists());
+        assert!(!temporary.path().join("second.txt").exists());
     }
 
     #[test]
