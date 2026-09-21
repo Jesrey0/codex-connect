@@ -147,8 +147,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.client.catalog), 14)
         self.assertEqual(set(self.client.tools), EXPECTED)
         wait_timeout = self.client.tools["codex.wait"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(wait_timeout["default"], 60000)
-        self.assertEqual(wait_timeout["maximum"], 120000)
+        self.assertEqual(wait_timeout["default"], 20000)
+        self.assertEqual(wait_timeout["maximum"], 30000)
         self.assertEqual(wait_timeout["minimum"], 1)
         self.assertNotIn("afterCursor", self.client.tools["codex.wait"]["inputSchema"]["properties"])
         self.assertEqual(
@@ -156,11 +156,11 @@ class OperatorProtocolTests(unittest.TestCase):
             "semantic",
         )
         exec_timeout = self.client.tools["command.exec"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(exec_timeout["default"], 60000)
-        self.assertEqual(exec_timeout["maximum"], 300000)
+        self.assertEqual(exec_timeout["default"], 30000)
+        self.assertEqual(exec_timeout["maximum"], 35000)
         read_timeout = self.client.tools["command.read"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(read_timeout["default"], 30000)
-        self.assertEqual(read_timeout["maximum"], 120000)
+        self.assertEqual(read_timeout["default"], 20000)
+        self.assertEqual(read_timeout["maximum"], 40000)
         start_size = self.client.tools["command.start"]["inputSchema"]["properties"]["size"]["anyOf"][0]
         resize = self.client.tools["command.control"]["inputSchema"]["oneOf"][1]["properties"]
         self.assertEqual(start_size["properties"]["rows"]["minimum"], 1)
@@ -221,8 +221,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(observer["runtime"], runtime)
         projection = observer["projection"]
         self.assertEqual(set(projection), {
-            "cwd", "usage", "usageRefreshMs", "activeTurns",
-            "pendingActions", "cursor", "historyLost", "events",
+            "cwd", "usage", "usageRefreshMs", "workers", "pendingActions", "notices",
         })
         self.assertEqual(projection["cwd"], str(self.workspace))
         self.assertEqual(projection["usageRefreshMs"], 5000)
@@ -324,8 +323,8 @@ class OperatorProtocolTests(unittest.TestCase):
         schema = self.client.tools["command.exec"]["inputSchema"]["properties"]
         self.assertNotIn("disableTimeout", schema)
         self.assertNotIn("disableOutputCap", schema)
-        self.assertEqual(schema["timeoutMs"]["default"], 60000)
-        self.assertEqual(schema["timeoutMs"]["maximum"], 300000)
+        self.assertEqual(schema["timeoutMs"]["default"], 30000)
+        self.assertEqual(schema["timeoutMs"]["maximum"], 35000)
         self.assertEqual(schema["outputBytesCap"]["default"], 65536)
         inherited = self.client.call("command.exec", {"command":["fixture-policy"]})
         self.assertIsNone(json.loads(inherited["stdout"]))
@@ -337,7 +336,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertFalse(result["stderrMayBeTruncated"])
         self.assertGreaterEqual(result["durationMs"], 0)
         self.assertEqual(self.client.call("command.exec", {
-            "command":["echo","fixture"], "timeoutMs":300000,
+            "command":["echo","fixture"], "timeoutMs":35000,
         })["exitCode"], 0)
         self.assertEqual(self.client.call("command.exec", {
             "command":["echo","fixture"], "cwd":"/etc",
@@ -346,7 +345,7 @@ class OperatorProtocolTests(unittest.TestCase):
             {"command":[]}, {"command":["echo"],"tty":True},
             {"command":["echo"],"disableTimeout":True},
             {"command":["echo"],"disableOutputCap":True},
-            {"command":["echo"],"timeoutMs":300001},
+            {"command":["echo"],"timeoutMs":35001},
             {"command":["echo"],"sandboxPolicy":{"type":"externalSandbox"}},
             {"command":["echo"],"sandboxPolicy":{"type":"workspaceWrite","writableRoots":["project"]}},
         ]:
@@ -620,13 +619,14 @@ class OperatorProtocolTests(unittest.TestCase):
         with urllib.request.urlopen(self.url + "/observe") as response:
             observer = json.load(response)
         observed = next(
-            turn for turn in observer["projection"]["activeTurns"]
+            turn for turn in observer["projection"]["workers"]
             if turn["turnId"] == next_work["turnId"]
         )
         self.assertEqual(observed["mode"], "work")
         self.assertEqual(observed["model"], "gpt-6-astra")
         self.assertEqual(observed["effort"], "high")
         self.assertEqual(observed["serviceTier"], "priority")
+        self.assertEqual(observed["prompt"], "idle")
         self.assertGreater(observed["lastActivityAtMs"], 0)
         self.assertIn(observed["activityKind"], {"turn", "think", "message", "tool", "file", "search", "item", "waiting"})
         self.assertIn("activitySummary", observed)
@@ -636,11 +636,17 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["detail"], "semantic")
 
     def test_observer_transcript_is_live_and_survives_terminal_cleanup(self):
-        work = self.start("progress")
+        work = self.start("progress", developerInstructions="Prefer concise operator-facing output")
         active = self.transcript(work)
         self.assertEqual(active["threadId"], work["threadId"])
         self.assertEqual(active["turnId"], work["turnId"])
         self.assertEqual(active["status"], "inProgress")
+        self.assertEqual(active["context"]["prompt"], "progress")
+        self.assertEqual(
+            active["context"]["developerInstructions"],
+            "Prefer concise operator-facing output",
+        )
+        self.assertEqual(active["pendingActions"], [])
         self.assertEqual(active["activity"]["kind"], "message")
         self.assertIn("Working", active["activity"]["summary"])
 
@@ -655,6 +661,22 @@ class OperatorProtocolTests(unittest.TestCase):
             for entry in terminal["entries"]
         ))
 
+    def test_observer_transcript_projects_operator_action_context(self):
+        work = self.start("question")
+        pending = self.transcript(work)
+        self.assertEqual(pending["context"]["prompt"], "question")
+        self.assertEqual(len(pending["pendingActions"]), 1)
+        action = pending["pendingActions"][0]
+        self.assertEqual(action["kind"], "userInput")
+        self.assertTrue(action["isBlocking"])
+        self.assertEqual(action["params"]["questions"][0]["question"], "Which output format?")
+        self.client.call("codex.action.respond", {
+            "type": "userInput",
+            "requestId": action["requestId"],
+            "answers": {"format": ["JSON"]},
+        })
+        self.assertEqual(self.wait(work)["state"], "terminal")
+
     def test_observer_transcript_stops_hydrating_after_the_entry_cap(self):
         work = self.start("long_transcript")
         self.assertEqual(self.wait(work)["state"], "terminal")
@@ -663,7 +685,17 @@ class OperatorProtocolTests(unittest.TestCase):
         calls = self.method_params("thread/items/list")[before:]
         self.assertTrue(transcript["truncated"])
         self.assertEqual(len(transcript["entries"]), 512)
-        self.assertIn(13, [call["limit"] for call in calls])
+        self.assertEqual(transcript["entries"][0]["text"], "entry 188")
+        self.assertEqual(transcript["entries"][-1]["text"], "entry 699")
+        self.assertTrue(all(call["sortDirection"] == "desc" for call in calls))
+
+    def test_observer_transcript_marks_exact_character_bound_as_truncated(self):
+        work = self.start("exact_transcript_bound")
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        transcript = self.transcript(work)
+        self.assertTrue(transcript["truncated"])
+        self.assertEqual(len(transcript["entries"]), 6)
+        self.assertTrue(all(len(entry["text"]) == 32 * 1024 for entry in transcript["entries"]))
 
     def test_wait_rejects_timeout_above_server_limit(self):
         work = self.start("idle")
@@ -693,13 +725,22 @@ class OperatorProtocolTests(unittest.TestCase):
         )
         with urllib.request.urlopen(self.url + "/observe") as response:
             observer = json.load(response)
-        self.assertNotIn(
-            work["turnId"],
-            [turn["turnId"] for turn in observer["projection"]["activeTurns"]],
+        observed = next(
+            turn for turn in observer["projection"]["workers"]
+            if turn["turnId"] == work["turnId"]
         )
+        self.assertEqual(observed["status"], "completed")
         result = self.wait(work)
         self.assertEqual(result["state"], "terminal")
         self.assertEqual(result["turn"]["status"], "completed")
+        with urllib.request.urlopen(self.url + "/observe") as response:
+            observer = json.load(response)
+        retained = next(
+            turn for turn in observer["projection"]["workers"]
+            if turn["turnId"] == work["turnId"]
+        )
+        self.assertEqual(retained["status"], "completed")
+        self.assertGreater(retained["terminalAtMs"], 0)
         unsubscribes = self.wait_for_method_count(
             "thread/unsubscribe", unsubscribes_before + 1,
         )
@@ -795,7 +836,7 @@ class OperatorProtocolTests(unittest.TestCase):
             with urllib.request.urlopen(self.url + "/observe") as response:
                 observer = json.load(response)
             successes = [
-                event for event in observer["projection"]["events"]
+                event for event in observer["projection"]["notices"]
                 if event["kind"] == "system"
                 and event["threadId"] == work["threadId"]
                 and "thread unsubscribed" in (event["summary"] or "")
@@ -805,7 +846,7 @@ class OperatorProtocolTests(unittest.TestCase):
                 break
             time.sleep(0.025)
         else:
-            self.fail("unsubscribe success was not exposed through the observer journal")
+            self.fail("unsubscribe success was not exposed through observer notices")
 
     def test_start_failure_after_thread_load_releases_subscription(self):
         unsubscribes_before = len(self.method_params("thread/unsubscribe"))
@@ -830,7 +871,7 @@ class OperatorProtocolTests(unittest.TestCase):
             with urllib.request.urlopen(self.url + "/observe") as response:
                 observer = json.load(response)
             failures = [
-                event for event in observer["projection"]["events"]
+                event for event in observer["projection"]["notices"]
                 if event["kind"] == "error"
                 and event["threadId"] == work["threadId"]
                 and "thread unsubscribe failed" in (event["summary"] or "")
@@ -839,7 +880,7 @@ class OperatorProtocolTests(unittest.TestCase):
                 break
             time.sleep(0.025)
         else:
-            self.fail("unsubscribe failure was not exposed through the observer journal")
+            self.fail("unsubscribe failure was not exposed through observer notices")
 
         resumed = self.start("complete", threadId=work["threadId"])
         self.assertEqual(self.wait(resumed)["state"], "terminal")
@@ -887,7 +928,7 @@ class OperatorProtocolTests(unittest.TestCase):
             observer = json.load(response)
         self.assertNotIn(
             f"{review['threadId']}-review-auxiliary",
-            [turn["turnId"] for turn in observer["projection"]["activeTurns"]],
+            [turn["turnId"] for turn in observer["projection"]["workers"]],
         )
 
     def test_wait_uses_paginated_turn_lookup(self):

@@ -76,7 +76,10 @@ pub(crate) fn activity(method: &str, params: &Value) -> Option<Activity> {
             ),
         });
     }
-    if lowered.contains("requestapproval") || lowered.contains("requestuserinput") {
+    if lowered.contains("requestapproval")
+        || lowered.contains("requestuserinput")
+        || method == "mcpServer/elicitation/request"
+    {
         return Some(Activity {
             kind: "waiting".into(),
             summary: Some("operator action required".into()),
@@ -234,5 +237,17 @@ mod tests {
             assert_eq!(event.summary.as_deref(), Some(status));
             assert_eq!(event.phase.as_deref(), Some("failed"));
         }
+    }
+
+    #[test]
+    fn elicitation_is_an_operator_wait_state() {
+        let event = semantic_event(
+            3,
+            "mcpServer/elicitation/request",
+            &json!({"threadId":"a","turnId":"one","message":"Authorize"}),
+        )
+        .unwrap();
+        assert_eq!(event.kind, "waiting");
+        assert_eq!(event.summary.as_deref(), Some("operator action required"));
     }
 }

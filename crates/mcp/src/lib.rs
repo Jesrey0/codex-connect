@@ -26,12 +26,25 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
 
-const DEFAULT_WAIT_MS: u64 = 60_000;
+const DEFAULT_WAIT_MS: u64 = 20_000;
+const SYNCHRONOUS_TOOL_TARGET_MS: u64 = 40_000;
+const SYNCHRONOUS_TOOL_GUARD_MS: u64 = 45_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
+const MAX_INSPECT_CONCURRENCY: usize = 4;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Host tools run with host-user authority; the configured cwd is navigation only. Use codex.* for Codex semantics rather than invoking the Codex CLI through host commands. Tool timeouts express operation semantics; tunnel-client independently enforces any per-command upstream response deadline and that transport deadline must not be duplicated as a fixed Codex Connect invariant. Use command.exec for bounded deterministic host work and command.start/read for persistent, interactive, or unusually long-running commands. Delegated work requires an explicit sandboxPolicy, uses the server-owned on-request approval policy, and does not inherit the ChatGPT conversation; provide self-contained worker context. Delegate only when autonomous reasoning materially improves progress or verification. Once delegated, the worker owns its assigned scope until it becomes terminal, blocks for operator action, or is explicitly interrupted; continue only non-overlapping operator work and do not redo the delegated task because a codex.wait lease expired. codex.wait is synchronization-only: it quietly joins the selected turn until terminal state, operator action, or lease expiry. If delegated work still owns the remaining critical path after a timeout, repeat bounded joins rather than taking over its scope. Use codex.inspect for worker activity/history and raw forensic events. Treat workerEvents as sparse semantic interrupts, not a progress feed. Codex CLI/App Server and tunnel-client are upstream-owned. Do not create Git workflow state unless the user requests version-control work. Official App Server state is authoritative for Codex lifecycles.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Host tools run with host-user authority; the configured cwd is navigation only. Use codex.* for Codex semantics rather than invoking the Codex CLI through host commands. Keep ChatGPT-native capabilities as a separate platform plane: web/research, user/project files, Scheduled Tasks, Work/browser, and installed plugins/apps may be used when they are the owning source or action surface, but they do not inherit HostPlane filesystem/process authority and HostPlane does not inherit their connected-account authority. Within that platform plane prefer a native capability first, then an already-connected app/plugin; discover or suggest a new integration only when an external account/data source materially improves the task and no current capability owns it. Codex workers likewise do not inherit the ChatGPT conversation, native tools, plugin/app connections, files, or scheduled-task context unless relevant content is explicitly supplied. Tool timeouts express operation semantics; tunnel-client independently enforces any per-command upstream response deadline. Public synchronous work targets completion within 40 seconds and is guarded at 45 seconds in this server. Use command.exec only for bounded deterministic host work expected to fit that envelope; use command.start/read for persistent, interactive, or longer-running commands. Delegated work requires an explicit sandboxPolicy, uses the server-owned on-request approval policy, and needs self-contained worker context. Delegate only when autonomous reasoning materially improves progress or verification. Once delegated, the worker owns its assigned scope until it becomes terminal, blocks for operator action, or is explicitly interrupted; continue only non-overlapping operator work and do not redo the delegated task because a codex.wait lease expired. codex.wait is synchronization-only: use a short bounded join for interactive coordination. If a legitimately long-running worker owns the remaining critical path and no useful non-overlapping work remains, prefer a ChatGPT Scheduled Task/monitoring handoff when that feature is available and can access this connector, rather than spinning repeated waits. A scheduled worker-monitor prompt must carry the exact threadId/turnId and monitoring intent and must not assume Project/uploaded files are available. Scheduling never interrupts the worker, transfers its scope, or merges platform authority with HostPlane; the later run must re-establish authoritative state through Codex Connect. Use codex.inspect for worker activity/history and raw forensic events. Treat workerEvents as sparse semantic interrupts, not a progress feed. Codex CLI/App Server and tunnel-client are upstream-owned. Do not create Git workflow state unless the user requests version-control work. Official App Server state is authoritative for Codex lifecycles.";
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -357,19 +370,42 @@ impl ServerHandler for McpHandler {
         let name = request.name.as_ref();
         let arguments = request.arguments.unwrap_or_default();
         if name == "view_image" {
-            return image_response(&self.relay, &self.host, arguments).await;
+            return match tokio::time::timeout(
+                Duration::from_millis(SYNCHRONOUS_TOOL_GUARD_MS),
+                image_response(&self.relay, &self.host, arguments),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "synchronous MCP operation exceeded the {SYNCHRONOUS_TOOL_GUARD_MS} ms guard (normal target {SYNCHRONOUS_TOOL_TARGET_MS} ms)"
+                ))])
+                .into()),
+            };
         }
-        match dispatch(
-            &self.relay,
-            &self.host,
-            &self.runtime,
-            name,
-            arguments,
-            &context,
+        let operation_cancelled = Arc::new(AtomicBool::new(false));
+        let dispatched = tokio::time::timeout(
+            Duration::from_millis(SYNCHRONOUS_TOOL_GUARD_MS),
+            dispatch(
+                &self.relay,
+                &self.host,
+                &self.runtime,
+                name,
+                arguments,
+                &context,
+                operation_cancelled.clone(),
+            ),
         )
-        .await
-        {
-            Ok(mut value) => {
+        .await;
+        match dispatched {
+            Err(_) => {
+                operation_cancelled.store(true, Ordering::Release);
+                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "synchronous MCP operation exceeded the {SYNCHRONOUS_TOOL_GUARD_MS} ms guard (normal target {SYNCHRONOUS_TOOL_TARGET_MS} ms); use an asynchronous/persistent path when the operation can outlive one ChatGPT tool call"
+                ))])
+                .into())
+            }
+            Ok(Ok(mut value)) => {
                 if host_plane_reports_worker_events(name) {
                     attach_worker_events(&mut value, self.relay.take_worker_events().await);
                 }
@@ -378,7 +414,7 @@ impl ServerHandler for McpHandler {
                 result.structured_content = Some(value);
                 Ok(result.into())
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 Ok(CallToolResult::error(vec![ContentBlock::text(error.to_string())]).into())
             }
         }
@@ -576,13 +612,14 @@ async fn dispatch(
     name: &str,
     arguments: JsonObject,
     context: &RequestContext<RoleServer>,
+    operation_cancelled: Arc<AtomicBool>,
 ) -> anyhow::Result<Value> {
     match name {
         "status" => {
             ensure_empty(arguments)?;
             Ok(serde_json::to_value(McpStatus::read(relay, runtime))?)
         }
-        "inspect" => inspect(relay, host, parse(arguments)?, context).await,
+        "inspect" => inspect(relay, host, parse(arguments)?, context, operation_cancelled).await,
         "apply_patch" => {
             let args: PatchArgs = parse(arguments)?;
             Ok(json!({"applied": host.apply_patch(&args.patch, args.cwd.as_deref())?}))
@@ -790,67 +827,115 @@ async fn inspect(
     host: &Host,
     args: InspectArgs,
     context: &RequestContext<RoleServer>,
+    operation_cancelled: Arc<AtomicBool>,
 ) -> anyhow::Result<Value> {
+    let _cancel_on_drop = CancelOnDrop(operation_cancelled.clone());
     if args.operations.is_empty() || args.operations.len() > MAX_INSPECT_OPERATIONS {
         anyhow::bail!("inspect requires 1 to {MAX_INSPECT_OPERATIONS} operations");
     }
     let cwd = host.resolve_cwd(args.cwd.as_deref())?;
-    let mut results = Vec::with_capacity(args.operations.len());
-    let mut output_bytes = 0usize;
+    let operation_count = args.operations.len();
+    let mut pending = tokio::task::JoinSet::new();
+    let gate = Arc::new(tokio::sync::Semaphore::new(MAX_INSPECT_CONCURRENCY));
     for (index, operation) in args.operations.into_iter().enumerate() {
-        if context.ct.is_cancelled() {
-            anyhow::bail!("inspection cancelled");
-        }
-        let result: anyhow::Result<Value> = async {
-            let requested = match &operation {
-                InspectOperation::ReadText { path, .. }
-                | InspectOperation::ReadDirectory { path }
-                | InspectOperation::Metadata { path } => path.as_str(),
-                InspectOperation::SearchContent { path, .. }
-                | InspectOperation::FuzzyFileSearch { path, .. } => path.as_deref().unwrap_or("."),
+        let relay = relay.clone();
+        let host = host.clone();
+        let cwd = cwd.clone();
+        let cancelled = context.ct.clone();
+        let operation_cancelled = operation_cancelled.clone();
+        let permit = gate.clone().acquire_owned().await?;
+        pending.spawn(async move {
+            let _permit = permit;
+            if cancelled.is_cancelled() {
+                return Err(anyhow::anyhow!("inspection cancelled"));
+            }
+            let kind = match &operation {
+                InspectOperation::ReadText { .. } => "readText",
+                InspectOperation::ReadDirectory { .. } => "readDirectory",
+                InspectOperation::Metadata { .. } => "metadata",
+                InspectOperation::SearchContent { .. } => "searchContent",
+                InspectOperation::FuzzyFileSearch { .. } => "fuzzyFileSearch",
             };
-            let path = Host::path_from_cwd(&cwd, requested)?;
-            Ok(match &operation {
-                InspectOperation::ReadText {
-                    start_line,
-                    end_line,
-                    ..
-                } => serde_json::to_value(
-                    relay
-                        .inspect_read_text(&path, *start_line, *end_line)
-                        .await?,
-                ),
-                InspectOperation::ReadDirectory { .. } => {
-                    serde_json::to_value(relay.inspect_read_directory(&path).await?)
-                }
-                InspectOperation::Metadata { .. } => {
-                    serde_json::to_value(relay.inspect_metadata(&path).await?)
-                }
-                InspectOperation::SearchContent {
-                    query, max_results, ..
-                } => serde_json::to_value(host.search_with_cancel(
-                    query,
-                    Some(&path),
-                    Some(&cwd),
-                    *max_results,
-                    || context.ct.is_cancelled(),
-                )?),
-                InspectOperation::FuzzyFileSearch { query, .. } => {
-                    serde_json::to_value(relay.inspect_fuzzy_file_search(query, Some(&path)).await?)
-                }
-            }?)
-        }
-        .await;
-        if context.ct.is_cancelled() {
-            anyhow::bail!("inspection cancelled");
-        }
-        let kind = match operation {
-            InspectOperation::ReadText { .. } => "readText",
-            InspectOperation::ReadDirectory { .. } => "readDirectory",
-            InspectOperation::Metadata { .. } => "metadata",
-            InspectOperation::SearchContent { .. } => "searchContent",
-            InspectOperation::FuzzyFileSearch { .. } => "fuzzyFileSearch",
-        };
+            let result: anyhow::Result<Value> = async {
+                let requested = match &operation {
+                    InspectOperation::ReadText { path, .. }
+                    | InspectOperation::ReadDirectory { path }
+                    | InspectOperation::Metadata { path } => path.as_str(),
+                    InspectOperation::SearchContent { path, .. }
+                    | InspectOperation::FuzzyFileSearch { path, .. } => {
+                        path.as_deref().unwrap_or(".")
+                    }
+                };
+                let path = Host::path_from_cwd(&cwd, requested)?;
+                Ok(match &operation {
+                    InspectOperation::ReadText {
+                        start_line,
+                        end_line,
+                        ..
+                    } => serde_json::to_value(
+                        relay
+                            .inspect_read_text(&path, *start_line, *end_line)
+                            .await?,
+                    ),
+                    InspectOperation::ReadDirectory { .. } => {
+                        serde_json::to_value(relay.inspect_read_directory(&path).await?)
+                    }
+                    InspectOperation::Metadata { .. } => {
+                        serde_json::to_value(relay.inspect_metadata(&path).await?)
+                    }
+                    InspectOperation::SearchContent {
+                        query, max_results, ..
+                    } => {
+                        let search_host = host.clone();
+                        let query = query.clone();
+                        let path = path.clone();
+                        let cwd = cwd.clone();
+                        let max_results = *max_results;
+                        let search_cancelled = cancelled.clone();
+                        let operation_cancelled = operation_cancelled.clone();
+                        serde_json::to_value(
+                            tokio::task::spawn_blocking(move || {
+                                search_host.search_with_cancel(
+                                    &query,
+                                    Some(&path),
+                                    Some(&cwd),
+                                    max_results,
+                                    || {
+                                        search_cancelled.is_cancelled()
+                                            || operation_cancelled.load(Ordering::Acquire)
+                                    },
+                                )
+                            })
+                            .await
+                            .map_err(|error| {
+                                anyhow::anyhow!("inspection search task failed: {error}")
+                            })??,
+                        )
+                    }
+                    InspectOperation::FuzzyFileSearch { query, .. } => serde_json::to_value(
+                        relay.inspect_fuzzy_file_search(query, Some(&path)).await?,
+                    ),
+                }?)
+            }
+            .await;
+            Ok::<_, anyhow::Error>((index, kind, result))
+        });
+    }
+    let mut ordered = std::iter::repeat_with(|| None)
+        .take(operation_count)
+        .collect::<Vec<_>>();
+    while let Some(joined) = pending.join_next().await {
+        let (index, kind, result) =
+            joined.map_err(|error| anyhow::anyhow!("inspection task failed: {error}"))??;
+        ordered[index] = Some((kind, result));
+    }
+    if context.ct.is_cancelled() {
+        anyhow::bail!("inspection cancelled");
+    }
+    let mut results = Vec::with_capacity(operation_count);
+    let mut output_bytes = 0usize;
+    for (index, entry) in ordered.into_iter().enumerate() {
+        let (kind, result) = entry.ok_or_else(|| anyhow::anyhow!("inspection result missing"))?;
         let row = match result {
             Ok(result) => json!({"index":index,"type":kind,"result":result}),
             Err(error) => json!({"index":index,"type":kind,"error":error.to_string()}),
@@ -980,19 +1065,23 @@ async fn image_response(
 
 #[cfg(test)]
 mod tests {
-    use super::SERVER_INSTRUCTIONS;
+    use super::{SERVER_INSTRUCTIONS, SYNCHRONOUS_TOOL_GUARD_MS, SYNCHRONOUS_TOOL_TARGET_MS};
 
     #[test]
     fn server_instructions_calibrate_control_plane_and_delegation() {
         assert!(SERVER_INSTRUCTIONS.contains("primary host and Codex control plane"));
         assert!(SERVER_INSTRUCTIONS.contains("rather than invoking the Codex CLI"));
-        assert!(SERVER_INSTRUCTIONS.contains("does not inherit the ChatGPT conversation"));
+        assert!(SERVER_INSTRUCTIONS.contains("Codex workers likewise do not inherit"));
         assert!(SERVER_INSTRUCTIONS.contains("server-owned on-request approval policy"));
         assert!(SERVER_INSTRUCTIONS.contains("worker owns its assigned scope"));
-        assert!(SERVER_INSTRUCTIONS.contains("repeat bounded joins"));
+        assert!(SERVER_INSTRUCTIONS.contains("Scheduled Task"));
+        assert!(SERVER_INSTRUCTIONS.contains("separate platform plane"));
+        assert!(SERVER_INSTRUCTIONS.contains("do not inherit"));
         assert!(SERVER_INSTRUCTIONS.contains("codex.inspect"));
         assert!(SERVER_INSTRUCTIONS.contains("synchronization-only"));
         assert!(SERVER_INSTRUCTIONS.contains("workerEvents"));
+        assert_eq!(SYNCHRONOUS_TOOL_TARGET_MS, 40_000);
+        assert_eq!(SYNCHRONOUS_TOOL_GUARD_MS, 45_000);
         assert!(SERVER_INSTRUCTIONS.contains("upstream-owned"));
         assert!(SERVER_INSTRUCTIONS.contains("Official App Server state is authoritative"));
     }

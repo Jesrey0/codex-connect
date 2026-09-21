@@ -328,6 +328,16 @@ for line in sys.stdin:
                 for index in range(700)
             ]
             notify("turn/completed", {"threadId": thread_id, "turn": turn})
+        elif scenario == "exact_transcript_bound":
+            turn["status"] = "completed"
+            turn["items"] = [
+                {"type": "agentMessage", "id": "older", "text": "older message"},
+                *[
+                    {"type": "agentMessage", "id": f"exact-{index}", "text": "x" * (32 * 1024)}
+                    for index in range(6)
+                ],
+            ]
+            notify("turn/completed", {"threadId": thread_id, "turn": turn})
         elif scenario == "unsubscribe_error":
             unsubscribe_failures.add(thread_id)
             complete(thread_id, turn_id)

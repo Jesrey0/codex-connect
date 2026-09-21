@@ -8,6 +8,8 @@ use tokio::time::{MissedTickBehavior, interval};
 
 const REFRESH_MS: u64 = 750;
 const STALE_AFTER: Duration = Duration::from_secs(3);
+const MAX_ACTION_TEXT_CHARS: usize = 2 * 1024;
+const MAX_ACTION_ROW_CHARS: usize = 512;
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -162,6 +164,9 @@ enum InputKey {
     Character(char),
     Up,
     Down,
+    Left,
+    Right,
+    Enter,
     Escape,
 }
 
@@ -189,6 +194,14 @@ impl InputDecoder {
                 self.escape.clear();
                 vec![InputKey::Down]
             }
+            [b'\x1b', b'['] if byte == b'C' => {
+                self.escape.clear();
+                vec![InputKey::Right]
+            }
+            [b'\x1b', b'['] if byte == b'D' => {
+                self.escape.clear();
+                vec![InputKey::Left]
+            }
             [] => byte_to_key(byte).into_iter().collect(),
             _ => {
                 self.escape.clear();
@@ -208,7 +221,10 @@ impl InputDecoder {
 }
 
 fn byte_to_key(byte: u8) -> Option<InputKey> {
-    char::from_u32(byte as u32).map(InputKey::Character)
+    match byte {
+        b'\r' | b'\n' => Some(InputKey::Enter),
+        _ => char::from_u32(byte as u32).map(InputKey::Character),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,6 +245,8 @@ struct ConsoleState {
     transcript_error: Option<String>,
     scroll: usize,
     follow: bool,
+    selected_worker: usize,
+    selected_worker_target: Option<TranscriptTarget>,
 }
 
 impl Default for ConsoleState {
@@ -239,6 +257,8 @@ impl Default for ConsoleState {
             transcript_error: None,
             scroll: 0,
             follow: true,
+            selected_worker: 0,
+            selected_worker_target: None,
         }
     }
 }
@@ -253,29 +273,51 @@ impl ConsoleState {
 
     fn handle_key(&mut self, key: InputKey, snapshot: Option<&Value>) -> bool {
         match &self.view {
-            View::Dashboard => {
-                let InputKey::Character(key) = key else {
-                    return false;
-                };
-                let Some(index) = key.to_digit(10).filter(|index| *index > 0) else {
-                    return false;
-                };
-                let target = snapshot
-                    .and_then(active_turns)
-                    .and_then(|turns| turns.get(index as usize - 1))
-                    .and_then(transcript_target_for_turn);
-                let Some(target) = target else {
-                    return false;
-                };
-                self.view = View::Transcript(target);
-                self.transcript = None;
-                self.transcript_error = None;
-                self.scroll = 0;
-                self.follow = true;
-                true
-            }
+            View::Dashboard => match key {
+                InputKey::Up | InputKey::Character('k') => {
+                    let next = self.selected_worker.saturating_sub(1);
+                    let changed = next != self.selected_worker;
+                    self.selected_worker = next;
+                    self.selected_worker_target = snapshot
+                        .and_then(workers)
+                        .and_then(|turns| turns.get(next))
+                        .and_then(transcript_target_for_turn);
+                    changed
+                }
+                InputKey::Down | InputKey::Character('j') => {
+                    let count = snapshot.and_then(workers).map_or(0, Vec::len);
+                    let next = self
+                        .selected_worker
+                        .saturating_add(1)
+                        .min(count.saturating_sub(1));
+                    let changed = next != self.selected_worker;
+                    self.selected_worker = next;
+                    self.selected_worker_target = snapshot
+                        .and_then(workers)
+                        .and_then(|turns| turns.get(next))
+                        .and_then(transcript_target_for_turn);
+                    changed
+                }
+                InputKey::Enter | InputKey::Right => {
+                    let target = snapshot
+                        .and_then(workers)
+                        .and_then(|turns| turns.get(self.selected_worker))
+                        .and_then(transcript_target_for_turn);
+                    let Some(target) = target else {
+                        return false;
+                    };
+                    self.selected_worker_target = Some(target.clone());
+                    self.view = View::Transcript(target);
+                    self.transcript = None;
+                    self.transcript_error = None;
+                    self.scroll = 0;
+                    self.follow = true;
+                    true
+                }
+                _ => false,
+            },
             View::Transcript(_) => match key {
-                InputKey::Escape | InputKey::Character('b') => {
+                InputKey::Escape | InputKey::Left | InputKey::Character('b') => {
                     self.view = View::Dashboard;
                     self.transcript_error = None;
                     true
@@ -294,14 +336,19 @@ impl ConsoleState {
                     self.follow = true;
                     true
                 }
+                InputKey::Character('g') => {
+                    self.scroll = 0;
+                    self.follow = false;
+                    true
+                }
                 _ => false,
             },
         }
     }
 }
 
-fn active_turns(snapshot: &Value) -> Option<&Vec<Value>> {
-    snapshot["projection"]["activeTurns"].as_array()
+fn workers(snapshot: &Value) -> Option<&Vec<Value>> {
+    snapshot["projection"]["workers"].as_array()
 }
 
 fn transcript_target_for_turn(turn: &Value) -> Option<TranscriptTarget> {
@@ -309,6 +356,35 @@ fn transcript_target_for_turn(turn: &Value) -> Option<TranscriptTarget> {
         thread_id: turn["threadId"].as_str()?.to_owned(),
         turn_id: turn["turnId"].as_str()?.to_owned(),
     })
+}
+
+fn same_worker(turn: &Value, target: &TranscriptTarget) -> bool {
+    turn["threadId"].as_str() == Some(target.thread_id.as_str())
+        && turn["turnId"].as_str() == Some(target.turn_id.as_str())
+}
+
+fn sync_worker_selection(state: &mut ConsoleState, workers: &[Value]) {
+    if workers.is_empty() {
+        state.selected_worker = 0;
+        state.selected_worker_target = None;
+    } else if let Some(target) = state.selected_worker_target.as_ref() {
+        if let Some(index) = workers
+            .iter()
+            .position(|worker| same_worker(worker, target))
+        {
+            state.selected_worker = index;
+        } else {
+            state.selected_worker = state.selected_worker.min(workers.len() - 1);
+            state.selected_worker_target = workers
+                .get(state.selected_worker)
+                .and_then(transcript_target_for_turn);
+        }
+    } else {
+        state.selected_worker = state.selected_worker.min(workers.len() - 1);
+        state.selected_worker_target = workers
+            .get(state.selected_worker)
+            .and_then(transcript_target_for_turn);
+    }
 }
 
 fn draw(
@@ -350,12 +426,14 @@ fn draw(
 
     match &state.view {
         View::Dashboard => match snapshot {
-            Some(snapshot) => render_snapshot(&mut lines, snapshot, width, body_height),
+            Some(snapshot) => {
+                render_snapshot(&mut lines, state, snapshot, width, body_height, frame)
+            }
             None => lines.push(styled(row(" acquiring backend projection…", width), YELLOW)),
         },
         View::Transcript(target) => {
             let target = target.clone();
-            render_transcript(&mut lines, state, &target, width, body_height);
+            render_transcript(&mut lines, state, &target, width, body_height, frame);
         }
     }
     lines.truncate(body_start.saturating_add(body_height));
@@ -372,8 +450,11 @@ fn draw(
     lines.push(styled(
         row_lr(
             match state.view {
-                View::Dashboard => " ◉ OBSERVE ONLY · 1-9 opens worker transcript",
-                View::Transcript(_) => " ◉ OBSERVE ONLY · j/k scroll · G tail · Esc/b back",
+                View::Dashboard => " ◉ OBSERVE ONLY · ↑/↓ select · Enter open",
+                View::Transcript(_) if state.follow => {
+                    " ◉ FOLLOWING LIVE · ↑/↓ scroll · g start · Esc back"
+                }
+                View::Transcript(_) => " ◉ PAUSED · G live · g start · ↑/↓ scroll · Esc back",
             },
             "Ctrl-C exits ",
             width,
@@ -392,7 +473,14 @@ fn draw(
     Ok(())
 }
 
-fn render_snapshot(lines: &mut Vec<String>, snapshot: &Value, width: usize, height: usize) {
+fn render_snapshot(
+    lines: &mut Vec<String>,
+    state: &mut ConsoleState,
+    snapshot: &Value,
+    width: usize,
+    height: usize,
+    frame: usize,
+) {
     let runtime = &snapshot["runtime"];
     let projection = &snapshot["projection"];
     let ready = runtime["ready"].as_bool().unwrap_or(false);
@@ -417,73 +505,92 @@ fn render_snapshot(lines: &mut Vec<String>, snapshot: &Value, width: usize, heig
         ),
         DIM,
     ));
+    lines.push(styled(row(&account_line(projection, width), width), DIM));
 
-    let active = projection["activeTurns"].as_array();
-    let pending = projection["pendingActions"].as_array();
+    let pending = projection["pendingActions"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let errors = projection["notices"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|notice| notice["kind"].as_str() == Some("error"))
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
+        section(lines, "SYSTEM ATTENTION", width);
+        for notice in errors.iter().rev().take(2).rev() {
+            let summary = notice["summary"].as_str().unwrap_or("observer error");
+            lines.push(styled(
+                row(&format!(" ✕ {}", safe_terminal_text(summary)), width),
+                &format!("{BOLD}{RED}"),
+            ));
+        }
+    }
+    if !pending.is_empty() {
+        section(lines, "NEEDS OPERATOR", width);
+        for action in pending.iter().take(2) {
+            lines.push(compact_action_row(action, width));
+        }
+        if pending.len() > 2 {
+            lines.push(styled(
+                row(
+                    &format!("   +{} more pending actions", pending.len() - 2),
+                    width,
+                ),
+                DIM,
+            ));
+        }
+    }
+
+    let workers = projection["workers"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    sync_worker_selection(state, workers);
+    let active_count = workers
+        .iter()
+        .filter(|worker| !is_terminal_status(worker["status"].as_str()))
+        .count();
+    let recent_count = workers.len().saturating_sub(active_count);
     section(
         lines,
         &format!(
-            "NOW // {} WORKERS // {} ACTIONS",
-            active.map_or(0, Vec::len),
-            pending.map_or(0, Vec::len)
+            "WORKERS · {active_count} active · {recent_count} recent{}",
+            if workers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " · selected {}/{}",
+                    state.selected_worker + 1,
+                    workers.len()
+                )
+            }
         ),
         width,
     );
-    if let Some(active) = active {
-        if active.is_empty() {
-            lines.push(styled(
-                row(" ◌ IDLE · no active observed turns", width),
-                DIM,
-            ));
-        } else {
-            for (index, turn) in active.iter().take(worker_capacity(height)).enumerate() {
-                lines.push(worker_row(index + 1, turn, width));
-            }
-        }
-    }
-    if let Some(pending) = pending {
-        for action in pending.iter().take(4) {
-            lines.push(styled(
-                row(
-                    &format!(
-                        " ⚠ ACTION PENDING · {} · resolve through ChatGPT operator",
-                        text(&action["kind"], "unknown")
-                    ),
-                    width,
-                ),
-                YELLOW,
+    if workers.is_empty() {
+        lines.push(styled(row(" ◌ IDLE · no observed workers", width), DIM));
+    } else {
+        let capacity = worker_capacity(height, pending.len());
+        let start = state
+            .selected_worker
+            .saturating_add(1)
+            .saturating_sub(capacity);
+        for (index, worker) in workers.iter().enumerate().skip(start).take(capacity) {
+            let waiting = pending
+                .iter()
+                .any(|action| action_matches_worker(action, worker));
+            lines.extend(worker_rows(
+                index == state.selected_worker,
+                worker,
+                waiting,
+                width,
+                frame,
             ));
         }
     }
-
-    section(lines, "JOURNAL // RECENT ACTIVITY", width);
-    let events = projection["events"].as_array();
-    let journal_rows = journal_capacity(height, lines.len());
-    let journal = events
-        .map(|events| semantic_events(events))
-        .unwrap_or_default();
-    if journal.is_empty() {
-        lines.push(styled(row(" · no observed worker events yet", width), DIM));
-    } else {
-        for entry in journal.iter().rev().take(journal_rows).rev() {
-            lines.push(styled(row(&entry.text, width), entry.style));
-        }
-    }
-    let cursor = projection["cursor"].as_u64().unwrap_or(0);
-    let history = if projection["historyLost"].as_bool().unwrap_or(false) {
-        "   ⚠ older history evicted"
-    } else {
-        ""
-    };
-    lines.push(styled(
-        row_lr(
-            &format!(" journal cursor #{cursor}{history}"),
-            "bounded relay projection ",
-            width,
-        ),
-        DIM,
-    ));
-    lines.push(styled(row(&account_line(projection, width), width), DIM));
 }
 
 fn render_transcript(
@@ -492,36 +599,85 @@ fn render_transcript(
     target: &TranscriptTarget,
     width: usize,
     height: usize,
+    frame: usize,
 ) {
     let mut body = Vec::new();
-    body.push(styled(
-        row(
-            &format!(
-                " TRANSCRIPT · thread {} · turn {}",
-                short_id(&target.thread_id),
-                short_id(&target.turn_id)
-            ),
-            width,
-        ),
-        &format!("{BOLD}{CYAN}"),
-    ));
     match state.transcript.as_ref() {
         Some(transcript) => {
+            let context = transcript.get("context").filter(|value| !value.is_null());
+            let status = text(&transcript["status"], "unknown");
+            let mode = context
+                .map(|value| text(&value["mode"], "worker"))
+                .unwrap_or("worker");
+            let model = context
+                .and_then(|value| value["model"].as_str())
+                .unwrap_or("default/inherited");
+            let effort = context
+                .and_then(|value| value["effort"].as_str())
+                .unwrap_or("default/inherited");
+            body.push(styled(
+                row_lr(
+                    &format!(" WORKER · {} · {status}", mode.to_ascii_uppercase()),
+                    &format!("{model} · {effort} "),
+                    width,
+                ),
+                &format!("{BOLD}{CYAN}"),
+            ));
+            body.push(styled(
+                row(
+                    &format!(
+                        " thread {} · turn {}",
+                        short_id(&target.thread_id),
+                        short_id(&target.turn_id)
+                    ),
+                    width,
+                ),
+                DIM,
+            ));
+
+            let prompt = context.and_then(|value| value["prompt"].as_str());
+            if let Some(prompt) = prompt {
+                body.push(styled(row(" TASK", width), &format!("{BOLD}{CYAN}")));
+                body.extend(render_wrapped_text(prompt, "   ", width, CYAN));
+            }
+            if let Some(instructions) =
+                context.and_then(|value| value["developerInstructions"].as_str())
+            {
+                body.push(styled(
+                    row(" DEVELOPER INSTRUCTIONS", width),
+                    &format!("{BOLD}{CYAN}"),
+                ));
+                body.extend(render_wrapped_text(instructions, "   ", width, DIM));
+            }
+
+            let pending = transcript["pendingActions"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !pending.is_empty() {
+                body.push(styled(
+                    row(" NEEDS OPERATOR", width),
+                    &format!("{BOLD}{YELLOW}"),
+                ));
+                for action in pending {
+                    body.extend(render_action_card(action, width));
+                }
+            }
+
             if transcript["truncated"].as_bool().unwrap_or(false) {
                 body.push(styled(
-                    row(" ⚠ transcript output truncated to observer bounds", width),
+                    row(" ⚠ older transcript history omitted; newest human-visible output preserved", width),
                     YELLOW,
                 ));
             }
-            if let Some(activity) = transcript.get("activity").filter(|value| !value.is_null()) {
-                body.extend(render_live_activity(activity, width));
-            }
+            body.push(styled(
+                row(" CONVERSATION", width),
+                &format!("{BOLD}{CYAN}"),
+            ));
             body.extend(render_transcript_entries(transcript, width));
+            body.extend(render_live_activity(transcript, width, frame));
         }
         None => body.push(styled(row(" acquiring live transcript…", width), YELLOW)),
-    }
-    if body.len() == 1 && state.transcript.is_some() {
-        body.push(styled(row(" · no transcript entries yet", width), DIM));
     }
 
     let available = height.max(1);
@@ -541,71 +697,97 @@ fn render_transcript_entries(transcript: &Value, width: usize) -> Vec<String> {
     };
     for entry in entries {
         let kind = entry["kind"].as_str().unwrap_or("entry");
-        if kind.eq_ignore_ascii_case("reasoning") || kind.eq_ignore_ascii_case("think") {
-            lines.push(styled(
-                row(&format!(" ◌ THINK{}", status_suffix(entry)), width),
-                DIM,
-            ));
+        if !matches!(kind, "user" | "agent") {
             continue;
         }
-        let label = safe_terminal_text(&kind.to_ascii_uppercase());
+        let Some(text) = entry["text"].as_str() else {
+            continue;
+        };
+        if entry["initialTask"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let label = if kind.eq_ignore_ascii_case("agent") {
+            match entry["title"].as_str() {
+                Some(title) if title.contains("FINAL") => "AGENT · FINAL",
+                Some(title) if title.contains("REVIEW") => "AGENT · REVIEW",
+                _ => "AGENT",
+            }
+        } else {
+            "OPERATOR"
+        };
         lines.push(styled(
-            row(&format!(" {label}{}", status_suffix(entry)), width),
-            entry_style(kind, entry["status"].as_str()),
+            row(&format!(" {label}"), width),
+            entry_style(kind, None),
         ));
-        if let Some(title) = entry["title"].as_str() {
-            lines.extend(render_wrapped_text(title, "   ", width, DIM));
-        }
-        if let Some(text) = entry["text"].as_str() {
-            lines.extend(render_wrapped_text(
-                text,
-                "   ",
-                width,
-                entry_style(kind, None),
-            ));
-        }
+        lines.extend(render_wrapped_text(
+            text,
+            "   ",
+            width,
+            entry_style(kind, None),
+        ));
     }
     lines
 }
 
-fn render_live_activity(activity: &Value, width: usize) -> Vec<String> {
+fn render_live_activity(transcript: &Value, width: usize, frame: usize) -> Vec<String> {
+    if is_terminal_status(transcript["status"].as_str()) {
+        return Vec::new();
+    }
+    let Some(activity) = transcript.get("activity").filter(|value| !value.is_null()) else {
+        return Vec::new();
+    };
     let kind = activity["kind"].as_str().unwrap_or("working");
     let age = activity["lastActivityAtMs"]
         .as_u64()
         .map(activity_age)
         .unwrap_or_else(|| "now".to_string());
-    let usage = activity["tokenUsage"]
-        .as_object()
-        .and_then(|usage| {
-            Some(format!(
-                " · {} / {} tok",
-                usage.get("totalTokens")?.as_u64()?,
-                usage.get("modelContextWindow")?.as_u64()?
-            ))
-        })
+    let pulse = ["◐", "◓", "◑", "◒"][frame % 4];
+    let usage = activity["tokenUsage"]["totalTokens"]
+        .as_u64()
+        .map(|tokens| format!(" · {} tok", compact_number(tokens)))
         .unwrap_or_default();
-    let reasoning = kind.eq_ignore_ascii_case("reasoning") || kind.eq_ignore_ascii_case("think");
-    let detail = if reasoning {
-        "THINK".to_string()
-    } else {
-        let summary = activity["summary"].as_str().unwrap_or("working");
-        format!(
-            "{}: {}",
-            safe_terminal_text(kind),
-            safe_terminal_text(summary)
-        )
-    };
+    if matches!(kind.to_ascii_lowercase().as_str(), "reasoning" | "think") {
+        return vec![styled(
+            row(&format!(" {pulse} THINKING · {age}{usage}"), width),
+            CYAN,
+        )];
+    }
+    if kind.eq_ignore_ascii_case("waiting") {
+        return vec![styled(
+            row(&format!(" ⚠ WAITING FOR OPERATOR · {age}"), width),
+            YELLOW,
+        )];
+    }
+    if kind.eq_ignore_ascii_case("message") {
+        let Some(summary) = activity["summary"].as_str().filter(|text| !text.is_empty()) else {
+            return vec![styled(
+                row(&format!(" {pulse} RESPONDING · {age}{usage}"), width),
+                GREEN,
+            )];
+        };
+        if latest_agent_text(transcript).is_some_and(|text| text == summary) {
+            return Vec::new();
+        }
+        let mut lines = vec![styled(
+            row(
+                &format!(" {pulse} AGENT · responding · {age}{usage}"),
+                width,
+            ),
+            GREEN,
+        )];
+        lines.extend(render_wrapped_text(summary, "   ", width, GREEN));
+        return lines;
+    }
+    if kind.eq_ignore_ascii_case("error") {
+        let summary = activity["summary"].as_str().unwrap_or("worker error");
+        let mut lines = vec![styled(row(" ✕ WORKER ERROR", width), RED)];
+        lines.extend(render_wrapped_text(summary, "   ", width, RED));
+        return lines;
+    }
     vec![styled(
-        row(&format!(" ▶ LIVE · {detail} · {age}{usage}"), width),
-        if reasoning { DIM } else { GREEN },
+        row(&format!(" {pulse} WORKING · {age}{usage}"), width),
+        DIM,
     )]
-}
-
-fn status_suffix(entry: &Value) -> String {
-    entry["status"]
-        .as_str()
-        .map(|status| format!(" · {}", safe_terminal_text(status)))
-        .unwrap_or_default()
 }
 
 fn entry_style(kind: &str, status: Option<&str>) -> &'static str {
@@ -685,60 +867,288 @@ fn char_display_width(character: char) -> usize {
     }
 }
 
-fn worker_row(number: usize, turn: &Value, width: usize) -> String {
-    let mode = text(&turn["mode"], "unknown");
-    let model = turn["model"].as_str().unwrap_or("default/inherited");
-    let effort = turn["effort"].as_str().unwrap_or("default/inherited");
-    let state = text(&turn["status"], "unknown");
-    let tier = turn["serviceTier"].as_str().unwrap_or("default");
-    let activity = activity_line(turn);
-    let glyph = match state {
-        "inProgress" => "▶",
-        "completed" => "✓",
-        "failed" => "✕",
-        "interrupted" => "■",
-        _ => "•",
-    };
-    let line = format!(
-        " {number} {glyph} {} · {} · {} · {} · {} · {}",
-        clip(mode, 12),
-        clip(model, 24),
-        clip(effort, 12),
-        clip(tier, 12),
-        clip(&activity, 48),
-        state,
-    );
-    styled(
-        row(&line, width),
-        if state == "failed" { RED } else { GREEN },
-    )
-}
-
-fn activity_line(turn: &Value) -> String {
-    let kind = turn["activityKind"].as_str().unwrap_or("working");
-    let summary = turn["activitySummary"].as_str();
-    let age = turn["lastActivityAtMs"]
+fn worker_rows(
+    selected: bool,
+    worker: &Value,
+    waiting: bool,
+    width: usize,
+    frame: usize,
+) -> Vec<String> {
+    let mode = text(&worker["mode"], "worker").to_ascii_uppercase();
+    let model = worker["model"].as_str().unwrap_or("default/inherited");
+    let effort = worker["effort"].as_str().unwrap_or("default/inherited");
+    let tier = worker["serviceTier"].as_str().unwrap_or("default");
+    let status = text(&worker["status"], "unknown");
+    let kind = worker["activityKind"].as_str().unwrap_or("working");
+    let age = worker["lastActivityAtMs"]
         .as_u64()
         .map(activity_age)
         .unwrap_or_else(|| "age unknown".into());
-    let usage = turn["tokenUsage"]
-        .as_object()
-        .and_then(|usage| {
-            Some(format!(
-                " · {} / {} tok",
-                usage.get("totalTokens")?.as_u64()?,
-                usage.get("modelContextWindow")?.as_u64()?
-            ))
-        })
+    let tokens = worker["tokenUsage"]["totalTokens"]
+        .as_u64()
+        .map(|tokens| format!(" · {} tok", compact_number(tokens)))
         .unwrap_or_default();
-    let hidden_reasoning = matches!(kind.to_ascii_lowercase().as_str(), "reasoning" | "think");
-    let label = if hidden_reasoning { "THINK" } else { kind };
-    match summary {
-        Some(summary) if !hidden_reasoning => {
-            format!("{label}: {} · {age}{usage}", clip(summary, 42))
+    let pulse = ["◐", "◓", "◑", "◒"][frame % 4];
+    let (glyph, state_label) = if waiting && !is_terminal_status(Some(status)) {
+        ("⚠", "WAITING FOR OPERATOR".to_string())
+    } else {
+        match status {
+            "completed" => ("✓", "COMPLETED".into()),
+            "failed" => ("✕", "FAILED".into()),
+            "interrupted" => ("■", "INTERRUPTED".into()),
+            _ if matches!(kind.to_ascii_lowercase().as_str(), "reasoning" | "think") => {
+                (pulse, "THINKING".into())
+            }
+            _ if kind.eq_ignore_ascii_case("message") => (pulse, "RESPONDING".into()),
+            _ => (pulse, "WORKING".into()),
         }
-        _ => format!("{label} · {age}{usage}"),
+    };
+    let marker = if selected { "›" } else { " " };
+    let tier = if tier == "default" {
+        String::new()
+    } else {
+        format!(" · {tier}")
+    };
+    let line = format!(
+        " {marker} {glyph} {mode} · {model} · {effort}{tier} · {state_label} · {age}{tokens}"
+    );
+    let style = if status == "failed" {
+        format!("{BOLD}{RED}")
+    } else if waiting {
+        format!("{BOLD}{YELLOW}")
+    } else if selected {
+        format!("{BOLD}{CYAN}")
+    } else if is_terminal_status(Some(status)) {
+        DIM.to_string()
+    } else {
+        GREEN.to_string()
+    };
+    let prompt = worker["prompt"]
+        .as_str()
+        .map(one_line_terminal_text)
+        .unwrap_or_else(|| {
+            format!(
+                "thread {} · turn {}",
+                short_id(text(&worker["threadId"], "unknown")),
+                short_id(text(&worker["turnId"], "unknown"))
+            )
+        });
+    vec![
+        styled(row(&line, width), &style),
+        styled(
+            row(
+                &format!("     {}", clip(&prompt, width.saturating_sub(8))),
+                width,
+            ),
+            DIM,
+        ),
+    ]
+}
+
+fn one_line_terminal_text(text: &str) -> String {
+    safe_terminal_text(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn bounded_terminal_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let clipped = chars.by_ref().take(max_chars).collect::<String>();
+    let truncated = chars.next().is_some();
+    let mut safe = safe_terminal_text(&clipped);
+    if truncated {
+        safe.push('…');
     }
+    safe
+}
+
+fn bounded_one_line_terminal_text(text: &str, max_chars: usize) -> String {
+    bounded_terminal_text(text, max_chars)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_terminal_status(status: Option<&str>) -> bool {
+    matches!(status, Some("completed" | "failed" | "interrupted"))
+}
+
+fn compact_number(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn action_matches_worker(action: &Value, worker: &Value) -> bool {
+    action["threadId"].as_str() == worker["threadId"].as_str()
+        && action["turnId"]
+            .as_str()
+            .is_none_or(|turn_id| worker["turnId"].as_str() == Some(turn_id))
+}
+
+fn action_label(action: &Value) -> &'static str {
+    match action["method"].as_str().unwrap_or_default() {
+        "item/commandExecution/requestApproval" => "COMMAND APPROVAL",
+        "item/fileChange/requestApproval" => "FILE APPROVAL",
+        "item/permissions/requestApproval" => "PERMISSION REQUEST",
+        "item/tool/requestUserInput" => "QUESTION",
+        "mcpServer/elicitation/request" => "ELICITATION",
+        _ => "OPERATOR ACTION",
+    }
+}
+
+fn action_summary(action: &Value) -> String {
+    let params = &action["params"];
+    if let Some(command) = params["command"].as_str().filter(|value| !value.is_empty()) {
+        return command.to_string();
+    }
+    if let Some(reason) = params["reason"].as_str().filter(|value| !value.is_empty()) {
+        return reason.to_string();
+    }
+    if let Some(question) = params["questions"]
+        .as_array()
+        .and_then(|questions| questions.first())
+        .and_then(|question| question["question"].as_str())
+    {
+        return question.to_string();
+    }
+    if let Some(message) = params["message"].as_str().filter(|value| !value.is_empty()) {
+        return message.to_string();
+    }
+    if let Some(root) = params["grantRoot"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    {
+        return format!("write access under {root}");
+    }
+    if !params["permissions"].is_null() {
+        return serde_json::to_string(&params["permissions"])
+            .unwrap_or_else(|_| "additional permissions requested".into());
+    }
+    "operator response required".into()
+}
+
+fn compact_action_row(action: &Value, width: usize) -> String {
+    let blocking = if action["isBlocking"].as_bool().unwrap_or(true) {
+        "blocking"
+    } else {
+        "nonblocking"
+    };
+    styled(
+        row(
+            &format!(
+                " ⚠ {} · {} · {}",
+                action_label(action),
+                blocking,
+                bounded_one_line_terminal_text(&action_summary(action), MAX_ACTION_ROW_CHARS)
+            ),
+            width,
+        ),
+        &format!("{BOLD}{YELLOW}"),
+    )
+}
+
+fn render_action_card(action: &Value, width: usize) -> Vec<String> {
+    let blocking = if action["isBlocking"].as_bool().unwrap_or(true) {
+        "blocking"
+    } else {
+        "nonblocking"
+    };
+    let mut lines = vec![styled(
+        row(&format!(" ⚠ {} · {blocking}", action_label(action)), width),
+        &format!("{BOLD}{YELLOW}"),
+    )];
+    let params = &action["params"];
+    if action["method"].as_str() == Some("item/tool/requestUserInput") {
+        if let Some(questions) = params["questions"].as_array() {
+            for question in questions.iter().take(4) {
+                if let Some(text) = question["question"].as_str() {
+                    lines.extend(render_wrapped_text(
+                        &bounded_terminal_text(text, MAX_ACTION_TEXT_CHARS),
+                        "   ",
+                        width,
+                        YELLOW,
+                    ));
+                }
+                if let Some(options) = question["options"].as_array() {
+                    let labels = options
+                        .iter()
+                        .take(8)
+                        .filter_map(|option| option["label"].as_str())
+                        .map(|label| bounded_one_line_terminal_text(label, 128))
+                        .collect::<Vec<_>>()
+                        .join(" / ");
+                    if !labels.is_empty() {
+                        lines.extend(render_wrapped_text(
+                            &format!("options: {labels}"),
+                            "     ",
+                            width,
+                            DIM,
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        lines.extend(render_wrapped_text(
+            &bounded_terminal_text(&action_summary(action), MAX_ACTION_TEXT_CHARS),
+            "   ",
+            width,
+            YELLOW,
+        ));
+        if let Some(reason) = params["reason"]
+            .as_str()
+            .filter(|reason| !reason.is_empty() && Some(*reason) != params["command"].as_str())
+        {
+            lines.extend(render_wrapped_text(
+                &bounded_terminal_text(reason, MAX_ACTION_TEXT_CHARS),
+                "   ",
+                width,
+                DIM,
+            ));
+        }
+        if let Some(decisions) = params["availableDecisions"].as_array() {
+            let decisions = decisions
+                .iter()
+                .filter_map(|decision| {
+                    decision.as_str().map(str::to_string).or_else(|| {
+                        decision
+                            .as_object()
+                            .and_then(|object| object.keys().next().cloned())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(" / ");
+            if !decisions.is_empty() {
+                lines.extend(render_wrapped_text(
+                    &bounded_terminal_text(&format!("choices: {decisions}"), MAX_ACTION_TEXT_CHARS),
+                    "   ",
+                    width,
+                    DIM,
+                ));
+            }
+        }
+    }
+    lines.push(styled(
+        row("   resolve through ChatGPT operator", width),
+        DIM,
+    ));
+    lines
+}
+
+fn latest_agent_text(transcript: &Value) -> Option<&str> {
+    transcript["entries"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|entry| entry["kind"].as_str() == Some("agent"))?
+        .get("text")?
+        .as_str()
 }
 
 fn activity_age(last_activity_ms: u64) -> String {
@@ -820,55 +1230,6 @@ fn reset_in(epoch_seconds: u64) -> String {
     }
 }
 
-struct JournalEntry {
-    text: String,
-    style: &'static str,
-}
-
-fn semantic_events(events: &[Value]) -> Vec<JournalEntry> {
-    events.iter().filter_map(semantic_event).collect()
-}
-
-fn semantic_event(event: &Value) -> Option<JournalEntry> {
-    let cursor = event["cursor"].as_u64().unwrap_or(0);
-    let kind = event["kind"].as_str()?;
-    let phase = event["phase"].as_str();
-    let subject = event["threadId"].as_str().map(short_id).unwrap_or("system");
-    let summary = event["summary"].as_str();
-    let hidden_reasoning = matches!(kind.to_ascii_lowercase().as_str(), "think" | "reasoning");
-    let detail = if hidden_reasoning {
-        "THINK".to_string()
-    } else {
-        match summary {
-            Some(summary) if !summary.is_empty() => format!("{kind} {}", clip(summary, 56)),
-            _ => kind.to_string(),
-        }
-    };
-    Some(JournalEntry {
-        text: format!(
-            " {} #{cursor} {subject} · {detail}",
-            semantic_event_glyph(kind, phase)
-        ),
-        style: semantic_event_style(kind, phase),
-    })
-}
-
-fn semantic_event_glyph(kind: &str, phase: Option<&str>) -> &'static str {
-    if kind == "error" || phase == Some("failed") {
-        "✕"
-    } else if kind == "waiting" {
-        "⚠"
-    } else if kind == "think" || kind == "reasoning" {
-        "◌"
-    } else if phase == Some("completed") {
-        "✓"
-    } else if phase == Some("started") {
-        "▶"
-    } else {
-        "·"
-    }
-}
-
 fn freshness_label(last_success: Option<SystemTime>, now: SystemTime) -> &'static str {
     match last_success.and_then(|time| now.duration_since(time).ok()) {
         Some(age) if age <= STALE_AFTER => "LIVE",
@@ -876,26 +1237,9 @@ fn freshness_label(last_success: Option<SystemTime>, now: SystemTime) -> &'stati
     }
 }
 
-fn worker_capacity(height: usize) -> usize {
-    height.saturating_sub(13).clamp(1, 9)
-}
-
-fn journal_capacity(height: usize, rendered: usize) -> usize {
-    height.saturating_sub(rendered + 2)
-}
-
-fn semantic_event_style(kind: &str, phase: Option<&str>) -> &'static str {
-    if kind == "error" || phase == Some("failed") {
-        RED
-    } else if kind == "waiting" {
-        YELLOW
-    } else if phase == Some("completed") {
-        GREEN
-    } else if phase == Some("started") {
-        CYAN
-    } else {
-        DIM
-    }
+fn worker_capacity(height: usize, pending: usize) -> usize {
+    let pending_rows = if pending == 0 { 0 } else { pending.min(2) + 2 };
+    (height.saturating_sub(10 + pending_rows) / 2).clamp(1, 12)
 }
 
 fn section(lines: &mut Vec<String>, title: &str, width: usize) {
@@ -998,23 +1342,25 @@ mod tests {
     }
 
     #[test]
-    fn worker_row_exposes_model_and_effort() {
+    fn worker_rows_expose_model_effort_and_prompt() {
         let turn = serde_json::json!({
             "threadId": "thread-123456789",
             "turnId": "turn-123456789",
             "status": "inProgress",
             "mode": "work",
             "model": "gpt-5.6-sol",
-            "effort": "high"
+            "effort": "high",
+            "prompt": "Refactor the console for a human operator"
         });
-        let rendered = worker_row(1, &turn, 120);
-        assert!(rendered.contains(" 1 ▶"));
+        let rendered = worker_rows(true, &turn, false, 120, 0).join("\n");
+        assert!(rendered.contains("› ◐ WORK"));
         assert!(rendered.contains("gpt-5.6-sol"));
         assert!(rendered.contains("high"));
+        assert!(rendered.contains("Refactor the console"));
     }
 
     #[test]
-    fn worker_row_shows_activity_age_and_usage_without_thinking_text() {
+    fn worker_rows_show_thinking_and_usage_without_reasoning_text() {
         let turn = serde_json::json!({
             "threadId": "thread-123456789",
             "turnId": "turn-123456789",
@@ -1028,37 +1374,66 @@ mod tests {
             "activitySummary": "private chain of thought",
             "tokenUsage": {"totalTokens": 123, "modelContextWindow": 456}
         });
-        let rendered = worker_row(1, &turn, 160);
-        assert!(rendered.contains("THINK"));
-        assert!(rendered.contains("123 / 456 tok"));
+        let rendered = worker_rows(false, &turn, false, 160, 0).join("\n");
+        assert!(rendered.contains("THINKING"));
+        assert!(rendered.contains("123 tok"));
         assert!(!rendered.contains("private chain of thought"));
     }
 
     #[test]
-    fn semantic_journal_renders_relay_projection_and_hides_reasoning_text() {
-        let events = vec![
-            serde_json::json!({
-                "cursor": 1,
-                "threadId": "thread-123456789",
-                "turnId": "turn-1",
-                "kind": "tool",
-                "summary": "cargo test",
-                "phase": "started"
-            }),
-            serde_json::json!({
-                "cursor": 2,
-                "threadId": "thread-123456789",
-                "turnId": "turn-1",
-                "kind": "think",
-                "summary": "secret reasoning",
-                "phase": "started"
-            }),
-        ];
-        let rendered = semantic_events(&events);
+    fn worker_task_preview_stays_on_one_terminal_row() {
+        let turn = serde_json::json!({
+            "threadId": "thread-123456789",
+            "turnId": "turn-123456789",
+            "status": "inProgress",
+            "mode": "work",
+            "prompt": "first line\nsecond line"
+        });
+        let rendered = worker_rows(false, &turn, false, 120, 0);
         assert_eq!(rendered.len(), 2);
-        assert!(rendered[0].text.contains("tool cargo test"));
-        assert!(rendered[1].text.contains("THINK"));
-        assert!(!rendered[1].text.contains("secret"));
+        assert!(!rendered[1].contains('\n'));
+        assert!(rendered[1].contains("first line second line"));
+    }
+
+    #[test]
+    fn action_cards_surface_the_human_question_and_options() {
+        let action = serde_json::json!({
+            "method": "item/tool/requestUserInput",
+            "kind": "userInput",
+            "isBlocking": true,
+            "params": {
+                "questions": [{
+                    "question": "Which output format?",
+                    "options": [{"label": "JSON"}, {"label": "Markdown"}]
+                }]
+            }
+        });
+        let rendered = render_action_card(&action, 100).join("\n");
+        assert!(rendered.contains("QUESTION · blocking"));
+        assert!(rendered.contains("Which output format?"));
+        assert!(rendered.contains("JSON / Markdown"));
+        assert!(rendered.contains("resolve through ChatGPT operator"));
+    }
+
+    #[test]
+    fn action_projection_bounds_text_and_keeps_dashboard_rows_single_line() {
+        let compact = serde_json::json!({
+            "method": "item/commandExecution/requestApproval",
+            "isBlocking": true,
+            "params": {"command": "echo one\necho two"}
+        });
+        let row = compact_action_row(&compact, 120);
+        assert!(!row.contains('\n'));
+        assert!(row.contains("echo one echo two"));
+
+        let question = serde_json::json!({
+            "method": "item/tool/requestUserInput",
+            "isBlocking": true,
+            "params": {"questions": [{"question": "Q".repeat(100_000)}]}
+        });
+        let rendered = render_action_card(&question, 100);
+        assert!(rendered.len() < 40);
+        assert!(rendered.join("\n").contains('…'));
     }
 
     #[test]
@@ -1102,10 +1477,10 @@ mod tests {
     }
 
     #[test]
-    fn number_key_selects_the_matching_active_worker_and_back_returns() {
+    fn arrow_and_enter_select_worker_and_back_returns() {
         let snapshot = serde_json::json!({
             "projection": {
-                "activeTurns": [
+                "workers": [
                     {"threadId": "thread-one", "turnId": "turn-one"},
                     {"threadId": "thread-two", "turnId": "turn-two"}
                 ]
@@ -1113,7 +1488,8 @@ mod tests {
         });
         let mut state = ConsoleState::default();
 
-        assert!(state.handle_key(InputKey::Character('2'), Some(&snapshot)));
+        assert!(state.handle_key(InputKey::Down, Some(&snapshot)));
+        assert!(state.handle_key(InputKey::Enter, Some(&snapshot)));
         assert_eq!(
             state.view,
             View::Transcript(TranscriptTarget {
@@ -1121,8 +1497,33 @@ mod tests {
                 turn_id: "turn-two".into(),
             })
         );
-        assert!(state.handle_key(InputKey::Character('b'), Some(&snapshot)));
+        assert!(state.handle_key(InputKey::Left, Some(&snapshot)));
         assert_eq!(state.view, View::Dashboard);
+    }
+
+    #[test]
+    fn worker_selection_tracks_identity_across_reordering() {
+        let mut state = ConsoleState {
+            selected_worker: 1,
+            selected_worker_target: Some(TranscriptTarget {
+                thread_id: "thread-two".into(),
+                turn_id: "turn-two".into(),
+            }),
+            ..ConsoleState::default()
+        };
+        let reordered = vec![
+            serde_json::json!({"threadId":"thread-two","turnId":"turn-two"}),
+            serde_json::json!({"threadId":"thread-one","turnId":"turn-one"}),
+        ];
+        sync_worker_selection(&mut state, &reordered);
+        assert_eq!(state.selected_worker, 0);
+        assert_eq!(
+            state.selected_worker_target,
+            Some(TranscriptTarget {
+                thread_id: "thread-two".into(),
+                turn_id: "turn-two".into(),
+            })
+        );
     }
 
     #[test]
@@ -1153,6 +1554,10 @@ mod tests {
         assert!(decoder.push(b'[').is_empty());
         assert_eq!(decoder.push(b'A'), vec![InputKey::Up]);
         assert!(decoder.push(b'\x1b').is_empty());
+        assert!(decoder.push(b'[').is_empty());
+        assert_eq!(decoder.push(b'C'), vec![InputKey::Right]);
+        assert_eq!(decoder.push(b'\r'), vec![InputKey::Enter]);
+        assert!(decoder.push(b'\x1b').is_empty());
         assert_eq!(decoder.flush_escape(), Some(InputKey::Escape));
     }
 
@@ -1163,7 +1568,7 @@ mod tests {
             "entries": [
                 {"kind": "user", "text": user_text},
                 {"kind": "agent", "title": "Answer", "text": "the complete agent response"},
-                {"kind": "reasoning", "text": "private chain of thought"}
+                {"kind": "tool", "text": "raw tool output must stay hidden"}
             ]
         });
         let rendered = render_transcript_entries(&transcript, 32).join("\n");
@@ -1175,23 +1580,39 @@ mod tests {
         );
         assert!(rendered.contains("^[[31m"));
         assert!(rendered.contains("complete agent"));
-        assert!(rendered.contains("THINK"));
-        assert!(!rendered.contains("private chain"));
+        assert!(!rendered.contains("raw tool output"));
         assert!(!rendered.contains("\u{1b}[31m"));
         assert_eq!(wrap_terminal_text("abcdefgh", 3), ["abc", "def", "gh"]);
     }
 
     #[test]
-    fn live_reasoning_activity_keeps_think_private() {
-        let activity = serde_json::json!({
-            "kind": "reasoning",
-            "summary": "private chain of thought",
-            "lastActivityAtMs": 0,
-            "tokenUsage": {"totalTokens": 12, "modelContextWindow": 34}
+    fn transcript_hides_only_the_relay_tagged_initial_task() {
+        let transcript = serde_json::json!({
+            "entries": [
+                {"kind": "user", "text": "do the task", "initialTask": true},
+                {"kind": "user", "text": "do the task"},
+                {"kind": "agent", "text": "working on it"}
+            ]
         });
-        let rendered = render_live_activity(&activity, 100).join("\n");
-        assert!(rendered.contains("LIVE · THINK"));
-        assert!(rendered.contains("12 / 34 tok"));
+        let rendered = render_transcript_entries(&transcript, 80).join("\n");
+        assert_eq!(rendered.matches("do the task").count(), 1);
+        assert!(rendered.contains("working on it"));
+    }
+
+    #[test]
+    fn live_reasoning_activity_keeps_think_private() {
+        let transcript = serde_json::json!({
+            "status": "inProgress",
+            "activity": {
+                "kind": "reasoning",
+                "summary": "private chain of thought",
+                "lastActivityAtMs": 0,
+                "tokenUsage": {"totalTokens": 12, "modelContextWindow": 34}
+            }
+        });
+        let rendered = render_live_activity(&transcript, 100, 0).join("\n");
+        assert!(rendered.contains("THINKING"));
+        assert!(rendered.contains("12 tok"));
         assert!(!rendered.contains("private chain"));
     }
 }

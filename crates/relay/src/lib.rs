@@ -39,23 +39,31 @@ use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, Instant};
 
-pub const MAX_WAIT_MS: u64 = 120_000;
+pub const MAX_WAIT_MS: u64 = 30_000;
+const WAIT_FINALIZATION_RESERVE_MS: u64 = 10_000;
+const MAX_WAIT_OPERATION_MS: u64 = 40_000;
 const WAIT_RECONCILE_MS: u64 = 1_000;
 const OBSERVER_USAGE_REFRESH_MS: u64 = 5_000;
 const MAX_SEMANTIC_EVENTS: usize = 16;
 const MAX_TRANSCRIPT_TEXT_CHARS: usize = 32 * 1024;
 const MAX_TRANSCRIPT_TOTAL_CHARS: usize = 192 * 1024;
 const MAX_TRANSCRIPT_ENTRIES: usize = 512;
+const MAX_TRANSCRIPT_SCAN_ITEMS: usize = 4_096;
+const MAX_LIVE_MESSAGE_CHARS: usize = 8 * 1024;
+const MAX_OBSERVER_PROMPT_CHARS: usize = 8 * 1024;
+const MAX_OBSERVER_DEVELOPER_INSTRUCTIONS_CHARS: usize = 16 * 1024;
+const MAX_OBSERVER_SUMMARY_PROMPT_CHARS: usize = 512;
 const MAX_LIVE_TURNS: usize = 256;
+const MAX_RECENT_WORKERS: usize = 8;
 const TURN_PAGE_SIZE: u32 = 50;
 const ITEM_PAGE_SIZE: u32 = 100;
 pub const COMMAND_EXEC_RESPONSE_ALLOWANCE_MS: u64 = 5_000;
-pub const DEFAULT_COMMAND_MS: u64 = 60_000;
+pub const DEFAULT_COMMAND_MS: u64 = 30_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
-pub const MAX_COMMAND_MS: u64 = 5 * 60 * 1_000;
+pub const MAX_COMMAND_MS: u64 = 35_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
-pub const MAX_COMMAND_READ_MS: u64 = 120_000;
-pub const DEFAULT_COMMAND_READ_MS: u64 = 30_000;
+pub const MAX_COMMAND_READ_MS: u64 = 40_000;
+pub const DEFAULT_COMMAND_READ_MS: u64 = 20_000;
 pub const MAX_COMMAND_WRITE_BYTES: usize = 64 * 1024;
 const WORKSPACE_POLICY: &str = "Workspace policy: treat the working directory as a general filesystem workspace. Version control is optional. Do not initialize repositories, create branches, commits, or tags, or use Git as a checkpoint/workflow mechanism unless the task explicitly requests version-control operations. Existing VCS metadata may be read only when it is materially required by the task. Approval discipline: stay within the granted sandbox whenever possible. Do not request approval or additional permissions merely for convenience, broader discovery, cache writes, or optional tooling. Try a sandbox-safe alternative first. Request additional authority only when it is necessary to complete the explicit task, and state the concrete blocker.";
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
@@ -75,6 +83,33 @@ fn compose_developer_instructions(additional: Option<&str>) -> String {
         }
         None => WORKSPACE_POLICY.into(),
     }
+}
+
+fn review_target_prompt(target: &ReviewTarget) -> String {
+    match target {
+        ReviewTarget::UncommittedChanges => "Review uncommitted changes".into(),
+        ReviewTarget::BaseBranch { branch } => {
+            format!("Review changes against base branch {branch}")
+        }
+        ReviewTarget::Commit { sha, title } => title
+            .as_ref()
+            .map(|title| format!("Review commit {sha}: {title}"))
+            .unwrap_or_else(|| format!("Review commit {sha}")),
+        ReviewTarget::Custom { instructions } => instructions.clone(),
+    }
+}
+
+fn tail_text(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(2);
+    let tail = value
+        .chars()
+        .skip(count.saturating_sub(keep))
+        .collect::<String>();
+    format!("…\n{tail}")
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -128,6 +163,8 @@ pub enum RelayError {
     Json(#[from] serde_json::Error),
     #[error("invalid Codex request: {0}")]
     Invalid(String),
+    #[error("Codex operation budget exceeded: {0}")]
+    BudgetExceeded(String),
 }
 
 #[derive(Clone)]
@@ -148,6 +185,7 @@ pub struct Relay {
 struct LiveTurns {
     turns: HashMap<(String, String), ObservedTurn>,
     order: VecDeque<(String, String)>,
+    recent: VecDeque<(String, String, ObservedTurn)>,
 }
 
 #[derive(Clone)]
@@ -157,6 +195,9 @@ struct ObservedTurn {
     model: Option<String>,
     effort: Option<String>,
     service_tier: Option<String>,
+    prompt: Option<String>,
+    developer_instructions: Option<String>,
+    terminal_at_ms: Option<u64>,
     last_activity_at_ms: u64,
     activity_kind: String,
     activity_summary: Option<String>,
@@ -164,6 +205,15 @@ struct ObservedTurn {
     message_excerpt: String,
     token_usage_total: Option<u64>,
     model_context_window: Option<u64>,
+}
+
+struct WorkerAnnotation {
+    mode: String,
+    model: Option<String>,
+    effort: Option<String>,
+    service_tier: Option<String>,
+    prompt: Option<String>,
+    developer_instructions: Option<String>,
 }
 
 #[derive(Default)]
@@ -263,7 +313,10 @@ impl ThreadSubscriptions {
 }
 
 impl LiveTurns {
-    fn insert(&mut self, thread_id: &str, turn: codex_connect_app_server::protocol::Turn) {
+    fn insert(&mut self, thread_id: &str, mut turn: codex_connect_app_server::protocol::Turn) {
+        // Live observer state owns lifecycle/presentation metadata, not App Server-owned
+        // turn history. Never retain potentially multi-megabyte item payloads here.
+        turn.items.clear();
         let key = (thread_id.to_string(), turn.id.clone());
         if let Some(existing) = self.turns.get_mut(&key) {
             // App Server notifications can race ahead of the turn/start response. Once a
@@ -272,12 +325,17 @@ impl LiveTurns {
             if existing.turn.status.is_terminal() && !turn.status.is_terminal() {
                 return;
             }
+            let became_terminal = !existing.turn.status.is_terminal() && turn.status.is_terminal();
             existing.turn = turn;
+            if became_terminal {
+                existing.terminal_at_ms = Some(now_epoch_ms());
+            }
             return;
         }
         if !self.turns.contains_key(&key) {
             self.order.push_back(key.clone());
         }
+        let terminal_at_ms = turn.status.is_terminal().then(now_epoch_ms);
         self.turns.insert(
             key,
             ObservedTurn {
@@ -286,6 +344,9 @@ impl LiveTurns {
                 model: None,
                 effort: None,
                 service_tier: None,
+                prompt: None,
+                developer_instructions: None,
+                terminal_at_ms,
                 last_activity_at_ms: now_epoch_ms(),
                 activity_kind: "turn".into(),
                 activity_summary: Some("turn observed".into()),
@@ -312,23 +373,21 @@ impl LiveTurns {
             .map(|observed| observed.turn.clone())
     }
 
-    fn annotate(
-        &mut self,
-        thread_id: &str,
-        turn_id: &str,
-        mode: &str,
-        model: Option<String>,
-        effort: Option<String>,
-        service_tier: Option<String>,
-    ) {
+    fn annotate(&mut self, thread_id: &str, turn_id: &str, annotation: WorkerAnnotation) {
         if let Some(observed) = self
             .turns
             .get_mut(&(thread_id.to_string(), turn_id.to_string()))
         {
-            observed.mode = Some(mode.to_string());
-            observed.model = model;
-            observed.effort = effort;
-            observed.service_tier = service_tier;
+            observed.mode = Some(annotation.mode);
+            observed.model = annotation.model;
+            observed.effort = annotation.effort;
+            observed.service_tier = annotation.service_tier;
+            observed.prompt = annotation
+                .prompt
+                .map(|value| observer_clip(&value, MAX_OBSERVER_PROMPT_CHARS));
+            observed.developer_instructions = annotation
+                .developer_instructions
+                .map(|value| observer_clip(&value, MAX_OBSERVER_DEVELOPER_INSTRUCTIONS_CHARS));
         }
     }
 
@@ -369,11 +428,12 @@ impl LiveTurns {
                 }
                 if let Some(delta) = params["delta"].as_str() {
                     observed.message_excerpt.push_str(delta);
-                    observed.message_excerpt = compact_text(&observed.message_excerpt, 240);
+                    observed.message_excerpt =
+                        tail_text(&observed.message_excerpt, MAX_LIVE_MESSAGE_CHARS);
                 }
                 observed.activity_kind = "message".into();
                 observed.activity_summary = (!observed.message_excerpt.is_empty())
-                    .then(|| observed.message_excerpt.clone());
+                    .then(|| compact_text(&observed.message_excerpt, 240));
             }
             return;
         }
@@ -383,6 +443,87 @@ impl LiveTurns {
             observed.activity_kind = next.kind;
             observed.activity_summary = next.summary;
         }
+    }
+
+    fn reconcile_terminal(
+        &mut self,
+        thread_id: &str,
+        turn: &codex_connect_app_server::protocol::Turn,
+    ) {
+        if !turn.status.is_terminal() {
+            return;
+        }
+        let Some(observed) = self
+            .turns
+            .get_mut(&(thread_id.to_string(), turn.id.clone()))
+        else {
+            return;
+        };
+        observed.turn = turn.clone();
+        observed.turn.items.clear();
+        observed.terminal_at_ms.get_or_insert_with(now_epoch_ms);
+        self.record_recent(thread_id, &turn.id);
+    }
+
+    fn record_recent(&mut self, thread_id: &str, turn_id: &str) {
+        let key = (thread_id.to_string(), turn_id.to_string());
+        let Some(mut observed) = self.turns.get(&key).cloned() else {
+            return;
+        };
+        if observed.mode.is_none() || !observed.turn.status.is_terminal() {
+            return;
+        }
+        observed.turn.items.clear();
+        if let Some(index) = self
+            .recent
+            .iter()
+            .position(|(recent_thread, recent_turn, _)| {
+                recent_thread == thread_id && recent_turn == turn_id
+            })
+        {
+            self.recent[index] = (thread_id.to_string(), turn_id.to_string(), observed);
+            return;
+        }
+        self.recent
+            .push_back((thread_id.to_string(), turn_id.to_string(), observed));
+        while self.recent.len() > MAX_RECENT_WORKERS {
+            self.recent.pop_front();
+        }
+    }
+
+    fn observer_workers(&self) -> Vec<Value> {
+        let mut active = Vec::new();
+        for (thread_id, turn_id) in &self.order {
+            let Some(observed) = self.turns.get(&(thread_id.clone(), turn_id.clone())) else {
+                continue;
+            };
+            if observed.mode.is_none() || observed.turn.status.is_terminal() {
+                continue;
+            }
+            active.push(observer_worker_summary_value(thread_id, observed));
+        }
+        active.extend(
+            self.recent
+                .iter()
+                .rev()
+                .map(|(thread_id, _, observed)| observer_worker_summary_value(thread_id, observed)),
+        );
+        active
+    }
+
+    fn observer_context_value(&self, thread_id: &str, turn_id: &str) -> Option<Value> {
+        self.turns
+            .get(&(thread_id.to_string(), turn_id.to_string()))
+            .filter(|observed| observed.mode.is_some())
+            .map(|observed| observer_worker_value(thread_id, observed))
+            .or_else(|| {
+                self.recent
+                    .iter()
+                    .find(|(recent_thread, recent_turn, _)| {
+                        recent_thread == thread_id && recent_turn == turn_id
+                    })
+                    .map(|(_, _, observed)| observer_worker_value(thread_id, observed))
+            })
     }
 
     fn remove(&mut self, thread_id: &str, turn_id: &str) {
@@ -398,6 +539,58 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+fn observer_worker_value(thread_id: &str, observed: &ObservedTurn) -> Value {
+    json!({
+        "threadId": thread_id,
+        "turnId": observed.turn.id,
+        "status": observed.turn.status,
+        "mode": observed.mode,
+        "model": observed.model,
+        "effort": observed.effort,
+        "serviceTier": observed.service_tier,
+        "prompt": observed.prompt,
+        "developerInstructions": observed.developer_instructions,
+        "terminalAtMs": observed.terminal_at_ms,
+        "lastActivityAtMs": observed.last_activity_at_ms,
+        "activityKind": observed.activity_kind,
+        "activitySummary": observed.activity_summary,
+        "tokenUsage": {
+            "totalTokens": observed.token_usage_total,
+            "modelContextWindow": observed.model_context_window,
+        },
+    })
+}
+
+fn observer_worker_summary_value(thread_id: &str, observed: &ObservedTurn) -> Value {
+    json!({
+        "threadId": thread_id,
+        "turnId": observed.turn.id,
+        "status": observed.turn.status,
+        "mode": observed.mode,
+        "model": observed.model,
+        "effort": observed.effort,
+        "serviceTier": observed.service_tier,
+        "prompt": observed.prompt.as_deref().map(|value| observer_clip(value, MAX_OBSERVER_SUMMARY_PROMPT_CHARS)),
+        "terminalAtMs": observed.terminal_at_ms,
+        "lastActivityAtMs": observed.last_activity_at_ms,
+        "activityKind": observed.activity_kind,
+        "activitySummary": observed.activity_summary,
+        "tokenUsage": {
+            "totalTokens": observed.token_usage_total,
+            "modelContextWindow": observed.model_context_window,
+        },
+    })
+}
+
+fn observer_clip(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    format!("{}…", value.chars().take(keep).collect::<String>())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -458,14 +651,12 @@ impl Relay {
         &self,
         thread_id: &str,
         turn_id: &str,
-        mode: &str,
-        model: Option<String>,
-        effort: Option<String>,
-        service_tier: Option<String>,
+        annotation: WorkerAnnotation,
     ) {
         let terminal = {
             let mut live = self.live_turns.lock().await;
-            live.annotate(thread_id, turn_id, mode, model, effort, service_tier);
+            live.annotate(thread_id, turn_id, annotation);
+            live.record_recent(thread_id, turn_id);
             live.turns
                 .get(&(thread_id.to_string(), turn_id.to_string()))
                 .cloned()
@@ -578,6 +769,31 @@ impl Relay {
         json!({
             "kind": observed.activity_kind,
             "summary": observed.activity_summary,
+            "lastActivityAtMs": observed.last_activity_at_ms,
+            "tokenUsage": {
+                "totalTokens": observed.token_usage_total,
+                "modelContextWindow": observed.model_context_window,
+            }
+        })
+    }
+
+    async fn observer_activity_value(&self, thread_id: &str, turn_id: &str) -> Value {
+        let live = self.live_turns.lock().await;
+        let Some(observed) = live
+            .turns
+            .get(&(thread_id.to_string(), turn_id.to_string()))
+        else {
+            return Value::Null;
+        };
+        let summary = if observed.activity_kind == "message" && !observed.message_excerpt.is_empty()
+        {
+            Some(observed.message_excerpt.as_str())
+        } else {
+            observed.activity_summary.as_deref()
+        };
+        json!({
+            "kind": observed.activity_kind,
+            "summary": summary,
             "lastActivityAtMs": observed.last_activity_at_ms,
             "tokenUsage": {
                 "totalTokens": observed.token_usage_total,
@@ -989,6 +1205,8 @@ impl Relay {
             ));
         }
         validate_work_sandbox_policy(&sandbox_policy)?;
+        let observer_prompt = task.clone();
+        let observer_developer_instructions = developer_instructions.clone();
         let thread_sandbox = sandbox_mode(&sandbox_policy);
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
@@ -1027,10 +1245,14 @@ impl Relay {
         self.annotate_live_turn(
             &thread_id,
             &response.turn.id,
-            "work",
-            model,
-            effort,
-            service_tier,
+            WorkerAnnotation {
+                mode: "work".into(),
+                model,
+                effort,
+                service_tier,
+                prompt: Some(observer_prompt),
+                developer_instructions: observer_developer_instructions,
+            },
         )
         .await;
         Ok(
@@ -1172,6 +1394,78 @@ impl Relay {
         Ok(items)
     }
 
+    async fn read_recent_transcript_entries(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<(Vec<Value>, bool), RelayError> {
+        let mut cursor = None;
+        let mut entries = Vec::new();
+        let mut remaining_chars = MAX_TRANSCRIPT_TOTAL_CHARS;
+        let mut scanned = 0usize;
+        let mut truncated = false;
+        let mut reached_history_start = false;
+        'pages: loop {
+            if scanned >= MAX_TRANSCRIPT_SCAN_ITEMS {
+                truncated = true;
+                break;
+            }
+            let page_limit = (MAX_TRANSCRIPT_SCAN_ITEMS - scanned).min(ITEM_PAGE_SIZE as usize);
+            let response = self
+                .app_server
+                .request(ThreadItemsList {
+                    thread_id: thread_id.to_string(),
+                    turn_id: Some(turn_id.to_string()),
+                    cursor,
+                    limit: Some(page_limit as u32),
+                    sort_direction: Some(SortDirection::Desc),
+                })
+                .await?;
+            let next_cursor = response.next_cursor;
+            let page_len = response.data.len();
+            for (index, entry) in response.data.into_iter().enumerate() {
+                scanned += 1;
+                if entries.len() >= MAX_TRANSCRIPT_ENTRIES {
+                    truncated = true;
+                    break 'pages;
+                }
+                if remaining_chars == 0 {
+                    truncated = true;
+                    break 'pages;
+                }
+                if let Some(projected) =
+                    transcript_entry(&entry.item, &mut remaining_chars, &mut truncated)
+                {
+                    entries.push(projected);
+                }
+                if remaining_chars == 0 {
+                    reached_history_start = index + 1 == page_len && next_cursor.is_none();
+                    if index + 1 < page_len || next_cursor.is_some() {
+                        truncated = true;
+                    }
+                    break 'pages;
+                }
+                if scanned >= MAX_TRANSCRIPT_SCAN_ITEMS {
+                    reached_history_start = index + 1 == page_len && next_cursor.is_none();
+                    if index + 1 < page_len || next_cursor.is_some() {
+                        truncated = true;
+                    }
+                    break 'pages;
+                }
+            }
+            match next_cursor {
+                Some(next) => cursor = Some(next),
+                None => {
+                    reached_history_start = true;
+                    break;
+                }
+            }
+        }
+        entries.reverse();
+        mark_initial_task_entry(&mut entries, reached_history_start);
+        Ok((entries, truncated))
+    }
+
     async fn find_stored_turn_metadata(
         &self,
         thread_id: &str,
@@ -1210,7 +1504,14 @@ impl Relay {
                 "timeoutMs must be between 1 and {MAX_WAIT_MS}"
             )));
         }
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_millis(timeout_ms);
+        let operation_deadline = started_at
+            + Duration::from_millis(
+                timeout_ms
+                    .saturating_add(WAIT_FINALIZATION_RESERVE_MS)
+                    .min(MAX_WAIT_OPERATION_MS),
+            );
         // Subscribe before the authoritative read so actionable requests and terminal
         // notifications cannot race the wait setup.
         let mut transport_changes = self.app_server.changes();
@@ -1222,8 +1523,19 @@ impl Relay {
         };
         let mut stored = if initial_live.is_none() {
             // A turn that predates this relay process needs the minimum authoritative read
-            // required to establish trustworthy state.
-            initial_reconcile.await?
+            // required to establish trustworthy state. Reconciliation may use the finalization
+            // reserve, but it must not consume the entire public MCP lifetime.
+            match tokio::time::timeout_at(operation_deadline, initial_reconcile).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(RelayError::BudgetExceeded(format!(
+                        "codex.wait could not reconcile turn state within {} ms",
+                        timeout_ms
+                            .saturating_add(WAIT_FINALIZATION_RESERVE_MS)
+                            .min(MAX_WAIT_OPERATION_MS)
+                    )));
+                }
+            }
         } else {
             match tokio::time::timeout_at(deadline, initial_reconcile).await {
                 Ok(result) => result?,
@@ -1252,8 +1564,27 @@ impl Relay {
                     )));
                 }
             };
-            if selected.status.is_terminal() && stored_terminal {
-                self.hydrate_turn_items(&thread_id, &mut selected).await?;
+            if selected.status.is_terminal() && selected.items.is_empty() {
+                match tokio::time::timeout_at(
+                    operation_deadline,
+                    self.hydrate_turn_items(&thread_id, &mut selected),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(RelayError::BudgetExceeded(
+                            "codex.wait reached terminal state but terminal output hydration exceeded the reserved finalization budget; inspect the completed turn explicitly"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            if selected.status.is_terminal() {
+                self.live_turns
+                    .lock()
+                    .await
+                    .reconcile_terminal(&thread_id, &selected);
             }
             let selected_id = Some(selected.id.as_str());
             let pending = self
@@ -1494,6 +1825,7 @@ impl Relay {
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
         let observer_model = model.clone();
+        let observer_prompt = review_target_prompt(&target);
         let (thread_id, _) = self
             .prepare_thread(
                 cwd,
@@ -1524,10 +1856,14 @@ impl Relay {
         self.annotate_live_turn(
             &thread_id,
             &response.turn.id,
-            "review",
-            observer_model,
-            None,
-            None,
+            WorkerAnnotation {
+                mode: "review".into(),
+                model: observer_model,
+                effort: None,
+                service_tier: None,
+                prompt: Some(observer_prompt),
+                developer_instructions: None,
+            },
         )
         .await;
         // The pinned App Server returns the inline review turn on the source thread even
@@ -1655,44 +1991,19 @@ impl Relay {
                 value
             }
         };
-        let active_turns = {
+        let workers = {
             let live = self.live_turns.lock().await;
-            live.order
-                .iter()
-                .filter_map(|(thread_id, turn_id)| {
-                    let observed = live.turns.get(&(thread_id.clone(), turn_id.clone()))?;
-                    (!observed.turn.status.is_terminal() && observed.mode.is_some()).then(|| {
-                        json!({
-                            "threadId": thread_id,
-                            "turnId": observed.turn.id,
-                            "status": observed.turn.status,
-                            "mode": observed.mode,
-                            "model": observed.model,
-                            "effort": observed.effort,
-                            "serviceTier": observed.service_tier,
-                            "lastActivityAtMs": observed.last_activity_at_ms,
-                            "activityKind": observed.activity_kind,
-                            "activitySummary": observed.activity_summary,
-                            "tokenUsage": {
-                                "totalTokens": observed.token_usage_total,
-                                "modelContextWindow": observed.model_context_window,
-                            },
-                        })
-                    })
-                })
-                .collect::<Vec<_>>()
+            live.observer_workers()
         };
         let pending_actions = self.pending_actions(None).await;
-        let recent = self.journal.semantic_tail(64).await;
+        let notices = self.journal.observer_notices(8).await;
         Ok(json!({
             "cwd": self.default_cwd(),
             "usage": usage,
             "usageRefreshMs": OBSERVER_USAGE_REFRESH_MS,
-            "activeTurns": active_turns,
+            "workers": workers,
             "pendingActions": pending_actions,
-            "cursor": recent.cursor,
-            "historyLost": recent.history_lost,
-            "events": recent.events,
+            "notices": notices,
         }))
     }
 
@@ -1718,21 +2029,36 @@ impl Relay {
                 )));
             }
         };
-        let items = self
-            .read_turn_items_limited(&thread_id, &turn_id, Some(MAX_TRANSCRIPT_ENTRIES + 1))
+        if selected.status.is_terminal() {
+            self.live_turns
+                .lock()
+                .await
+                .reconcile_terminal(&thread_id, &selected);
+        }
+        let (entries, truncated) = self
+            .read_recent_transcript_entries(&thread_id, &turn_id)
             .await?;
-        let mut truncated = items.len() > MAX_TRANSCRIPT_ENTRIES;
-        let mut remaining_chars = MAX_TRANSCRIPT_TOTAL_CHARS;
-        let entries = items
-            .iter()
-            .take(MAX_TRANSCRIPT_ENTRIES)
-            .filter_map(|item| transcript_entry(item, &mut remaining_chars, &mut truncated))
+        let context = {
+            let live = self.live_turns.lock().await;
+            live.observer_context_value(&thread_id, &turn_id)
+        };
+        let pending_actions = self
+            .pending_actions(Some(&thread_id))
+            .await
+            .into_iter()
+            .filter(|action| {
+                action["turnId"]
+                    .as_str()
+                    .is_none_or(|candidate| candidate == turn_id)
+            })
             .collect::<Vec<_>>();
         Ok(json!({
             "threadId": thread_id,
             "turnId": turn_id,
             "status": selected.status,
-            "activity": self.current_activity_value(&thread_id, &turn_id).await,
+            "context": context,
+            "activity": self.observer_activity_value(&thread_id, &turn_id).await,
+            "pendingActions": pending_actions,
             "entries": entries,
             "truncated": truncated,
         }))
@@ -1771,6 +2097,7 @@ impl Relay {
                                     let terminal = {
                                         let mut live = live_turns.lock().await;
                                         live.insert(thread_id, turn);
+                                        live.record_recent(thread_id, &turn_id);
                                         live.turns
                                             .get(&(thread_id.to_string(), turn_id))
                                             .cloned()
@@ -1992,12 +2319,7 @@ fn transcript_entry(
     let item_type = item.get("type")?.as_str()?;
     let status = item.get("status").cloned().unwrap_or(Value::Null);
     match item_type {
-        "reasoning" => Some(json!({
-            "kind":"think",
-            "title":"THINK",
-            "text":Value::Null,
-            "status":status,
-        })),
+        "reasoning" => None,
         "userMessage" => Some(json!({
             "kind":"user",
             "title":"USER",
@@ -2019,43 +2341,19 @@ fn transcript_entry(
             "text":transcript_clip(item.get("review").and_then(Value::as_str).unwrap_or_default(), remaining_chars, truncated),
             "status":status,
         })),
-        "commandExecution" => Some(json!({
-            "kind":"command",
-            "title":transcript_clip(item.get("command").and_then(Value::as_str).unwrap_or("command"), remaining_chars, truncated),
-            "text":transcript_clip(item.get("aggregatedOutput").and_then(Value::as_str).unwrap_or_default(), remaining_chars, truncated),
-            "status":status,
-        })),
-        "fileChange" => Some(json!({
-            "kind":"file",
-            "title":"FILESYSTEM CHANGE",
-            "text":transcript_json(item.get("changes"), remaining_chars, truncated),
-            "status":status,
-        })),
-        "webSearch" => Some(json!({
-            "kind":"search",
-            "title":"WEB SEARCH",
-            "text":transcript_clip(item.get("query").and_then(Value::as_str).unwrap_or_default(), remaining_chars, truncated),
-            "status":status,
-        })),
-        "mcpToolCall" => {
-            let title = item
-                .get("tool")
-                .and_then(Value::as_str)
-                .or_else(|| item.get("name").and_then(Value::as_str))
-                .unwrap_or("MCP TOOL");
-            Some(json!({
-                "kind":"tool",
-                "title":transcript_clip(title, remaining_chars, truncated),
-                "text":transcript_json(item.get("result"), remaining_chars, truncated),
-                "status":status,
-            }))
-        }
-        other => Some(json!({
-            "kind":"item",
-            "title":other,
-            "text":Value::Null,
-            "status":status,
-        })),
+        _ => None,
+    }
+}
+
+fn mark_initial_task_entry(entries: &mut [Value], reached_history_start: bool) {
+    if !reached_history_start {
+        return;
+    }
+    if let Some(initial) = entries
+        .iter_mut()
+        .find(|entry| entry["kind"].as_str() == Some("user"))
+    {
+        initial["initialTask"] = Value::Bool(true);
     }
 }
 
@@ -2070,18 +2368,6 @@ fn message_item_text(item: &Value) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     Some(text)
-}
-
-fn transcript_json(
-    value: Option<&Value>,
-    remaining_chars: &mut usize,
-    truncated: &mut bool,
-) -> Value {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Value::Null;
-    };
-    let rendered = serde_json::to_string_pretty(value).unwrap_or_default();
-    transcript_clip(&rendered, remaining_chars, truncated)
 }
 
 fn transcript_clip(value: &str, remaining_chars: &mut usize, truncated: &mut bool) -> Value {
@@ -2150,12 +2436,22 @@ fn validate_command(command: &CommandExec) -> Result<(), RelayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_connect_app_server::protocol::{Turn, TurnStatus};
+
+    fn test_turn(id: &str, status: TurnStatus) -> Turn {
+        Turn {
+            id: id.into(),
+            status,
+            items: Vec::new(),
+            error: None,
+        }
+    }
 
     #[test]
-    fn transcript_reasoning_is_phase_only() {
+    fn transcript_hides_reasoning_and_tool_noise() {
         let mut remaining = MAX_TRANSCRIPT_TOTAL_CHARS;
         let mut truncated = false;
-        let entry = transcript_entry(
+        let reasoning = transcript_entry(
             &json!({
                 "type":"reasoning",
                 "summary":"private reasoning",
@@ -2163,18 +2459,23 @@ mod tests {
             }),
             &mut remaining,
             &mut truncated,
-        )
-        .unwrap();
-        assert_eq!(entry["kind"], "think");
-        assert_eq!(entry["title"], "THINK");
-        assert!(entry["text"].is_null());
-        assert!(!entry.to_string().contains("private reasoning"));
-        assert!(!entry.to_string().contains("hidden"));
+        );
+        let command = transcript_entry(
+            &json!({
+                "type":"commandExecution",
+                "command":"cargo test",
+                "aggregatedOutput":"very noisy output",
+            }),
+            &mut remaining,
+            &mut truncated,
+        );
+        assert!(reasoning.is_none());
+        assert!(command.is_none());
         assert!(!truncated);
     }
 
     #[test]
-    fn transcript_preserves_message_newlines_and_bounds_large_tool_output() {
+    fn transcript_preserves_human_message_newlines() {
         let mut remaining = MAX_TRANSCRIPT_TOTAL_CHARS;
         let mut truncated = false;
         let message = transcript_entry(
@@ -2188,26 +2489,6 @@ mod tests {
 
         let mut remaining = MAX_TRANSCRIPT_TOTAL_CHARS;
         let mut truncated = false;
-        let command = transcript_entry(
-            &json!({
-                "type":"commandExecution",
-                "command":"cargo test",
-                "aggregatedOutput":"x".repeat(MAX_TRANSCRIPT_TEXT_CHARS + 1),
-            }),
-            &mut remaining,
-            &mut truncated,
-        )
-        .unwrap();
-        assert!(truncated);
-        assert!(
-            command["text"]
-                .as_str()
-                .unwrap()
-                .contains("entry truncated")
-        );
-
-        let mut remaining = MAX_TRANSCRIPT_TOTAL_CHARS;
-        let mut truncated = false;
         let review = transcript_entry(
             &json!({"type":"exitedReviewMode","review":"review finding"}),
             &mut remaining,
@@ -2217,5 +2498,183 @@ mod tests {
         assert_eq!(review["title"], "AGENT · REVIEW");
         assert_eq!(review["text"], "review finding");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn observer_metadata_is_bounded() {
+        let mut live = LiveTurns::default();
+        live.insert("thread", test_turn("turn", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "turn",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: None,
+                effort: None,
+                service_tier: None,
+                prompt: Some("x".repeat(MAX_OBSERVER_PROMPT_CHARS + 10)),
+                developer_instructions: Some(
+                    "y".repeat(MAX_OBSERVER_DEVELOPER_INSTRUCTIONS_CHARS + 10),
+                ),
+            },
+        );
+        let observed = live
+            .turns
+            .get(&("thread".to_string(), "turn".to_string()))
+            .unwrap();
+        let prompt = observed.prompt.as_ref().unwrap();
+        let instructions = observed.developer_instructions.as_ref().unwrap();
+        assert_eq!(prompt.chars().count(), MAX_OBSERVER_PROMPT_CHARS);
+        assert_eq!(
+            instructions.chars().count(),
+            MAX_OBSERVER_DEVELOPER_INSTRUCTIONS_CHARS
+        );
+        assert!(prompt.ends_with('…'));
+        assert!(instructions.ends_with('…'));
+    }
+
+    #[test]
+    fn observer_worker_summary_omits_large_developer_context() {
+        let mut live = LiveTurns::default();
+        live.insert("thread", test_turn("turn", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "turn",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: Some("gpt-5.6-sol".into()),
+                effort: Some("high".into()),
+                service_tier: None,
+                prompt: Some("x".repeat(MAX_OBSERVER_PROMPT_CHARS)),
+                developer_instructions: Some("y".repeat(MAX_OBSERVER_DEVELOPER_INSTRUCTIONS_CHARS)),
+            },
+        );
+        let worker = live.observer_workers().pop().unwrap();
+        assert!(worker.get("developerInstructions").is_none());
+        assert!(
+            worker["prompt"].as_str().unwrap().chars().count() <= MAX_OBSERVER_SUMMARY_PROMPT_CHARS
+        );
+        assert!(serde_json::to_vec(&worker).unwrap().len() < 4 * 1024);
+    }
+
+    #[test]
+    fn initial_task_marker_does_not_hide_repeated_followup() {
+        let mut entries = vec![
+            json!({"kind":"user","text":"repeat"}),
+            json!({"kind":"user","text":"repeat"}),
+            json!({"kind":"agent","text":"answer"}),
+        ];
+        mark_initial_task_entry(&mut entries, true);
+        assert_eq!(entries[0]["initialTask"], true);
+        assert!(entries[1].get("initialTask").is_none());
+
+        let mut truncated_entries = entries.clone();
+        for entry in &mut truncated_entries {
+            entry.as_object_mut().unwrap().remove("initialTask");
+        }
+        mark_initial_task_entry(&mut truncated_entries, false);
+        assert!(
+            truncated_entries
+                .iter()
+                .all(|entry| entry.get("initialTask").is_none())
+        );
+    }
+
+    #[test]
+    fn live_message_keeps_large_console_excerpt_but_compact_operator_summary() {
+        let mut live = LiveTurns::default();
+        live.insert("thread", test_turn("turn", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "turn",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: None,
+                effort: None,
+                service_tier: None,
+                prompt: None,
+                developer_instructions: None,
+            },
+        );
+        live.observe_event(
+            "item/agentMessage/delta",
+            &json!({
+                "threadId":"thread",
+                "turnId":"turn",
+                "itemId":"message",
+                "delta":"x".repeat(2_000),
+            }),
+        );
+        let observed = live
+            .turns
+            .get(&("thread".to_string(), "turn".to_string()))
+            .unwrap();
+        assert_eq!(observed.message_excerpt.chars().count(), 2_000);
+        assert!(observed.activity_summary.as_ref().unwrap().chars().count() <= 241);
+    }
+
+    #[test]
+    fn recent_workers_are_ranked_by_terminal_recency() {
+        let mut live = LiveTurns::default();
+        live.insert("thread", test_turn("turn-0", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "turn-0",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: None,
+                effort: None,
+                service_tier: None,
+                prompt: Some("turn-0".into()),
+                developer_instructions: None,
+            },
+        );
+        for index in 1..10 {
+            let turn_id = format!("turn-{index}");
+            live.insert("thread", test_turn(&turn_id, TurnStatus::Completed));
+            live.annotate(
+                "thread",
+                &turn_id,
+                WorkerAnnotation {
+                    mode: "work".into(),
+                    model: None,
+                    effort: None,
+                    service_tier: None,
+                    prompt: Some(turn_id.clone()),
+                    developer_instructions: None,
+                },
+            );
+            live.record_recent("thread", &turn_id);
+        }
+        live.reconcile_terminal("thread", &test_turn("turn-0", TurnStatus::Completed));
+
+        let workers = live.observer_workers();
+        assert_eq!(workers.len(), 8);
+        assert_eq!(workers[0]["turnId"], "turn-0");
+        assert_eq!(workers[1]["turnId"], "turn-9");
+        assert!(!workers.iter().any(|worker| worker["turnId"] == "turn-1"));
+    }
+
+    #[test]
+    fn recent_workers_drop_terminal_turn_items() {
+        let mut live = LiveTurns::default();
+        let mut turn = test_turn("turn", TurnStatus::Completed);
+        turn.items =
+            vec![json!({"type":"commandExecution","aggregatedOutput":"x".repeat(32 * 1024)})];
+        live.insert("thread", turn);
+        live.annotate(
+            "thread",
+            "turn",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: None,
+                effort: None,
+                service_tier: None,
+                prompt: Some("task".into()),
+                developer_instructions: None,
+            },
+        );
+        live.record_recent("thread", "turn");
+        assert!(live.recent.back().unwrap().2.turn.items.is_empty());
     }
 }

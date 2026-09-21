@@ -84,7 +84,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.read",
                 "Read Persistent Command",
-                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. The default lease is 30 seconds and callers may extend it to 120 seconds when a quieter persistent command warrants fewer polling turns. Use afterCursor from the previous start/read result to consume incrementally. Process state and output consumption are independent: state=exited/failed can be returned while newer retained output still exists. hasMoreOutput reports whether a newer retained chunk was withheld by the per-read response bound; drained=true means the command is terminal and all currently retained output has been consumed by this read. historyLost=true independently means older output was already evicted.",
+                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. The default lease is 20 seconds and callers may extend it to 40 seconds. Use afterCursor from the previous start/read result to consume incrementally. The process may outlive any number of reads; do not stretch one synchronous read to approximate process lifetime. Process state and output consumption are independent: state=exited/failed can be returned while newer retained output still exists. hasMoreOutput reports whether a newer retained chunk was withheld by the per-read response bound; drained=true means the command is terminal and all currently retained output has been consumed by this read. historyLost=true independently means older output was already evicted.",
                 true,
                 false,
                 false,
@@ -129,7 +129,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for one known bounded deterministic host command, including a shell command that composes several related repository/tool queries into one result. This is the App Server command/exec path, not a separate executor; Codex Connect's dedicated App Server is launched with danger-full-access for the primary operator plane. Non-interactive, with a 60-second default process timeout and a 5-minute maximum. The 60-second default fits normal repository/build/test work observed on this workspace; use command.start/read for persistent, interactive, or unusually long-running commands rather than stretching one synchronous call indefinitely. The relay gives App Server a small finite allowance to deliver its final buffered response. Any outer tunnel response deadline is independently owned by tunnel-client/control-plane metadata. stdoutMayBeTruncated/stderrMayBeTruncated conservatively report when the returned byte count exactly reached outputBytesCap; the upstream buffered response does not prove whether additional bytes existed. durationMs is Connect-observed App Server request wall time. For delegated autonomous investigation/coding use codex.start.",
+                "Use for one known bounded deterministic host command, including a shell command that composes several related repository/tool queries into one result. This is the App Server command/exec path, not a separate executor; Codex Connect's dedicated App Server is launched with danger-full-access for the primary operator plane. Non-interactive, with a 30-second default child timeout and a 35-second maximum; a 5-second response allowance keeps the normal synchronous path within the 40-second target and below the server's 45-second guard. Use command.start/read for persistent, interactive, or longer-running commands instead of stretching one synchronous call. Any outer tunnel response deadline is independently owned by tunnel-client/control-plane metadata. stdoutMayBeTruncated/stderrMayBeTruncated conservatively report when the returned byte count exactly reached outputBytesCap; the upstream buffered response does not prove whether additional bytes existed. durationMs is Connect-observed App Server request wall time. For delegated autonomous investigation/coding use codex.start.",
                 false,
                 true,
                 true,
@@ -176,7 +176,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.wait",
                 "Wait for Codex Turn",
-                "Quietly join a delegated Codex turn. The default lease is 60 seconds and callers may extend it to 120 seconds. Routine tool calls, file changes, worker commentary, and token updates do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required. The result includes compact currentActivity and pendingActions but never the raw event journal. Lease timeout means the worker is still active, not stalled; repeat bounded joins when the worker still owns the remaining critical path. Use codex.inspect when you need worker activity/history or raw forensic events. Any outer tunnel response deadline is independently owned by tunnel-client/control-plane metadata.",
+                "Quietly join a delegated Codex turn. The default quiet lease is 20 seconds and the maximum is 30 seconds. Codex Connect reserves up to 10 additional seconds, capped at a 40-second total wait operation budget, for authoritative reconciliation and terminal-output hydration before the server's 45-second synchronous guard. Routine tool calls, file changes, worker commentary, and token updates do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required. The result includes compact currentActivity and pendingActions but never the raw event journal. Lease timeout means the worker is still active, not stalled or abandoned. Continue useful non-overlapping operator work when available. If the worker legitimately owns the remaining critical path for a long interval and no useful parallel work remains, prefer a ChatGPT Scheduled Task/monitoring handoff when available and able to access this connector instead of spinning repeated waits; scheduling does not transfer scope ownership and the later run must re-establish state through Codex Connect. Use codex.inspect when you need worker activity/history or raw forensic events. Any outer tunnel response deadline is independently owned by tunnel-client/control-plane metadata.",
                 true,
                 false,
                 false,
@@ -595,7 +595,7 @@ fn work_sandbox_schema() -> Value {
 }
 fn command_schema() -> Value {
     object_schema(
-        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Child-process timeout in milliseconds. Defaults to 60000 and may be extended to 300000 for bounded deterministic work. Use command.start/read for persistent, interactive, or unusually long-running commands. Tunnel-client independently enforces any outer per-command response deadline supplied by the control plane."},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Per-stream stdout/stderr capture cap in bytes. The pinned App Server buffered response has no truncation flag; if a returned stream is exactly this many bytes, treat it as potentially incomplete."},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}}}),
+        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Child-process timeout in milliseconds. Defaults to 30000 and may be extended to 35000. A separate 5000 ms response allowance keeps command.exec within the 40000 ms normal synchronous target and below the server's 45000 ms guard. Use command.start/read for persistent, interactive, or longer-running commands. Tunnel-client independently enforces any outer per-command response deadline supplied by the control plane."},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Per-stream stdout/stderr capture cap in bytes. The pinned App Server buffered response has no truncation flag; if a returned stream is exactly this many bytes, treat it as potentially incomplete."},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}}}),
         &["command"],
     )
 }
@@ -636,7 +636,7 @@ fn command_read_schema() -> Value {
         json!({
             "processId":{"type":"string","minLength":1},
             "afterCursor":{"type":"integer","minimum":0,"default":0},
-            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Bounded output/exit wait in milliseconds. Defaults to 30000 and may be extended to 120000. The process itself may outlive any number of reads; tunnel-client independently enforces any outer per-command response deadline."}
+            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Bounded output/exit wait in milliseconds. Defaults to 20000 and may be extended to 40000. The process itself may outlive any number of reads; use another read later rather than consuming the whole synchronous tool-call envelope. Tunnel-client independently enforces any outer per-command response deadline."}
         }),
         &["processId"],
     )
@@ -758,7 +758,7 @@ fn codex_start_schema() -> Value {
 }
 fn codex_wait_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet join lease in milliseconds. Defaults to 60000 and may be extended to 120000. Lease expiry means the worker remains active; repeat the join when it still owns the remaining critical path. Tunnel-client independently enforces any outer per-command response deadline."}}),
+        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet join lease in milliseconds. Defaults to 20000 and may be extended to 30000. Codex Connect may use up to 10000 additional milliseconds, capped at a 40000 ms total wait operation budget, for authoritative reconciliation and terminal-output hydration. Lease expiry means the worker remains active. Continue useful non-overlapping work when available; for legitimately long-running critical-path workers with nothing useful left to parallelize, prefer a ChatGPT Scheduled Task/monitoring handoff when available and able to access this connector rather than spinning joins. Scheduling does not transfer worker ownership. Tunnel-client independently enforces any outer per-command response deadline."}}),
         &["threadId", "turnId"],
     )
 }
@@ -1141,8 +1141,9 @@ mod tests {
             .find(|tool| tool.name.as_ref() == "command.exec")
             .unwrap();
         let exec_description = exec.description.as_deref().unwrap();
-        assert!(exec_description.contains("60-second default process timeout"));
-        assert!(exec_description.contains("5-minute maximum"));
+        assert!(exec_description.contains("30-second default child timeout"));
+        assert!(exec_description.contains("35-second maximum"));
+        assert!(exec_description.contains("40-second target"));
         assert!(exec_description.contains("command.start/read"));
         assert!(exec_description.contains("independently owned by tunnel-client"));
         assert!(exec_description.contains("stdoutMayBeTruncated"));
@@ -1182,8 +1183,9 @@ mod tests {
                 .contains(&json!("turnId"))
         );
         assert_eq!(input["properties"]["timeoutMs"]["minimum"], 1);
-        assert_eq!(input["properties"]["timeoutMs"]["default"], 60_000);
-        assert_eq!(input["properties"]["timeoutMs"]["maximum"], 120_000);
+        assert_eq!(input["properties"]["timeoutMs"]["default"], 20_000);
+        assert_eq!(input["properties"]["timeoutMs"]["maximum"], 30_000);
+        assert!(input.to_string().contains("Scheduled Task"));
         assert!(input["properties"].get("afterCursor").is_none());
     }
 

@@ -187,30 +187,19 @@ impl EventJournal {
         Ok(batch)
     }
 
-    pub async fn semantic_tail(&self, max_events: usize) -> SemanticBatch {
+    pub async fn observer_notices(&self, max_events: usize) -> Vec<SemanticEvent> {
         let state = self.state.lock().await;
-        let mut reduced = Vec::new();
-        for (event, _) in &state.events {
-            if let Some(entry) = semantic_event(event.cursor, &event.method, &event.params) {
-                let duplicate = reduced.last().is_some_and(|previous: &SemanticEvent| {
-                    previous.thread_id == entry.thread_id
-                        && previous.turn_id == entry.turn_id
-                        && previous.kind == entry.kind
-                        && previous.summary == entry.summary
-                        && previous.phase == entry.phase
-                });
-                if !duplicate {
-                    reduced.push(entry);
-                }
-            }
-        }
-        let start = reduced.len().saturating_sub(max_events);
-        SemanticBatch {
-            events: reduced.into_iter().skip(start).collect(),
-            cursor: state.cursor,
-            history_lost: state.dropped_through > 0,
-            has_more: false,
-        }
+        let mut notices = state
+            .events
+            .iter()
+            .filter_map(|(event, _)| {
+                let reduced = semantic_event(event.cursor, &event.method, &event.params)?;
+                matches!(reduced.kind.as_str(), "system" | "error").then_some(reduced)
+            })
+            .collect::<Vec<_>>();
+        let start = notices.len().saturating_sub(max_events);
+        notices.drain(..start);
+        notices
     }
 }
 
@@ -337,20 +326,5 @@ mod tests {
         assert_eq!(second.events.len(), 1);
         assert!(!second.has_more);
         assert_eq!(second.events[0].summary.as_deref(), Some("three"));
-    }
-
-    #[tokio::test]
-    async fn semantic_tail_does_not_deduplicate_different_workers() {
-        let journal = EventJournal::default();
-        journal
-            .push("turn/started", &json!({"threadId":"a","turn":{"id":"one"}}))
-            .await;
-        journal
-            .push("turn/started", &json!({"threadId":"b","turn":{"id":"two"}}))
-            .await;
-        let tail = journal.semantic_tail(10).await;
-        assert_eq!(tail.events.len(), 2);
-        assert_eq!(tail.events[0].thread_id.as_deref(), Some("a"));
-        assert_eq!(tail.events[1].thread_id.as_deref(), Some("b"));
     }
 }
