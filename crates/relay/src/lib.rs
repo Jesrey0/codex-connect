@@ -65,7 +65,6 @@ pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_COMMAND_READ_MS: u64 = 40_000;
 pub const DEFAULT_COMMAND_READ_MS: u64 = 20_000;
 pub const MAX_COMMAND_WRITE_BYTES: usize = 64 * 1024;
-const WORKSPACE_POLICY: &str = "Workspace policy: treat the working directory as a general filesystem workspace. Version control is optional. Do not initialize repositories, create branches, commits, or tags, or use Git as a checkpoint/workflow mechanism unless the task explicitly requests version-control operations. Existing VCS metadata may be read only when materially required. Stay within the granted sandbox; if required authority is unavailable, report the concrete blocker rather than treating mechanical approval as an escalation path.";
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
 const MAX_APP_SERVER_RESPONSE_BYTES: usize = MAX_WIRE_BYTES - APP_SERVER_RESPONSE_HEADROOM_BYTES;
 const MAX_FS_READ_FILE_BYTES: u64 = ((MAX_APP_SERVER_RESPONSE_BYTES / 4) * 3) as u64;
@@ -74,10 +73,6 @@ const MAX_FS_READ_FILE_BYTES: u64 = ((MAX_APP_SERVER_RESPONSE_BYTES / 4) * 3) as
 pub struct RelayConfig {
     pub codex_bin: PathBuf,
     pub default_cwd: PathBuf,
-}
-
-fn workspace_developer_instructions() -> String {
-    WORKSPACE_POLICY.into()
 }
 
 fn review_target_prompt(target: &ReviewTarget) -> String {
@@ -1273,7 +1268,6 @@ impl Relay {
                     sandbox: new_thread_sandbox,
                     cwd: Some(cwd.unwrap_or_else(|| self.default_cwd())),
                     service_name: Some("codex-connect".into()),
-                    developer_instructions: Some(workspace_developer_instructions()),
                     ..ThreadStart::default()
                 })
                 .await?;

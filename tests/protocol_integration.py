@@ -1163,8 +1163,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(self.wait(work)["state"], "terminal")
         thread_start = self.method_params("thread/start")[before]
         self.assertEqual(thread_start["sandbox"], "workspace-write")
-        self.assertTrue(thread_start["developerInstructions"].startswith("Workspace policy:"))
-        self.assertIn("Stay within the granted sandbox", thread_start["developerInstructions"])
+        self.assertNotIn("developerInstructions", thread_start)
         turn_start = self.method_params("turn/start")[-1]
         self.assertEqual(turn_start["approvalPolicy"], "never")
         self.assertEqual(turn_start["sandboxPolicy"]["type"], "workspaceWrite")
