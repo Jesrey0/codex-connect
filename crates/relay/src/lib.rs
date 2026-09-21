@@ -43,6 +43,7 @@ pub const MAX_WAIT_MS: u64 = 30_000;
 const WAIT_FINALIZATION_RESERVE_MS: u64 = 10_000;
 const MAX_WAIT_OPERATION_MS: u64 = 40_000;
 const WAIT_RECONCILE_MS: u64 = 1_000;
+const WAIT_STORAGE_RETRY_MS: u64 = 25;
 const OBSERVER_USAGE_REFRESH_MS: u64 = 5_000;
 const MAX_SEMANTIC_EVENTS: usize = 16;
 const MAX_TRANSCRIPT_TEXT_CHARS: usize = 32 * 1024;
@@ -159,6 +160,17 @@ pub enum RelayError {
     Invalid(String),
     #[error("Codex operation budget exceeded: {0}")]
     BudgetExceeded(String),
+}
+
+fn is_unflushed_thread_store(error: &RelayError) -> bool {
+    matches!(
+        error,
+        RelayError::AppServer(AppServerError::Remote { method, message, .. })
+            if matches!(method.as_str(), "thread/read" | "thread/turns/list" | "thread/items/list")
+                && message.contains("thread-store internal error")
+                && message.contains("rollout")
+                && message.contains(" is empty")
+    )
 }
 
 #[derive(Clone)]
@@ -1302,6 +1314,22 @@ impl Relay {
         Ok(())
     }
 
+    async fn hydrate_turn_items_when_ready(
+        &self,
+        thread_id: &str,
+        turn: &mut codex_connect_app_server::protocol::Turn,
+    ) -> Result<(), RelayError> {
+        loop {
+            match self.hydrate_turn_items(thread_id, turn).await {
+                Ok(()) => return Ok(()),
+                Err(error) if is_unflushed_thread_store(&error) => {
+                    tokio::time::sleep(Duration::from_millis(WAIT_STORAGE_RETRY_MS)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     async fn read_turn_items(
         &self,
         thread_id: &str,
@@ -1470,14 +1498,14 @@ impl Relay {
         let mut transport_changes = self.app_server.changes();
         let mut journal_changes = self.journal.changes();
         let initial_live = self.live_turn(&thread_id, &turn_id).await;
-        let initial_reconcile = async {
-            self.read_thread_metadata(thread_id.clone()).await?;
-            self.find_stored_turn_metadata(&thread_id, &turn_id).await
-        };
         let mut stored = if initial_live.is_none() {
             // A turn that predates this relay process needs the minimum authoritative read
             // required to establish trustworthy state. Reconciliation may use the finalization
             // reserve, but it must not consume the entire public MCP lifetime.
+            let initial_reconcile = async {
+                self.read_thread_metadata(thread_id.clone()).await?;
+                self.find_stored_turn_metadata(&thread_id, &turn_id).await
+            };
             match tokio::time::timeout_at(operation_deadline, initial_reconcile).await {
                 Ok(result) => result?,
                 Err(_) => {
@@ -1490,8 +1518,21 @@ impl Relay {
                 }
             }
         } else {
-            match tokio::time::timeout_at(deadline, initial_reconcile).await {
-                Ok(result) => result?,
+            // A turn started by this relay is already represented by the official turn/start
+            // response and live lifecycle notifications, and its thread cwd was validated during
+            // thread/start or thread/resume. Avoid an immediate thread/read here: upstream may
+            // acknowledge a new turn before its rollout metadata has been flushed to disk. Keep
+            // the turn-list reconciliation so terminal state remains authoritative even when an
+            // upstream lifecycle notification is absent.
+            match tokio::time::timeout_at(
+                deadline,
+                self.find_stored_turn_metadata(&thread_id, &turn_id),
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) if is_unflushed_thread_store(&error) => None,
+                Ok(Err(error)) => return Err(error),
                 Err(_) => None,
             }
         };
@@ -1520,7 +1561,7 @@ impl Relay {
             if selected.status.is_terminal() && selected.items.is_empty() {
                 match tokio::time::timeout_at(
                     operation_deadline,
-                    self.hydrate_turn_items(&thread_id, &mut selected),
+                    self.hydrate_turn_items_when_ready(&thread_id, &mut selected),
                 )
                 .await
                 {
@@ -1620,7 +1661,13 @@ impl Relay {
                 )
                 .await
                 {
-                    Ok(result) => stored = result?,
+                    Ok(Ok(result)) => stored = result,
+                    Ok(Err(error)) if is_unflushed_thread_store(&error) => {
+                        // A just-created App Server rollout can briefly exist before its session
+                        // metadata is readable. The relay-owned live turn remains authoritative
+                        // for this interval; retry persistence reconciliation on the next lease.
+                    }
+                    Ok(Err(error)) => return Err(error),
                     Err(_) => {
                         // The join lease bounds reconciliation, not the worker lifetime. A
                         // slow authoritative status read must not extend an otherwise expired

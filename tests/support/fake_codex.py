@@ -71,6 +71,8 @@ threads = {}
 subscriptions = set()
 unsubscribe_failures = set()
 slow_turn_list_at = {}
+empty_turn_list_once = set()
+empty_items_list_once = set()
 turn_list_counts = {}
 pending = {}
 command_sessions = {}
@@ -244,6 +246,21 @@ for line in sys.stdin:
         limit = params.get("limit") or 100
         result["data"] = entries[start:start + limit]
         result["nextCursor"] = str(start + limit) if start + limit < len(entries) else None
+        thread_id = params["threadId"]
+        if thread_id in empty_items_list_once:
+            empty_items_list_once.remove(thread_id)
+            send({
+                "id": message["id"],
+                "error": {
+                    "code": -32603,
+                    "message": (
+                        "failed to read thread: thread-store internal error: "
+                        "failed to read session metadata /tmp/rollout-fixture.jsonl: "
+                        "rollout at /tmp/rollout-fixture.jsonl is empty"
+                    ),
+                },
+            })
+            continue
     elif method == "thread/turns/list":
         turns = copy.deepcopy(threads[params["threadId"]]["turns"])
         if params.get("itemsView") == "notLoaded":
@@ -256,6 +273,20 @@ for line in sys.stdin:
         result["data"] = turns[start:start + limit]
         result["nextCursor"] = str(start + limit) if start + limit < len(turns) else None
         thread_id = params["threadId"]
+        if thread_id in empty_turn_list_once:
+            empty_turn_list_once.remove(thread_id)
+            send({
+                "id": message["id"],
+                "error": {
+                    "code": -32603,
+                    "message": (
+                        "failed to read thread: thread-store internal error: "
+                        "failed to read session metadata /tmp/rollout-fixture.jsonl: "
+                        "rollout at /tmp/rollout-fixture.jsonl is empty"
+                    ),
+                },
+            })
+            continue
         if thread_id in slow_turn_list_at:
             count = turn_list_counts.get(thread_id, 0) + 1
             turn_list_counts[thread_id] = count
@@ -300,6 +331,13 @@ for line in sys.stdin:
         turn_id = f"{thread_id}-turn-{len(thread['turns']) + 1}"
         turn.update(id=turn_id, status="inProgress", items=[], error=None)
         thread["turns"].append(turn)
+        if scenario == "empty_rollout_initial":
+            empty_turn_list_once.add(thread_id)
+        if scenario == "empty_rollout_terminal":
+            empty_items_list_once.add(thread_id)
+            complete(thread_id, turn_id, emit_notification=False)
+            respond(message, result)
+            continue
         if scenario == "early_complete":
             stale_result = copy.deepcopy(result)
             notify("turn/started", {"threadId": thread_id, "turn": turn})
@@ -323,6 +361,8 @@ for line in sys.stdin:
             slow_turn_list_at[thread_id] = 2
         elif scenario == "slow_initial_reconcile":
             slow_turn_list_at[thread_id] = 1
+        elif scenario == "empty_rollout_initial":
+            pass
         elif scenario == "delayed_complete":
             timer = threading.Timer(1.25, complete, (thread_id, turn_id))
             timer.daemon = True
