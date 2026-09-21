@@ -67,6 +67,12 @@ The local observer endpoint and console do not add an MCP tool or a second contr
 
 `codex.*` is the public namespace for interacting with the Codex CLI/App Server agent domain. `codex-connect` remains the implementation/product identity of the bridge, while host/operator operations such as `status`, `inspect`, `apply_patch`, `view_image`, and `command.*` speak for the connector environment directly.
 
+### Operator execution domains
+
+The public MCP contract deliberately distinguishes the Codex Connect host from ChatGPT's native execution surfaces. A path visible to ChatGPT's native file/runtime tooling (for example `/mnt/data` or an uploaded/Project file handle) is not implicitly a path on the Codex Connect host, and a host path returned by `inspect` or `command.*` is not implicitly available to ChatGPT-native tools. Browser/plugin state and connected-account authority are likewise not inherited by the host or by delegated Codex workers. Crossing these domains must therefore be explicit: read or materialize content from the owning surface, then deliberately pass the needed content or write it into the destination surface.
+
+This distinction is routing guidance, not an extra authorization mechanism. Host `cwd` remains navigation only, host tools keep primary-operator host authority, and delegated Codex turns keep their explicit per-task sandbox. The MCP server instructions repeat only these cross-tool invariants; individual lifecycle, timeout, cursor, and argument semantics live on the tool/parameter metadata that owns them.
+
 An upstream method is not automatically public merely because it exists. For example, the pinned App Server also exposes fuzzy-file-search session methods intended for interactive picker-style clients; ChatGPT's one-shot exploration path does not need that lifecycle, so Codex Connect exposes only the one-shot ranked search. Conversely, a bridge must be removed or reduced when a future pinned App Server version gains the equivalent semantic capability.
 
 ## Event-driven work

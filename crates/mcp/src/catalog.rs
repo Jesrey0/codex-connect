@@ -4,7 +4,7 @@ use codex_connect_relay::{
     DEFAULT_COMMAND_MS, DEFAULT_COMMAND_OUTPUT_BYTES, DEFAULT_COMMAND_READ_MS, MAX_COMMAND_MS,
     MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_READ_MS, MAX_COMMAND_WRITE_BYTES,
 };
-use rmcp::model::{JsonObject, Tool, ToolAnnotations};
+use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "status",
                 "Read Operator Status",
-                "Use first to orient to Codex Connect readiness, live build identity, configured navigation cwd, and ordinary worker defaults. Detailed deployment/App Server diagnostics stay on the loopback management plane.",
+                "Read current Codex Connect readiness, live build identity, host navigation cwd, and ordinary Codex defaults. Call when current runtime identity or defaults matter; do not call merely because a turn started. Detailed deployment and App Server diagnostics stay on the loopback management plane.",
                 true,
                 false,
                 false,
@@ -39,7 +39,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "inspect",
                 "Inspect Workspace",
-                "Use for structured read-only host exploration. Batch independent text reads, directory listings, metadata checks, content searches, and ranked App Server fuzzy file searches in one call whenever possible. Absolute host paths are accepted; relative paths resolve against request cwd, which defaults to the configured navigation cwd. Each operation returns an indexed result or error without discarding successful siblings. Use command.exec instead when the answer is naturally produced by one deterministic repository/tool command.",
+                "Batch read-only inspection of files and directories on the Codex Connect host. Prefer this for direct host reads, metadata, content search, and fuzzy file discovery; batch independent reads when possible. This does not inspect ChatGPT uploads or /mnt/data. Use command.exec instead when one deterministic repository or system command naturally produces the answer.",
                 true,
                 false,
                 false,
@@ -52,14 +52,14 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "apply_patch",
                 "Apply Patch",
-                "Use when the exact textual file change is already known. Absolute host paths are accepted; relative patch paths resolve against request cwd, which defaults to the configured navigation cwd. Patch transaction, regular-file, and symlink-mutation protections remain enforced. For delegated autonomous multi-step coding, use codex.start instead.",
+                "Apply an exact textual patch to files on the Codex Connect host. Use when the intended diff is already known. For autonomous investigation, multi-step coding, or iterative repair, use codex.start instead. This never edits ChatGPT's native sandbox or uploaded files.",
                 false,
                 true,
                 false,
                 false,
             ),
             object_schema(
-                json!({"patch":{"type":"string","minLength":1},"cwd":cwd_schema()}),
+                json!({"patch":{"type":"string","minLength":1,"description":"Exact apply_patch-format diff for files on the Codex Connect host."},"cwd":cwd_schema()}),
                 &["patch"],
             ),
             Some(object_schema(
@@ -71,7 +71,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.start",
                 "Start Persistent Command",
-                "Use for a deterministic host command that must remain running or interactive: dev servers, watchers, REPLs, debuggers, installers, prompts, or interactive CLIs. Host commands run through Codex Connect's dedicated App Server, which is launched with danger-full-access for the primary operator plane. Returns a connection-scoped processId immediately after the official App Server command request is flushed; follow with command.read for observation and command.control for stdin, PTY resize, or termination. Set tty=true only when terminal semantics are needed.",
+                "Start a deterministic Codex Connect host command that must remain running or interactive, such as a dev server, watcher, REPL, debugger, installer, or prompt. Returns a processId immediately; use command.read to observe it and command.control for stdin, PTY resize, or termination. Set tty=true only when terminal semantics are required.",
                 false,
                 true,
                 true,
@@ -84,7 +84,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.read",
                 "Read Persistent Command",
-                "Read new stdout/stderr and lifecycle state for a command.start session. Waits for output or exit up to timeoutMs; output itself wakes the read because it may require operator interaction. The default lease is 20 seconds and callers may extend it to 40 seconds. Use afterCursor from the previous start/read result to consume incrementally. The process may outlive any number of reads; do not stretch one synchronous read to approximate process lifetime. Process state and output consumption are independent: state=exited/failed can be returned while newer retained output still exists. hasMoreOutput reports whether a newer retained chunk was withheld by the per-read response bound; drained=true means the command is terminal and all currently retained output has been consumed by this read. historyLost=true independently means older output was already evicted.",
+                "Read incremental output and lifecycle state for a command.start process. Use the previous cursor to consume only new output. A read timeout means no output or exit arrived during that lease; the process may still be running. Terminal state and output consumption are independent, so continue until drained=true when final retained output matters.",
                 true,
                 false,
                 false,
@@ -97,7 +97,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.control",
                 "Control Persistent Command",
-                "Mutate a running command.start session. Use action=write for exact UTF-8 stdin bytes or stdin closure, action=resize for a PTY-backed session, and action=terminate to request process termination. Termination is not a graceful-shutdown guarantee; follow with command.read to observe final state and drain retained output.",
+                "Control a command.start process. Write exact stdin bytes or close stdin, resize a PTY, or request termination. Termination is not a graceful-shutdown guarantee; use command.read afterward to observe authoritative final state and drain retained output.",
                 false,
                 true,
                 false,
@@ -110,14 +110,18 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "view_image",
                 "View Image",
-                "Use to inspect an image file on the host. Absolute host paths are accepted; relative paths resolve against request cwd, which defaults to the configured navigation cwd.",
+                "Load an image file from the Codex Connect host for model inspection. Paths resolve on the host, not in ChatGPT's native sandbox or uploaded-file storage.",
                 true,
                 false,
                 false,
                 true,
             ),
             object_schema(
-                json!({"cwd":cwd_schema(),"path":{"type":"string"},"detail":{"type":"string","enum":["high","original"],"default":"high"}}),
+                json!({
+                    "cwd":cwd_schema(),
+                    "path":{"type":"string","description":"Image path on the Codex Connect host, relative to host cwd unless absolute."},
+                    "detail":{"type":"string","enum":["high","original"],"default":"high","description":"high is the normal model-oriented view; original requests the original-resolution image when supported by the adapter."}
+                }),
                 &["path"],
             ),
             Some(object_schema(
@@ -129,7 +133,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Use for one known bounded deterministic host command, including a shell command that composes several related repository/tool queries into one result. This is the App Server command/exec path, not a separate executor; Codex Connect's dedicated App Server is launched with danger-full-access for the primary operator plane. Non-interactive, with a 30-second default child timeout and a 35-second maximum; a 5-second response allowance keeps the normal synchronous path within the 40-second target and below the server's 45-second guard. Use command.start/read for persistent, interactive, or longer-running commands instead of stretching one synchronous call. Any outer tunnel response deadline is independently owned by tunnel-client/control-plane metadata. stdoutMayBeTruncated/stderrMayBeTruncated conservatively report when the returned byte count exactly reached outputBytesCap; the upstream buffered response does not prove whether additional bytes existed. durationMs is Connect-observed App Server request wall time. For delegated autonomous investigation/coding use codex.start.",
+                "Run one known, bounded, non-interactive command on the Codex Connect host. Prefer this for deterministic repository, test, build, Git, or system commands that fit one synchronous call. Use command.start for persistent or interactive processes and codex.start for autonomous investigation or coding.",
                 false,
                 true,
                 true,
@@ -163,7 +167,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Start delegated Codex work or an official Codex review. Use mode=work only when autonomous reasoning or iteration materially improves the critical path or quality; Codex workers do not inherit the ChatGPT conversation, so task must be self-contained with relevant context, constraints, paths, decisions, and acceptance criteria. Once started, the worker owns its assigned scope until terminal, blocked for operator action, or explicitly interrupted; the operator should continue only non-overlapping work rather than independently redoing the delegated task. Work mode requires an explicit sandboxPolicy selected per task. New work threads may include developerInstructions for a concise operating contract; Codex Connect appends them after its server-owned workspace policy. developerInstructions is creation-time only and must be omitted when threadId resumes an existing thread. New review threads are read-only and may select a model; existing review threads keep their established settings. Use mode=review for the official review/start lifecycle. Follow with codex.wait.",
+                "Delegate autonomous work or start an official Codex review. Use work mode when reasoning, iteration, or independent implementation materially improves the task; use review mode for the official review lifecycle. Workers do not inherit the ChatGPT conversation, native tools, uploads, or sandbox, so supply self-contained context. Once started, the worker owns its assigned scope until terminal, blocked, or interrupted; continue only non-overlapping operator work.",
                 false,
                 true,
                 true,
@@ -176,7 +180,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.wait",
                 "Wait for Codex Turn",
-                "Quietly join a delegated Codex turn. The default quiet lease is 20 seconds and the maximum is 30 seconds. Codex Connect reserves up to 10 additional seconds, capped at a 40-second total wait operation budget, for authoritative reconciliation and terminal-output hydration before the server's 45-second synchronous guard. Routine tool calls, file changes, worker commentary, and token updates do not end the wait. Returns early only when the turn becomes terminal or operator action/input is required. The result includes compact currentActivity and pendingActions but never the raw event journal. Lease timeout means the worker is still active, not stalled or abandoned. Continue useful non-overlapping operator work when available. If the worker legitimately owns the remaining critical path for a long interval and no useful parallel work remains, prefer a ChatGPT Scheduled Task/monitoring handoff when available and able to access this connector instead of spinning repeated waits; scheduling does not transfer scope ownership and the later run must re-establish state through Codex Connect. Use codex.inspect when you need worker activity/history or raw forensic events. Any outer tunnel response deadline is independently owned by tunnel-client/control-plane metadata.",
+                "Synchronize with a delegated Codex turn. Returns early when the turn becomes terminal or operator action/input is required; a lease timeout only means the worker is still active. This is not a progress-polling API. Continue useful non-overlapping work when available, use codex.inspect for activity/history, and use a native Scheduled Task for genuinely long unattended monitoring when appropriate.",
                 true,
                 false,
                 false,
@@ -189,7 +193,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.inspect",
                 "Inspect Codex Turn",
-                "Read worker activity without joining or mutating the turn. detail=semantic is the default operator view: compact meaningful activity transitions with a bounded response and continuation cursor. Use detail=raw only for explicit forensic inspection of original App Server notifications. afterCursor consumes either view incrementally; codex.start returns a cursor suitable for beginning inspection at delegation time.",
+                "Inspect worker activity without joining or mutating the turn. Use semantic detail for normal operator visibility and raw detail only for App Server forensics. Supply the previous cursor to continue incrementally.",
                 true,
                 false,
                 false,
@@ -202,7 +206,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.control",
                 "Control Active Codex Turn",
-                "Mutate an active official Codex turn. Use action=steer to add self-contained instructions to the currently steerable turn without creating a new thread, or action=interrupt to stop the selected turn.",
+                "Steer or interrupt an active Codex turn. Steering adds self-contained instructions to the current turn without creating a new thread; interrupt stops the selected turn.",
                 false,
                 true,
                 false,
@@ -215,7 +219,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.action.respond",
                 "Respond to Pending Codex Action",
-                "Resolve a pending Codex approval, permission request, semantic user-input question, or MCP elicitation returned by codex.wait. The response type must match the authoritative pending action associated with requestId; accepted elicitations require content while decline/cancel omit it.",
+                "Resolve an authoritative pending approval, permission request, semantic user-input question, or MCP elicitation returned by codex.wait. Match the response type to the pending action and preserve its requestId.",
                 false,
                 true,
                 false,
@@ -228,7 +232,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.info",
                 "Read Codex Information",
-                "Batch read-only Codex discovery/account queries in one call. Use type=models for model and reasoning-effort discovery, type=skills for skills available to selected working directories, and type=usage for authoritative account usage/rate-limit telemetry. Independent query failures are returned per result without discarding successful siblings.",
+                "Batch read-only Codex discovery and account queries. Use models before selecting a non-default model or effort, skills to discover worker skills for host directories, and usage before expensive or multi-worker delegation. Independent query failures do not discard successful siblings.",
                 true,
                 false,
                 false,
@@ -272,7 +276,8 @@ fn tool(metadata: ToolMetadata, input: Value, output: Option<Value>) -> Tool {
             .destructive(metadata.destructive)
             .open_world(metadata.open_world)
             .idempotent(metadata.idempotent),
-    );
+    )
+    .with_meta(tool_invocation_meta(metadata.name));
     match output {
         Some(schema) => {
             let schema = if host_plane_reports_worker_events(metadata.name) {
@@ -284,6 +289,39 @@ fn tool(metadata: ToolMetadata, input: Value, output: Option<Value>) -> Tool {
         }
         None => tool,
     }
+}
+
+fn tool_invocation_meta(name: &str) -> MetaObject {
+    let (invoking, invoked) = match name {
+        "status" => (
+            "Reading Codex Connect status…",
+            "Codex Connect status ready",
+        ),
+        "inspect" => ("Inspecting host workspace…", "Host workspace inspected"),
+        "apply_patch" => ("Applying host patch…", "Host patch applied"),
+        "command.start" => ("Starting host command…", "Host command started"),
+        "command.read" => ("Reading host command…", "Host command state updated"),
+        "command.control" => ("Controlling host command…", "Host command controlled"),
+        "view_image" => ("Loading host image…", "Host image loaded"),
+        "command.exec" => ("Running host command…", "Host command finished"),
+        "codex.start" => ("Starting Codex turn…", "Codex turn started"),
+        "codex.wait" => ("Synchronizing with Codex…", "Codex state updated"),
+        "codex.inspect" => ("Inspecting Codex activity…", "Codex activity inspected"),
+        "codex.control" => ("Controlling Codex turn…", "Codex turn controlled"),
+        "codex.action.respond" => ("Responding to Codex…", "Codex response sent"),
+        "codex.info" => ("Reading Codex information…", "Codex information ready"),
+        _ => ("Running Codex Connect tool…", "Codex Connect tool finished"),
+    };
+    let mut meta = MetaObject::new();
+    meta.0.insert(
+        "openai/toolInvocation/invoking".into(),
+        Value::String(invoking.into()),
+    );
+    meta.0.insert(
+        "openai/toolInvocation/invoked".into(),
+        Value::String(invoked.into()),
+    );
+    meta
 }
 
 pub(super) fn host_plane_reports_worker_events(name: &str) -> bool {
@@ -555,18 +593,18 @@ fn codex_inspect_output_schema() -> Value {
 }
 fn inspect_schema() -> Value {
     object_schema(
-        json!({"cwd":cwd_schema(),"operations":{"type":"array","minItems":1,"maxItems":MAX_INSPECT_OPERATIONS,"items":{"oneOf":[
-            object_schema(json!({"type":{"const":"readText"},"path":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1}}), &["type","path"]),
-            object_schema(json!({"type":{"const":"readDirectory"},"path":{"type":"string"}}), &["type","path"]),
-            object_schema(json!({"type":{"const":"metadata"},"path":{"type":"string"}}), &["type","path"]),
-            object_schema(json!({"type":{"const":"searchContent"},"query":{"type":"string","minLength":1},"path":{"type":"string"},"maxResults":{"type":"integer","minimum":1,"maximum":1000}}), &["type","query"]),
-            object_schema(json!({"type":{"const":"fuzzyFileSearch"},"query":{"type":"string","minLength":1},"path":{"type":"string"}}), &["type","query"])
+        json!({"cwd":cwd_schema(),"operations":{"type":"array","minItems":1,"maxItems":MAX_INSPECT_OPERATIONS,"description":"Independent read-only host inspections. Batch unrelated reads/searches in one call to reduce operator round trips.","items":{"oneOf":[
+            object_schema(json!({"type":{"const":"readText"},"path":{"type":"string","description":"Host file path, relative to the selected host cwd unless absolute."},"startLine":{"type":"integer","minimum":1,"description":"Optional 1-based first line."},"endLine":{"type":"integer","minimum":1,"description":"Optional 1-based final line."}}), &["type","path"]),
+            object_schema(json!({"type":{"const":"readDirectory"},"path":{"type":"string","description":"Host directory path, relative to the selected host cwd unless absolute."}}), &["type","path"]),
+            object_schema(json!({"type":{"const":"metadata"},"path":{"type":"string","description":"Host path whose filesystem metadata should be read."}}), &["type","path"]),
+            object_schema(json!({"type":{"const":"searchContent"},"query":{"type":"string","minLength":1,"description":"Literal text query to search within host files."},"path":{"type":"string","description":"Optional host subtree to search; omitted means the selected host cwd."},"maxResults":{"type":"integer","minimum":1,"maximum":1000,"description":"Maximum matching lines to return."}}), &["type","query"]),
+            object_schema(json!({"type":{"const":"fuzzyFileSearch"},"query":{"type":"string","minLength":1,"description":"Fuzzy file/directory name query handled by Codex App Server."},"path":{"type":"string","description":"Optional host search root; omitted means the selected host cwd."}}), &["type","query"])
         ]}}}),
         &["operations"],
     )
 }
 fn cwd_schema() -> Value {
-    json!({"type":["string","null"],"description":"Request working directory on the host. Absolute paths are accepted. Relative cwd is resolved from the configured navigation cwd; omitted or null cwd selects that configured cwd. Relative operation paths resolve from the selected cwd."})
+    json!({"type":["string","null"],"description":"Working directory on the Codex Connect host. This is not ChatGPT's native sandbox or /mnt/data. Absolute host paths are accepted; relative cwd resolves from the configured navigation cwd, and omitted/null uses that default."})
 }
 fn network_access_schema() -> Value {
     json!({"type":"boolean","default":false,"description":"Network access for an explicitly supplied sandbox policy. false may block sockets, including socket-based localhost tests. true enables broader network access, not only loopback. No automatic escalation or retry."})
@@ -577,17 +615,20 @@ fn workspace_write_policy_schema() -> Value {
             "type":{"const":"workspaceWrite"},
             "writableRoots":{"type":"array","description":"Additional absolute writable directory paths for the delegated Codex workspace-write policy, as required by the pinned upstream contract. They are not an exclusive allowlist. The requested task sandbox remains explicit even though the primary host-operator plane runs with danger-full-access.","items":{"type":"string","pattern":"^/"}},
             "networkAccess":network_access_schema(),
-            "excludeSlashTmp":{"type":"boolean"},
-            "excludeTmpdirEnvVar":{"type":"boolean"}
+            "excludeSlashTmp":{"type":"boolean","description":"Forward the upstream workspace-write option that excludes /tmp from writable roots."},
+            "excludeTmpdirEnvVar":{"type":"boolean","description":"Forward the upstream workspace-write option that excludes the TMPDIR environment path from writable roots."}
         }),
         &["type"],
     )
 }
 fn danger_full_access_schema() -> Value {
-    object_schema(json!({"type":{"const":"dangerFullAccess"}}), &["type"])
+    object_schema(
+        json!({"type":{"const":"dangerFullAccess","description":"Run the delegated Codex worker without a filesystem/network sandbox. Select only when the task actually requires unrestricted host authority."}}),
+        &["type"],
+    )
 }
 fn work_sandbox_schema() -> Value {
-    json!({"oneOf":[
+    json!({"description":"Explicit sandbox for delegated Codex work. This policy applies to the worker only; it is independent of the primary host-operator plane.","oneOf":[
         object_schema(json!({"type":{"const":"readOnly"},"networkAccess":network_access_schema()}), &["type"]),
         workspace_write_policy_schema(),
         danger_full_access_schema()
@@ -595,15 +636,21 @@ fn work_sandbox_schema() -> Value {
 }
 fn command_schema() -> Value {
     object_schema(
-        json!({"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":["string","null"]},"timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Child-process timeout in milliseconds. Defaults to 30000 and may be extended to 35000. A separate 5000 ms response allowance keeps command.exec within the 40000 ms normal synchronous target and below the server's 45000 ms guard. Use command.start/read for persistent, interactive, or longer-running commands. Tunnel-client independently enforces any outer per-command response deadline supplied by the control plane."},"outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Per-stream stdout/stderr capture cap in bytes. The pinned App Server buffered response has no truncation flag; if a returned stream is exactly this many bytes, treat it as potentially incomplete."},"env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}}}),
+        json!({
+            "command":{"type":"array","minItems":1,"description":"Exact argv to execute on the Codex Connect host. Prefer direct argv; use a shell explicitly only when shell composition is the intended command.","items":{"type":"string"}},
+            "cwd":cwd_schema(),
+            "timeoutMs":{"type":["integer","null"],"minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Child-process timeout in milliseconds. Defaults to 30000 and may be extended to 35000. A separate 5000 ms response allowance keeps command.exec within the 40000 ms normal synchronous target and below the server's 45000 ms guard. Use command.start/read for persistent, interactive, or longer-running commands. tunnel-client independently enforces any outer response deadline supplied by the control plane."},
+            "outputBytesCap":{"type":["integer","null"],"minimum":0,"maximum":MAX_COMMAND_OUTPUT_BYTES,"default":DEFAULT_COMMAND_OUTPUT_BYTES,"description":"Maximum captured bytes per stdout/stderr stream. If a returned stream exactly reaches this cap, stdoutMayBeTruncated/stderrMayBeTruncated reports that the result may be incomplete."},
+            "env":{"type":["object","null"],"description":"Optional environment overrides for this host command. Null values remove variables from the child environment.","additionalProperties":{"type":["string","null"]}}
+        }),
         &["command"],
     )
 }
 fn terminal_size_schema() -> Value {
     object_schema(
         json!({
-            "rows":{"type":"integer","minimum":1,"maximum":65535},
-            "cols":{"type":"integer","minimum":1,"maximum":65535}
+            "rows":{"type":"integer","minimum":1,"maximum":65535,"description":"PTY rows."},
+            "cols":{"type":"integer","minimum":1,"maximum":65535,"description":"PTY columns."}
         }),
         &["rows", "cols"],
     )
@@ -611,11 +658,11 @@ fn terminal_size_schema() -> Value {
 fn command_start_schema() -> Value {
     object_schema(
         json!({
-            "command":{"type":"array","minItems":1,"items":{"type":"string"}},
-            "cwd":{"type":["string","null"]},
-            "env":{"type":["object","null"],"additionalProperties":{"type":["string","null"]}},
-            "tty":{"type":"boolean","default":false},
-            "size":nullable(terminal_size_schema())
+            "command":{"type":"array","minItems":1,"description":"Exact argv for the persistent or interactive host process.","items":{"type":"string"}},
+            "cwd":cwd_schema(),
+            "env":{"type":["object","null"],"description":"Optional environment overrides for the host process. Null values remove variables from the child environment.","additionalProperties":{"type":["string","null"]}},
+            "tty":{"type":"boolean","default":false,"description":"Enable PTY semantics only when the program needs an interactive terminal."},
+            "size":{"description":"Initial PTY size. Relevant only when tty=true.","anyOf":[terminal_size_schema(),{"type":"null"}]}
         }),
         &["command"],
     )
@@ -634,9 +681,9 @@ fn command_started_schema() -> Value {
 fn command_read_schema() -> Value {
     object_schema(
         json!({
-            "processId":{"type":"string","minLength":1},
-            "afterCursor":{"type":"integer","minimum":0,"default":0},
-            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Bounded output/exit wait in milliseconds. Defaults to 20000 and may be extended to 40000. The process itself may outlive any number of reads; use another read later rather than consuming the whole synchronous tool-call envelope. Tunnel-client independently enforces any outer per-command response deadline."}
+            "processId":{"type":"string","minLength":1,"description":"Connection-scoped process handle returned by command.start."},
+            "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Return output newer than this cursor. Use the cursor from the previous command.start/read result to consume incrementally."},
+            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Bounded wait for new output or process exit. Defaults to 20000 and may extend to 40000. Timeout does not terminate or imply a stalled process; the process may outlive any number of reads. tunnel-client independently owns any outer response deadline."}
         }),
         &["processId"],
     )
@@ -680,16 +727,16 @@ fn command_control_schema() -> Value {
         object_schema(
             json!({
                 "action":{"const":"write"},
-                "processId":{"type":"string","minLength":1},
-                "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES},
-                "closeStdin":{"type":"boolean","default":false}
+                "processId":{"type":"string","minLength":1,"description":"Process handle returned by command.start."},
+                "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES,"description":"Exact UTF-8 bytes to write to stdin. Omit/null when only closing stdin."},
+                "closeStdin":{"type":"boolean","default":false,"description":"Close stdin after any supplied input is written."}
             }),
             &["action", "processId"],
         ),
         object_schema(
             json!({
                 "action":{"const":"resize"},
-                "processId":{"type":"string","minLength":1},
+                "processId":{"type":"string","minLength":1,"description":"PTY-backed process handle returned by command.start."},
                 "rows":{"type":"integer","minimum":1,"maximum":65535},
                 "cols":{"type":"integer","minimum":1,"maximum":65535}
             }),
@@ -698,7 +745,7 @@ fn command_control_schema() -> Value {
         object_schema(
             json!({
                 "action":{"const":"terminate"},
-                "processId":{"type":"string","minLength":1}
+                "processId":{"type":"string","minLength":1,"description":"Process handle returned by command.start. Termination is a request; follow with command.read for final state."}
             }),
             &["action", "processId"],
         ),
@@ -721,11 +768,11 @@ fn command_control_output_schema() -> Value {
     ])
 }
 fn review_target_schema() -> Value {
-    json!({"oneOf":[
+    json!({"description":"Official Codex review target.","oneOf":[
         object_schema(json!({"type":{"const":"uncommittedChanges"}}), &["type"]),
-        object_schema(json!({"type":{"const":"baseBranch"},"branch":{"type":"string"}}), &["type","branch"]),
-        object_schema(json!({"type":{"const":"commit"},"sha":{"type":"string"},"title":{"type":["string","null"]}}), &["type","sha"]),
-        object_schema(json!({"type":{"const":"custom"},"instructions":{"type":"string"}}), &["type","instructions"])
+        object_schema(json!({"type":{"const":"baseBranch"},"branch":{"type":"string","description":"Base branch name to review the current work against."}}), &["type","branch"]),
+        object_schema(json!({"type":{"const":"commit"},"sha":{"type":"string","description":"Exact commit SHA to review."},"title":{"type":["string","null"],"description":"Optional human-readable review title."}}), &["type","sha"]),
+        object_schema(json!({"type":{"const":"custom"},"instructions":{"type":"string","description":"Self-contained custom review scope and acceptance criteria."}}), &["type","instructions"])
     ]})
 }
 fn codex_start_schema() -> Value {
@@ -733,13 +780,13 @@ fn codex_start_schema() -> Value {
         object_schema(
             json!({
                 "mode":{"const":"work"},
-                "task":{"type":"string","minLength":1},
-                "cwd":{"type":"string"},
-                "threadId":{"type":"string"},
+                "task":{"type":"string","minLength":1,"description":"Self-contained delegated task. Include relevant host paths, constraints, decisions, and acceptance criteria because the worker does not inherit the ChatGPT conversation or native-tool context."},
+                "cwd":{"type":"string","description":"Codex Connect host working directory for the delegated turn. Omit to use the configured navigation cwd."},
+                "threadId":{"type":"string","description":"Existing Codex thread to resume. Omit to create a new thread. When resuming, omit developerInstructions and keep the thread's established settings."},
                 "developerInstructions":{"type":"string","minLength":1,"description":"Additional developer instructions for a new work thread. Codex Connect appends them after its server-owned workspace policy. Not valid with threadId; resumed threads keep their established developer instructions."},
-                "model":{"type":"string"},
-                "effort":{"type":"string"},
-                "serviceTier":{"type":"string"},
+                "model":{"type":"string","description":"Optional exact Codex model ID for this new thread/turn. Prefer a supported ID returned by codex.info(type=models); omit to use the configured/upstream default."},
+                "effort":{"type":"string","description":"Optional reasoning effort for work mode. Prefer a value supported by the selected model from codex.info(type=models); omit to use the configured/upstream default."},
+                "serviceTier":{"type":"string","description":"Optional Codex service tier override. Omit unless intentionally overriding the configured/upstream default."},
                 "sandboxPolicy":work_sandbox_schema()
             }),
             &["mode", "task", "sandboxPolicy"],
@@ -747,10 +794,10 @@ fn codex_start_schema() -> Value {
         object_schema(
             json!({
                 "mode":{"const":"review"},
-                "cwd":{"type":"string"},
-                "threadId":{"type":"string"},
+                "cwd":{"type":"string","description":"Codex Connect host working directory for the review. Omit to use the configured navigation cwd."},
+                "threadId":{"type":"string","description":"Existing Codex review thread to resume. Existing threads keep their established model/settings."},
                 "target":review_target_schema(),
-                "model":{"type":"string"}
+                "model":{"type":"string","description":"Optional exact model ID for a new review thread. Prefer a supported ID returned by codex.info(type=models). Not valid as a model override for an existing thread."}
             }),
             &["mode", "target"],
         ),
@@ -758,15 +805,19 @@ fn codex_start_schema() -> Value {
 }
 fn codex_wait_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet join lease in milliseconds. Defaults to 20000 and may be extended to 30000. Codex Connect may use up to 10000 additional milliseconds, capped at a 40000 ms total wait operation budget, for authoritative reconciliation and terminal-output hydration. Lease expiry means the worker remains active. Continue useful non-overlapping work when available; for legitimately long-running critical-path workers with nothing useful left to parallelize, prefer a ChatGPT Scheduled Task/monitoring handoff when available and able to access this connector rather than spinning joins. Scheduling does not transfer worker ownership. Tunnel-client independently enforces any outer per-command response deadline."}}),
+        json!({
+            "threadId":{"type":"string","description":"Codex thread ID returned by codex.start."},
+            "turnId":{"type":"string","description":"Specific delegated turn ID returned by codex.start."},
+            "timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet synchronization lease. Defaults to 20000 and may extend to 30000; Codex Connect may spend additional bounded time reconciling terminal state while remaining inside its 40000 ms target/45000 ms guard. Lease expiry means the worker remains active, not stalled. tunnel-client independently owns any outer response deadline."}
+        }),
         &["threadId", "turnId"],
     )
 }
 fn codex_inspect_schema() -> Value {
     object_schema(
         json!({
-            "threadId":{"type":"string"},
-            "turnId":{"type":"string"},
+            "threadId":{"type":"string","description":"Codex thread ID returned by codex.start."},
+            "turnId":{"type":"string","description":"Specific delegated turn ID to inspect."},
             "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by codex.start or codex.inspect. Use the returned cursor to continue incrementally."},
             "detail":{"type":"string","enum":["semantic","raw"],"default":"semantic","description":"semantic returns compact meaningful activity; raw returns original App Server notifications for explicit forensic inspection."}
         }),
@@ -778,17 +829,17 @@ fn codex_control_schema() -> Value {
         object_schema(
             json!({
                 "action":{"const":"steer"},
-                "threadId":{"type":"string"},
-                "expectedTurnId":{"type":"string"},
-                "instruction":{"type":"string","minLength":1}
+                "threadId":{"type":"string","description":"Thread containing the active turn."},
+                "expectedTurnId":{"type":"string","description":"Active turn ID expected before applying the steering instruction; prevents steering a different/newer turn by mistake."},
+                "instruction":{"type":"string","minLength":1,"description":"Self-contained additional instruction for the active turn."}
             }),
             &["action", "threadId", "expectedTurnId", "instruction"],
         ),
         object_schema(
             json!({
                 "action":{"const":"interrupt"},
-                "threadId":{"type":"string"},
-                "turnId":{"type":"string"}
+                "threadId":{"type":"string","description":"Thread containing the turn to stop."},
+                "turnId":{"type":"string","description":"Exact active turn to interrupt."}
             }),
             &["action", "threadId", "turnId"],
         ),
@@ -808,34 +859,34 @@ fn codex_action_respond_schema() -> Value {
         object_schema(
             json!({
                 "type":{"const":"approval"},
-                "requestId":rpc_id_schema(),
-                "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"]}
+                "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
+                "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"],"description":"Decision for the authoritative pending approval request."}
             }),
             &["type", "requestId", "decision"],
         ),
         object_schema(
             json!({
                 "type":{"const":"permissions"},
-                "requestId":rpc_id_schema(),
+                "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
                 "permissions":permissions_schema(),
-                "scope":{"type":"string","enum":["turn","session"]}
+                "scope":{"type":"string","enum":["turn","session"],"description":"Grant the requested permissions for only this turn or for the current Codex session."}
             }),
             &["type", "requestId", "permissions"],
         ),
         object_schema(
             json!({
                 "type":{"const":"userInput"},
-                "requestId":rpc_id_schema(),
-                "answers":{"type":"object","minProperties":1,"additionalProperties":{"type":"array","items":{"type":"string"}}}
+                "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
+                "answers":{"type":"object","minProperties":1,"description":"Answers keyed exactly as requested by the pending semantic user-input question.","additionalProperties":{"type":"array","items":{"type":"string"}}}
             }),
             &["type", "requestId", "answers"],
         ),
         object_schema(
             json!({
                 "type":{"const":"elicitation"},
-                "requestId":rpc_id_schema(),
-                "action":{"type":"string","enum":["accept","decline","cancel"]},
-                "content":{}
+                "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
+                "action":{"type":"string","enum":["accept","decline","cancel"],"description":"Disposition for the MCP elicitation."},
+                "content":{"description":"Accepted elicitation payload matching the pending request. Omit for decline/cancel."}
             }),
             &["type", "requestId", "action"],
         ),
@@ -845,19 +896,19 @@ fn codex_info_schema() -> Value {
     let query = json!({"oneOf":[
         object_schema(json!({
             "type":{"const":"models"},
-            "cursor":{"type":["string","null"]},
-            "includeHidden":{"type":["boolean","null"]},
-            "limit":{"type":["integer","null"],"minimum":0}
+            "cursor":{"type":["string","null"],"description":"Optional upstream model-list pagination cursor."},
+            "includeHidden":{"type":["boolean","null"],"description":"Include hidden upstream models only when explicitly needed."},
+            "limit":{"type":["integer","null"],"minimum":0,"description":"Optional upstream model-list page size."}
         }), &["type"]),
         object_schema(json!({
             "type":{"const":"skills"},
-            "cwds":{"type":"array","items":{"type":"string"}},
-            "forceReload":{"type":"boolean","default":false}
+            "cwds":{"type":"array","description":"Codex Connect host working directories whose available Codex skills should be discovered.","items":{"type":"string"}},
+            "forceReload":{"type":"boolean","default":false,"description":"Force upstream skill discovery to refresh rather than use its normal cache."}
         }), &["type"]),
         object_schema(json!({"type":{"const":"usage"}}), &["type"])
     ]});
     object_schema(
-        json!({"queries":{"type":"array","minItems":1,"maxItems":10,"items":query}}),
+        json!({"queries":{"type":"array","minItems":1,"maxItems":10,"description":"Independent read-only Codex discovery/account queries. Batch unrelated queries in one call when useful.","items":query}}),
         &["queries"],
     )
 }
@@ -1002,7 +1053,7 @@ mod tests {
             properties["timeoutMs"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("Tunnel-client independently enforces")
+                .contains("tunnel-client independently")
         );
         assert_eq!(
             properties["outputBytesCap"]["default"],
@@ -1016,7 +1067,7 @@ mod tests {
             properties["outputBytesCap"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("potentially incomplete")
+                .contains("may be incomplete")
         );
         assert_eq!(schema["additionalProperties"], false);
         assert!(
@@ -1110,9 +1161,8 @@ mod tests {
             .find(|tool| tool.name.as_ref() == "command.read")
             .unwrap();
         let read_description = read.description.as_deref().unwrap();
-        assert!(read_description.contains("state=exited/failed"));
-        assert!(read_description.contains("hasMoreOutput"));
         assert!(read_description.contains("drained=true"));
+        assert!(read_description.contains("process may still be running"));
         let read_output = command_read_output_schema();
         assert!(
             read_output["required"]
@@ -1141,13 +1191,28 @@ mod tests {
             .find(|tool| tool.name.as_ref() == "command.exec")
             .unwrap();
         let exec_description = exec.description.as_deref().unwrap();
-        assert!(exec_description.contains("30-second default child timeout"));
-        assert!(exec_description.contains("35-second maximum"));
-        assert!(exec_description.contains("40-second target"));
-        assert!(exec_description.contains("command.start/read"));
-        assert!(exec_description.contains("independently owned by tunnel-client"));
-        assert!(exec_description.contains("stdoutMayBeTruncated"));
-        assert!(exec_description.contains("durationMs"));
+        assert!(exec_description.contains("bounded, non-interactive"));
+        assert!(exec_description.contains("command.start"));
+        assert!(exec_description.contains("codex.start"));
+        let exec_input = command_schema();
+        assert!(
+            exec_input["properties"]["timeoutMs"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("40000 ms normal synchronous target")
+        );
+        assert!(
+            exec_input["properties"]["timeoutMs"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("45000 ms guard")
+        );
+        assert!(
+            exec_input["properties"]["timeoutMs"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("tunnel-client independently")
+        );
         let exec_output = exec.output_schema.as_ref().unwrap();
         for field in [
             "stdoutBytes",
@@ -1185,8 +1250,22 @@ mod tests {
         assert_eq!(input["properties"]["timeoutMs"]["minimum"], 1);
         assert_eq!(input["properties"]["timeoutMs"]["default"], 20_000);
         assert_eq!(input["properties"]["timeoutMs"]["maximum"], 30_000);
-        assert!(input.to_string().contains("Scheduled Task"));
+        assert!(
+            input
+                .to_string()
+                .contains("worker remains active, not stalled")
+        );
         assert!(input["properties"].get("afterCursor").is_none());
+        let tool = tool_catalog()
+            .into_iter()
+            .find(|tool| tool.name.as_ref() == "codex.wait")
+            .unwrap();
+        assert!(
+            tool.description
+                .as_deref()
+                .unwrap()
+                .contains("Scheduled Task")
+        );
     }
 
     #[test]
@@ -1304,12 +1383,58 @@ mod tests {
             assert!(tool["outputSchema"].is_object());
             assert_eq!(tool["inputSchema"]["type"], "object");
             assert_eq!(tool["outputSchema"]["type"], "object");
+            let meta = tool["_meta"].as_object().unwrap();
+            for key in [
+                "openai/toolInvocation/invoking",
+                "openai/toolInvocation/invoked",
+            ] {
+                let message = meta[key].as_str().unwrap();
+                assert!(!message.is_empty());
+                assert!(message.chars().count() <= 64);
+            }
             assert!(
                 serde_json::to_vec(tool).unwrap().len() < 20_000,
                 "tool schema too large: {}",
                 tool["name"]
             );
         }
+    }
+
+    #[test]
+    fn high_leverage_parameters_explain_execution_domain_and_selection() {
+        assert!(
+            cwd_schema()["description"]
+                .as_str()
+                .unwrap()
+                .contains("not ChatGPT's native sandbox")
+        );
+        let command = command_schema();
+        assert!(
+            command["properties"]["command"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Codex Connect host")
+        );
+        let start = codex_start_schema();
+        let work = &start["oneOf"][0]["properties"];
+        assert!(
+            work["task"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("does not inherit the ChatGPT conversation")
+        );
+        assert!(
+            work["model"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("codex.info(type=models)")
+        );
+        assert!(
+            work["threadId"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("omit developerInstructions")
+        );
     }
 
     #[test]

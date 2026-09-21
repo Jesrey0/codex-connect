@@ -36,7 +36,7 @@ const SYNCHRONOUS_TOOL_GUARD_MS: u64 = 45_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_CONCURRENCY: usize = 4;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect is ChatGPT's primary host and Codex control plane. Host tools run with host-user authority; the configured cwd is navigation only. Use codex.* for Codex semantics rather than invoking the Codex CLI through host commands. Keep ChatGPT-native capabilities as a separate platform plane: web/research, user/project files, Scheduled Tasks, Work/browser, and installed plugins/apps may be used when they are the owning source or action surface, but they do not inherit HostPlane filesystem/process authority and HostPlane does not inherit their connected-account authority. Within that platform plane prefer a native capability first, then an already-connected app/plugin; discover or suggest a new integration only when an external account/data source materially improves the task and no current capability owns it. Codex workers likewise do not inherit the ChatGPT conversation, native tools, plugin/app connections, files, or scheduled-task context unless relevant content is explicitly supplied. Tool timeouts express operation semantics; tunnel-client independently enforces any per-command upstream response deadline. Public synchronous work targets completion within 40 seconds and is guarded at 45 seconds in this server. Use command.exec only for bounded deterministic host work expected to fit that envelope; use command.start/read for persistent, interactive, or longer-running commands. Delegated work requires an explicit sandboxPolicy, uses the server-owned on-request approval policy, and needs self-contained worker context. Delegate only when autonomous reasoning materially improves progress or verification. Once delegated, the worker owns its assigned scope until it becomes terminal, blocks for operator action, or is explicitly interrupted; continue only non-overlapping operator work and do not redo the delegated task because a codex.wait lease expired. codex.wait is synchronization-only: use a short bounded join for interactive coordination. If a legitimately long-running worker owns the remaining critical path and no useful non-overlapping work remains, prefer a ChatGPT Scheduled Task/monitoring handoff when that feature is available and can access this connector, rather than spinning repeated waits. A scheduled worker-monitor prompt must carry the exact threadId/turnId and monitoring intent and must not assume Project/uploaded files are available. Scheduling never interrupts the worker, transfers its scope, or merges platform authority with HostPlane; the later run must re-establish authoritative state through Codex Connect. Use codex.inspect for worker activity/history and raw forensic events. Treat workerEvents as sparse semantic interrupts, not a progress feed. Codex CLI/App Server and tunnel-client are upstream-owned. Do not create Git workflow state unless the user requests version-control work. Official App Server state is authoritative for Codex lifecycles.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect is the authoritative host/Codex control plane for its host workspace. It is NOT ChatGPT's native sandbox: never assume /mnt/data, uploaded or Project files, browser/plugin state, or native-tool paths exist on the Codex Connect host. Use Codex Connect host tools for host files/processes and ChatGPT-native tools for their own data; bridge content only deliberately. Use codex.* for Codex lifecycle semantics, never the Codex CLI through host commands. The configured cwd is navigation only, not authorization. Host operations run with host-user authority; delegated Codex work always uses an explicit sandboxPolicy and self-contained context. Prefer deterministic host tools when the action is known; delegate only when autonomous reasoning or independent review materially helps. A delegated worker owns its scope until terminal, blocked for operator action, or interrupted; continue only non-overlapping work. Do not create Git workflow state unless requested. tunnel-client owns its transport lifecycle and outer deadlines; Codex Connect owns its bounded MCP operations.";
 
 struct CancelOnDrop(Arc<AtomicBool>);
 
@@ -1068,21 +1068,25 @@ mod tests {
     use super::{SERVER_INSTRUCTIONS, SYNCHRONOUS_TOOL_GUARD_MS, SYNCHRONOUS_TOOL_TARGET_MS};
 
     #[test]
-    fn server_instructions_calibrate_control_plane_and_delegation() {
-        assert!(SERVER_INSTRUCTIONS.contains("primary host and Codex control plane"));
-        assert!(SERVER_INSTRUCTIONS.contains("rather than invoking the Codex CLI"));
-        assert!(SERVER_INSTRUCTIONS.contains("Codex workers likewise do not inherit"));
-        assert!(SERVER_INSTRUCTIONS.contains("server-owned on-request approval policy"));
-        assert!(SERVER_INSTRUCTIONS.contains("worker owns its assigned scope"));
-        assert!(SERVER_INSTRUCTIONS.contains("Scheduled Task"));
-        assert!(SERVER_INSTRUCTIONS.contains("separate platform plane"));
-        assert!(SERVER_INSTRUCTIONS.contains("do not inherit"));
-        assert!(SERVER_INSTRUCTIONS.contains("codex.inspect"));
-        assert!(SERVER_INSTRUCTIONS.contains("synchronization-only"));
-        assert!(SERVER_INSTRUCTIONS.contains("workerEvents"));
+    fn server_instructions_define_compact_execution_domain_invariants() {
+        assert!(SERVER_INSTRUCTIONS.len() < 1_200);
+        let first_512 = &SERVER_INSTRUCTIONS[..SERVER_INSTRUCTIONS
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= 512)
+            .last()
+            .unwrap_or(SERVER_INSTRUCTIONS.len())];
+        assert!(first_512.contains("NOT ChatGPT's native sandbox"));
+        assert!(first_512.contains("/mnt/data"));
+        assert!(first_512.contains("Codex Connect host"));
+        assert!(SERVER_INSTRUCTIONS.contains("Use codex.* for Codex lifecycle semantics"));
+        assert!(SERVER_INSTRUCTIONS.contains("never the Codex CLI through host commands"));
+        assert!(SERVER_INSTRUCTIONS.contains("cwd is navigation only"));
+        assert!(SERVER_INSTRUCTIONS.contains("explicit sandboxPolicy"));
+        assert!(SERVER_INSTRUCTIONS.contains("worker owns its scope"));
+        assert!(SERVER_INSTRUCTIONS.contains("Do not create Git workflow state unless requested"));
+        assert!(SERVER_INSTRUCTIONS.contains("tunnel-client owns"));
         assert_eq!(SYNCHRONOUS_TOOL_TARGET_MS, 40_000);
         assert_eq!(SYNCHRONOUS_TOOL_GUARD_MS, 45_000);
-        assert!(SERVER_INSTRUCTIONS.contains("upstream-owned"));
-        assert!(SERVER_INSTRUCTIONS.contains("Official App Server state is authoritative"));
     }
 }
