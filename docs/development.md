@@ -1,34 +1,30 @@
 # Development
 
-This repository is canonical-only pre-release code. Read [Architecture](architecture/overview.md) before changing authority, delegation, public tools, App Server integration, deployment, or service management.
+Read [Architecture](architecture/overview.md) before changing authority, lifecycle, App Server integration, or service management.
 
 ## Pinned protocol contract
 
-The current Codex CLI/App Server pin is `0.155.1`, recorded in `config/codex-cli-pin`. The project does not depend on Codex's internal Rust API. Instead, `scripts/generate-app-server-tool-schemas.py` verifies the installed release, generates the experimental App Server schema, and checks the self-contained protocol subset used by the adapter.
+The Codex CLI/App Server release is pinned in `config/codex-cli-pin`. `scripts/generate-app-server-tool-schemas.py` verifies the installed release, generates its experimental schema, and checks the protocol subset used by the adapter.
 
 `config/app-server-tool-schemas.json` is an internal protocol drift guard, not the public MCP catalog. App Server owns official thread, turn, review, command, filesystem, approval, permission, elicitation, account, and notification semantics. Connect may project or adapt them, and may add a bridge only where the pinned App Server has no equivalent (currently content search and deterministic patch semantics).
 
 ## Public MCP governance
 
-The exact public catalog is the 14-tool surface tested in `crates/mcp`: `status`, `inspect`, `view_image`, `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control`, `codex.start`, `codex.wait`, `codex.inspect`, `codex.control`, `codex.action.respond`, and `codex.info`.
+The public catalog and schemas are owned by `crates/mcp/src/catalog.rs`; parsing and dispatch are in `crates/mcp/src/lib.rs`. Update both with protocol tests when changing inputs or outputs.
 
-Public inputs are intent-shaped. `command.exec` exposes only `command`, optional `cwd`, and optional `env`; execution timeout and output limits are server-owned. Its public path uses a 40-second child budget plus bounded response allowance; persistent/interactive work belongs on `command.start`. Persistent commands retain stdin, PTY resize, termination, cursor lifecycle, and event-driven reads (40-second default, 45-second maximum). Work delegation exposes `task`, optional `cwd`, `threadId`, `model`, `effort`, and `access`; review exposes its target plus optional `cwd`, `threadId`, and `model`.
+Expose choices that control operator intent. Keep execution limits and the worker wait budget in the relay; MCP guards must allow operations to finalize. `codex.wait` accepts only thread and turn IDs. `command.read.timeoutMs` supports immediate reads and bounded waits for interactive processes.
 
-Do not expose `serviceTier`, raw `sandboxPolicy`, approval policy, developer instructions, writable-root/network/temp switches, skill-cache forcing, or other server-owned controls. Do not invoke the Codex CLI through HostPlane commands when a `codex.*` semantic tool exists. Preserve the intent-shaped catalog, tool annotations, compact schemas, selection tests, and PTY support.
+Keep service tier, raw sandbox/approval policy, developer instructions, and cache controls internal. Preserve tool annotations, OAuth metadata, compact schemas, and PTY support. Test accepted inputs, outputs, and behavior without locking explanatory prose.
 
 ## Worker contract
 
-Connect sends no `thread/start.developerInstructions`. Worker cognition comes from `~/.codex/config.toml` `developer_instructions`, `~/.codex/AGENTS.md`, repository/directory `AGENTS.md`, and the delegated task. Connect owns authority, lifecycle, and operator-facing orchestration.
+Worker instructions come from Codex config, AGENTS.md, and the delegated task. Connect supplies authority and lifecycle controls; it does not inject developer instructions.
 
-For work, omitted `access` maps to the writable workspace sandbox with network access; `access="full"` maps to `danger-full-access`. Work turns send `approvalPolicy="never"`; this avoids mechanical approval stalls and does not widen the sandbox. New reviews are read-only.
+Work uses `approvalPolicy="never"` with the selected workspace or full-access sandbox. Disabling prompts does not widen the sandbox. New reviews start read-only.
 
-Delegation is exclusive scope ownership until terminal, semantic action/input block, interrupt, or user redirect. A `codex.wait` timeout is only a bounded lease expiry, never failure, stall evidence, or takeover permission. The current ChatGPT tool runner was measured live at an approximately 60-second outer response deadline. The public wait lease therefore defaults to and is capped at 40 seconds, leaving up to 10 seconds for terminal/reconciliation finalization plus connector headroom. Prefer one bounded event-driven join after useful non-overlapping operator work is exhausted instead of progress polling. `codex.start` is relay-owned once submitted: thread/resume/start plus turn/review start are completed independently of caller lifetime, and an unclaimed handle is retained as a one-shot `workerStarted` host event. Live state is notification-driven: reads establish pre-existing state, reconcile explicit history loss, hydrate terminal output, or perform one final lease-expiry check; they do not periodically observe progress. `codex.wait` synchronizes; `codex.inspect` owns activity/history observation; the console is a human-oriented read-only projection. App Server state remains authoritative; Connect's journals/reducers/caches are bounded observations.
+Preserve the [worker lifecycle and recovery contract](operations.md#worker-lifecycle). Starts complete independently of caller lifetime. Events drive live state; reads hydrate existing state, reconcile history loss or wait expiry, and load terminal output. Do not poll App Server for progress.
 
-Timeouts are classified by semantics but all public synchronous MCP guards now fit under the observed ~60-second ChatGPT outer response budget. Quick/control tools keep a 45-second local guard; `codex.start` gets a 50-second caller guard while its relay-owned upstream start can still finish afterward; `command.exec` uses a 40-second default / 45-second maximum child budget with a 55-second MCP guard; `command.read` uses 40/45-second default/maximum leases with 5 seconds of MCP headroom; and `codex.wait` uses a 40-second public lease with a 55-second MCP guard, covering its 10-second finalization reserve plus extra transport headroom. Ordinary App Server RPCs remain at 30 seconds, and management/health deadlines remain independently fail-fast. The 60-second figure is an empirically observed PlatformPlane budget, not an MCP protocol guarantee, so these margins are intentionally conservative.
-
-The canonical public transport is ngrok through host ingress. Secure MCP Tunnel is secondary fallback only and must not leak transport-specific lifecycle, polling, profile, or response-deadline assumptions into application code, public schemas, tests, or operator guidance.
-
-Each tool descriptor must retain the OAuth `securitySchemes` compatibility metadata for scope `codex-connect:access`. This is discovery metadata only: token validation, `WWW-Authenticate`, resource metadata, and authorization-server behavior belong to host ingress and must not be duplicated in the loopback MCP handler.
+Each tool descriptor advertises OAuth scope `codex-connect:access`. Host ingress owns token validation, discovery challenges, and authorization metadata.
 
 ## Validation
 
@@ -46,7 +42,7 @@ python3 tests/protocol_integration.py
 
 The protocol tests validate the exact catalog, App Server request/response schemas, server requests, streaming commands, worker authority mapping, and end-to-end lifecycle. Do not weaken a test or schema to accommodate an unpinned CLI.
 
-For documentation changes, also check local Markdown links and search all maintained docs for retired terms. Keep the states distinct: `SourceChanged != Committed != Pushed != Deployed != Live != CIGreen`. Do not commit, push, deploy, or refresh the connector as part of documentation validation.
+For documentation changes, verify local Markdown links and search for stale contract references. Validation does not include commit, push, deployment, or connector refresh.
 
 ## Dependency and change discipline
 

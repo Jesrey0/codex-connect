@@ -1,5 +1,5 @@
 //! Public operator catalog and compact MCP schemas.
-use super::{DEFAULT_WAIT_MS, MAX_INSPECT_OPERATIONS, MAX_PUBLIC_WAIT_MS};
+use super::MAX_INSPECT_OPERATIONS;
 use codex_connect_relay::{DEFAULT_COMMAND_READ_MS, MAX_COMMAND_READ_MS, MAX_COMMAND_WRITE_BYTES};
 use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
@@ -25,7 +25,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "status",
                 "Read Operator Status",
-                "Read current Codex Connect readiness, live build identity, host navigation cwd, and ordinary Codex defaults. Call when current runtime identity or defaults matter; do not call merely because a turn started. Detailed deployment and App Server diagnostics stay on the loopback management plane.",
+                "Read backend readiness, live build identity, host cwd, and Codex defaults. Use codex-connect doctor on the host for detailed diagnostics.",
                 true,
                 false,
                 false,
@@ -38,7 +38,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "inspect",
                 "Inspect Workspace",
-                "Batch read-only inspection of files and directories on the Codex Connect host. Prefer this for direct host reads, metadata, content search, and fuzzy file discovery; batch independent reads when possible. This does not inspect ChatGPT uploads or /mnt/data. Use command.exec instead when one deterministic repository or system command naturally produces the answer.",
+                "Batch host file reads, directory listings, metadata, content search, and fuzzy file discovery. Use command.exec when a repository or system command answers the question directly.",
                 true,
                 false,
                 false,
@@ -51,14 +51,14 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "apply_patch",
                 "Apply Patch",
-                "Apply an exact textual patch to files on the Codex Connect host. Use when the intended diff is already known. For autonomous investigation, multi-step coding, or iterative repair, use codex.start instead. This never edits ChatGPT's native sandbox or uploaded files.",
+                "Apply a known diff to host files. Use codex.start for investigation or iterative coding.",
                 false,
                 true,
                 false,
                 false,
             ),
             object_schema(
-                json!({"patch":{"type":"string","minLength":1,"description":"Exact apply_patch-format diff for files on the Codex Connect host."},"cwd":cwd_schema()}),
+                json!({"patch":{"type":"string","minLength":1,"description":"apply_patch-format diff for host files."},"cwd":cwd_schema()}),
                 &["patch"],
             ),
             Some(object_schema(
@@ -70,7 +70,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.start",
                 "Start Persistent Command",
-                "Start a deterministic Codex Connect host command that must remain running or interactive, such as a dev server, watcher, REPL, debugger, installer, or prompt. Returns a processId immediately; use command.read to observe it and command.control for stdin, PTY resize, or termination. Set tty=true only when terminal semantics are required.",
+                "Start a long-running or interactive host command. Returns processId; use command.read for output and command.control for stdin, PTY resize, or termination.",
                 false,
                 true,
                 true,
@@ -83,7 +83,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.read",
                 "Read Persistent Command",
-                "Read incremental output and lifecycle state for a command.start process. Use the previous cursor to consume only new output. A read timeout means no output or exit arrived during that lease; the process may still be running. Terminal state and output consumption are independent, so continue until drained=true when final retained output matters.",
+                "Read output and state for a command.start process. Continue from the returned cursor until drained=true to collect final retained output. Timeout does not terminate the process.",
                 true,
                 false,
                 false,
@@ -96,7 +96,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.control",
                 "Control Persistent Command",
-                "Control a command.start process. Write exact stdin bytes or close stdin, resize a PTY, or request termination. Termination is not a graceful-shutdown guarantee; use command.read afterward to observe authoritative final state and drain retained output.",
+                "Write or close stdin, resize a PTY, or terminate a command.start process. Termination may be forceful; use command.read to confirm exit and drain output.",
                 false,
                 true,
                 false,
@@ -109,7 +109,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "view_image",
                 "View Image",
-                "Load an image file from the Codex Connect host for model inspection. Paths resolve on the host, not in ChatGPT's native sandbox or uploaded-file storage.",
+                "Load a host image for inspection. ChatGPT uploads and native sandbox paths are separate.",
                 true,
                 false,
                 false,
@@ -119,7 +119,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
                 json!({
                     "cwd":cwd_schema(),
                     "path":{"type":"string","description":"Image path on the Codex Connect host, relative to host cwd unless absolute."},
-                    "detail":{"type":"string","enum":["high","original"],"default":"high","description":"high is the normal model-oriented view; original requests the original-resolution image when supported by the adapter."}
+                    "detail":{"type":"string","enum":["high","original"],"default":"high","description":"high resizes for inspection; original preserves resolution when supported."}
                 }),
                 &["path"],
             ),
@@ -132,7 +132,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.exec",
                 "Run Deterministic Command",
-                "Run one known, bounded, non-interactive command on the Codex Connect host using a server-owned 40-second child timeout and bounded output. Prefer this for deterministic repository, test, build, Git, or system commands that fit one synchronous call. Use command.start when execution can exceed about 40 seconds or needs persistence/interaction, and codex.start for autonomous investigation or coding.",
+                "Run a short, non-interactive host command with bounded output. Use command.start for long-running or interactive commands; use codex.start for autonomous investigation or coding.",
                 false,
                 true,
                 true,
@@ -146,9 +146,9 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
                     "stderr":{"type":"string"},
                     "stdoutBytes":{"type":"integer","minimum":0},
                     "stderrBytes":{"type":"integer","minimum":0},
-                    "stdoutMayBeTruncated":{"type":"boolean","description":"True when stdout byte length exactly reached the server-owned output cap. Upstream does not expose a definitive truncation flag."},
-                    "stderrMayBeTruncated":{"type":"boolean","description":"True when stderr byte length exactly reached the server-owned output cap. Upstream does not expose a definitive truncation flag."},
-                    "durationMs":{"type":"integer","minimum":0,"description":"Codex Connect-observed wall time for the App Server command request, in milliseconds."}
+                    "stdoutMayBeTruncated":{"type":"boolean","description":"stdout reached the output cap; truncation is possible."},
+                    "stderrMayBeTruncated":{"type":"boolean","description":"stderr reached the output cap; truncation is possible."},
+                    "durationMs":{"type":"integer","minimum":0,"description":"Elapsed App Server command request time."}
                 }),
                 &[
                     "exitCode",
@@ -166,7 +166,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Delegate autonomous work or start an official Codex review. Work defaults to a writable workspace sandbox with network access and non-blocking approvals; set access=full only when unrestricted host authority is required. Reviews are read-only. Workers do not inherit the ChatGPT conversation, native tools, uploads, or sandbox, so supply self-contained context. Start completion is relay-owned: if the caller disappears after submission, worker creation continues and an unclaimed handle can be recovered through a one-shot workerStarted host event. Once started, the worker owns its assigned scope until terminal, blocked, or interrupted; continue only non-overlapping operator work.",
+                "Delegate work or a read-only review. Supply self-contained context. If the call is lost, creation continues: recover threadId/turnId from a workerStarted event on a host tool response before retrying.",
                 false,
                 true,
                 true,
@@ -179,7 +179,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.wait",
                 "Wait for Codex Turn",
-                "Synchronize with a delegated Codex turn. Returns early when the turn becomes terminal or operator action/input is required; a lease timeout only means the worker is still active. This is not a progress-polling API. Continue useful non-overlapping work when available, use codex.inspect for activity/history, and use a native Scheduled Task for genuinely long unattended monitoring when appropriate.",
+                "Wait for a turn to finish or require operator action/input. Returns after a bounded wait if still active; timeout does not mean failure or loss of scope ownership. Use codex.inspect for activity/history.",
                 true,
                 false,
                 false,
@@ -192,7 +192,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.inspect",
                 "Inspect Codex Turn",
-                "Inspect worker activity without joining or mutating the turn. Use semantic detail for normal operator visibility and raw detail only for App Server forensics. Supply the previous cursor to continue incrementally.",
+                "Read worker activity/history without waiting for completion. Use semantic detail for activity and raw for App Server notifications. Continue from the returned cursor.",
                 true,
                 false,
                 false,
@@ -205,7 +205,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.control",
                 "Control Active Codex Turn",
-                "Steer or interrupt an active Codex turn. Steering adds self-contained instructions to the current turn without creating a new thread; interrupt stops the selected turn.",
+                "Steer or interrupt an active turn. Steering adds instructions to that turn; interrupt requests it to stop.",
                 false,
                 true,
                 false,
@@ -218,7 +218,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.action.respond",
                 "Respond to Pending Codex Action",
-                "Resolve an authoritative pending approval, permission request, semantic user-input question, or MCP elicitation returned by codex.wait. Match the response type to the pending action and preserve its requestId.",
+                "Answer a pending approval, permission request, user question, or MCP elicitation from codex.wait. Match its kind and requestId.",
                 false,
                 true,
                 false,
@@ -231,7 +231,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.info",
                 "Read Codex Information",
-                "Batch read-only Codex discovery and account queries. Use models before selecting a non-default model or effort, skills to discover worker skills for host directories, and usage before expensive or multi-worker delegation. Independent query failures do not discard successful siblings.",
+                "Batch model, skill, or account-usage queries. Each query returns its own result or error.",
                 true,
                 false,
                 false,
@@ -320,10 +320,7 @@ fn tool_invocation_meta(name: &str) -> MetaObject {
         "openai/toolInvocation/invoked".into(),
         Value::String(invoked.into()),
     );
-    // host-ingress is the authentication authority and validates every request
-    // before proxying it to this loopback-only MCP server. Advertise that
-    // requirement per tool for ChatGPT/App SDK compatibility without duplicating
-    // bearer-token parsing or authorization inside Codex Connect.
+    // Advertise the OAuth scope enforced by host ingress.
     meta.0.insert(
         "securitySchemes".into(),
         json!([{"type":"oauth2","scopes":[OAUTH_SCOPE]}]),
@@ -404,7 +401,7 @@ fn worker_events_schema() -> Value {
     json!({
         "type":"array",
         "maxItems":8,
-        "description":"Unread semantic worker lifecycle/events delivered opportunistically on host-plane calls, including recovery handles, terminal state, required action, or history loss. Use codex.wait to synchronize with a known turn and codex.inspect for activity/history; do not poll when this field is absent.",
+        "description":"One-shot worker notifications on host calls. workerStarted recovers an unclaimed start handle; historyLost means notifications are missing. Absence gives no worker status; use codex.wait for a known turn.",
         "items":{"oneOf":[started,terminal,action,lost]}
     })
 }
@@ -523,7 +520,7 @@ fn status_schema() -> Value {
                     "model":{"type":["string","null"]},
                     "reasoningEffort":{"type":["string","null"]},
                     "serviceTier":{"type":["string","null"]},
-                    "source":{"enum":["userConfig","upstream"],"description":"userConfig means at least one ordinary worker default is explicitly set in the user Codex config; upstream means all three are left for Codex to resolve."}
+                    "source":{"enum":["userConfig","upstream"],"description":"userConfig: at least one default is set in Codex config. upstream: Codex resolves all defaults. Null values are unset."}
                 }), &["model","reasoningEffort","serviceTier","source"])
             }), &["release","defaults"])
         }),
@@ -609,8 +606,8 @@ fn codex_inspect_output_schema() -> Value {
 }
 fn inspect_schema() -> Value {
     object_schema(
-        json!({"cwd":cwd_schema(),"operations":{"type":"array","minItems":1,"maxItems":MAX_INSPECT_OPERATIONS,"description":"Independent read-only host inspections. Batch unrelated reads/searches in one call to reduce operator round trips.","items":{"oneOf":[
-            object_schema(json!({"type":{"const":"readText"},"path":{"type":"string","description":"Host file path, relative to the selected host cwd unless absolute."},"startLine":{"type":"integer","minimum":1,"description":"Optional 1-based first line."},"endLine":{"type":"integer","minimum":1,"description":"Optional 1-based final line."}}), &["type","path"]),
+        json!({"cwd":cwd_schema(),"operations":{"type":"array","minItems":1,"maxItems":MAX_INSPECT_OPERATIONS,"description":"Independent host inspections; each returns a result or error.","items":{"oneOf":[
+            object_schema(json!({"type":{"const":"readText"},"path":{"type":"string","description":"Host file path, relative to the selected host cwd unless absolute."},"startLine":{"type":"integer","minimum":1,"description":"First line, inclusive; defaults to 1."},"endLine":{"type":"integer","minimum":1,"description":"Last line, inclusive; omit to read to EOF."}}), &["type","path"]),
             object_schema(json!({"type":{"const":"readDirectory"},"path":{"type":"string","description":"Host directory path, relative to the selected host cwd unless absolute."}}), &["type","path"]),
             object_schema(json!({"type":{"const":"metadata"},"path":{"type":"string","description":"Host path whose filesystem metadata should be read."}}), &["type","path"]),
             object_schema(json!({"type":{"const":"searchContent"},"query":{"type":"string","minLength":1,"description":"Literal text query to search within host files."},"path":{"type":"string","description":"Optional host subtree to search; omitted means the selected host cwd."},"maxResults":{"type":"integer","minimum":1,"maximum":1000,"description":"Maximum matching lines to return."}}), &["type","query"]),
@@ -620,14 +617,14 @@ fn inspect_schema() -> Value {
     )
 }
 fn cwd_schema() -> Value {
-    json!({"type":["string","null"],"description":"Working directory on the Codex Connect host. This is not ChatGPT's native sandbox or /mnt/data. Absolute host paths are accepted; relative cwd resolves from the configured navigation cwd, and omitted/null uses that default."})
+    json!({"type":["string","null"],"description":"Host working directory. Relative paths resolve from configured default_cwd; omitted/null uses that default. Absolute paths are accepted."})
 }
 fn command_schema() -> Value {
     object_schema(
         json!({
-            "command":{"type":"array","minItems":1,"description":"Exact argv to execute on the Codex Connect host. Prefer direct argv; use a shell explicitly only when shell composition is the intended command.","items":{"type":"string"}},
+            "command":{"type":"array","minItems":1,"description":"Host argv. Invoke a shell explicitly for pipes, redirects, or shell expansion.","items":{"type":"string"}},
             "cwd":cwd_schema(),
-            "env":{"type":["object","null"],"description":"Optional environment overrides for this host command. Null values remove variables from the child environment.","additionalProperties":{"type":["string","null"]}}
+            "env":{"type":["object","null"],"description":"Child environment overrides; null values remove variables.","additionalProperties":{"type":["string","null"]}}
         }),
         &["command"],
     )
@@ -646,7 +643,7 @@ fn command_start_schema() -> Value {
         json!({
             "command":{"type":"array","minItems":1,"description":"Exact argv for the persistent or interactive host process.","items":{"type":"string"}},
             "cwd":cwd_schema(),
-            "env":{"type":["object","null"],"description":"Optional environment overrides for the host process. Null values remove variables from the child environment.","additionalProperties":{"type":["string","null"]}},
+            "env":{"type":["object","null"],"description":"Child environment overrides; null values remove variables.","additionalProperties":{"type":["string","null"]}},
             "tty":{"type":"boolean","default":false,"description":"Enable PTY semantics only when the program needs an interactive terminal."},
             "size":{"description":"Initial PTY size. Relevant only when tty=true.","anyOf":[terminal_size_schema(),{"type":"null"}]}
         }),
@@ -668,8 +665,8 @@ fn command_read_schema() -> Value {
     object_schema(
         json!({
             "processId":{"type":"string","minLength":1,"description":"Connection-scoped process handle returned by command.start."},
-            "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Return output newer than this cursor. Use the cursor from the previous command.start/read result to consume incrementally."},
-            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Event-driven wait for new output or process exit. Defaults to 40000 and may extend to 45000. The bound is calibrated below ChatGPT's observed ~60000 ms outer tool-call deadline. Returns early on output or exit. Timeout does not terminate or imply a stalled process; the process may outlive any number of reads."}
+            "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Return output after the cursor from command.start/read."},
+            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Wait for output or exit; 0 returns immediately. Timeout does not stop the process."}
         }),
         &["processId"],
     )
@@ -684,8 +681,8 @@ fn command_read_output_schema() -> Value {
             "stdinOpen":{"type":"boolean"},
             "cursor":{"type":"integer","minimum":0},
             "historyLost":{"type":"boolean"},
-            "hasMoreOutput":{"type":"boolean","description":"True when a newer retained output chunk exists but was withheld by the per-read response bound."},
-            "drained":{"type":"boolean","description":"True when the command is terminal and this read consumed all currently retained output. historyLost may still indicate older evicted output."},
+            "hasMoreOutput":{"type":"boolean","description":"More retained output is available after this cursor."},
+            "drained":{"type":"boolean","description":"The command is terminal and all retained output was read. historyLost indicates missing older output."},
             "stdout":{"type":"string"},
             "stderr":{"type":"string"},
             "exitCode":{"type":["integer","null"]},
@@ -766,12 +763,12 @@ fn codex_start_schema() -> Value {
         object_schema(
             json!({
                 "mode":{"const":"work"},
-                "task":{"type":"string","minLength":1,"description":"Self-contained delegated task. Include relevant host paths, constraints, decisions, and acceptance criteria because the worker does not inherit the ChatGPT conversation or native-tool context."},
+                "task":{"type":"string","minLength":1,"description":"Self-contained task with host paths, context, constraints, and acceptance criteria."},
                 "cwd":{"type":"string","description":"Codex Connect host working directory for the delegated turn. Omit to use the configured navigation cwd."},
-                "threadId":{"type":"string","description":"Existing Codex thread to resume. Omit to create a new thread; resumed threads keep their established settings."},
-                "model":{"type":"string","description":"Optional exact Codex model ID for this new thread/turn. Prefer a supported ID returned by codex.info(type=models); omit to use the configured/upstream default."},
-                "effort":{"type":"string","description":"Optional reasoning effort for work mode. Prefer a value supported by the selected model from codex.info(type=models); omit to use the configured/upstream default."},
-                "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Worker authority. workspace is the normal writable workspace sandbox with network access and non-blocking approvals; full explicitly requests danger-full-access."}
+                "threadId":{"type":"string","description":"Thread to resume; omit to create one. Model, effort, and access apply to this turn."},
+                "model":{"type":"string","description":"Model ID for this turn. Discover IDs with a models query to codex.info; omit to use Codex defaults."},
+                "effort":{"type":"string","description":"Effort supported by the selected model; discover with codex.info. Omit to use Codex defaults."},
+                "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"workspace permits workspace writes and network access; full grants unrestricted host access. Approval prompts are disabled within the selected sandbox."}
             }),
             &["mode", "task"],
         ),
@@ -779,9 +776,9 @@ fn codex_start_schema() -> Value {
             json!({
                 "mode":{"const":"review"},
                 "cwd":{"type":"string","description":"Codex Connect host working directory for the review. Omit to use the configured navigation cwd."},
-                "threadId":{"type":"string","description":"Existing Codex review thread to resume. Existing threads keep their established model/settings."},
+                "threadId":{"type":"string","description":"Thread to review. Retains its model/settings; model cannot be supplied with threadId."},
                 "target":review_target_schema(),
-                "model":{"type":"string","description":"Optional exact model ID for a new review thread. Prefer a supported ID returned by codex.info(type=models). Not valid as a model override for an existing thread."}
+                "model":{"type":"string","description":"Model ID for a new review thread; discover with codex.info. Omit to use Codex defaults."}
             }),
             &["mode", "target"],
         ),
@@ -791,8 +788,7 @@ fn codex_wait_schema() -> Value {
     object_schema(
         json!({
             "threadId":{"type":"string","description":"Codex thread ID returned by codex.start."},
-            "turnId":{"type":"string","description":"Specific delegated turn ID returned by codex.start."},
-            "timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_PUBLIC_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet event-driven synchronization lease. Defaults to and is capped at 40000 ms so the lease plus up to 10 seconds of terminal/reconciliation finalization and MCP headroom stays below ChatGPT's observed ~60000 ms outer tool-call deadline. Returns early on terminal state or required operator input/action. Before joining, continue any useful non-overlapping operator work; once a join is appropriate, prefer one bounded event-driven lease over polling. Lease expiry means the worker remains active, not stalled."}
+            "turnId":{"type":"string","description":"Specific delegated turn ID returned by codex.start."}
         }),
         &["threadId", "turnId"],
     )
@@ -802,8 +798,8 @@ fn codex_inspect_schema() -> Value {
         json!({
             "threadId":{"type":"string","description":"Codex thread ID returned by codex.start."},
             "turnId":{"type":"string","description":"Specific delegated turn ID to inspect."},
-            "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Journal cursor previously returned by codex.start or codex.inspect. Use the returned cursor to continue incrementally."},
-            "detail":{"type":"string","enum":["semantic","raw"],"default":"semantic","description":"semantic returns compact meaningful activity; raw returns original App Server notifications for explicit forensic inspection."}
+            "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Cursor from codex.start or codex.inspect."},
+            "detail":{"type":"string","enum":["semantic","raw"],"default":"semantic","description":"semantic returns activity summaries; raw returns App Server notifications."}
         }),
         &["threadId", "turnId"],
     )
@@ -814,7 +810,7 @@ fn codex_control_schema() -> Value {
             json!({
                 "action":{"const":"steer"},
                 "threadId":{"type":"string","description":"Thread containing the active turn."},
-                "expectedTurnId":{"type":"string","description":"Active turn ID expected before applying the steering instruction; prevents steering a different/newer turn by mistake."},
+                "expectedTurnId":{"type":"string","description":"Must match the active turn before steering."},
                 "instruction":{"type":"string","minLength":1,"description":"Self-contained additional instruction for the active turn."}
             }),
             &["action", "threadId", "expectedTurnId", "instruction"],
@@ -844,7 +840,7 @@ fn codex_action_respond_schema() -> Value {
             json!({
                 "type":{"const":"approval"},
                 "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
-                "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"],"description":"Decision for the authoritative pending approval request."}
+                "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"],"description":"Choose a decision offered by the pending request."}
             }),
             &["type", "requestId", "decision"],
         ),
@@ -853,7 +849,7 @@ fn codex_action_respond_schema() -> Value {
                 "type":{"const":"permissions"},
                 "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
                 "permissions":permissions_schema(),
-                "scope":{"type":"string","enum":["turn","session"],"description":"Grant the requested permissions for only this turn or for the current Codex session."}
+                "scope":{"type":"string","enum":["turn","session"],"description":"Grant lifetime; defaults to turn."}
             }),
             &["type", "requestId", "permissions"],
         ),
@@ -861,7 +857,7 @@ fn codex_action_respond_schema() -> Value {
             json!({
                 "type":{"const":"userInput"},
                 "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
-                "answers":{"type":"object","minProperties":1,"description":"Answers keyed exactly as requested by the pending semantic user-input question.","additionalProperties":{"type":"array","items":{"type":"string"}}}
+                "answers":{"type":"object","minProperties":1,"description":"Map each question ID to its answers.","additionalProperties":{"type":"array","items":{"type":"string"}}}
             }),
             &["type", "requestId", "answers"],
         ),
@@ -886,7 +882,7 @@ fn codex_info_schema() -> Value {
         object_schema(json!({"type":{"const":"usage"}}), &["type"])
     ]});
     object_schema(
-        json!({"queries":{"type":"array","minItems":1,"maxItems":10,"description":"Independent read-only Codex discovery/account queries. Batch unrelated queries in one call when useful.","items":query}}),
+        json!({"queries":{"type":"array","minItems":1,"maxItems":10,"description":"Independent discovery/account queries.","items":query}}),
         &["queries"],
     )
 }
@@ -936,7 +932,7 @@ fn event_schema() -> Value {
         json!({
             "cursor":{"type":"integer","minimum":0},"method":{"type":"string"},
             "threadId":{"type":["string","null"]},"turnId":{"type":["string","null"]},
-            "params":{"description":"Original official notification data, or omittedBytes for an oversized event."},
+            "params":{"description":"App Server notification data, or omittedBytes for an oversized event."},
             "truncated":{"type":"boolean"}
         }),
         &[
@@ -957,7 +953,7 @@ fn pending_schema() -> Value {
             "kind":{"enum":["approval","permissions","elicitation","userInput"]},
             "threadId":{"type":"string"},"turnId":{"type":["string","null"]},
             "isBlocking":{"type":"boolean"},
-            "params":{"type":"object","description":"Original official request data: questions, offered decisions, permissions, or elicitation form/URL."}
+            "params":{"type":"object","description":"Request data: questions, decisions, permissions, or elicitation form/URL."}
         }),
         &[
             "requestId",
@@ -1109,50 +1105,40 @@ mod tests {
     }
 
     #[test]
-    fn command_metadata_documents_terminal_drain_and_stop_semantics() {
+    fn command_schemas_expose_lifecycle_and_output_bounds() {
+        let output = command_read_output_schema();
+        for field in ["hasMoreOutput", "drained", "historyLost"] {
+            assert_eq!(output["properties"][field]["type"], "boolean");
+            assert!(
+                output["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(field))
+            );
+        }
+        assert_eq!(
+            output["properties"]["state"]["enum"],
+            json!(["running", "exited", "failed"])
+        );
+        assert_eq!(
+            output["properties"]["wakeReason"]["enum"],
+            json!(["output", "exit", "timeout"])
+        );
+        let input = command_read_schema();
+        assert_eq!(input["properties"]["timeoutMs"]["minimum"], 0);
+        assert_eq!(
+            input["properties"]["timeoutMs"]["default"],
+            DEFAULT_COMMAND_READ_MS
+        );
+        assert_eq!(
+            input["properties"]["timeoutMs"]["maximum"],
+            MAX_COMMAND_READ_MS
+        );
         let tools = tool_catalog();
-        let read = tools
-            .iter()
-            .find(|tool| tool.name.as_ref() == "command.read")
-            .unwrap();
-        let read_description = read.description.as_deref().unwrap();
-        assert!(read_description.contains("drained=true"));
-        assert!(read_description.contains("process may still be running"));
-        let read_output = command_read_output_schema();
-        assert!(
-            read_output["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "hasMoreOutput")
-        );
-        assert!(
-            read_output["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "drained")
-        );
-
-        let control = tools
-            .iter()
-            .find(|tool| tool.name.as_ref() == "command.control")
-            .unwrap();
-        let control_description = control.description.as_deref().unwrap();
-        assert!(control_description.contains("not a graceful-shutdown guarantee"));
-
         let exec = tools
             .iter()
-            .find(|tool| tool.name.as_ref() == "command.exec")
+            .find(|tool| tool.name == "command.exec")
             .unwrap();
-        let exec_description = exec.description.as_deref().unwrap();
-        assert!(exec_description.contains("bounded, non-interactive"));
-        assert!(exec_description.contains("server-owned 40-second child timeout"));
-        assert!(exec_description.contains("command.start"));
-        assert!(exec_description.contains("codex.start"));
-        let exec_input = command_schema();
-        assert!(exec_input["properties"].get("timeoutMs").is_none());
-        assert!(exec_input["properties"].get("outputBytesCap").is_none());
         let exec_output = exec.output_schema.as_ref().unwrap();
         for field in [
             "stdoutBytes",
@@ -1181,31 +1167,16 @@ mod tests {
         assert!(output.to_string().contains("currentActivity"));
 
         let input = codex_wait_schema();
-        assert!(
-            input["required"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("turnId"))
+        let properties = input["properties"].as_object().unwrap();
+        assert_eq!(
+            properties
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["threadId", "turnId"])
         );
-        assert_eq!(input["properties"]["timeoutMs"]["minimum"], 1);
-        assert_eq!(input["properties"]["timeoutMs"]["default"], 40_000);
-        assert_eq!(input["properties"]["timeoutMs"]["maximum"], 40_000);
-        assert!(
-            input
-                .to_string()
-                .contains("worker remains active, not stalled")
-        );
-        assert!(input["properties"].get("afterCursor").is_none());
-        let tool = tool_catalog()
-            .into_iter()
-            .find(|tool| tool.name.as_ref() == "codex.wait")
-            .unwrap();
-        assert!(
-            tool.description
-                .as_deref()
-                .unwrap()
-                .contains("Scheduled Task")
-        );
+        assert_eq!(input["required"], json!(["threadId", "turnId"]));
+        assert_eq!(input["additionalProperties"], false);
     }
 
     #[test]
@@ -1219,7 +1190,10 @@ mod tests {
         let output = codex_inspect_output_schema().to_string();
         assert!(output.contains("currentActivity"));
         assert!(output.contains("hasMore"));
-        assert!(output.contains("Original official notification data"));
+        let raw = &codex_inspect_output_schema()["oneOf"][1]["properties"]["events"]["items"];
+        for field in ["method", "params", "truncated"] {
+            assert!(raw["properties"].get(field).is_some());
+        }
     }
 
     #[test]
@@ -1345,43 +1319,6 @@ mod tests {
     }
 
     #[test]
-    fn high_leverage_parameters_explain_execution_domain_and_selection() {
-        assert!(
-            cwd_schema()["description"]
-                .as_str()
-                .unwrap()
-                .contains("not ChatGPT's native sandbox")
-        );
-        let command = command_schema();
-        assert!(
-            command["properties"]["command"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("Codex Connect host")
-        );
-        let start = codex_start_schema();
-        let work = &start["oneOf"][0]["properties"];
-        assert!(
-            work["task"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("does not inherit the ChatGPT conversation")
-        );
-        assert!(
-            work["model"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("codex.info(type=models)")
-        );
-        assert!(
-            work["access"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("danger-full-access")
-        );
-    }
-
-    #[test]
     fn scoped_codex_control_tools_are_closed_world() {
         let value = serde_json::to_value(tool_catalog()).unwrap();
         let tools = value.as_array().unwrap();
@@ -1393,49 +1330,5 @@ mod tests {
             assert_eq!(annotations["openWorldHint"], false);
             assert_eq!(annotations["idempotentHint"], false);
         }
-    }
-
-    #[test]
-    fn tool_selection_fixture_references_only_canonical_tools() {
-        let cases = [
-            ("find where Relay is defined", Some("inspect")),
-            (
-                "show status, recent commits, and changed files",
-                Some("command.exec"),
-            ),
-            ("run cargo test", Some("command.exec")),
-            (
-                "start the dev server and keep it running",
-                Some("command.start"),
-            ),
-            (
-                "read the new output from the dev server",
-                Some("command.read"),
-            ),
-            ("send `continue` to the debugger", Some("command.control")),
-            ("resize the debugger terminal", Some("command.control")),
-            ("stop the running dev server", Some("command.control")),
-            (
-                "investigate these test failures and fix them",
-                Some("codex.start"),
-            ),
-            ("wait for the coding agent to finish", Some("codex.wait")),
-            (
-                "show me what the coding agent has been doing",
-                Some("codex.inspect"),
-            ),
-            ("review my uncommitted changes", Some("codex.start")),
-            ("show me this png", Some("view_image")),
-            (
-                "answer the coding agent's question",
-                Some("codex.action.respond"),
-            ),
-            ("show models, skills, and usage", Some("codex.info")),
-            ("what is the weather", None),
-        ];
-        assert_eq!(cases.len(), 16);
-        assert!(cases.iter().all(|(_, tool)| {
-            tool.is_none_or(|name| tool_catalog().iter().any(|t| t.name.as_ref() == name))
-        }));
     }
 }

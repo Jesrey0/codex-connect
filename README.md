@@ -16,17 +16,17 @@ ChatGPT is the primary technical operator and orchestrator. Keep these planes di
 
 HostPlane is authoritative for host work. WorkerPlane is authoritative for delegated Codex lifecycle and cognition. PlatformPlane does not acquire host authority, and host or worker tools do not acquire connected-account authority. Workers do not inherit ChatGPT conversation, files, native tools, plugins, or scheduled tasks; delegated tasks must carry their own context and acceptance criteria.
 
-The canonical remote path is ChatGPT → ngrok HTTPS → host ingress with OAuth → loopback Codex Connect. Codex CLI/App Server and host ingress have independent user-global lifecycles. Codex Connect owns its backend, configuration/state/cache, and installed artifacts. OpenAI Secure MCP Tunnel may be retained only as an independently managed secondary fallback; it is not part of normal setup, health, deployment, or timeout semantics.
+The remote path is ChatGPT → ngrok HTTPS → host ingress with OAuth → loopback Codex Connect. Codex CLI/App Server and host ingress are independently managed. Connect owns its backend, configuration, state, cache, and installed artifacts.
 
-Every public tool advertises the `codex-connect:access` OAuth requirement in its descriptor metadata. Host ingress remains the sole token-validation authority: it verifies the Bearer token and strips credentials before proxying the request, so Codex Connect does not duplicate OAuth state or token parsing.
+Tools advertise the `codex-connect:access` OAuth scope; host ingress validates tokens before forwarding to the backend.
 
 ## Authority and delegation
 
 Deterministic host tools run with the OS account's authority. The configured `default_cwd` is navigation only, not an authorization boundary; absolute host paths are valid. The dedicated App Server uses a process-local `danger-full-access` launch override for HostPlane.
 
-`codex.start(mode=work)` is WorkerPlane. Omitted `access` selects the canonical writable workspace sandbox with network access; `access="full"` selects `danger-full-access`. Work turns use `approvalPolicy="never"`, which removes mechanical approval stalls without widening the selected sandbox. Reviews are read-only. Connect does not send `thread/start.developerInstructions`: worker cognition comes from `~/.codex/config.toml` `developer_instructions`, `~/.codex/AGENTS.md`, repository/directory `AGENTS.md`, and then the delegated task. Connect owns authority and lifecycle.
+`codex.start(mode=work)` defaults to a writable workspace sandbox with network access; `access="full"` grants unrestricted host access. Approval prompts are disabled within the selected sandbox. Reviews are read-only. Workers use the normal Codex config and AGENTS.md instruction sources.
 
-Delegated scope ownership persists until terminal, semantic block/action, interrupt, or user redirect. `codex.wait` is a bounded synchronization lease driven by App Server lifecycle notifications; reads hydrate pre-existing state, reconcile explicit history loss, or perform one final lease-expiry check. ChatGPT's current outer tool-call budget was measured live at about 60 seconds, so the public wait lease is capped at 40 seconds; this leaves room for up to 10 seconds of terminal/reconciliation finalization plus MCP/transport headroom. Once no useful non-overlapping operator work remains, prefer one bounded event-driven join over polling. A timeout is not failure, a stall diagnosis, or permission to take over. A dropped `codex.start` caller also does not cancel upstream worker creation: Connect owns start completion and can recover the handle through a one-shot `workerStarted` host event. Use `codex.inspect` for activity/history; the human `console` is a read-only event-driven projection, not an event trace. Its local UI clock never polls App Server state. PTY support remains available through `command.start/read/control`.
+Workers own their delegated scope until completion, required action/input, interruption, or user redirect. Continue only non-overlapping work, then use `codex.wait` to join. Timeout means the worker is still active; use `codex.inspect` for activity/history. See [Operations](docs/operations.md#worker-lifecycle) for pending actions and lost-call recovery.
 
 Do not invoke the Codex CLI through HostPlane commands when a `codex.*` semantic tool exists. Git actions are operator workflow, not application workflow.
 
@@ -36,19 +36,12 @@ The live public catalog contains exactly 14 tools:
 
 `status`, `inspect`, `view_image`, `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control`, `codex.start`, `codex.wait`, `codex.inspect`, `codex.control`, `codex.action.respond`, and `codex.info`.
 
-The intent-shaped inputs are deliberately compact:
-
-- `command.exec`: required `command`; optional `cwd` and `env`. The server-owned child timeout is 40 seconds, with a 45-second hard child ceiling and bounded response allowance; longer jobs belong on `command.start`.
-- `command.start/read/control`: persistent command lifecycle with stdin, PTY resize, termination, cursors, and event-driven reads; `command.read` defaults to 40 seconds and permits 45 seconds so the MCP response remains inside the observed ChatGPT outer deadline.
-- `codex.start(mode=work)`: `task`, optional `cwd`, `threadId`, `model`, `effort`, and `access`.
-- `codex.start(mode=review)`: review `target`, optional `cwd`, `threadId`, and `model`; reviews are read-only.
-
-`serviceTier`, developer instructions, raw sandbox policy, approval policy, and other low-level controls are server-owned/hidden. Model, skill, and usage discovery is batched through `codex.info`.
+Use `command.exec` for short commands, `command.start/read/control` for persistent or interactive processes, and `codex.start` for delegated work/review. Discover models, skills, and usage with `codex.info`. The live schemas define inputs and limits.
 
 ## Install and operate
 
-Start with [Getting Started](docs/getting-started.md). It installs the pinned Codex CLI/App Server `0.155.1` and Codex Connect, configures authenticated ngrok HTTPS through host ingress, and proves the complete ChatGPT path. Read [Security](SECURITY.md) first: this is a high-trust loopback host bridge whose public authentication is enforced at ingress.
+Start with [Getting Started](docs/getting-started.md) to install the pinned Codex CLI/App Server and backend, configure authenticated HTTPS ingress, and verify calls from ChatGPT. Read [Security](SECURITY.md) first.
 
-For steady-state lifecycle and recovery, see [Operations](docs/operations.md). Backend deployment and connector refresh are separate: `SourceChanged != Committed != Pushed != Deployed != Live != CIGreen`. Verify each state at its owner. Backend deployment never refreshes the ChatGPT connector or supervises ingress.
+See [Operations](docs/operations.md) for lifecycle, recovery, and deployment. Source, Git, deployed artifacts, live builds, connector discovery, and CI must be verified separately.
 
 For architecture, see [Architecture](docs/architecture/overview.md). For protocol governance and validation, see [Development](docs/development.md). Contributor rules are in [CONTRIBUTING.md](CONTRIBUTING.md); historical release notes are in [CHANGELOG.md](CHANGELOG.md).

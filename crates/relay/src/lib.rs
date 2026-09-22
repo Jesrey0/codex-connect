@@ -39,9 +39,9 @@ use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::{Duration, Instant};
 
-pub const MAX_WAIT_MS: u64 = 300_000;
+const WORK_WAIT_MS: u64 = 40_000;
 const WAIT_FINALIZATION_RESERVE_MS: u64 = 10_000;
-pub const MAX_WAIT_OPERATION_MS: u64 = MAX_WAIT_MS + WAIT_FINALIZATION_RESERVE_MS;
+pub const WORK_WAIT_OPERATION_MS: u64 = WORK_WAIT_MS + WAIT_FINALIZATION_RESERVE_MS;
 const WAIT_FINAL_RECONCILE_MS: u64 = 500;
 const WAIT_STORAGE_RETRY_MS: u64 = 25;
 const WAIT_STORAGE_RETRY_MAX_MS: u64 = 500;
@@ -1623,25 +1623,10 @@ impl Relay {
         }
     }
 
-    pub async fn work_wait(
-        &self,
-        thread_id: String,
-        turn_id: String,
-        timeout_ms: u64,
-    ) -> Result<Value, RelayError> {
-        if timeout_ms == 0 || timeout_ms > MAX_WAIT_MS {
-            return Err(RelayError::Invalid(format!(
-                "timeoutMs must be between 1 and {MAX_WAIT_MS}"
-            )));
-        }
+    pub async fn work_wait(&self, thread_id: String, turn_id: String) -> Result<Value, RelayError> {
         let started_at = Instant::now();
-        let deadline = started_at + Duration::from_millis(timeout_ms);
-        let operation_deadline = started_at
-            + Duration::from_millis(
-                timeout_ms
-                    .saturating_add(WAIT_FINALIZATION_RESERVE_MS)
-                    .min(MAX_WAIT_OPERATION_MS),
-            );
+        let deadline = started_at + Duration::from_millis(WORK_WAIT_MS);
+        let operation_deadline = started_at + Duration::from_millis(WORK_WAIT_OPERATION_MS);
         // Subscribe before the authoritative read so actionable requests and terminal
         // notifications cannot race the wait setup.
         let mut transport_changes = self.app_server.changes();
@@ -1660,10 +1645,7 @@ impl Relay {
                 Ok(result) => result?,
                 Err(_) => {
                     return Err(RelayError::BudgetExceeded(format!(
-                        "codex.wait could not reconcile turn state within {} ms",
-                        timeout_ms
-                            .saturating_add(WAIT_FINALIZATION_RESERVE_MS)
-                            .min(MAX_WAIT_OPERATION_MS)
+                        "codex.wait could not reconcile turn state within {WORK_WAIT_OPERATION_MS} ms"
                     )));
                 }
             }

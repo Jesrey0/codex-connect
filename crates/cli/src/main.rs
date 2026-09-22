@@ -108,7 +108,7 @@ enum CommandName {
         #[arg(short = 'n', long, default_value_t = 100)]
         lines: usize,
     },
-    /// Run end-to-end deployment diagnostics.
+    /// Diagnose the local backend and App Server.
     Doctor,
     /// Watch the local read-only Codex Connect observability console.
     Console,

@@ -21,7 +21,45 @@ codex-connect console
 codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-project
 ```
 
-`status` is concise runtime/readiness/orientation: readiness, live build identity, navigation cwd, and Codex default provenance. `console` is a read-only event-driven human projection of workers, quota, pending actions, and selected transcripts; it hydrates once, then waits for observer changes rather than polling. Its local UI clock only redraws animation/countdowns. Quota refresh is triggered by observer launch and worker/message lifecycle boundaries and is independent from the worker projection. `doctor` is the detailed local diagnostic. PTY command sessions are controlled through the MCP `command.start/read/control` tools.
+`status` reports readiness, live build identity, navigation cwd, and Codex defaults. `doctor` provides local diagnostics. `console` follows worker activity, quota, pending actions, and transcripts without changing worker state.
+
+## Host commands
+
+Use `command.exec` for short, non-interactive commands and `command.start` for
+long-running or interactive work. Commands take argv; invoke a shell explicitly
+for pipes, redirects, or expansion. Set `tty=true` only when a terminal is needed.
+
+After `command.start`, retain `processId` and pass each returned cursor to
+`command.read`. `timeoutMs=0` reads immediately; otherwise the read waits for output
+or exit. Timeout does not terminate the process. Continue until `drained=true` for
+final output; `historyLost=true` means older output was evicted. Termination can be
+forceful: confirm exit with `command.read`. Process handles belong to the backend's
+App Server connection and do not survive its restart.
+
+## Worker lifecycle
+
+Supply `codex.start` with a self-contained task, host paths, constraints, and
+acceptance criteria. Use `codex.info` to discover model IDs and supported effort.
+Work can resume a thread and override model, effort, and access for that turn;
+review retains an existing thread's settings and rejects a model override.
+
+Retain `threadId` and `turnId`. Continue only non-overlapping operator work, then
+call `codex.wait` with those IDs. It uses a fixed server wait and returns:
+
+- `terminal`: read the turn status, output, and error.
+- `actionRequired` or `inputRequired`: respond with `codex.action.respond`, matching
+  the pending kind, requestId, and requested answers or decisions; then wait again.
+- `timeout`: the worker is active. Continue waiting or inspect activity; timeout
+  does not establish a stall or authorize taking over its scope.
+
+Use `codex.inspect` and its cursor for activity/history, `codex.control` to steer
+or interrupt, and `codex.wait` to confirm terminal state after interruption.
+
+A lost `codex.start` response does not cancel creation. Before retrying, check a
+host tool response (for example `status`) for a one-shot `workerStarted` event and
+save its IDs. `workerEvents` can also report completion or required action. Their
+absence provides no worker status; `historyLost` means notifications are missing. After a
+backend restart, use retained thread/turn IDs to reconcile through `codex.wait`.
 
 ## Ingress lifecycle
 
@@ -37,7 +75,7 @@ Host ingress owns `host-ngrok`, `host-ingress` (Caddy), and `host-oauth` service
 
 ### Secondary fallback
 
-OpenAI Secure MCP Tunnel may be retained as an explicitly secondary recovery path. Its process, profile, credentials, reconnect behavior, and native state are upstream-owned and must stay outside the Codex Connect source/config tree. Normal operation uses ngrok through host ingress; keep the fallback inactive unless needed and operate it only through native `tunnel-client` lifecycle commands. Backend health, deployment, timeout behavior, and ingress readiness never depend on it.
+An independently configured OpenAI Secure MCP Tunnel can provide recovery access. Manage it with `tunnel-client`, outside Connect configuration/state, and keep it inactive unless needed. Backend health and deployment do not manage it.
 
 ## Restart recovery
 
@@ -65,7 +103,7 @@ codex-connect deploy status <operation-id>
 
 `prepare` queues a detached release build and records a durable operation. Wait for `prepared`; `activate` queues the backend restart; the final `status` verifies the exact prepared artifact is live. The deployment build cache at `~/.cache/codex-connect/deploy/build` is a compiler cache, not runtime authority. Deployment does not restart ingress or refresh the connector.
 
-The states are deliberately distinct: `SourceChanged != Committed != Pushed != Deployed != Live != CIGreen`. Git commits/pushes are operator workflow and are never implied by deployment. Verify source, Git, deployment, service/build identity, connector discovery, and CI at their respective owners.
+Verify source, Git, prepared artifact, live build identity, connector discovery, and CI separately. Deployment does not commit or push.
 
 ## Configuration and uninstall
 

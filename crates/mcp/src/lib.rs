@@ -30,24 +30,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-const CHATGPT_TOOL_RESPONSE_BUDGET_MS: u64 = 60_000;
-const CHATGPT_TOOL_RESPONSE_HEADROOM_MS: u64 = 5_000;
-const MAX_SYNC_TOOL_GUARD_MS: u64 =
-    CHATGPT_TOOL_RESPONSE_BUDGET_MS - CHATGPT_TOOL_RESPONSE_HEADROOM_MS;
-const DEFAULT_WAIT_MS: u64 = 40_000;
-const MAX_PUBLIC_WAIT_MS: u64 = 40_000;
 const QUICK_TOOL_GUARD_MS: u64 = 45_000;
 const CODEX_START_GUARD_MS: u64 = 50_000;
-const COMMAND_EXEC_GUARD_MS: u64 = MAX_SYNC_TOOL_GUARD_MS;
+const COMMAND_EXEC_GUARD_MS: u64 = codex_connect_relay::DEFAULT_COMMAND_MS
+    + codex_connect_relay::COMMAND_EXEC_RESPONSE_ALLOWANCE_MS
+    + 5_000;
 const COMMAND_READ_GUARD_ALLOWANCE_MS: u64 = 5_000;
 const COMMAND_READ_GUARD_MS: u64 =
     codex_connect_relay::MAX_COMMAND_READ_MS + COMMAND_READ_GUARD_ALLOWANCE_MS;
-const CODEX_WAIT_GUARD_ALLOWANCE_MS: u64 = 15_000;
-const CODEX_WAIT_GUARD_MS: u64 = MAX_SYNC_TOOL_GUARD_MS;
+const CODEX_WAIT_GUARD_MS: u64 = codex_connect_relay::WORK_WAIT_OPERATION_MS + 5_000;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_CONCURRENCY: usize = 4;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect is the authoritative host/Codex control plane for its host workspace. It is NOT ChatGPT's native sandbox: never assume /mnt/data, uploaded or Project files, browser/plugin state, or native-tool paths exist on the Codex Connect host. Use host tools for host files/processes and codex.* for Codex lifecycle semantics; never invoke the Codex CLI through host commands. cwd is navigation, not authorization. Direct host operations use host-user authority. Delegated work defaults to a server-owned writable workspace sandbox with network access and non-blocking approvals; access=full explicitly requests danger-full-access. Reviews remain read-only. ApprovalPolicy=never removes mechanical approval stalls but does not enlarge the selected sandbox. Workers need self-contained context and own delegated scope until terminal, blocked for semantic input, or interrupted. Preserve PTY tools for interactive processes. Do not create Git workflow state unless requested.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect tools operate on the connected host. HostPlane handles host files and processes; WorkerPlane uses codex.* for delegated work and review. PlatformPlane belongs to ChatGPT: conversation, uploads, /mnt/data, browser, apps, and Scheduled Tasks are not shared with the host or workers. Host tools use the OS account's authority; cwd only selects a directory. Workers use the selected sandbox and need self-contained tasks. Workers own their scope until terminal, blocked for action/input, interrupted, or redirected by the user. Continue only non-overlapping work; timeout does not release scope. Use codex.* for Codex lifecycle operations, never host commands invoking the Codex CLI. Create Git workflow state only when requested.";
 
 struct CancelOnDrop(Arc<AtomicBool>);
 
@@ -431,7 +426,7 @@ impl ServerHandler for McpHandler {
             Err(_) => {
                 operation_cancelled.store(true, Ordering::Release);
                 Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "MCP operation exceeded its {guard_ms} ms local guard; the calling client may enforce a shorter response deadline"
+                    "{name} exceeded its {guard_ms} ms deadline; check state before retrying"
                 ))])
                 .into())
             }
@@ -453,16 +448,7 @@ impl ServerHandler for McpHandler {
 
 fn tool_guard_ms(name: &str, arguments: &JsonObject) -> u64 {
     match name {
-        "codex.wait" => {
-            let requested = arguments
-                .get("timeoutMs")
-                .and_then(Value::as_u64)
-                .unwrap_or(DEFAULT_WAIT_MS)
-                .min(MAX_PUBLIC_WAIT_MS);
-            requested
-                .saturating_add(CODEX_WAIT_GUARD_ALLOWANCE_MS)
-                .min(CODEX_WAIT_GUARD_MS)
-        }
+        "codex.wait" => CODEX_WAIT_GUARD_MS,
         "command.read" => {
             let requested = arguments
                 .get("timeoutMs")
@@ -581,11 +567,6 @@ fn work_sandbox_policy(access: WorkAccess) -> SandboxPolicy {
 struct CodexWaitArgs {
     thread_id: String,
     turn_id: String,
-    #[serde(default = "default_wait_ms")]
-    timeout_ms: u64,
-}
-fn default_wait_ms() -> u64 {
-    DEFAULT_WAIT_MS
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -773,11 +754,8 @@ async fn dispatch(
         },
         "codex.wait" => {
             let a: CodexWaitArgs = parse(arguments)?;
-            if a.timeout_ms == 0 || a.timeout_ms > MAX_PUBLIC_WAIT_MS {
-                anyhow::bail!("timeoutMs must be between 1 and {MAX_PUBLIC_WAIT_MS}");
-            }
             relay
-                .work_wait(a.thread_id, a.turn_id, a.timeout_ms)
+                .work_wait(a.thread_id, a.turn_id)
                 .await
                 .map_err(Into::into)
         }
@@ -1170,62 +1148,43 @@ async fn image_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CHATGPT_TOOL_RESPONSE_BUDGET_MS, CODEX_START_GUARD_MS, CODEX_WAIT_GUARD_MS,
-        COMMAND_EXEC_GUARD_MS, COMMAND_READ_GUARD_MS, QUICK_TOOL_GUARD_MS, SERVER_INSTRUCTIONS,
-        tool_guard_ms,
-    };
+    use super::*;
 
     #[test]
-    fn server_instructions_define_compact_execution_domain_invariants() {
-        assert!(SERVER_INSTRUCTIONS.len() < 1_200);
-        let first_512 = &SERVER_INSTRUCTIONS[..SERVER_INSTRUCTIONS
-            .char_indices()
-            .map(|(index, _)| index)
-            .take_while(|index| *index <= 512)
-            .last()
-            .unwrap_or(SERVER_INSTRUCTIONS.len())];
-        assert!(first_512.contains("NOT ChatGPT's native sandbox"));
-        assert!(first_512.contains("/mnt/data"));
-        assert!(first_512.contains("Codex Connect host"));
-        assert!(SERVER_INSTRUCTIONS.contains("codex.* for Codex lifecycle semantics"));
-        assert!(SERVER_INSTRUCTIONS.contains("never invoke the Codex CLI through host commands"));
-        assert!(SERVER_INSTRUCTIONS.contains("cwd is navigation, not authorization"));
-        assert!(SERVER_INSTRUCTIONS.contains("access=full"));
-        assert!(SERVER_INSTRUCTIONS.contains("ApprovalPolicy=never"));
-        assert!(SERVER_INSTRUCTIONS.contains("own delegated scope"));
-        assert!(SERVER_INSTRUCTIONS.contains("Preserve PTY tools"));
-        assert!(SERVER_INSTRUCTIONS.contains("Do not create Git workflow state unless requested"));
-        assert_eq!(CHATGPT_TOOL_RESPONSE_BUDGET_MS, 60_000);
-        assert_eq!(QUICK_TOOL_GUARD_MS, 45_000);
-        assert_eq!(CODEX_START_GUARD_MS, 50_000);
-        assert_eq!(COMMAND_EXEC_GUARD_MS, 55_000);
-        assert_eq!(COMMAND_READ_GUARD_MS, 50_000);
-        assert_eq!(CODEX_WAIT_GUARD_MS, 55_000);
-        for guard in [
-            QUICK_TOOL_GUARD_MS,
-            CODEX_START_GUARD_MS,
-            COMMAND_EXEC_GUARD_MS,
-            COMMAND_READ_GUARD_MS,
-            CODEX_WAIT_GUARD_MS,
-        ] {
-            assert!(guard < CHATGPT_TOOL_RESPONSE_BUDGET_MS);
+    fn server_instructions_are_compact_and_identify_the_planes() {
+        assert!(SERVER_INSTRUCTIONS.len() < 800);
+        for plane in ["HostPlane", "WorkerPlane", "PlatformPlane"] {
+            assert!(SERVER_INSTRUCTIONS.contains(plane));
         }
-        let default_wait = serde_json::Map::new();
-        assert_eq!(tool_guard_ms("codex.wait", &default_wait), 55_000);
-        let max_wait = serde_json::json!({"timeoutMs":40_000});
-        assert_eq!(
-            tool_guard_ms("codex.wait", max_wait.as_object().unwrap()),
-            55_000
+    }
+
+    #[test]
+    fn tool_guards_cover_operation_budgets() {
+        let empty = serde_json::Map::new();
+        assert_eq!(tool_guard_ms("codex.wait", &empty), CODEX_WAIT_GUARD_MS);
+        assert!(tool_guard_ms("codex.wait", &empty) > codex_connect_relay::WORK_WAIT_OPERATION_MS);
+        assert!(
+            tool_guard_ms("command.exec", &empty)
+                > codex_connect_relay::DEFAULT_COMMAND_MS
+                    + codex_connect_relay::COMMAND_EXEC_RESPONSE_ALLOWANCE_MS
         );
-        assert_eq!(tool_guard_ms("command.read", &default_wait), 45_000);
-        let max_read = serde_json::json!({"timeoutMs":45_000});
+        for timeout in [
+            0,
+            codex_connect_relay::DEFAULT_COMMAND_READ_MS,
+            codex_connect_relay::MAX_COMMAND_READ_MS,
+        ] {
+            let arguments = json!({"timeoutMs":timeout});
+            assert_eq!(
+                tool_guard_ms("command.read", arguments.as_object().unwrap()),
+                timeout + COMMAND_READ_GUARD_ALLOWANCE_MS
+            );
+        }
         assert_eq!(
-            tool_guard_ms("command.read", max_read.as_object().unwrap()),
-            50_000
+            tool_guard_ms("command.read", &empty),
+            codex_connect_relay::DEFAULT_COMMAND_READ_MS + COMMAND_READ_GUARD_ALLOWANCE_MS
         );
-        assert_eq!(tool_guard_ms("command.exec", &default_wait), 55_000);
-        assert_eq!(tool_guard_ms("codex.start", &default_wait), 50_000);
-        assert_eq!(tool_guard_ms("status", &default_wait), 45_000);
+        assert_eq!(tool_guard_ms("command.exec", &empty), COMMAND_EXEC_GUARD_MS);
+        assert_eq!(tool_guard_ms("codex.start", &empty), CODEX_START_GUARD_MS);
+        assert_eq!(tool_guard_ms("status", &empty), QUICK_TOOL_GUARD_MS);
     }
 }

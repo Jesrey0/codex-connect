@@ -19,10 +19,7 @@ host bridge. Its port must remain on loopback; authentication belongs to host in
   Availability and UI labels vary by account and workspace; check current settings
   and [OpenAI's developer-mode guide](https://developers.openai.com/api/docs/guides/developer-mode).
 
-Codex CLI and host ingress are user-global, independently managed dependencies.
-Codex Connect owns its backend, configuration, deployment records, and installed
-artifacts. Secure MCP Tunnel is optional secondary recovery only; it is not required
-for normal installation, health, deployment, or connector operation.
+Codex CLI and host ingress are independently managed. Codex Connect owns its backend, configuration, deployment records, and installed artifacts.
 
 ## 1. Check the host and install Codex
 
@@ -69,25 +66,14 @@ address as the remote ChatGPT connector URL.
 
 ## 3. Configure and verify host ingress
 
-Follow the host-ingress README for its credential setup, one-time OAuth identity
-initialization, source validation, and deployment. Use the existing ngrok agent;
-do not create another public endpoint or proxy. From the host-ingress checkout:
+Follow the [host-ingress README](https://github.com/Jesrey0/host-ingress) for OAuth setup and deployment. From its checkout:
 
 ```bash
 ./scripts/status
 CHECK_PUBLIC=1 ./scripts/check
 ```
 
-The canonical public URL is `${NGROK_URL}/codex-connect/mcp`; host ingress owns
-`NGROK_URL` and reports it through `scripts/status`. Its authentication contract is:
-
-- OAuth authorization code with S256 PKCE and ChatGPT CIMD client registration.
-- ChatGPT's signed `private_key_jwt` client assertion at the token endpoint.
-- Single-operator browser login and explicit consent at host ingress.
-- Access tokens bound to the canonical MCP resource and `codex-connect:access`.
-- Persistent ChatGPT refresh authorization even when `offline_access` is not
-  requested; the ChatGPT refresh credential is non-rotating so concurrent silent
-  refresh attempts do not invalidate one another.
+The public URL is `${NGROK_URL}/codex-connect/mcp`; host ingress reports `NGROK_URL` through `scripts/status`.
 
 Anonymous and invalid-token MCP requests must return 401 with a Bearer discovery
 challenge. Public metadata must describe the exact HTTPS resource and issuer.
@@ -103,32 +89,12 @@ Private status/health endpoints and undeclared routes must remain inaccessible.
    host-ingress credential; do not put it in the MCP URL or ChatGPT client fields.
 5. Scan/discover tools and enable the app. Expect exactly 14 tools.
 
-The authorization server uses issuer identification and the stable callback
-`https://chatgpt.com/connector_platform_oauth_redirect`. The allowed client metadata
-document is `https://chatgpt.com/oauth/client.json`.
-
 Backend deployment and connector refresh are separate. Refresh/rediscover after
 tool metadata changes; a running service does not prove the connector snapshot is current.
 
 ## 5. Verify from ChatGPT
 
-Use the connected app to call `status` and `inspect`; check the live build and
-navigation cwd. Then verify `command.exec`, `command.start`, `command.read`,
-`command.control`, worker lifecycle, and any pending action/approval flow using
-disposable work. Repeat after an idle period and after a controlled backend restart.
-Run only 5 × status and 5 × inspect for a lightweight latency sanity check.
-
-Treat latency as an environment-specific validation signal rather than a fixed product
-threshold. Establish a local baseline with lightweight calls after ingress is stable;
-measure command initiation separately because backend/App Server work can dominate it.
-
-### Optional secondary fallback
-
-You may retain an independently configured OpenAI Secure MCP Tunnel for recovery.
-Keep it outside the Codex Connect source/config tree and manage it only through the
-upstream `tunnel-client`. Normal operation uses the ngrok/host-ingress connector;
-keep the fallback inactive unless needed, and never make backend health, deployment,
-or application timeout behavior depend on it.
+Use the connected app to call `status` and `inspect`; check live build identity and navigation cwd. Verify command, worker, and pending-action flows with disposable work as described in [Operations](operations.md). Repeat after an idle period and a controlled backend restart.
 
 ## Updates, restart, and removal
 

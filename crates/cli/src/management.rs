@@ -440,7 +440,9 @@ pub async fn setup(no_start: bool) -> Result<()> {
     let store = ConfigStore::default()?;
     let original = store.exists().then(|| store.read_bytes()).transpose()?;
     let mut config = if store.exists() {
-        store.load().context("existing configuration cannot be used; replace it with the current single-backend configuration")?
+        store
+            .load()
+            .context("invalid configuration; correct the reported error before running setup")?
     } else {
         Config::new()
     };
