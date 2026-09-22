@@ -143,8 +143,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.client.catalog), 14)
         self.assertEqual(set(self.client.tools), EXPECTED)
         wait_timeout = self.client.tools["codex.wait"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(wait_timeout["default"], 120000)
-        self.assertEqual(wait_timeout["maximum"], 300000)
+        self.assertEqual(wait_timeout["default"], 40000)
+        self.assertEqual(wait_timeout["maximum"], 40000)
         self.assertEqual(wait_timeout["minimum"], 1)
         self.assertNotIn("afterCursor", self.client.tools["codex.wait"]["inputSchema"]["properties"])
         self.assertEqual(
@@ -155,8 +155,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertNotIn("timeoutMs", exec_properties)
         self.assertNotIn("outputBytesCap", exec_properties)
         read_timeout = self.client.tools["command.read"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(read_timeout["default"], 60000)
-        self.assertEqual(read_timeout["maximum"], 80000)
+        self.assertEqual(read_timeout["default"], 40000)
+        self.assertEqual(read_timeout["maximum"], 45000)
         start_size = self.client.tools["command.start"]["inputSchema"]["properties"]["size"]["anyOf"][0]
         resize = self.client.tools["command.control"]["inputSchema"]["oneOf"][1]["properties"]
         self.assertEqual(start_size["properties"]["rows"]["minimum"], 1)
@@ -402,7 +402,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertFalse(result["stderrMayBeTruncated"])
         self.assertGreaterEqual(result["durationMs"], 0)
         command_params = self.method_params("command/exec")[-1]
-        self.assertEqual(command_params["timeoutMs"], 60000)
+        self.assertEqual(command_params["timeoutMs"], 40000)
         self.assertEqual(command_params["outputBytesCap"], 65536)
         self.assertNotIn("sandboxPolicy", command_params)
         self.assertEqual(self.client.call("command.exec", {
@@ -763,12 +763,12 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(len(transcript["entries"]), 6)
         self.assertTrue(all(len(entry["text"]) == 32 * 1024 for entry in transcript["entries"]))
 
-    def test_wait_rejects_timeout_above_server_limit(self):
+    def test_wait_rejects_timeout_above_public_limit(self):
         complete = self.start("complete")
         longest = self.client.call("codex.wait", {
             "threadId": complete["threadId"],
             "turnId": complete["turnId"],
-            "timeoutMs": 300000,
+            "timeoutMs": 40000,
         })
         self.assertEqual(longest["state"], "terminal")
 
@@ -777,7 +777,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.client.call("codex.wait", {
             "threadId": work["threadId"],
             "turnId": work["turnId"],
-            "timeoutMs": 300001,
+            "timeoutMs": 40001,
         }, error=True, validate_input=False)
         self.assertEqual(len(self.method_params("thread/read")), reads_before)
         self.client.call("codex.wait", {

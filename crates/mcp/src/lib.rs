@@ -9,9 +9,8 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use codex_connect_host::Host;
 use codex_connect_relay::{
-    ApprovalDecision, CommandExec, CommandExecTerminalSize, ElicitationAction, MAX_WAIT_MS,
-    MAX_WAIT_OPERATION_MS, PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId,
-    SandboxPolicy,
+    ApprovalDecision, CommandExec, CommandExecTerminalSize, ElicitationAction, PermissionGrant,
+    PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
 };
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
@@ -31,15 +30,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-const DEFAULT_WAIT_MS: u64 = 120_000;
+const CHATGPT_TOOL_RESPONSE_BUDGET_MS: u64 = 60_000;
+const CHATGPT_TOOL_RESPONSE_HEADROOM_MS: u64 = 5_000;
+const MAX_SYNC_TOOL_GUARD_MS: u64 =
+    CHATGPT_TOOL_RESPONSE_BUDGET_MS - CHATGPT_TOOL_RESPONSE_HEADROOM_MS;
+const DEFAULT_WAIT_MS: u64 = 40_000;
+const MAX_PUBLIC_WAIT_MS: u64 = 40_000;
 const QUICK_TOOL_GUARD_MS: u64 = 45_000;
-const CODEX_START_GUARD_MS: u64 = 90_000;
-const COMMAND_EXEC_GUARD_MS: u64 = 75_000;
+const CODEX_START_GUARD_MS: u64 = 50_000;
+const COMMAND_EXEC_GUARD_MS: u64 = MAX_SYNC_TOOL_GUARD_MS;
 const COMMAND_READ_GUARD_ALLOWANCE_MS: u64 = 5_000;
 const COMMAND_READ_GUARD_MS: u64 =
     codex_connect_relay::MAX_COMMAND_READ_MS + COMMAND_READ_GUARD_ALLOWANCE_MS;
 const CODEX_WAIT_GUARD_ALLOWANCE_MS: u64 = 15_000;
-const CODEX_WAIT_GUARD_MS: u64 = MAX_WAIT_OPERATION_MS + 5_000;
+const CODEX_WAIT_GUARD_MS: u64 = MAX_SYNC_TOOL_GUARD_MS;
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_CONCURRENCY: usize = 4;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -454,7 +458,7 @@ fn tool_guard_ms(name: &str, arguments: &JsonObject) -> u64 {
                 .get("timeoutMs")
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_WAIT_MS)
-                .min(MAX_WAIT_MS);
+                .min(MAX_PUBLIC_WAIT_MS);
             requested
                 .saturating_add(CODEX_WAIT_GUARD_ALLOWANCE_MS)
                 .min(CODEX_WAIT_GUARD_MS)
@@ -769,6 +773,9 @@ async fn dispatch(
         },
         "codex.wait" => {
             let a: CodexWaitArgs = parse(arguments)?;
+            if a.timeout_ms == 0 || a.timeout_ms > MAX_PUBLIC_WAIT_MS {
+                anyhow::bail!("timeoutMs must be between 1 and {MAX_PUBLIC_WAIT_MS}");
+            }
             relay
                 .work_wait(a.thread_id, a.turn_id, a.timeout_ms)
                 .await
@@ -1164,8 +1171,9 @@ async fn image_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        CODEX_START_GUARD_MS, CODEX_WAIT_GUARD_MS, COMMAND_EXEC_GUARD_MS, COMMAND_READ_GUARD_MS,
-        QUICK_TOOL_GUARD_MS, SERVER_INSTRUCTIONS, tool_guard_ms,
+        CHATGPT_TOOL_RESPONSE_BUDGET_MS, CODEX_START_GUARD_MS, CODEX_WAIT_GUARD_MS,
+        COMMAND_EXEC_GUARD_MS, COMMAND_READ_GUARD_MS, QUICK_TOOL_GUARD_MS, SERVER_INSTRUCTIONS,
+        tool_guard_ms,
     };
 
     #[test]
@@ -1188,26 +1196,36 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("own delegated scope"));
         assert!(SERVER_INSTRUCTIONS.contains("Preserve PTY tools"));
         assert!(SERVER_INSTRUCTIONS.contains("Do not create Git workflow state unless requested"));
+        assert_eq!(CHATGPT_TOOL_RESPONSE_BUDGET_MS, 60_000);
         assert_eq!(QUICK_TOOL_GUARD_MS, 45_000);
-        assert_eq!(CODEX_START_GUARD_MS, 90_000);
-        assert_eq!(COMMAND_EXEC_GUARD_MS, 75_000);
-        assert_eq!(COMMAND_READ_GUARD_MS, 85_000);
-        assert_eq!(CODEX_WAIT_GUARD_MS, 315_000);
+        assert_eq!(CODEX_START_GUARD_MS, 50_000);
+        assert_eq!(COMMAND_EXEC_GUARD_MS, 55_000);
+        assert_eq!(COMMAND_READ_GUARD_MS, 50_000);
+        assert_eq!(CODEX_WAIT_GUARD_MS, 55_000);
+        for guard in [
+            QUICK_TOOL_GUARD_MS,
+            CODEX_START_GUARD_MS,
+            COMMAND_EXEC_GUARD_MS,
+            COMMAND_READ_GUARD_MS,
+            CODEX_WAIT_GUARD_MS,
+        ] {
+            assert!(guard < CHATGPT_TOOL_RESPONSE_BUDGET_MS);
+        }
         let default_wait = serde_json::Map::new();
-        assert_eq!(tool_guard_ms("codex.wait", &default_wait), 135_000);
-        let max_wait = serde_json::json!({"timeoutMs":300_000});
+        assert_eq!(tool_guard_ms("codex.wait", &default_wait), 55_000);
+        let max_wait = serde_json::json!({"timeoutMs":40_000});
         assert_eq!(
             tool_guard_ms("codex.wait", max_wait.as_object().unwrap()),
-            315_000
+            55_000
         );
-        assert_eq!(tool_guard_ms("command.read", &default_wait), 65_000);
-        let max_read = serde_json::json!({"timeoutMs":80_000});
+        assert_eq!(tool_guard_ms("command.read", &default_wait), 45_000);
+        let max_read = serde_json::json!({"timeoutMs":45_000});
         assert_eq!(
             tool_guard_ms("command.read", max_read.as_object().unwrap()),
-            85_000
+            50_000
         );
-        assert_eq!(tool_guard_ms("command.exec", &default_wait), 75_000);
-        assert_eq!(tool_guard_ms("codex.start", &default_wait), 90_000);
+        assert_eq!(tool_guard_ms("command.exec", &default_wait), 55_000);
+        assert_eq!(tool_guard_ms("codex.start", &default_wait), 50_000);
         assert_eq!(tool_guard_ms("status", &default_wait), 45_000);
     }
 }
