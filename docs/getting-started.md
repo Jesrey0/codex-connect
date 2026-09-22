@@ -85,7 +85,9 @@ The canonical public URL is `${NGROK_URL}/codex-connect/mcp`; host ingress owns
 - ChatGPT's signed `private_key_jwt` client assertion at the token endpoint.
 - Single-operator browser login and explicit consent at host ingress.
 - Access tokens bound to the canonical MCP resource and `codex-connect:access`.
-- `offline_access` with persistent, rotating refresh tokens.
+- Persistent ChatGPT refresh authorization even when `offline_access` is not
+  requested; the ChatGPT refresh credential is non-rotating so concurrent silent
+  refresh attempts do not invalidate one another.
 
 Anonymous and invalid-token MCP requests must return 401 with a Bearer discovery
 challenge. Public metadata must describe the exact HTTPS resource and issuer.
