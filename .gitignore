@@ -5,6 +5,5 @@
 !.cargo/config.toml.example
 .env
 .env.*
-/config/tunnel-client/codex-connect.yaml
 /target/
 /AGENTS.md

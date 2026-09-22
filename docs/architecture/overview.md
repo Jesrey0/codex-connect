@@ -6,7 +6,10 @@ Codex Connect is a compact MCP projection over a persistent host and the officia
 
 ```text
 ChatGPT / PlatformPlane
-        │ Secure MCP Tunnel
+        │ HTTPS / ngrok
+        ▼
+Host ingress (Caddy routing + OAuth)
+        │ loopback MCP
         ▼
 Codex Connect
   ├─ HostPlane: inspect, patch, image, commands, status, deployment
@@ -15,7 +18,9 @@ Codex Connect
 
 PlatformPlane is ChatGPT-native web/files/plugins/apps/Work/browser/Scheduled Tasks. It has no implicit host access. HostPlane is deterministic and authoritative for the OS account's filesystem, processes, Git, and deployment. WorkerPlane is delegated autonomous work/review; workers do not inherit ChatGPT conversation, native tools, files, or credentials.
 
-The official `tunnel-client` is an independent upstream runtime. Codex CLI/App Server is another independent upstream dependency. Their binaries, credentials, profiles, and state are not Codex Connect-owned.
+Host ingress owns the canonical public URL, TLS edge configuration, routing, and OAuth boundary. Codex CLI/App Server and host ingress are independently managed dependencies; their binaries, credentials, and state are not Codex Connect-owned.
+
+OpenAI Secure MCP Tunnel is outside the canonical architecture. An operator may retain it as a separately managed secondary fallback, but its process, profile, credentials, reconnect behavior, and response deadlines are not Codex Connect state or design invariants. Normal installation, readiness, deployment, recovery, and performance expectations are defined against host ingress.
 
 ## Authority and configuration
 
@@ -47,11 +52,11 @@ codex.start → codex.wait ─┬─ terminal
                          └─ lease expiry → codex.inspect or another bounded wait
 ```
 
-The worker owns its delegated scope from start submission until terminal, semantic block/action, interrupt, or user redirect. Start completion itself is relay-owned: if the initiating MCP caller disappears, Connect continues thread/resume/start and turn/review start, registers the resulting worker, and retains an unclaimed handle as a one-shot `workerStarted` host event. App Server lifecycle notifications drive live worker state. `codex.wait` performs no periodic status read: it hydrates a turn that predates the current relay, resumes that thread's official notification subscription when needed, reconciles explicit history loss, and performs one final authoritative check when the lease expires. The ChatGPT-facing default lease is 80 seconds, calibrated below the observed ~100-second tool-runner ceiling; the public hard maximum remains five minutes for other callers/explicit experiments. `tunnel-client` independently owns and may enforce a shorter outer command deadline. A `codex.wait` timeout is only lease expiry: it is not worker failure, stall evidence, or permission to take over. The operator may continue non-overlapping work.
+The worker owns its delegated scope from start submission until terminal, semantic block/action, interrupt, or user redirect. Start completion itself is relay-owned: if the initiating MCP caller disappears, Connect continues thread/resume/start and turn/review start, registers the resulting worker, and retains an unclaimed handle as a one-shot `workerStarted` host event. App Server lifecycle notifications drive live worker state. `codex.wait` performs no periodic status read: it hydrates a turn that predates the current relay, resumes that thread's official notification subscription when needed, reconciles explicit history loss, and performs one final authoritative check when the lease expires. The ChatGPT-facing default lease is 80 seconds, calibrated below the observed ~100-second tool-runner ceiling; the public hard maximum remains five minutes for other callers/explicit experiments. Client response deadlines remain independent. A `codex.wait` timeout is only lease expiry: it is not worker failure, stall evidence, or permission to take over. The operator may continue non-overlapping work.
 
-The general runtime invariant is: **events drive live state; reads hydrate or reconcile state; deadlines bound operations; retries recover unavailable event sources or transient persistence races.** No periodic App Server read may exist merely to observe progress. Secure MCP Tunnel is a separate transport plane: `tunnel-client` owns its upstream long-poll lifecycle and Codex Connect neither duplicates nor supervises it.
+The general runtime invariant is: **events drive live state; reads hydrate or reconcile state; deadlines bound operations; retries recover unavailable event sources or transient persistence races.** No periodic App Server read may exist merely to observe progress. Ingress availability is verified independently from backend readiness.
 
-Timeout policy follows operation class rather than one global number. Quick control/inspection paths use a 45-second local guard. `codex.start` has a 90-second caller guard but durable relay-owned completion. `command.exec` uses a 60-second child timeout with a 75-second MCP guard; longer deterministic jobs move to `command.start`. `command.read` is an event-driven 60-second default / 80-second maximum lease with five seconds of guard headroom. `codex.wait` is an event-driven 80-second default with 15 seconds of guard headroom and a 300-second server maximum. Ordinary App Server RPCs stay at 30 seconds because local RPC failure detection is independent from frontend/tunnel longevity.
+Timeout policy follows operation class rather than one global number. Quick control/inspection paths use a 45-second local guard. `codex.start` has a 90-second caller guard but durable relay-owned completion. `command.exec` uses a 60-second child timeout with a 75-second MCP guard; longer deterministic jobs move to `command.start`. `command.read` is an event-driven 60-second default / 80-second maximum lease with five seconds of guard headroom. `codex.wait` is an event-driven 80-second default with 15 seconds of guard headroom and a 300-second server maximum. Ordinary App Server RPCs stay at 30 seconds because local RPC failure detection is independent from client-response deadlines.
 
 ## Public surface
 
@@ -61,4 +66,4 @@ The public contract is intent-shaped. `command.exec` accepts only `command`, opt
 
 ## Version-state boundaries
 
-`SourceChanged != Committed != Pushed != Deployed != Live != CIGreen`. Each state is owned and verified separately. Git actions are operator workflow, not application workflow. Backend deployment changes Codex Connect only; it does not refresh the ChatGPT connector or restart/recreate the independently owned tunnel runtime.
+`SourceChanged != Committed != Pushed != Deployed != Live != CIGreen`. Each state is owned and verified separately. Git actions are operator workflow, not application workflow. Backend deployment changes Codex Connect only; it does not refresh the ChatGPT connector or restart independently owned ingress services.

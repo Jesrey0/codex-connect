@@ -427,7 +427,7 @@ impl ServerHandler for McpHandler {
             Err(_) => {
                 operation_cancelled.store(true, Ordering::Release);
                 Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "MCP operation exceeded its {guard_ms} ms local guard; tunnel-client independently owns and may enforce a shorter outer response deadline"
+                    "MCP operation exceeded its {guard_ms} ms local guard; the calling client may enforce a shorter response deadline"
                 ))])
                 .into())
             }

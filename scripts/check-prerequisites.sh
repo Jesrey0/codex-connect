@@ -53,13 +53,6 @@ else
   fail "Codex CLI missing (required release: $pin)"
 fi
 
-if command -v tunnel-client >/dev/null 2>&1; then
-  tunnel_version="$(tunnel-client --version 2>/dev/null | head -n1)"
-  pass "tunnel-client available ($tunnel_version)"
-else
-  fail "tunnel-client missing; install OpenAI Secure MCP Tunnel client"
-fi
-
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 if [[ "$config_home" != /* ]]; then
   config_home="$HOME/.config"

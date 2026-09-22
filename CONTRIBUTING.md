@@ -32,11 +32,12 @@ Preserve PTY support. Do not expose raw sandbox policy, service tier, developer 
 
 ## Operating rules
 
-- Keep Codex CLI/App Server and `tunnel-client` independently owned; do not add tunnel supervision.
+- Keep Codex CLI/App Server and host ingress independently owned; public routing and OAuth belong to host ingress.
+- Treat ngrok through host ingress as the canonical remote path. Secure MCP Tunnel may exist only as an independently managed secondary fallback; do not make its lifecycle, configuration, or response deadlines application invariants.
 - Keep `default_cwd` as navigation, never authorization.
 - Keep worker tasks self-contained and preserve delegated scope ownership until terminal/action/interrupt/redirect. A `codex.wait` timeout is not permission to take over.
-- Keep live state event-driven; App Server remains authoritative. Reads may hydrate or reconcile state at explicit boundaries but must not periodically observe progress. Do not reintroduce timer-based worker, observer, transcript, or quota polling. Keep `tunnel-client` long-poll transport independent rather than mirroring its cadence inside Codex Connect.
-- Keep timeout classes independent. Do not derive App Server, host, worker-join, or command budgets from `tunnel-client` poll timeout. Caller loss must not orphan durable worker starts, and a timed-out mutating host operation must not continue silently without cooperative cancellation/rollback.
+- Keep live state event-driven; App Server remains authoritative. Reads may hydrate or reconcile state at explicit boundaries but must not periodically observe progress. Do not reintroduce timer-based worker, observer, transcript, or quota polling.
+- Keep timeout classes independent. App Server, host, worker-join, command, and client-response budgets follow their own semantics. Caller loss must not orphan durable worker starts, and a timed-out mutating host operation must not continue silently without cooperative cancellation/rollback.
 - Git actions are operator workflow, not application workflow.
 - Remove superseded terminology and compatibility baggage end-to-end; this pre-release repository represents the current canonical implementation only.
 

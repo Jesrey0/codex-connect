@@ -4,9 +4,9 @@ Use [Getting Started](getting-started.md) for a fresh installation. This guide c
 
 ## Ownership
 
-Codex Connect owns its backend service, user-global configuration/state/cache, deployment records, and installed content-addressed artifacts. Codex CLI/App Server and OpenAI `tunnel-client` are independent upstream dependencies. Their binaries, credentials, profiles, state, and lifecycle remain user-global and are not installed, relocated, duplicated, upgraded, deleted, or supervised by Codex Connect.
+Codex Connect owns its backend service, user-global configuration/state/cache, deployment records, and installed content-addressed artifacts. Codex CLI/App Server and host ingress have independent user-global lifecycles. Host ingress is the sole owner of public routing and OAuth.
 
-The backend listens on loopback at `127.0.0.1:8767/mcp`. It has no application-level authentication; Secure MCP Tunnel provides the remote path. Never expose the port directly.
+The backend listens on loopback at `127.0.0.1:8767/mcp`. Public calls use `${NGROK_URL}/codex-connect/mcp` through ngrok and the OAuth-protected host ingress. Never expose the backend port directly.
 
 ## Backend lifecycle
 
@@ -23,28 +23,34 @@ codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-projec
 
 `status` is concise runtime/readiness/orientation: readiness, live build identity, navigation cwd, and Codex default provenance. `console` is a read-only event-driven human projection of workers, quota, pending actions, and selected transcripts; it hydrates once, then waits for observer changes rather than polling. Its local UI clock only redraws animation/countdowns. Quota refresh is triggered by observer launch and worker/message lifecycle boundaries and is independent from the worker projection. `doctor` is the detailed local diagnostic. PTY command sessions are controlled through the MCP `command.start/read/control` tools.
 
-## Tunnel lifecycle
+## Ingress lifecycle
 
-Manage the native tunnel independently:
+Verify ingress independently:
 
 ```bash
-tunnel-client runtimes status codex-connect --json
-# use the repair_command reported by tunnel-client when needed
+# from the host-ingress checkout
+./scripts/status
+CHECK_PUBLIC=1 ./scripts/check
 ```
 
-The tunnel owns its runtime API key, organization context, profile, reconnect behavior, and native state. Do not create a second systemd tunnel service or duplicate profile. Backend `restart`, deployment, and uninstall do not manage the tunnel. Backend deployment is not connector refresh; rediscover/refresh the ChatGPT app separately when its tool catalog needs updating.
+Host ingress owns `host-ngrok`, `host-ingress` (Caddy), and `host-oauth` services, their startup ordering, public URL, credentials, and reconnect behavior. Codex Connect readiness describes the local backend; it does not assert public reachability or a valid ChatGPT connection. Backend restart/deployment/uninstall do not manage ingress. Rediscover/refresh the ChatGPT app separately when its tool catalog changes.
+
+### Secondary fallback
+
+OpenAI Secure MCP Tunnel may be retained as an explicitly secondary recovery path. Its process, profile, credentials, reconnect behavior, and native state are upstream-owned and must stay outside the Codex Connect source/config tree. Normal operation uses ngrok through host ingress; keep the fallback inactive unless needed and operate it only through native `tunnel-client` lifecycle commands. Backend health, deployment, timeout behavior, and ingress readiness never depend on it.
 
 ## Restart recovery
 
-After reboot, verify the two owners separately:
+After reboot, verify backend and ingress separately:
 
 ```bash
 codex-connect status
 codex-connect doctor
-tunnel-client runtimes status codex-connect --json
+# from the host-ingress checkout
+CHECK_PUBLIC=1 ./scripts/check
 ```
 
-Restart the backend only if its checks fail. If the tunnel runtime is stopped, use its reported native repair command and recheck status. Do not rerun installation or recreate the profile merely because the computer restarted.
+Restart only the failed service. User-systemd services are enabled independently; ngrok wants Caddy, and Caddy wants the OAuth service. OAuth grants/refresh state survive restarts. MCP clients initialize a new session after backend restart. Verify a real authenticated call after recovery rather than rerunning setup.
 
 ## Deployment
 
@@ -57,7 +63,7 @@ codex-connect deploy activate <operation-id>
 codex-connect deploy status <operation-id>
 ```
 
-`prepare` queues a detached release build and records a durable operation. Wait for `prepared`; `activate` queues the backend restart; the final `status` verifies the exact prepared artifact is live. The deployment build cache at `~/.cache/codex-connect/deploy/build` is a compiler cache, not runtime authority. Deployment does not restart the tunnel or refresh the connector.
+`prepare` queues a detached release build and records a durable operation. Wait for `prepared`; `activate` queues the backend restart; the final `status` verifies the exact prepared artifact is live. The deployment build cache at `~/.cache/codex-connect/deploy/build` is a compiler cache, not runtime authority. Deployment does not restart ingress or refresh the connector.
 
 The states are deliberately distinct: `SourceChanged != Committed != Pushed != Deployed != Live != CIGreen`. Git commits/pushes are operator workflow and are never implied by deployment. Verify source, Git, deployment, service/build identity, connector discovery, and CI at their respective owners.
 
@@ -80,6 +86,6 @@ codex_bin = "/home/you/.local/bin/codex"
 codex-connect uninstall
 ```
 
-Uninstall removes Codex Connect's service, configuration, state/cache, operator symlink, and installed artifacts. It leaves the source tree, Codex CLI/App Server, and tunnel-client state untouched.
+Uninstall removes Codex Connect's service, configuration, state/cache, operator symlink, and installed artifacts. It leaves the source tree, Codex CLI/App Server, and host ingress state untouched.
 
 For security implications, see [Security](../SECURITY.md).

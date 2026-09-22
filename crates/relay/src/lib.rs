@@ -1069,8 +1069,7 @@ impl Relay {
         let output_bytes_cap = request.output_bytes_cap.unwrap();
         request.sandbox_policy = None;
         // App Server owns the child-process timeout. Keep a small local allowance for its final
-        // response delivery; any outer tunnel command deadline is independently owned and enforced
-        // by tunnel-client/control-plane metadata rather than duplicated here.
+        // response delivery; the calling client's deadline is independent of this local budget.
         let duration =
             Duration::from_millis(request.timeout_ms.unwrap() + COMMAND_EXEC_RESPONSE_ALLOWANCE_MS);
         let started = Instant::now();

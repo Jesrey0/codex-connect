@@ -2,6 +2,14 @@
 
 Notable project-level changes are recorded for tagged releases. Codex Connect is pre-release; support is defined by the current documentation and the pinned Codex CLI contract.
 
+## Unreleased
+
+### Changed
+
+- The canonical ChatGPT path is now ngrok HTTPS → host ingress (routing + OAuth) → loopback Codex Connect.
+- OpenAI Secure MCP Tunnel is retained only as an independently managed secondary fallback and is no longer a setup, health, deployment, timeout, or application-architecture dependency.
+- Transport-specific tunnel configuration is no longer project-owned; client response deadlines remain independent from Codex Connect operation budgets.
+
 ## 0.1.0-alpha.1 — 2026-09-18
 
 Initial public alpha of the single-user, self-hosted Codex Connect architecture.

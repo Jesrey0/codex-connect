@@ -180,9 +180,9 @@ pub async fn uninstall() -> Result<()> {
     println!(
         "✓ Removed Codex Connect-managed backend service, configuration, state, and installed binaries."
     );
-    println!("The source tree, Codex CLI, and tunnel-client state were not changed.");
+    println!("The source tree, Codex CLI, and host ingress state were not changed.");
     println!(
-        "If you no longer need the ChatGPT connection, stop/remove its tunnel-client runtime separately."
+        "If you no longer need the ChatGPT connection, remove its public route through host ingress."
     );
     Ok(())
 }
@@ -517,7 +517,7 @@ pub async fn setup(no_start: bool) -> Result<()> {
         config.backend.listen
     );
     println!(
-        "Native tunnel lifecycle remains independent. Connect it with `tunnel-client runtimes connect ...` and check it with `tunnel-client runtimes status <alias>`."
+        "Connect ChatGPT to the authenticated public HTTPS MCP URL managed by host ingress. Verify ingress and OAuth separately from backend readiness."
     );
     Ok(())
 }
@@ -534,7 +534,10 @@ pub async fn status() -> Result<()> {
         state.status.label(),
         state.unit_file_state
     );
-    println!("Endpoint: http://{}/mcp", config.backend.listen);
+    println!("Private endpoint: http://{}/mcp", config.backend.listen);
+    println!(
+        "Public transport: ngrok HTTPS via host ingress (routing and OAuth checked by host ingress)"
+    );
     println!("Navigation cwd: {}", config.workspace.default_cwd);
     match runtime_status_once(&config.backend).await {
         Ok(runtime) => {
@@ -651,9 +654,7 @@ pub async fn doctor() -> Result<()> {
             failures.push("backend".to_string());
         }
     }
-    println!(
-        "• Native tunnel lifecycle is intentionally not checked or supervised here; use `tunnel-client runtimes status <alias>`."
-    );
+    println!("• Public HTTPS routing and OAuth are checked separately by host ingress.");
     if failures.is_empty() {
         Ok(())
     } else {

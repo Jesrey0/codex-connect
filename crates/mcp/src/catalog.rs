@@ -659,7 +659,7 @@ fn command_read_schema() -> Value {
         json!({
             "processId":{"type":"string","minLength":1,"description":"Connection-scoped process handle returned by command.start."},
             "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Return output newer than this cursor. Use the cursor from the previous command.start/read result to consume incrementally."},
-            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Event-driven wait for new output or process exit. Defaults to 60000 and may extend to 80000, leaving margin below the validated ChatGPT tool-runner ceiling. Returns early on output or exit. Timeout does not terminate or imply a stalled process; the process may outlive any number of reads. tunnel-client independently owns any outer response deadline."}
+            "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Event-driven wait for new output or process exit. Defaults to 60000 and may extend to 80000, leaving margin below the validated ChatGPT tool-runner ceiling. Returns early on output or exit. Timeout does not terminate or imply a stalled process; the process may outlive any number of reads. The calling client independently owns its response deadline."}
         }),
         &["processId"],
     )
@@ -782,7 +782,7 @@ fn codex_wait_schema() -> Value {
         json!({
             "threadId":{"type":"string","description":"Codex thread ID returned by codex.start."},
             "turnId":{"type":"string","description":"Specific delegated turn ID returned by codex.start."},
-            "timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet event-driven synchronization lease. Defaults to 80000 based on the validated ChatGPT operator envelope and may extend to 300000 (5 minutes) for other callers or explicit experiments. Returns early on terminal state or required operator input/action. On this ChatGPT frontend, prefer leases at or below roughly 80000 so bounded finalization can finish before the observed ~100-second tool-runner ceiling. Lease expiry means the worker remains active, not stalled. Codex Connect may spend up to 10 seconds of bounded terminal/reconciliation finalization beyond the requested lease; tunnel-client independently owns and may enforce a shorter outer response deadline."}
+            "timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_MS,"default":DEFAULT_WAIT_MS,"description":"Quiet event-driven synchronization lease. Defaults to 80000 based on the validated ChatGPT operator envelope and may extend to 300000 (5 minutes) for other callers or explicit experiments. Returns early on terminal state or required operator input/action. On this ChatGPT frontend, prefer leases at or below roughly 80000 so bounded finalization can finish before the observed ~100-second tool-runner ceiling. Lease expiry means the worker remains active, not stalled. Codex Connect may spend up to 10 seconds of bounded terminal/reconciliation finalization beyond the requested lease; the calling client may enforce a shorter response deadline."}
         }),
         &["threadId", "turnId"],
     )
