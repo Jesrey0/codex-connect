@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-const DEFAULT_WAIT_MS: u64 = 80_000;
+const DEFAULT_WAIT_MS: u64 = 120_000;
 const QUICK_TOOL_GUARD_MS: u64 = 45_000;
 const CODEX_START_GUARD_MS: u64 = 90_000;
 const COMMAND_EXEC_GUARD_MS: u64 = 75_000;
@@ -1194,7 +1194,7 @@ mod tests {
         assert_eq!(COMMAND_READ_GUARD_MS, 85_000);
         assert_eq!(CODEX_WAIT_GUARD_MS, 315_000);
         let default_wait = serde_json::Map::new();
-        assert_eq!(tool_guard_ms("codex.wait", &default_wait), 95_000);
+        assert_eq!(tool_guard_ms("codex.wait", &default_wait), 135_000);
         let max_wait = serde_json::json!({"timeoutMs":300_000});
         assert_eq!(
             tool_guard_ms("codex.wait", max_wait.as_object().unwrap()),

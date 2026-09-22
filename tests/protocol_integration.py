@@ -143,7 +143,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.client.catalog), 14)
         self.assertEqual(set(self.client.tools), EXPECTED)
         wait_timeout = self.client.tools["codex.wait"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(wait_timeout["default"], 80000)
+        self.assertEqual(wait_timeout["default"], 120000)
         self.assertEqual(wait_timeout["maximum"], 300000)
         self.assertEqual(wait_timeout["minimum"], 1)
         self.assertNotIn("afterCursor", self.client.tools["codex.wait"]["inputSchema"]["properties"])
