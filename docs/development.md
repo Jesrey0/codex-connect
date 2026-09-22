@@ -28,6 +28,8 @@ Timeouts are classified by semantics: quick/control tools keep a 45-second local
 
 The canonical public transport is ngrok through host ingress. Secure MCP Tunnel is secondary fallback only and must not leak transport-specific lifecycle, polling, profile, or response-deadline assumptions into application code, public schemas, tests, or operator guidance.
 
+Each tool descriptor must retain the OAuth `securitySchemes` compatibility metadata for scope `codex-connect:access`. This is discovery metadata only: token validation, `WWW-Authenticate`, resource metadata, and authorization-server behavior belong to host ingress and must not be duplicated in the loopback MCP handler.
+
 ## Validation
 
 Run the repository gate with the pinned CLI installed and Python `jsonschema` available:

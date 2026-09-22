@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::sync::Arc;
 
+const OAUTH_SCOPE: &str = "codex-connect:access";
+
 #[derive(Clone, Copy)]
 struct ToolMetadata {
     name: &'static str,
@@ -317,6 +319,14 @@ fn tool_invocation_meta(name: &str) -> MetaObject {
     meta.0.insert(
         "openai/toolInvocation/invoked".into(),
         Value::String(invoked.into()),
+    );
+    // host-ingress is the authentication authority and validates every request
+    // before proxying it to this loopback-only MCP server. Advertise that
+    // requirement per tool for ChatGPT/App SDK compatibility without duplicating
+    // bearer-token parsing or authorization inside Codex Connect.
+    meta.0.insert(
+        "securitySchemes".into(),
+        json!([{"type":"oauth2","scopes":[OAUTH_SCOPE]}]),
     );
     meta
 }
@@ -1322,6 +1332,10 @@ mod tests {
                 assert!(!message.is_empty());
                 assert!(message.chars().count() <= 64);
             }
+            assert_eq!(
+                meta["securitySchemes"],
+                json!([{"type":"oauth2","scopes":[OAUTH_SCOPE]}])
+            );
             assert!(
                 serde_json::to_vec(tool).unwrap().len() < 20_000,
                 "tool schema too large: {}",

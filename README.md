@@ -18,6 +18,8 @@ HostPlane is authoritative for host work. WorkerPlane is authoritative for deleg
 
 The canonical remote path is ChatGPT → ngrok HTTPS → host ingress with OAuth → loopback Codex Connect. Codex CLI/App Server and host ingress have independent user-global lifecycles. Codex Connect owns its backend, configuration/state/cache, and installed artifacts. OpenAI Secure MCP Tunnel may be retained only as an independently managed secondary fallback; it is not part of normal setup, health, deployment, or timeout semantics.
 
+Every public tool advertises the `codex-connect:access` OAuth requirement in its descriptor metadata. Host ingress remains the sole token-validation authority: it verifies the Bearer token and strips credentials before proxying the request, so Codex Connect does not duplicate OAuth state or token parsing.
+
 ## Authority and delegation
 
 Deterministic host tools run with the OS account's authority. The configured `default_cwd` is navigation only, not an authorization boundary; absolute host paths are valid. The dedicated App Server uses a process-local `danger-full-access` launch override for HostPlane.

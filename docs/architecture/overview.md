@@ -20,6 +20,8 @@ PlatformPlane is ChatGPT-native web/files/plugins/apps/Work/browser/Scheduled Ta
 
 Host ingress owns the canonical public URL, TLS edge configuration, routing, and OAuth boundary. Codex CLI/App Server and host ingress are independently managed dependencies; their binaries, credentials, and state are not Codex Connect-owned.
 
+All public tools advertise the `codex-connect:access` OAuth scheme in descriptor metadata for client discovery. Authentication is still enforced before MCP dispatch: host ingress validates the token and removes credentials before forwarding to the loopback backend. Codex Connect therefore never treats OAuth credentials as application state and does not implement a competing token validator.
+
 OpenAI Secure MCP Tunnel is outside the canonical architecture. An operator may retain it as a separately managed secondary fallback, but its process, profile, credentials, reconnect behavior, and response deadlines are not Codex Connect state or design invariants. Normal installation, readiness, deployment, recovery, and performance expectations are defined against host ingress.
 
 ## Authority and configuration
