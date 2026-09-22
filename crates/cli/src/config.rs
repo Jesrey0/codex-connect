@@ -187,6 +187,7 @@ pub fn home_dir() -> Result<PathBuf> {
 pub(crate) fn runtime_path(home: &Path, path: &OsStr) -> Result<String> {
     let mut directories = vec![home.join(".local/bin"), home.join(".cargo/bin")];
     let transient_codex = home.join(".codex/tmp");
+    let vscode_server = home.join(".vscode-server");
 
     for directory in env::split_paths(path) {
         if !directory.is_absolute() {
@@ -198,7 +199,10 @@ pub(crate) fn runtime_path(home: &Path, path: &OsStr) -> Result<String> {
         if text.chars().any(char::is_control) {
             bail!("PATH contains a control character");
         }
-        if directory.starts_with(&transient_codex) {
+        if directory.starts_with(&transient_codex)
+            || directory.starts_with(&vscode_server)
+            || is_wsl_windows_path(&directory)
+        {
             continue;
         }
         if !directories.contains(&directory) {
@@ -215,6 +219,25 @@ pub(crate) fn runtime_path(home: &Path, path: &OsStr) -> Result<String> {
     std::env::join_paths(directories)?
         .into_string()
         .map_err(|_| anyhow::anyhow!("PATH is not UTF-8"))
+}
+
+fn is_wsl_windows_path(path: &Path) -> bool {
+    let mut components = path.components();
+    if components.next() != Some(std::path::Component::RootDir)
+        || components
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            != Some("mnt")
+    {
+        return false;
+    }
+    let Some(drive) = components
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+    else {
+        return false;
+    };
+    drive.len() == 1 && drive.as_bytes()[0].is_ascii_alphabetic()
 }
 pub fn expand_path(value: &str) -> Result<PathBuf> {
     let home = home_dir()?;
@@ -299,7 +322,7 @@ mod tests {
     fn runtime_path_is_global_and_drops_relative_or_transient_entries() {
         let home = Path::new("/home/operator");
         let input = OsStr::new(
-            "relative:/home/operator/.codex/tmp/arg0/run:/home/operator/.nvm/bin:/opt/custom/bin:/usr/bin",
+            "relative:/home/operator/.codex/tmp/arg0/run:/home/operator/.vscode-server/bin/remote-cli:/home/operator/.nvm/bin:/opt/custom/bin:/mnt/c/WINDOWS/system32:/mnt/data/tools:/usr/bin",
         );
         let normalized = runtime_path(home, input).unwrap();
         let entries = env::split_paths(OsStr::new(&normalized)).collect::<Vec<_>>();
@@ -307,12 +330,19 @@ mod tests {
         assert_eq!(entries[1], home.join(".cargo/bin"));
         assert!(entries.contains(&home.join(".nvm/bin")));
         assert!(entries.contains(&PathBuf::from("/opt/custom/bin")));
+        assert!(entries.contains(&PathBuf::from("/mnt/data/tools")));
         assert!(entries.contains(&PathBuf::from("/usr/bin")));
         assert!(
             !entries
                 .iter()
                 .any(|path| path.starts_with(home.join(".codex/tmp")))
         );
+        assert!(
+            !entries
+                .iter()
+                .any(|path| path.starts_with(home.join(".vscode-server")))
+        );
+        assert!(!entries.contains(&PathBuf::from("/mnt/c/WINDOWS/system32")));
         assert!(!entries.iter().any(|path| !path.is_absolute()));
     }
 }
