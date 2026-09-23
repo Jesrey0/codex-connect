@@ -9,8 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const RECORD_VERSION: u32 = 2;
-const PREVIOUS_RECORD_VERSION: u32 = 1;
 const OPERATION_ID_LENGTH: usize = 24;
 const ACTIVATION_HANDOFF_DELAY: &str = "3s";
 
@@ -108,8 +106,8 @@ fn acquire_lock(path: PathBuf, label: &str) -> Result<DeploymentLock> {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DeploymentRecord {
-    pub version: u32,
     pub operation_id: String,
     pub source: String,
     pub state: DeploymentState,
@@ -168,7 +166,6 @@ pub(crate) fn queue_prepare(source: &Path) -> Result<DeploymentRecord> {
     let operation_id = new_operation_id()?;
     let _lock = acquire_operation_lock(&operation_id)?;
     let mut record = DeploymentRecord {
-        version: RECORD_VERSION,
         operation_id,
         source: source.display().to_string(),
         state: DeploymentState::Building,
@@ -261,15 +258,8 @@ fn load_unlocked(operation_id: &str) -> Result<DeploymentRecord> {
     let path = record_path(operation_id)?;
     let bytes = fs::read(&path)
         .with_context(|| format!("deployment record not found for operation {operation_id}"))?;
-    let mut record: DeploymentRecord = serde_json::from_slice(&bytes)
+    let record: DeploymentRecord = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid deployment record at {}", path.display()))?;
-    normalize_record_version(&mut record, operation_id)?;
-    if record.version != RECORD_VERSION {
-        bail!(
-            "unsupported deployment record version {} for operation {operation_id}",
-            record.version
-        );
-    }
     if record.operation_id != operation_id {
         bail!(
             "deployment record identity mismatch: requested {operation_id}, found {}",
@@ -278,21 +268,6 @@ fn load_unlocked(operation_id: &str) -> Result<DeploymentRecord> {
     }
     validate_record(&record)?;
     Ok(record)
-}
-
-fn normalize_record_version(record: &mut DeploymentRecord, operation_id: &str) -> Result<()> {
-    // Activation is self-hosting: the prepared artifact must consume the record
-    // written by the immediately previous live binary before it can replace it.
-    match record.version {
-        PREVIOUS_RECORD_VERSION => {
-            record.version = RECORD_VERSION;
-            Ok(())
-        }
-        RECORD_VERSION => Ok(()),
-        version => {
-            bail!("unsupported deployment record version {version} for operation {operation_id}")
-        }
-    }
 }
 
 fn save_unlocked(record: &DeploymentRecord) -> Result<()> {
@@ -641,9 +616,6 @@ fn new_operation_id() -> Result<String> {
 }
 
 fn validate_record(record: &DeploymentRecord) -> Result<()> {
-    if record.version != RECORD_VERSION {
-        bail!("unsupported deployment record version {}", record.version);
-    }
     validate_operation_id(&record.operation_id)?;
     let source = Path::new(&record.source);
     if record.source.is_empty() || !source.is_absolute() {
@@ -717,11 +689,9 @@ fn activation_unit_name(operation_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn prepared_record() -> DeploymentRecord {
         DeploymentRecord {
-            version: RECORD_VERSION,
             operation_id: "0123456789abcdef01234567".into(),
             source: "/work/codex-connect".into(),
             state: DeploymentState::Prepared,
@@ -875,27 +845,22 @@ mod tests {
         let artifact = record.artifact_path().unwrap().unwrap();
         assert!(artifact.ends_with("builds/aaaaaaaaaaaa/codex-connect"));
         let serialized = serde_json::to_string(&record).unwrap();
+        assert!(!serialized.contains("version"));
         assert!(!serialized.contains("buildId"));
         assert!(!serialized.contains("executable"));
     }
 
     #[test]
-    fn previous_record_version_is_accepted_for_self_hosted_activation_handoff() {
-        let mut record: DeploymentRecord = serde_json::from_value(json!({
-            "version": PREVIOUS_RECORD_VERSION,
+    fn deployment_record_rejects_stale_fields() {
+        let stale = serde_json::json!({
+            "version": 2,
             "operationId": "0123456789abcdef01234567",
             "source": "/work/codex-connect",
             "state": "prepared",
-            "buildId": "aaaaaaaaaaaa",
             "sha256": "a".repeat(64),
-            "executable": "/home/user/.local/lib/codex-connect/builds/aaaaaaaaaaaa/codex-connect",
             "noStart": false
-        }))
-        .unwrap();
-        assert_eq!(record.version, PREVIOUS_RECORD_VERSION);
-        normalize_record_version(&mut record, "0123456789abcdef01234567").unwrap();
-        validate_record(&record).unwrap();
-        assert_eq!(record.build_id(), Some("aaaaaaaaaaaa"));
+        });
+        assert!(serde_json::from_value::<DeploymentRecord>(stale).is_err());
     }
 
     #[test]
@@ -924,9 +889,6 @@ mod tests {
         let record = prepared_record();
         assert_eq!(record.build_id(), Some("aaaaaaaaaaaa"));
         assert!(!serde_json::to_string(&record).unwrap().contains("buildId"));
-        let mut old_record = record;
-        old_record.version = 1;
-        assert!(validate_record(&old_record).is_err());
     }
 
     #[test]
