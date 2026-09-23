@@ -529,6 +529,8 @@ enum CodexStartArgs {
         task: String,
         cwd: Option<String>,
         thread_id: Option<String>,
+        fork_from_thread_id: Option<String>,
+        last_turn_id: Option<String>,
         model: Option<String>,
         effort: Option<String>,
         access: Option<WorkAccess>,
@@ -594,7 +596,7 @@ struct CodexInspectArgs {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-enum CodexControlArgs {
+enum CodexActArgs {
     Steer {
         thread_id: String,
         expected_turn_id: String,
@@ -604,40 +606,41 @@ enum CodexControlArgs {
         thread_id: String,
         turn_id: String,
     },
-}
-
-#[derive(Deserialize)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-enum CodexActionRespondArgs {
-    Approval {
+    RespondApproval {
         request_id: RpcId,
         decision: ApprovalDecision,
     },
-    Permissions {
+    RespondPermissions {
         request_id: RpcId,
         permissions: PermissionGrant,
         scope: Option<PermissionScope>,
     },
-    UserInput {
+    RespondUserInput {
         request_id: RpcId,
         answers: std::collections::BTreeMap<String, Vec<String>>,
     },
-    Elicitation {
+    RespondElicitation {
         request_id: RpcId,
-        action: ElicitationAction,
+        disposition: ElicitationAction,
         content: Option<Value>,
+    },
+    SetArchived {
+        thread_ids: Vec<String>,
+        archived: bool,
+    },
+    Delete {
+        thread_ids: Vec<String>,
+    },
+    TerminateBackgroundTerminal {
+        thread_id: String,
+        process_id: String,
     },
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CodexInfoArgs {
-    queries: Vec<CodexInfoQuery>,
+struct CodexQueryArgs {
+    queries: Vec<CodexQuery>,
 }
 
 #[derive(Deserialize)]
@@ -647,13 +650,28 @@ struct CodexInfoArgs {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-enum CodexInfoQuery {
+enum CodexQuery {
     Models,
     Skills {
         #[serde(default)]
         cwds: Vec<String>,
     },
     Usage,
+    Threads {
+        cursor: Option<String>,
+        limit: Option<u32>,
+        archived: Option<bool>,
+        cwd: Option<String>,
+        search_term: Option<String>,
+    },
+    Thread {
+        thread_id: String,
+    },
+    BackgroundTerminals {
+        thread_id: String,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    },
 }
 
 async fn dispatch(
@@ -730,17 +748,28 @@ async fn dispatch(
                 task,
                 cwd,
                 thread_id,
+                fork_from_thread_id,
+                last_turn_id,
                 model,
                 effort,
                 access,
             } => {
-                let sandbox_policy = if thread_id.is_none() {
+                let sandbox_policy = if thread_id.is_none() && fork_from_thread_id.is_none() {
                     Some(work_sandbox_policy(access.unwrap_or_default()))
                 } else {
                     access.map(work_sandbox_policy)
                 };
                 relay
-                    .work_start(task, cwd, thread_id, model, effort, sandbox_policy)
+                    .work_start(
+                        task,
+                        cwd,
+                        thread_id,
+                        fork_from_thread_id,
+                        last_turn_id,
+                        model,
+                        effort,
+                        sandbox_policy,
+                    )
                     .await
                     .map_err(Into::into)
             }
@@ -773,56 +802,78 @@ async fn dispatch(
                 .await
                 .map_err(Into::into)
         }
-        "codex.control" => match parse(arguments)? {
-            CodexControlArgs::Steer {
+        "codex.act" => match parse(arguments)? {
+            CodexActArgs::Steer {
                 thread_id,
                 expected_turn_id,
                 instruction,
-            } => relay
-                .work_steer(thread_id, expected_turn_id, instruction)
-                .await
-                .map_err(Into::into),
-            CodexControlArgs::Interrupt { thread_id, turn_id } => relay
-                .work_interrupt(thread_id, turn_id)
-                .await
-                .map_err(Into::into),
-        },
-        "codex.action.respond" => match parse(arguments)? {
-            CodexActionRespondArgs::Approval {
+            } => tag_action(
+                relay
+                    .work_steer(thread_id, expected_turn_id, instruction)
+                    .await?,
+                "steer",
+            ),
+            CodexActArgs::Interrupt { thread_id, turn_id } => {
+                tag_action(relay.work_interrupt(thread_id, turn_id).await?, "interrupt")
+            }
+            CodexActArgs::RespondApproval {
                 request_id,
                 decision,
-            } => relay
-                .respond_approval(request_id, decision)
-                .await
-                .map_err(Into::into),
-            CodexActionRespondArgs::Permissions {
+            } => tag_action(
+                relay.respond_approval(request_id, decision).await?,
+                "respondApproval",
+            ),
+            CodexActArgs::RespondPermissions {
                 request_id,
                 permissions,
                 scope,
-            } => relay
-                .respond_permissions(request_id, permissions, scope)
-                .await
-                .map_err(Into::into),
-            CodexActionRespondArgs::UserInput {
+            } => tag_action(
+                relay
+                    .respond_permissions(request_id, permissions, scope)
+                    .await?,
+                "respondPermissions",
+            ),
+            CodexActArgs::RespondUserInput {
                 request_id,
                 answers,
-            } => relay
-                .respond_user_input(request_id, answers)
-                .await
-                .map_err(Into::into),
-            CodexActionRespondArgs::Elicitation {
+            } => tag_action(
+                relay.respond_user_input(request_id, answers).await?,
+                "respondUserInput",
+            ),
+            CodexActArgs::RespondElicitation {
                 request_id,
-                action,
+                disposition,
                 content,
-            } => relay
-                .respond_elicitation(request_id, action, content)
-                .await
-                .map_err(Into::into),
+            } => tag_action(
+                relay
+                    .respond_elicitation(request_id, disposition, content)
+                    .await?,
+                "respondElicitation",
+            ),
+            CodexActArgs::SetArchived {
+                thread_ids,
+                archived,
+            } => tag_action(
+                relay.thread_set_archived(thread_ids, archived).await?,
+                "setArchived",
+            ),
+            CodexActArgs::Delete { thread_ids } => {
+                tag_action(relay.thread_delete(thread_ids).await?, "delete")
+            }
+            CodexActArgs::TerminateBackgroundTerminal {
+                thread_id,
+                process_id,
+            } => tag_action(
+                relay
+                    .background_terminal_terminate(thread_id, process_id)
+                    .await?,
+                "terminateBackgroundTerminal",
+            ),
         },
-        "codex.info" => {
-            let a: CodexInfoArgs = parse(arguments)?;
+        "codex.query" => {
+            let a: CodexQueryArgs = parse(arguments)?;
             if a.queries.is_empty() || a.queries.len() > 10 {
-                anyhow::bail!("codex.info queries must contain 1..=10 items");
+                anyhow::bail!("codex.query queries must contain 1..=10 items");
             }
             let query_count = a.queries.len();
             let mut pending = tokio::task::JoinSet::new();
@@ -830,11 +881,34 @@ async fn dispatch(
                 let relay = relay.clone();
                 pending.spawn(async move {
                     let (kind, result) = match query {
-                        CodexInfoQuery::Models => ("models", relay.model_list().await),
-                        CodexInfoQuery::Skills { cwds } => {
+                        CodexQuery::Models => ("models", relay.model_list().await),
+                        CodexQuery::Skills { cwds } => {
                             ("skills", relay.skills_list(cwds, false).await)
                         }
-                        CodexInfoQuery::Usage => ("usage", relay.usage().await),
+                        CodexQuery::Usage => ("usage", relay.usage().await),
+                        CodexQuery::Threads {
+                            cursor,
+                            limit,
+                            archived,
+                            cwd,
+                            search_term,
+                        } => (
+                            "threads",
+                            relay
+                                .thread_list(cursor, limit, archived, cwd, search_term)
+                                .await,
+                        ),
+                        CodexQuery::Thread { thread_id } => {
+                            ("thread", relay.thread_summary(thread_id).await)
+                        }
+                        CodexQuery::BackgroundTerminals {
+                            thread_id,
+                            cursor,
+                            limit,
+                        } => (
+                            "backgroundTerminals",
+                            relay.background_terminals(thread_id, cursor, limit).await,
+                        ),
                     };
                     let entry = match result {
                         Ok(value) => json!({"index":index,"type":kind,"result":value}),
@@ -845,14 +919,22 @@ async fn dispatch(
             }
             let mut results = vec![Value::Null; query_count];
             while let Some(joined) = pending.join_next().await {
-                let (index, entry) = joined
-                    .map_err(|error| anyhow::anyhow!("codex.info query task failed: {error}"))?;
+                let (index, entry) =
+                    joined.map_err(|error| anyhow::anyhow!("codex.query task failed: {error}"))?;
                 results[index] = entry;
             }
             Ok(json!({"results":results}))
         }
         _ => anyhow::bail!("unknown tool `{name}`"),
     }
+}
+
+fn tag_action(mut value: Value, action: &str) -> anyhow::Result<Value> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Codex action result must be an object"))?;
+    object.insert("action".into(), Value::String(action.into()));
+    Ok(value)
 }
 
 async fn inspect(
@@ -1023,7 +1105,7 @@ fn project_tool_output(name: &str, value: &mut Value) {
             }
         }
         "codex.inspect" => project_current_activity(value.get_mut("currentActivity")),
-        "codex.info" => project_codex_info(value),
+        "codex.query" => project_codex_query(value),
         _ => {}
     }
 }
@@ -1199,7 +1281,7 @@ fn approval_choices(params: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn project_codex_info(value: &mut Value) {
+fn project_codex_query(value: &mut Value) {
     let Some(results) = value.get_mut("results").and_then(Value::as_array_mut) else {
         return;
     };

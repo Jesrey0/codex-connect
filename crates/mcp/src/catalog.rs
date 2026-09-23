@@ -162,7 +162,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Delegate work or a read-only review. A new thread establishes cwd/model/settings; a resumed thread keeps them fixed and is accepted only inside Codex Connect's conservative 30-minute guaranteed-cache policy. Use fresh threads for unrelated work, setting changes, workstreams outside that cutoff, or intentionally independent review. If the call is lost, do not retry immediately: recover the handle from status.workers or a replayed workerStarted event; historyLost means retained notification history was exceeded.",
+                "Delegate work or a read-only review. Start fresh, resume a related cache-valid workstream, or fork durable thread context into a new workstream. If the call is lost, recover the handle from status.workers before starting replacement work.",
                 false,
                 true,
                 true,
@@ -199,42 +199,29 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "codex.control",
-                "Control Active Codex Turn",
-                "Steer or interrupt an active turn. Steering adds instructions to that turn; interrupt requests it to stop.",
-                false,
+                "codex.query",
+                "Query Codex State",
+                "Batch read Codex-owned models, skills, usage, persisted threads, thread metadata, or background terminals. Each query returns its own result or error.",
                 true,
                 false,
                 false,
+                true,
             ),
-            codex_control_schema(),
-            Some(codex_control_output_schema()),
+            codex_query_schema(),
+            Some(codex_query_output_schema()),
         ),
         tool(
             meta(
-                "codex.action.respond",
-                "Respond to Pending Codex Action",
-                "Answer a pending approval, permission request, user question, or MCP elicitation from codex.wait. Match its kind and requestId.",
+                "codex.act",
+                "Act on Codex State",
+                "Steer or interrupt a turn, answer pending Codex requests, archive/unarchive or delete persisted threads, or terminate a thread-owned background terminal.",
                 false,
                 true,
                 false,
                 false,
             ),
-            codex_action_respond_schema(),
-            Some(action_response_schema()),
-        ),
-        tool(
-            meta(
-                "codex.info",
-                "Read Codex Information",
-                "Batch model, skill, or account-usage queries. Each query returns its own result or error.",
-                true,
-                false,
-                false,
-                true,
-            ),
-            codex_info_schema(),
-            Some(codex_info_output_schema()),
+            codex_act_schema(),
+            Some(codex_act_output_schema()),
         ),
     ]
 }
@@ -302,9 +289,8 @@ fn tool_invocation_meta(name: &str) -> MetaObject {
         "codex.start" => ("Starting Codex turn…", "Codex turn started"),
         "codex.wait" => ("Synchronizing with Codex…", "Codex state updated"),
         "codex.inspect" => ("Inspecting Codex activity…", "Codex activity inspected"),
-        "codex.control" => ("Controlling Codex turn…", "Codex turn controlled"),
-        "codex.action.respond" => ("Responding to Codex…", "Codex response sent"),
-        "codex.info" => ("Reading Codex information…", "Codex information ready"),
+        "codex.query" => ("Reading Codex state…", "Codex state ready"),
+        "codex.act" => ("Acting on Codex state…", "Codex state updated"),
         _ => ("Running Codex Connect tool…", "Codex Connect tool finished"),
     };
     let mut meta = MetaObject::new();
@@ -492,12 +478,6 @@ fn results_schema() -> Value {
             }), &["index","type","error"])
         ]}}}),
         &["results"],
-    )
-}
-fn action_response_schema() -> Value {
-    object_schema(
-        json!({"requestId":rpc_id_schema(),"accepted":{"const":true}}),
-        &["requestId", "accepted"],
     )
 }
 fn status_schema() -> Value {
@@ -780,8 +760,8 @@ fn codex_start_schema() -> Value {
                 "mode":{"const":"work"},
                 "task":{"type":"string","minLength":1,"description":"Self-contained objective with host paths, context, constraints, and acceptance criteria."},
                 "cwd":{"type":"string","description":"Codex Connect host working directory for this workstream. Omit to use the backend navigation cwd."},
-                "model":{"type":"string","description":"Initial workstream model. Discover IDs with a models query to codex.info; omit to use Codex defaults."},
-                "effort":{"type":"string","description":"Initial workstream reasoning effort. Discover supported values with codex.info; omit to use the upstream default."},
+                "model":{"type":"string","description":"Initial workstream model. Discover IDs with a models query to codex.query; omit to use Codex defaults."},
+                "effort":{"type":"string","description":"Initial workstream reasoning effort. Discover supported values with codex.query; omit to use the upstream default."},
                 "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Initial workstream access. workspace permits workspace writes and network access; full grants unrestricted host access. Approval prompts are disabled within the selected sandbox."}
             }),
             &["mode", "task"],
@@ -796,10 +776,19 @@ fn codex_start_schema() -> Value {
         ),
         object_schema(
             json!({
+                "mode":{"const":"work"},
+                "task":{"type":"string","minLength":1,"description":"Objective for a new workstream forked from durable thread context."},
+                "forkFromThreadId":{"type":"string","description":"Source thread whose persisted context is copied into a new workstream. Forking is not subject to the resume cache-age cutoff."},
+                "lastTurnId":{"type":"string","description":"Optional source turn to fork through, inclusive. Omit to fork the current persisted source history."}
+            }),
+            &["mode", "task", "forkFromThreadId"],
+        ),
+        object_schema(
+            json!({
                 "mode":{"const":"review"},
                 "cwd":{"type":"string","description":"Codex Connect host working directory for the review. Omit to use the backend navigation cwd."},
                 "target":review_target_schema(),
-                "model":{"type":"string","description":"Model ID for a new review thread; discover with codex.info. Omit to use Codex defaults."}
+                "model":{"type":"string","description":"Model ID for a new review thread; discover with codex.query. Omit to use Codex defaults."}
             }),
             &["mode", "target"],
         ),
@@ -833,89 +822,96 @@ fn codex_inspect_schema() -> Value {
         &["threadId", "turnId"],
     )
 }
-fn codex_control_schema() -> Value {
-    union_object_schema(vec![
-        object_schema(
-            json!({
-                "action":{"const":"steer"},
-                "threadId":{"type":"string","description":"Thread containing the active turn."},
-                "expectedTurnId":{"type":"string","description":"Must match the active turn before steering."},
-                "instruction":{"type":"string","minLength":1,"description":"Self-contained additional instruction for the active turn."}
-            }),
-            &["action", "threadId", "expectedTurnId", "instruction"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"interrupt"},
-                "threadId":{"type":"string","description":"Thread containing the turn to stop."},
-                "turnId":{"type":"string","description":"Exact active turn to interrupt."}
-            }),
-            &["action", "threadId", "turnId"],
-        ),
-    ])
+fn thread_summary_schema() -> Value {
+    object_schema(
+        json!({
+            "threadId":{"type":"string"},
+            "sessionId":{"type":["string","null"]},
+            "forkedFromThreadId":{"type":["string","null"]},
+            "parentThreadId":{"type":["string","null"]},
+            "name":{"type":["string","null"]},
+            "preview":{"type":"string"},
+            "cwd":{"type":"string"},
+            "model":{"type":["string","null"]},
+            "effort":{"type":["string","null"]},
+            "createdAt":{"type":"integer"},
+            "updatedAt":{"type":"integer"},
+            "status":{"type":["string","null"]}
+        }),
+        &[
+            "threadId",
+            "sessionId",
+            "forkedFromThreadId",
+            "parentThreadId",
+            "name",
+            "preview",
+            "cwd",
+            "model",
+            "effort",
+            "createdAt",
+            "updatedAt",
+            "status",
+        ],
+    )
 }
-fn codex_control_output_schema() -> Value {
-    union_object_schema(vec![
-        object_schema(json!({"turnId":{"type":"string"}}), &["turnId"]),
-        object_schema(
-            json!({"turnId":{"type":"string"},"interrupted":{"const":true}}),
-            &["turnId", "interrupted"],
-        ),
-    ])
+
+fn background_terminal_schema() -> Value {
+    object_schema(
+        json!({
+            "itemId":{"type":"string"},
+            "processId":{"type":"string"},
+            "command":{"type":"string"},
+            "cwd":{"type":"string"},
+            "osPid":{"type":["integer","null"],"minimum":0},
+            "cpuPercent":{"type":["number","null"]},
+            "rssKb":{"type":["integer","null"],"minimum":0}
+        }),
+        &[
+            "itemId",
+            "processId",
+            "command",
+            "cwd",
+            "osPid",
+            "cpuPercent",
+            "rssKb",
+        ],
+    )
 }
-fn codex_action_respond_schema() -> Value {
-    union_object_schema(vec![
-        object_schema(
-            json!({
-                "type":{"const":"approval"},
-                "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
-                "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"],"description":"Choose a decision offered by the pending request."}
-            }),
-            &["type", "requestId", "decision"],
-        ),
-        object_schema(
-            json!({
-                "type":{"const":"permissions"},
-                "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
-                "permissions":permissions_schema(),
-                "scope":{"type":"string","enum":["turn","session"],"description":"Grant lifetime; defaults to turn."}
-            }),
-            &["type", "requestId", "permissions"],
-        ),
-        object_schema(
-            json!({
-                "type":{"const":"userInput"},
-                "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
-                "answers":{"type":"object","minProperties":1,"description":"Map each question ID to its answers.","additionalProperties":{"type":"array","items":{"type":"string"}}}
-            }),
-            &["type", "requestId", "answers"],
-        ),
-        object_schema(
-            json!({
-                "type":{"const":"elicitation"},
-                "requestId":{"description":"Exact pending request ID returned by codex.wait.","oneOf":rpc_id_schema()["oneOf"].clone()},
-                "action":{"type":"string","enum":["accept","decline","cancel"],"description":"Disposition for the MCP elicitation."},
-                "content":{"description":"Accepted elicitation payload matching the pending request. Omit for decline/cancel."}
-            }),
-            &["type", "requestId", "action"],
-        ),
-    ])
-}
-fn codex_info_schema() -> Value {
+
+fn codex_query_schema() -> Value {
     let query = json!({"oneOf":[
         object_schema(json!({"type":{"const":"models"}}), &["type"]),
         object_schema(json!({
             "type":{"const":"skills"},
-            "cwds":{"type":"array","description":"Codex Connect host working directories whose available Codex skills should be discovered.","items":{"type":"string"}}
+            "cwds":{"type":"array","description":"Host working directories whose available Codex skills should be discovered.","items":{"type":"string"}}
         }), &["type"]),
-        object_schema(json!({"type":{"const":"usage"}}), &["type"])
+        object_schema(json!({"type":{"const":"usage"}}), &["type"]),
+        object_schema(json!({
+            "type":{"const":"threads"},
+            "cursor":{"type":"string"},
+            "limit":{"type":"integer","minimum":1,"maximum":50,"default":25},
+            "archived":{"type":"boolean","description":"true lists archived threads; omitted/false lists non-archived threads."},
+            "cwd":{"type":"string","description":"Exact host cwd filter."},
+            "searchTerm":{"type":"string","minLength":1,"description":"Substring filter for persisted thread title/preview metadata."}
+        }), &["type"]),
+        object_schema(json!({
+            "type":{"const":"thread"},
+            "threadId":{"type":"string","minLength":1}
+        }), &["type","threadId"]),
+        object_schema(json!({
+            "type":{"const":"backgroundTerminals"},
+            "threadId":{"type":"string","minLength":1},
+            "cursor":{"type":"string"},
+            "limit":{"type":"integer","minimum":1,"maximum":50,"default":25}
+        }), &["type","threadId"])
     ]});
     object_schema(
-        json!({"queries":{"type":"array","minItems":1,"maxItems":10,"description":"Independent discovery/account queries.","items":query}}),
+        json!({"queries":{"type":"array","minItems":1,"maxItems":10,"description":"Independent Codex-state queries.","items":query}}),
         &["queries"],
     )
 }
-fn codex_info_output_schema() -> Value {
+
+fn codex_query_output_schema() -> Value {
     let model = object_schema(
         json!({
             "id":{"type":"string"},
@@ -990,6 +986,21 @@ fn codex_info_output_schema() -> Value {
             "resetCreditsAvailable",
         ],
     );
+    let threads = object_schema(
+        json!({
+            "threads":{"type":"array","items":thread_summary_schema()},
+            "nextCursor":{"type":["string","null"]},
+            "backwardsCursor":{"type":["string","null"]}
+        }),
+        &["threads", "nextCursor", "backwardsCursor"],
+    );
+    let background_terminals = object_schema(
+        json!({
+            "terminals":{"type":"array","items":background_terminal_schema()},
+            "nextCursor":{"type":["string","null"]}
+        }),
+        &["terminals", "nextCursor"],
+    );
     let success = |kind: &'static str, result: Value| {
         object_schema(
             json!({
@@ -1003,7 +1014,7 @@ fn codex_info_output_schema() -> Value {
     let error = object_schema(
         json!({
             "index":{"type":"integer","minimum":0},
-            "type":{"enum":["models","skills","usage"]},
+            "type":{"enum":["models","skills","usage","threads","thread","backgroundTerminals"]},
             "error":{"type":"string"}
         }),
         &["index", "type", "error"],
@@ -1013,10 +1024,151 @@ fn codex_info_output_schema() -> Value {
             success("models", models),
             success("skills", skills),
             success("usage", usage),
+            success("threads", threads),
+            success("thread", thread_summary_schema()),
+            success("backgroundTerminals", background_terminals),
             error
         ]}}}),
         &["results"],
     )
+}
+
+fn thread_ids_schema() -> Value {
+    json!({"type":"array","minItems":1,"maxItems":100,"uniqueItems":true,"items":{"type":"string","minLength":1}})
+}
+
+fn codex_act_schema() -> Value {
+    union_object_schema(vec![
+        object_schema(
+            json!({
+                "action":{"const":"steer"},
+                "threadId":{"type":"string"},
+                "expectedTurnId":{"type":"string"},
+                "instruction":{"type":"string","minLength":1}
+            }),
+            &["action", "threadId", "expectedTurnId", "instruction"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"interrupt"},
+                "threadId":{"type":"string"},
+                "turnId":{"type":"string"}
+            }),
+            &["action", "threadId", "turnId"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"respondApproval"},
+                "requestId":{"oneOf":rpc_id_schema()["oneOf"].clone()},
+                "decision":{"enum":["approve","approveForSession","decline","cancel"]}
+            }),
+            &["action", "requestId", "decision"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"respondPermissions"},
+                "requestId":{"oneOf":rpc_id_schema()["oneOf"].clone()},
+                "permissions":permissions_schema(),
+                "scope":{"enum":["turn","session"]}
+            }),
+            &["action", "requestId", "permissions"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"respondUserInput"},
+                "requestId":{"oneOf":rpc_id_schema()["oneOf"].clone()},
+                "answers":{"type":"object","minProperties":1,"additionalProperties":{"type":"array","items":{"type":"string"}}}
+            }),
+            &["action", "requestId", "answers"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"respondElicitation"},
+                "requestId":{"oneOf":rpc_id_schema()["oneOf"].clone()},
+                "disposition":{"enum":["accept","decline","cancel"]},
+                "content":{"description":"Accepted elicitation payload. Omit for decline/cancel."}
+            }),
+            &["action", "requestId", "disposition"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"setArchived"},
+                "threadIds":thread_ids_schema(),
+                "archived":{"type":"boolean"}
+            }),
+            &["action", "threadIds", "archived"],
+        ),
+        object_schema(
+            json!({"action":{"const":"delete"},"threadIds":thread_ids_schema()}),
+            &["action", "threadIds"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"terminateBackgroundTerminal"},
+                "threadId":{"type":"string"},
+                "processId":{"type":"string"}
+            }),
+            &["action", "threadId", "processId"],
+        ),
+    ])
+}
+
+fn codex_act_output_schema() -> Value {
+    let response = |action: &'static str| {
+        object_schema(
+            json!({
+                "action":{"const":action},
+                "requestId":rpc_id_schema(),
+                "accepted":{"const":true}
+            }),
+            &["action", "requestId", "accepted"],
+        )
+    };
+    let archive_row = json!({"oneOf":[
+        object_schema(json!({"threadId":{"type":"string"},"archived":{"type":"boolean"}}), &["threadId","archived"]),
+        object_schema(json!({"threadId":{"type":"string"},"error":{"type":"string"}}), &["threadId","error"])
+    ]});
+    let delete_row = json!({"oneOf":[
+        object_schema(json!({"threadId":{"type":"string"},"deleted":{"const":true}}), &["threadId","deleted"]),
+        object_schema(json!({"threadId":{"type":"string"},"error":{"type":"string"}}), &["threadId","error"])
+    ]});
+    union_object_schema(vec![
+        object_schema(
+            json!({"action":{"const":"steer"},"turnId":{"type":"string"}}),
+            &["action", "turnId"],
+        ),
+        object_schema(
+            json!({"action":{"const":"interrupt"},"turnId":{"type":"string"},"interrupted":{"const":true}}),
+            &["action", "turnId", "interrupted"],
+        ),
+        response("respondApproval"),
+        response("respondPermissions"),
+        response("respondUserInput"),
+        response("respondElicitation"),
+        object_schema(
+            json!({
+                "action":{"const":"setArchived"},
+                "results":{"type":"array","items":archive_row}
+            }),
+            &["action", "results"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"delete"},
+                "results":{"type":"array","items":delete_row}
+            }),
+            &["action", "results"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"terminateBackgroundTerminal"},
+                "threadId":{"type":"string"},
+                "processId":{"type":"string"},
+                "terminated":{"type":"boolean"}
+            }),
+            &["action", "threadId", "processId", "terminated"],
+        ),
+    ])
 }
 
 fn nullable(schema: Value) -> Value {
@@ -1186,10 +1338,20 @@ mod tests {
                 .is_none()
         );
         let start = codex_start_schema();
-        let new_work = &start["oneOf"][0];
-        let resumed_work = &start["oneOf"][1];
-        let new_review = &start["oneOf"][2];
-        let resumed_review = &start["oneOf"][3];
+        let branches = start["oneOf"].as_array().unwrap();
+        let find = |mode: &str, field: &str, present: bool| {
+            branches
+                .iter()
+                .find(|branch| {
+                    branch["properties"]["mode"]["const"].as_str() == Some(mode)
+                        && branch["properties"].get(field).is_some() == present
+                })
+                .unwrap()
+        };
+        let new_work = find("work", "threadId", false);
+        let resumed_work = find("work", "threadId", true);
+        let new_review = find("review", "threadId", false);
+        let resumed_review = find("review", "threadId", true);
         assert_eq!(new_work["properties"]["access"]["default"], "workspace");
         assert_eq!(
             new_work["properties"]["access"]["enum"],
@@ -1256,9 +1418,8 @@ mod tests {
             "codex.start",
             "codex.wait",
             "codex.inspect",
-            "codex.control",
-            "codex.action.respond",
-            "codex.info",
+            "codex.query",
+            "codex.act",
         ] {
             let tool = tools
                 .iter()
@@ -1369,10 +1530,9 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let expected = [
             "apply_patch",
-            "codex.action.respond",
-            "codex.control",
-            "codex.info",
+            "codex.act",
             "codex.inspect",
+            "codex.query",
             "codex.start",
             "codex.wait",
             "command.control",
@@ -1489,16 +1649,38 @@ mod tests {
     }
 
     #[test]
-    fn scoped_codex_control_tools_are_closed_world() {
+    fn codex_act_is_closed_world_and_destructive() {
         let value = serde_json::to_value(tool_catalog()).unwrap();
         let tools = value.as_array().unwrap();
-        for name in ["codex.control", "codex.action.respond"] {
-            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
-            let annotations = &tool["annotations"];
-            assert_eq!(annotations["readOnlyHint"], false);
-            assert_eq!(annotations["destructiveHint"], true);
-            assert_eq!(annotations["openWorldHint"], false);
-            assert_eq!(annotations["idempotentHint"], false);
-        }
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "codex.act")
+            .unwrap();
+        let annotations = &tool["annotations"];
+        assert_eq!(annotations["readOnlyHint"], false);
+        assert_eq!(annotations["destructiveHint"], true);
+        assert_eq!(annotations["openWorldHint"], false);
+        assert_eq!(annotations["idempotentHint"], false);
+        let schema = &tool["inputSchema"];
+        let actions = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|branch| branch["properties"]["action"]["const"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actions,
+            BTreeSet::from([
+                "steer",
+                "interrupt",
+                "respondApproval",
+                "respondPermissions",
+                "respondUserInput",
+                "respondElicitation",
+                "setArchived",
+                "delete",
+                "terminateBackgroundTerminal",
+            ])
+        );
     }
 }

@@ -85,6 +85,52 @@ fn turn_pagination_matches_the_pinned_wire_shape() {
 }
 
 #[test]
+fn thread_management_matches_the_pinned_wire_shape() {
+    assert_eq!(
+        serde_json::to_value(ThreadFork {
+            thread_id: "thread-1".into(),
+            last_turn_id: Some("turn-2".into()),
+            exclude_turns: true,
+        })
+        .unwrap(),
+        json!({"threadId":"thread-1","lastTurnId":"turn-2","excludeTurns":true})
+    );
+    assert_eq!(
+        serde_json::to_value(ThreadList {
+            cursor: Some("next".into()),
+            limit: Some(25),
+            sort_key: Some(ThreadSortKey::RecencyAt),
+            sort_direction: Some(SortDirection::Desc),
+            archived: Some(true),
+            cwd: Some("/workspace".into()),
+            search_term: Some("refactor".into()),
+        })
+        .unwrap(),
+        json!({
+            "cursor":"next","limit":25,"sortKey":"recency_at","sortDirection":"desc",
+            "archived":true,"cwd":"/workspace","searchTerm":"refactor"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(ThreadBackgroundTerminalsList {
+            thread_id: "thread-1".into(),
+            cursor: None,
+            limit: Some(10),
+        })
+        .unwrap(),
+        json!({"threadId":"thread-1","limit":10})
+    );
+    assert_eq!(
+        serde_json::to_value(ThreadBackgroundTerminalsTerminate {
+            thread_id: "thread-1".into(),
+            process_id: "process-1".into(),
+        })
+        .unwrap(),
+        json!({"threadId":"thread-1","processId":"process-1"})
+    );
+}
+
+#[test]
 fn exact_internal_contracts_include_initialization_and_selected_actions() {
     let artifact = artifact();
     assert_eq!(artifact["codexPin"], CODEX_PIN.trim());
@@ -92,8 +138,15 @@ fn exact_internal_contracts_include_initialization_and_selected_actions() {
         Initialize::METHOD,
         ThreadStart::METHOD,
         ThreadResume::METHOD,
+        ThreadFork::METHOD,
+        ThreadArchive::METHOD,
+        ThreadUnarchive::METHOD,
+        ThreadDelete::METHOD,
         ThreadUnsubscribe::METHOD,
         ThreadRead::METHOD,
+        ThreadList::METHOD,
+        ThreadBackgroundTerminalsList::METHOD,
+        ThreadBackgroundTerminalsTerminate::METHOD,
         ThreadItemsList::METHOD,
         ThreadTurnsList::METHOD,
         TurnStart::METHOD,

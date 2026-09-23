@@ -137,6 +137,43 @@ request!(ThreadResume, "thread/resume", ThreadResponse);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ThreadFork {
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_id: Option<String>,
+    pub exclude_turns: bool,
+}
+request!(ThreadFork, "thread/fork", ThreadForkResponse);
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ThreadForkResponse {
+    pub thread: Thread,
+    pub cwd: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadArchive {
+    pub thread_id: String,
+}
+request!(ThreadArchive, "thread/archive", EmptyResponse);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadUnarchive {
+    pub thread_id: String,
+}
+request!(ThreadUnarchive, "thread/unarchive", EmptyResponse);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadDelete {
+    pub thread_id: String,
+}
+request!(ThreadDelete, "thread/delete", EmptyResponse);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadUnsubscribe {
     pub thread_id: String,
 }
@@ -166,6 +203,93 @@ pub struct ThreadRead {
     pub include_turns: bool,
 }
 request!(ThreadRead, "thread/read", ThreadReadResponse);
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadSortKey {
+    CreatedAt,
+    UpdatedAt,
+    RecencyAt,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadList {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_key: Option<ThreadSortKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<SortDirection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_term: Option<String>,
+}
+request!(ThreadList, "thread/list", ThreadListResponse);
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListResponse {
+    pub data: Vec<Thread>,
+    pub next_cursor: Option<String>,
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadBackgroundTerminalsList {
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+request!(
+    ThreadBackgroundTerminalsList,
+    "thread/backgroundTerminals/list",
+    ThreadBackgroundTerminalsListResponse
+);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadBackgroundTerminal {
+    pub item_id: String,
+    pub process_id: String,
+    pub command: String,
+    pub cwd: String,
+    pub os_pid: Option<u32>,
+    pub cpu_percent: Option<f64>,
+    pub rss_kb: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadBackgroundTerminalsListResponse {
+    pub data: Vec<ThreadBackgroundTerminal>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadBackgroundTerminalsTerminate {
+    pub thread_id: String,
+    pub process_id: String,
+}
+request!(
+    ThreadBackgroundTerminalsTerminate,
+    "thread/backgroundTerminals/terminate",
+    ThreadBackgroundTerminalsTerminateResponse
+);
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ThreadBackgroundTerminalsTerminateResponse {
+    pub terminated: bool,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -256,10 +380,24 @@ pub enum TurnItemsView {
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub forked_from_id: Option<String>,
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
+    #[serde(default)]
+    pub preview: String,
     pub cwd: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub status: Value,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub turns: Vec<Turn>,
 }

@@ -53,22 +53,32 @@ Outside that cutoff, or when cwd/model/effort/access must change, start a fresh 
 self-contained context. Revalidate mutable repository, Git, runtime, and external state even
 inside a reused thread.
 
-Use `codex.info` to discover model IDs and supported effort. `codex.start` returns the
+Use `codex.query` to discover model IDs and supported effort. `codex.start` returns the
 effective model/effort reported for the workstream. `codex.wait` and semantic inspection
 surface compact context/cache telemetry: total/context-window tokens, latest cache-hit
 percentage, the minimum cache-guarantee deadline, and whether that guarantee is active.
+
+When durable thread context is still useful but normal resume is outside that cache window,
+`codex.start` can fork the persisted thread into a new workstream. A fork may optionally stop
+at a specific completed source turn. Forking preserves conversation history; it does not
+promise prompt-cache reuse.
 
 Retain `threadId` and `turnId`. Continue only non-overlapping operator work, then
 call `codex.wait` with those IDs. It uses a fixed server wait and returns:
 
 - `terminal`: read the turn status, output, and error.
-- `actionRequired` or `inputRequired`: respond with `codex.action.respond`, matching
+- `actionRequired` or `inputRequired`: respond with `codex.act`, matching
   the pending kind, requestId, and requested answers or decisions; then wait again.
 - `timeout`: the worker is active. Continue waiting or inspect activity; timeout
   does not establish a stall or authorize taking over its scope.
 
-Use `codex.inspect` and its cursor for activity/history, `codex.control` to steer
+Use `codex.inspect` and its cursor for activity/history, `codex.act` to steer
 or interrupt, and `codex.wait` to confirm terminal state after interruption.
+
+`codex.query` also reads persisted thread metadata/listings and App Server background terminals.
+`codex.act` archives, unarchives, or deletes persisted threads and can terminate a background
+terminal owned by a Codex thread. These background terminals are distinct from HostPlane
+`command.start` sessions and remain App Server-owned.
 
 If the ChatGPT caller/frontend is interrupted while the backend remains healthy, call
 `status` in the next turn before starting replacement work. Its `workers` projection lists

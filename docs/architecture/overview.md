@@ -29,7 +29,7 @@ Keep implementation ownership as narrow as the plane model:
 - `host` owns host path resolution plus Connect-only search, image, and patch mechanics. The backend creates one validated `Host` authority and shares it with Relay and MCP dispatch.
 - `app-server` owns the pinned Codex protocol transport and official request/response contracts.
 - `relay` composes App Server operations into worker, command-session, observer, and action lifecycles. It owns execution/wait budgets and bounded live projections, not host authorization or public MCP schemas.
-- `mcp` owns the public 14-tool catalog, input parsing/dispatch, HTTP observer/runtime routes, and client-facing guard budgets.
+- `mcp` owns the public 13-tool catalog, input parsing/dispatch, HTTP observer/runtime routes, and client-facing guard budgets.
 - `cli` is the composition and local-operations layer. Its console uses a small local backend client; deployment/service management does not own observer protocol behavior.
 
 Do not duplicate an authority object or mirror App Server-owned constants into the composition root. Runtime status should read invariants from the component that owns them.
@@ -52,10 +52,11 @@ Treat a Codex thread as a cache-bounded workstream, not a disposable invocation.
 
 Thread context is not runtime authority. Mutable repository, filesystem, Git, deployment, and external state must still be revalidated when current reality matters.
 
-- `codex.start` composes thread/turn work or read-only review.
+- `codex.start` composes fresh/resumed/forked thread work or read-only review. Forking copies persisted context into a new workstream without applying the resume cache-age gate.
 - `codex.wait` synchronizes one delegated turn and returns terminal/action-required/input-required state.
 - `codex.inspect` projects bounded semantic activity, or raw retained notifications when explicitly requested.
-- `codex.control` steers or interrupts; `codex.action.respond` answers approvals, permissions, user input, and elicitation.
+- `codex.query` reads Codex-owned discovery, persisted thread metadata/listings, and thread-owned background terminals.
+- `codex.act` steers or interrupts, answers pending requests, manages persisted thread archival/deletion, and terminates thread-owned background terminals.
 - `command.start/read/control` preserve the official streaming command lifecycle, including PTY stdin, resize, and termination.
 
 Connect journals and caches are bounded observations; App Server owns lifecycle state. The relay retains detailed cache/context telemetry for observation, while the public MCP projection exposes only operator-relevant totals, cache-hit percentage, and guaranteed-reuse state/deadline. Raw inspection remains available for deeper App Server telemetry. The read-only console follows observer events, refreshes transcripts asynchronously with bounded retry, preserves the last good view through transient read failures, and marks cached quota data with the age of its last successful refresh when updates fail. Quota refresh is independent of worker observation; the UI clock only redraws.
@@ -66,7 +67,7 @@ Use the protocol pinned by `config/codex-cli-pin`. Prefer an App Server method w
 
 ```text
 codex.start → codex.wait ─┬─ terminal
-                         ├─ pending action/input → codex.action.respond
+                         ├─ pending action/input → codex.act
                          └─ lease expiry → codex.inspect or another bounded wait
 ```
 

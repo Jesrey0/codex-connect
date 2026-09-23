@@ -32,11 +32,11 @@ Do not invoke the Codex CLI through HostPlane commands when a `codex.*` semantic
 
 ## Public MCP surface
 
-The live public catalog contains exactly 14 tools:
+The live public catalog contains exactly 13 tools:
 
-`status`, `inspect`, `view_image`, `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control`, `codex.start`, `codex.wait`, `codex.inspect`, `codex.control`, `codex.action.respond`, and `codex.info`.
+`status`, `inspect`, `view_image`, `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control`, `codex.start`, `codex.wait`, `codex.inspect`, `codex.query`, and `codex.act`.
 
-Use `command.exec` for short commands, `command.start/read/control` for persistent or interactive processes, and `codex.start` for delegated work/review. `status` is the recovery anchor for retained command handles and active/recent worker handles after caller interruption. Discover compact model, skill, and usage choices with `codex.info`. The live schemas define inputs and limits.
+Use `command.exec` for short HostPlane commands, `command.start/read/control` for persistent or interactive host processes, and `codex.start` for delegated work/review. `codex.start` can also fork persisted thread context into a new workstream. Use `codex.query` for Codex-owned discovery and persisted thread/process state, and `codex.act` for Codex-owned lifecycle mutations. `status` remains the recovery anchor after caller interruption. The live schemas define inputs and limits.
 
 ## Install and operate
 

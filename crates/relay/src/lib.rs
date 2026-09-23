@@ -22,9 +22,11 @@ use codex_connect_app_server::protocol::{
     CommandExecOutputDeltaNotification, CommandExecResize, CommandExecTerminate, CommandExecWrite,
     FsGetMetadata, FsGetMetadataResponse, FsReadDirectory, FsReadDirectoryResponse, FsReadFile,
     FuzzyFileSearch, FuzzyFileSearchResponse, RateLimitsRead, ReviewStart, SkillsList,
-    SortDirection, StreamingCommandExec, TextInput, Thread, ThreadItemsList, ThreadRead,
-    ThreadResume, ThreadStart, ThreadTurnsList, ThreadUnsubscribe, TurnInterrupt, TurnItemsView,
-    TurnStart, TurnSteer,
+    SortDirection, StreamingCommandExec, TextInput, Thread, ThreadArchive,
+    ThreadBackgroundTerminalsList, ThreadBackgroundTerminalsTerminate, ThreadDelete, ThreadFork,
+    ThreadItemsList, ThreadList, ThreadRead, ThreadResume, ThreadSortKey, ThreadStart,
+    ThreadTurnsList, ThreadUnarchive, ThreadUnsubscribe, TurnInterrupt, TurnItemsView, TurnStart,
+    TurnSteer,
 };
 use codex_connect_app_server::{
     AppServerClient, AppServerConfig, AppServerError, DEFAULT_REQUEST_TIMEOUT, DeferredRequest,
@@ -71,6 +73,10 @@ const THREAD_REUSE_POLICY_MS: u64 = 30 * 60 * 1000;
 const THREAD_REUSE_POLICY_SECS: i64 = 30 * 60;
 const TURN_PAGE_SIZE: u32 = 50;
 const ITEM_PAGE_SIZE: u32 = 100;
+const CODEX_QUERY_PAGE_DEFAULT: u32 = 25;
+const CODEX_QUERY_PAGE_MAX: u32 = 50;
+const MAX_THREAD_PREVIEW_CHARS: usize = 512;
+const MAX_BACKGROUND_COMMAND_CHARS: usize = 1024;
 pub const COMMAND_EXEC_RESPONSE_ALLOWANCE_MS: u64 = 10_000;
 pub const DEFAULT_COMMAND_MS: u64 = 40_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
@@ -278,6 +284,12 @@ fn turn_metadata(
 }
 
 impl LiveTurns {
+    fn has_active_thread(&self, thread_id: &str) -> bool {
+        self.turns.iter().any(|((candidate, _), observed)| {
+            candidate == thread_id && !observed.turn.status.is_terminal()
+        })
+    }
+
     fn insert(
         &mut self,
         thread_id: &str,
@@ -1406,12 +1418,24 @@ impl Relay {
         task: String,
         cwd: Option<String>,
         thread_id: Option<String>,
+        fork_from_thread_id: Option<String>,
+        last_turn_id: Option<String>,
         model: Option<String>,
         effort: Option<String>,
         sandbox_policy: Option<SandboxPolicy>,
     ) -> Result<Value, RelayError> {
         if task.trim().is_empty() {
             return Err(RelayError::Invalid("task must not be empty".into()));
+        }
+        if thread_id.is_some() && fork_from_thread_id.is_some() {
+            return Err(RelayError::Invalid(
+                "threadId and forkFromThreadId are mutually exclusive".into(),
+            ));
+        }
+        if last_turn_id.is_some() && fork_from_thread_id.is_none() {
+            return Err(RelayError::Invalid(
+                "lastTurnId requires forkFromThreadId".into(),
+            ));
         }
         if thread_id.is_some()
             && (cwd.is_some() || model.is_some() || effort.is_some() || sandbox_policy.is_some())
@@ -1420,9 +1444,16 @@ impl Relay {
                 "resumed work inherits cwd, model, effort, and access; start a fresh thread to change workstream settings".into(),
             ));
         }
+        if fork_from_thread_id.is_some()
+            && (cwd.is_some() || model.is_some() || effort.is_some() || sandbox_policy.is_some())
+        {
+            return Err(RelayError::Invalid(
+                "forked work inherits cwd, model, effort, and access from its source thread".into(),
+            ));
+        }
         if let Some(policy) = sandbox_policy.as_ref() {
             validate_work_sandbox_policy(policy)?;
-        } else if thread_id.is_none() {
+        } else if thread_id.is_none() && fork_from_thread_id.is_none() {
             return Err(RelayError::Invalid(
                 "new work requires an explicit sandbox policy".into(),
             ));
@@ -1431,7 +1462,16 @@ impl Relay {
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
             let result = relay
-                .work_start_owned(task, cwd, thread_id, model, effort, sandbox_policy)
+                .work_start_owned(
+                    task,
+                    cwd,
+                    thread_id,
+                    fork_from_thread_id,
+                    last_turn_id,
+                    model,
+                    effort,
+                    sandbox_policy,
+                )
                 .await;
             let _ = sender.send(result);
         });
@@ -1446,6 +1486,8 @@ impl Relay {
         task: String,
         cwd: Option<String>,
         thread_id: Option<String>,
+        fork_from_thread_id: Option<String>,
+        last_turn_id: Option<String>,
         model: Option<String>,
         effort: Option<String>,
         sandbox_policy: Option<SandboxPolicy>,
@@ -1453,16 +1495,24 @@ impl Relay {
         let observer_prompt = task.clone();
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
+        let fresh = thread_id.is_none() && fork_from_thread_id.is_none();
         let thread_sandbox = sandbox_policy.as_ref().map(sandbox_mode);
-        let prepared = self
-            .prepare_thread(
-                cwd,
-                thread_id,
-                model.clone(),
-                thread_sandbox,
-                created.then_some(ApprovalPolicy::Never),
-            )
-            .await?;
+        let prepared = match fork_from_thread_id {
+            Some(source_thread_id) => {
+                self.prepare_forked_thread(source_thread_id, last_turn_id)
+                    .await?
+            }
+            None => {
+                self.prepare_thread(
+                    cwd,
+                    thread_id,
+                    model.clone(),
+                    thread_sandbox,
+                    fresh.then_some(ApprovalPolicy::Never),
+                )
+                .await?
+            }
+        };
         let effective_model = model.or(prepared.model.clone());
         let effective_effort = effort.or(prepared.effort.clone());
         let annotation = WorkerAnnotation {
@@ -1471,7 +1521,7 @@ impl Relay {
             effort: effective_effort.clone(),
             prompt: Some(observer_prompt),
         };
-        let turn_sandbox = if created { sandbox_policy } else { None };
+        let turn_sandbox = if fresh { sandbox_policy } else { None };
         let response = match self
             .app_server
             .start_request(TurnStart {
@@ -1510,6 +1560,40 @@ impl Relay {
             "model":effective_model,
             "effort":effective_effort,
         }))
+    }
+
+    async fn prepare_forked_thread(
+        &self,
+        source_thread_id: String,
+        last_turn_id: Option<String>,
+    ) -> Result<PreparedThread, RelayError> {
+        self.read_thread_metadata(source_thread_id.clone()).await?;
+        let response = self
+            .app_server
+            .start_request(ThreadFork {
+                thread_id: source_thread_id,
+                last_turn_id,
+                exclude_turns: true,
+            })
+            .await?
+            .wait()
+            .await?;
+        let thread_id = response.thread.id.clone();
+        self.begin_thread_start(&thread_id).await;
+        self.mark_thread_subscribed(&thread_id).await;
+        let cwd = match self.host.resolve_app_server_directory(&response.cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                self.finish_thread_start(&thread_id, None).await;
+                return Err(error.into());
+            }
+        };
+        Ok(PreparedThread {
+            id: thread_id,
+            cwd,
+            model: response.thread.model,
+            effort: response.thread.reasoning_effort,
+        })
     }
 
     async fn prepare_thread(
@@ -2496,6 +2580,187 @@ impl Relay {
             .await?)
     }
 
+    pub async fn thread_list(
+        &self,
+        cursor: Option<String>,
+        limit: Option<u32>,
+        archived: Option<bool>,
+        cwd: Option<String>,
+        search_term: Option<String>,
+    ) -> Result<Value, RelayError> {
+        if limit.is_some_and(|limit| limit == 0 || limit > CODEX_QUERY_PAGE_MAX) {
+            return Err(RelayError::Invalid(format!(
+                "thread query limit must be between 1 and {CODEX_QUERY_PAGE_MAX}"
+            )));
+        }
+        let cwd = cwd
+            .map(|cwd| self.host.resolve_app_server_directory(&cwd))
+            .transpose()?;
+        let response = self
+            .app_server
+            .request(ThreadList {
+                cursor,
+                limit: Some(limit.unwrap_or(CODEX_QUERY_PAGE_DEFAULT)),
+                sort_key: Some(ThreadSortKey::RecencyAt),
+                sort_direction: Some(SortDirection::Desc),
+                archived,
+                cwd,
+                search_term,
+            })
+            .await?;
+        let mut threads = Vec::with_capacity(response.data.len());
+        for thread in response.data {
+            self.host.resolve_app_server_directory(&thread.cwd)?;
+            threads.push(thread_summary(&thread));
+        }
+        Ok(json!({
+            "threads":threads,
+            "nextCursor":response.next_cursor,
+            "backwardsCursor":response.backwards_cursor,
+        }))
+    }
+
+    pub async fn thread_summary(&self, thread_id: String) -> Result<Value, RelayError> {
+        let thread = self.read_thread_metadata(thread_id).await?;
+        Ok(thread_summary(&thread))
+    }
+
+    pub async fn background_terminals(
+        &self,
+        thread_id: String,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Value, RelayError> {
+        if limit.is_some_and(|limit| limit == 0 || limit > CODEX_QUERY_PAGE_MAX) {
+            return Err(RelayError::Invalid(format!(
+                "background terminal query limit must be between 1 and {CODEX_QUERY_PAGE_MAX}"
+            )));
+        }
+        self.read_thread_metadata(thread_id.clone()).await?;
+        let response = self
+            .app_server
+            .request(ThreadBackgroundTerminalsList {
+                thread_id,
+                cursor,
+                limit: Some(limit.unwrap_or(CODEX_QUERY_PAGE_DEFAULT)),
+            })
+            .await?;
+        for terminal in &response.data {
+            self.host.resolve_app_server_directory(&terminal.cwd)?;
+        }
+        let terminals = response
+            .data
+            .into_iter()
+            .map(|terminal| {
+                json!({
+                    "itemId":terminal.item_id,
+                    "processId":terminal.process_id,
+                    "command":observer_clip(&terminal.command, MAX_BACKGROUND_COMMAND_CHARS),
+                    "cwd":terminal.cwd,
+                    "osPid":terminal.os_pid,
+                    "cpuPercent":terminal.cpu_percent,
+                    "rssKb":terminal.rss_kb,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"terminals":terminals,"nextCursor":response.next_cursor}))
+    }
+
+    async fn ensure_thread_not_active(&self, thread_id: &str) -> Result<(), RelayError> {
+        if self.live_turns.lock().await.has_active_thread(thread_id) {
+            return Err(RelayError::Invalid(format!(
+                "thread {thread_id} has an active delegated turn"
+            )));
+        }
+        let thread = self.read_thread_metadata(thread_id.to_string()).await?;
+        if thread.status.get("type").and_then(Value::as_str) == Some("active") {
+            return Err(RelayError::Invalid(format!(
+                "thread {thread_id} is active in App Server"
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn thread_set_archived(
+        &self,
+        thread_ids: Vec<String>,
+        archived: bool,
+    ) -> Result<Value, RelayError> {
+        validate_thread_batch(&thread_ids)?;
+        let mut results = Vec::with_capacity(thread_ids.len());
+        for thread_id in thread_ids {
+            let result = if archived {
+                match self.ensure_thread_not_active(&thread_id).await {
+                    Ok(()) => self
+                        .app_server
+                        .request(ThreadArchive {
+                            thread_id: thread_id.clone(),
+                        })
+                        .await
+                        .map(|_| ()),
+                    Err(error) => {
+                        results.push(json!({"threadId":thread_id,"error":error.to_string()}));
+                        continue;
+                    }
+                }
+            } else {
+                self.app_server
+                    .request(ThreadUnarchive {
+                        thread_id: thread_id.clone(),
+                    })
+                    .await
+                    .map(|_| ())
+            };
+            match result {
+                Ok(()) => results.push(json!({"threadId":thread_id,"archived":archived})),
+                Err(error) => results.push(json!({"threadId":thread_id,"error":error.to_string()})),
+            }
+        }
+        Ok(json!({"results":results}))
+    }
+
+    pub async fn thread_delete(&self, thread_ids: Vec<String>) -> Result<Value, RelayError> {
+        validate_thread_batch(&thread_ids)?;
+        let mut results = Vec::with_capacity(thread_ids.len());
+        for thread_id in thread_ids {
+            if let Err(error) = self.ensure_thread_not_active(&thread_id).await {
+                results.push(json!({"threadId":thread_id,"error":error.to_string()}));
+                continue;
+            }
+            match self
+                .app_server
+                .request(ThreadDelete {
+                    thread_id: thread_id.clone(),
+                })
+                .await
+            {
+                Ok(_) => results.push(json!({"threadId":thread_id,"deleted":true})),
+                Err(error) => results.push(json!({"threadId":thread_id,"error":error.to_string()})),
+            }
+        }
+        Ok(json!({"results":results}))
+    }
+
+    pub async fn background_terminal_terminate(
+        &self,
+        thread_id: String,
+        process_id: String,
+    ) -> Result<Value, RelayError> {
+        self.read_thread_metadata(thread_id.clone()).await?;
+        let response = self
+            .app_server
+            .request(ThreadBackgroundTerminalsTerminate {
+                thread_id: thread_id.clone(),
+                process_id: process_id.clone(),
+            })
+            .await?;
+        Ok(json!({
+            "threadId":thread_id,
+            "processId":process_id,
+            "terminated":response.terminated,
+        }))
+    }
+
     async fn store_observer_usage_result(&self, result: Result<Value, RelayError>) {
         let (ok, error) = {
             let mut state = self.observer_usage.lock().await;
@@ -2743,6 +3008,42 @@ impl Relay {
             }
         });
     }
+}
+
+fn thread_summary(thread: &Thread) -> Value {
+    json!({
+        "threadId":thread.id,
+        "sessionId":thread.session_id,
+        "forkedFromThreadId":thread.forked_from_id,
+        "parentThreadId":thread.parent_thread_id,
+        "name":thread.name,
+        "preview":observer_clip(&thread.preview, MAX_THREAD_PREVIEW_CHARS),
+        "cwd":thread.cwd,
+        "model":thread.model,
+        "effort":thread.reasoning_effort,
+        "createdAt":thread.created_at,
+        "updatedAt":thread.updated_at,
+        "status":thread.status.get("type").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn validate_thread_batch(thread_ids: &[String]) -> Result<(), RelayError> {
+    if thread_ids.is_empty() || thread_ids.len() > 100 {
+        return Err(RelayError::Invalid(
+            "threadIds must contain between 1 and 100 IDs".into(),
+        ));
+    }
+    if thread_ids.iter().any(|id| id.trim().is_empty()) {
+        return Err(RelayError::Invalid(
+            "threadIds must not contain empty IDs".into(),
+        ));
+    }
+    if thread_ids.iter().collect::<HashSet<_>>().len() != thread_ids.len() {
+        return Err(RelayError::Invalid(
+            "threadIds must not contain duplicates".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn pending_action_matches(

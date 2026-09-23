@@ -24,7 +24,7 @@ CONTRACT = json.loads((ROOT / "config/app-server-tool-schemas.json").read_text()
 EXPECTED = {
     "status", "inspect", "apply_patch", "view_image", "command.exec",
     "command.start", "command.read", "command.control",
-    "codex.start", "codex.wait", "codex.inspect", "codex.control", "codex.action.respond", "codex.info",
+    "codex.start", "codex.wait", "codex.inspect", "codex.query", "codex.act",
 }
 
 
@@ -140,7 +140,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.fail("worker event was not delivered on the host plane")
 
     def test_catalog_status_runtime_and_origin_boundary(self):
-        self.assertEqual(len(self.client.catalog), 14)
+        self.assertEqual(len(self.client.catalog), 13)
         self.assertEqual(set(self.client.tools), EXPECTED)
         status = self.client.call("status")
         worker_events = status.pop("workerEvents", [])
@@ -273,7 +273,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(observed_worker["activityKind"], "message")
         self.assertIn("Working", observed_worker["activitySummary"])
         self.assertIn("transcriptRevision", observed_worker)
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action":"interrupt", "threadId":work["threadId"], "turnId":work["turnId"]
         })
         self.assertEqual(self.wait(work)["state"], "terminal")
@@ -707,7 +707,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(active["activity"]["kind"], "message")
         self.assertIn("Working", active["activity"]["summary"])
 
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })
         self.assertEqual(self.wait(work)["state"], "terminal")
@@ -727,8 +727,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(action["kind"], "userInput")
         self.assertTrue(action["isBlocking"])
         self.assertEqual(action["params"]["questions"][0]["question"], "Which output format?")
-        self.client.call("codex.action.respond", {
-            "type": "userInput",
+        self.client.call("codex.act", {
+            "action": "respondUserInput",
             "requestId": action["requestId"],
             "answers": {"format": ["JSON"]},
         })
@@ -768,7 +768,7 @@ class OperatorProtocolTests(unittest.TestCase):
                 self.assertIn("unknown field `timeoutMs`", result["content"][0]["text"])
         self.assertEqual(len(self.method_params("thread/read")), reads_before)
         self.assertEqual(len(self.method_params("thread/turns/list")), turns_before)
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })
         self.assertEqual(self.wait(work)["state"], "terminal")
@@ -847,8 +847,8 @@ class OperatorProtocolTests(unittest.TestCase):
         ))
         pending = self.wait(approval_work)["pendingActions"][0]
         self.assertEqual(pending["requestId"], action_event["requestId"])
-        self.client.call("codex.action.respond", {
-            "type": "approval",
+        self.client.call("codex.act", {
+            "action": "respondApproval",
             "requestId": pending["requestId"],
             "decision": "approve",
         })
@@ -870,8 +870,8 @@ class OperatorProtocolTests(unittest.TestCase):
             event.get("requestId") == pending["requestId"]
             for event in self.client.call("status").get("workerEvents", [])
         ))
-        self.client.call("codex.action.respond", {
-            "type": "approval",
+        self.client.call("codex.act", {
+            "action": "respondApproval",
             "requestId": pending["requestId"],
             "decision": "approve",
         })
@@ -955,14 +955,14 @@ class OperatorProtocolTests(unittest.TestCase):
         first = self.start("idle")
         second = self.start("idle", threadId=first["threadId"])
 
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action": "interrupt", "threadId": first["threadId"], "turnId": first["turnId"],
         })
         self.assertEqual(self.wait(first)["state"], "terminal")
         time.sleep(0.05)
         self.assertEqual(len(self.method_params("thread/unsubscribe")), unsubscribes_before)
 
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action": "interrupt", "threadId": second["threadId"], "turnId": second["turnId"],
         })
         self.assertEqual(self.wait(second)["state"], "terminal")
@@ -1016,8 +1016,8 @@ class OperatorProtocolTests(unittest.TestCase):
             if scenario == "oversized":
                 raw = self.inspect_turn(work, detail="raw")
                 self.assertTrue(any(event["truncated"] for event in raw["events"]))
-            self.client.call("codex.control",{"action":"steer","threadId":work["threadId"],"expectedTurnId":work["turnId"],"instruction":"continue"})
-            self.client.call("codex.control",{"action":"interrupt","threadId":work["threadId"],"turnId":work["turnId"]})
+            self.client.call("codex.act",{"action":"steer","threadId":work["threadId"],"expectedTurnId":work["turnId"],"instruction":"continue"})
+            self.client.call("codex.act",{"action":"interrupt","threadId":work["threadId"],"turnId":work["turnId"]})
             interrupted = self.wait(work)
             self.assertEqual(interrupted["state"],"terminal")
             self.assertEqual(interrupted["wakeReason"],"terminal")
@@ -1032,7 +1032,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["wakeReason"], "timeout")
         self.assertEqual(len(self.method_params("thread/turns/list")) - turns_before, 1)
         self.assertEqual(len(self.method_params("thread/items/list")) - items_before, 0)
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })
         self.assertEqual(self.wait(work)["state"], "terminal")
@@ -1059,7 +1059,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["wakeReason"], "timeout")
         self.assertGreaterEqual(elapsed, 39.5)
         self.assertLess(elapsed, 41.5)
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })
         self.assertEqual(self.wait(work)["state"], "terminal")
@@ -1076,7 +1076,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.method_params("thread/read")), reads_before)
         self.assertGreaterEqual(elapsed, 39.5)
         self.assertLess(elapsed, 41.5)
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })
         self.assertEqual(self.wait(work)["state"], "terminal")
@@ -1089,7 +1089,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["wakeReason"], "timeout")
         self.assertEqual(result["turn"]["id"], work["turnId"])
         self.assertEqual(len(self.method_params("thread/turns/list")) - turns_before, 1)
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })
         self.assertEqual(self.wait(work)["state"], "terminal")
@@ -1135,13 +1135,13 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(pending["questions"][0]["id"],"format")
         self.assertTrue(pending["blocking"])
         request_id = pending["requestId"]
-        self.client.call("codex.action.respond",{"type":"approval","requestId":request_id,"decision":"approve"},error=True)
-        self.client.call("codex.action.respond",{"type":"userInput","requestId":request_id,"answers":{"wrong":["JSON"]}},error=True)
-        self.client.call("codex.action.respond",{"type":"userInput","requestId":request_id,"answers":{"format":["JSON"]}})
+        self.client.call("codex.act",{"action":"respondApproval","requestId":request_id,"decision":"approve"},error=True)
+        self.client.call("codex.act",{"action":"respondUserInput","requestId":request_id,"answers":{"wrong":["JSON"]}},error=True)
+        self.client.call("codex.act",{"action":"respondUserInput","requestId":request_id,"answers":{"format":["JSON"]}})
         completed = self.wait(work)
         self.assertEqual(completed["state"],"terminal")
         self.assertEqual(completed["wakeReason"],"terminal")
-        self.client.call("codex.action.respond",{"type":"userInput","requestId":request_id,"answers":{"format":["JSON"]}},error=True)
+        self.client.call("codex.act",{"action":"respondUserInput","requestId":request_id,"answers":{"format":["JSON"]}},error=True)
         self.assertEqual(self.client.call("codex.wait",{
             "threadId": work["threadId"], "turnId": work["turnId"],
         })["pendingActions"], [])
@@ -1152,16 +1152,16 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"],"active")
         self.assertEqual(result["wakeReason"],"timeout")
         self.assertFalse(result["pendingActions"][0]["blocking"])
-        self.client.call("codex.control",{"action":"interrupt","threadId":work["threadId"],"turnId":work["turnId"]})
+        self.client.call("codex.act",{"action":"interrupt","threadId":work["threadId"],"turnId":work["turnId"]})
         self.assertEqual(self.client.call("codex.wait",{
             "threadId": work["threadId"], "turnId": work["turnId"],
         })["pendingActions"], [])
 
     def test_typed_approval_permission_and_elicitation_paths(self):
         cases = [
-            ("approval",{"type":"approval","decision":"approve"}),
-            ("file",{"type":"approval","decision":"decline"}),
-            ("permissions",{"type":"permissions","permissions":{"network":{"enabled":True}},"scope":"turn"}),
+            ("approval",{"action":"respondApproval","decision":"approve"}),
+            ("file",{"action":"respondApproval","decision":"decline"}),
+            ("permissions",{"action":"respondPermissions","permissions":{"network":{"enabled":True}},"scope":"turn"}),
         ]
         for scenario, answer in cases:
             with self.subTest(scenario=scenario):
@@ -1170,15 +1170,15 @@ class OperatorProtocolTests(unittest.TestCase):
                 self.assertEqual(result["state"],"active")
                 self.assertEqual(result["wakeReason"],"actionRequired")
                 request_id = result["pendingActions"][0]["requestId"]
-                self.client.call("codex.action.respond",{"requestId":request_id,**answer})
+                self.client.call("codex.act",{"requestId":request_id,**answer})
                 completed = self.wait(work)
                 self.assertEqual(completed["state"],"terminal")
                 self.assertEqual(completed["wakeReason"],"terminal")
 
         for scenario, response in [
-            ("form", {"action": "accept", "content": {"name": "Operator"}}),
-            ("openai_form", {"action": "accept", "content": {"opaque": True}}),
-            ("url", {"action": "cancel"}),
+            ("form", {"disposition": "accept", "content": {"name": "Operator"}}),
+            ("openai_form", {"disposition": "accept", "content": {"opaque": True}}),
+            ("url", {"disposition": "cancel"}),
         ]:
             with self.subTest(scenario=scenario):
                 work = self.start(scenario)
@@ -1186,8 +1186,8 @@ class OperatorProtocolTests(unittest.TestCase):
                 pending = result["pendingActions"][0]
                 self.assertEqual(pending["type"], "elicitation")
                 self.assertEqual(pending["request"]["mode"], scenario if scenario != "openai_form" else "openai/form")
-                self.client.call("codex.action.respond", {
-                    "type": "elicitation", "requestId": pending["requestId"], **response,
+                self.client.call("codex.act", {
+                    "action": "respondElicitation", "requestId": pending["requestId"], **response,
                 })
                 self.assertEqual(self.wait(work)["state"], "terminal")
 
@@ -1206,7 +1206,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["wakeReason"],"terminal")
         self.assertEqual(result["threadId"], source["threadId"])
         self.assertEqual(result["turnId"], review["turnId"])
-        info = self.client.call("codex.info", {"queries":[
+        info = self.client.call("codex.query", {"queries":[
             {"type":"models"}, {"type":"skills"}, {"type":"usage"},
         ]})
         self.assertEqual([entry["type"] for entry in info["results"]], ["models", "skills", "usage"])
@@ -1221,13 +1221,102 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(usage["resetCreditsAvailable"], 2)
         self.assertEqual(usage["primary"]["usedPercent"], 100)
         self.assertNotIn("accountId", usage)
-        self.client.call("codex.info", {"queries": []}, error=True, validate_input=False)
+        self.client.call("codex.query", {"queries": []}, error=True, validate_input=False)
         self.client.call(
-            "codex.info",
+            "codex.query",
             {"queries": [{"type": "usage"}] * 11},
             error=True,
             validate_input=False,
         )
+
+    def test_persisted_thread_query_archive_unarchive_and_delete(self):
+        first = self.start("complete")
+        second = self.start("complete")
+        self.assertEqual(self.wait(first)["state"], "terminal")
+        self.assertEqual(self.wait(second)["state"], "terminal")
+
+        listed = self.client.call("codex.query", {"queries": [{
+            "type": "threads", "limit": 50,
+        }]})["results"][0]["result"]
+        self.client.call("codex.query", {"queries": [{"type": "threads"}]})
+        self.assertEqual(self.method_params("thread/list")[-1]["limit"], 25)
+        listed_ids = {thread["threadId"] for thread in listed["threads"]}
+        self.assertIn(first["threadId"], listed_ids)
+        self.assertIn(second["threadId"], listed_ids)
+
+        archived = self.client.call("codex.act", {
+            "action": "setArchived",
+            "threadIds": [first["threadId"], second["threadId"]],
+            "archived": True,
+        })
+        self.assertEqual(
+            {row["threadId"] for row in archived["results"] if row.get("archived")},
+            {first["threadId"], second["threadId"]},
+        )
+        archived_list = self.client.call("codex.query", {"queries": [{
+            "type": "threads", "archived": True, "limit": 50,
+        }]})["results"][0]["result"]
+        archived_ids = {thread["threadId"] for thread in archived_list["threads"]}
+        self.assertTrue({first["threadId"], second["threadId"]}.issubset(archived_ids))
+
+        restored = self.client.call("codex.act", {
+            "action": "setArchived", "threadIds": [first["threadId"]], "archived": False,
+        })
+        self.assertTrue(restored["results"][0]["archived"] is False)
+
+        deleted = self.client.call("codex.act", {
+            "action": "delete", "threadIds": [first["threadId"], second["threadId"]],
+        })
+        self.assertTrue(all(row.get("deleted") for row in deleted["results"]))
+
+    def test_persisted_thread_mutations_refuse_active_delegated_work(self):
+        work = self.start("idle")
+        archived = self.client.call("codex.act", {
+            "action": "setArchived", "threadIds": [work["threadId"]], "archived": True,
+        })
+        self.assertIn("active delegated turn", archived["results"][0]["error"])
+        deleted = self.client.call("codex.act", {
+            "action": "delete", "threadIds": [work["threadId"]],
+        })
+        self.assertIn("active delegated turn", deleted["results"][0]["error"])
+        self.client.call("codex.act", {
+            "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
+        })
+        self.assertEqual(self.wait(work)["state"], "terminal")
+
+    def test_persisted_thread_mutations_fail_closed_when_thread_state_is_unreadable(self):
+        missing = "thread-does-not-exist"
+        archived = self.client.call("codex.act", {
+            "action": "setArchived", "threadIds": [missing], "archived": True,
+        })
+        self.assertIn("error", archived["results"][0])
+        deleted = self.client.call("codex.act", {
+            "action": "delete", "threadIds": [missing],
+        })
+        self.assertIn("error", deleted["results"][0])
+
+    def test_thread_owned_background_terminals_are_queryable_and_terminable(self):
+        work = self.start("background_terminal")
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        queried = self.client.call("codex.query", {"queries": [{
+            "type": "backgroundTerminals", "threadId": work["threadId"],
+        }]})["results"][0]["result"]
+        self.assertEqual(self.method_params("thread/backgroundTerminals/list")[-1]["limit"], 25)
+        self.assertEqual(len(queried["terminals"]), 1)
+        terminal = queried["terminals"][0]
+        self.assertEqual(terminal["processId"], "background-process-1")
+        self.assertEqual(terminal["osPid"], 4242)
+
+        terminated = self.client.call("codex.act", {
+            "action": "terminateBackgroundTerminal",
+            "threadId": work["threadId"],
+            "processId": terminal["processId"],
+        })
+        self.assertTrue(terminated["terminated"])
+        empty = self.client.call("codex.query", {"queries": [{
+            "type": "backgroundTerminals", "threadId": work["threadId"],
+        }]})["results"][0]["result"]
+        self.assertEqual(empty["terminals"], [])
 
     def test_new_thread_policy_projection_and_review_model_routing(self):
         before = len(self.method_params("thread/start"))
@@ -1335,6 +1424,24 @@ class OperatorProtocolTests(unittest.TestCase):
         )
         self.assertEqual(len(self.method_params("thread/resume")), resumes_before_expired)
 
+        forks_before = len(self.method_params("thread/fork"))
+        forked = self.client.call("codex.start", {
+            "mode": "work",
+            "task": "complete",
+            "forkFromThreadId": expired["threadId"],
+        })
+        self.assertNotEqual(forked["threadId"], expired["threadId"])
+        self.assertEqual(self.wait(forked)["state"], "terminal")
+        fork_call = self.method_params("thread/fork")[forks_before]
+        self.assertEqual(fork_call, {
+            "threadId": expired["threadId"],
+            "excludeTurns": True,
+        })
+        fork_summary = self.client.call("codex.query", {"queries": [{
+            "type": "thread", "threadId": forked["threadId"],
+        }]})["results"][0]["result"]
+        self.assertEqual(fork_summary["forkedFromThreadId"], expired["threadId"])
+
         before_threads = len(self.method_params("thread/start"))
         before_reviews = len(self.method_params("review/start"))
         review = self.client.call("codex.start", {
@@ -1398,12 +1505,12 @@ class OperatorProtocolTests(unittest.TestCase):
         })
 
         resumed = self.start("idle", threadId=source["threadId"])
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action": "steer", "threadId": resumed["threadId"],
             "expectedTurnId": resumed["turnId"],
             "instruction": "continue",
         })
-        self.client.call("codex.control", {
+        self.client.call("codex.act", {
             "action": "interrupt", "threadId": resumed["threadId"], "turnId": resumed["turnId"],
         })
         self.assertEqual(self.wait(resumed)["state"], "terminal")
@@ -1412,6 +1519,38 @@ class OperatorProtocolTests(unittest.TestCase):
             "mode": "review", "threadId": source["threadId"], "target": {"type": "uncommittedChanges"},
         })
         self.assertEqual(self.wait(review)["state"], "terminal")
+
+        forked = self.client.call("codex.start", {
+            "mode": "work", "task": "complete", "forkFromThreadId": source["threadId"],
+        })
+        self.assertEqual(self.wait(forked)["state"], "terminal")
+        self.client.call("codex.query", {"queries": [
+            {"type": "threads", "limit": 10},
+            {"type": "thread", "threadId": forked["threadId"]},
+        ]})
+
+        lifecycle = self.start("complete")
+        self.assertEqual(self.wait(lifecycle)["state"], "terminal")
+        self.client.call("codex.act", {
+            "action": "setArchived", "threadIds": [lifecycle["threadId"]], "archived": True,
+        })
+        self.client.call("codex.act", {
+            "action": "setArchived", "threadIds": [lifecycle["threadId"]], "archived": False,
+        })
+        self.client.call("codex.act", {
+            "action": "delete", "threadIds": [lifecycle["threadId"]],
+        })
+
+        background = self.start("background_terminal")
+        self.assertEqual(self.wait(background)["state"], "terminal")
+        terminals = self.client.call("codex.query", {"queries": [{
+            "type": "backgroundTerminals", "threadId": background["threadId"],
+        }]})["results"][0]["result"]["terminals"]
+        self.client.call("codex.act", {
+            "action": "terminateBackgroundTerminal",
+            "threadId": background["threadId"],
+            "processId": terminals[0]["processId"],
+        })
 
         self.client.call("command.exec", {"command": ["echo", "coverage"]})
         repl = self.client.call("command.start", {
@@ -1428,26 +1567,26 @@ class OperatorProtocolTests(unittest.TestCase):
         self.client.call("command.read", {"processId": quiet["processId"], "timeoutMs": 1000})
 
         for scenario, answer in [
-            ("approval", {"type": "approval", "decision": "approve"}),
-            ("file", {"type": "approval", "decision": "decline"}),
-            ("permissions", {"type": "permissions", "permissions": {"network": {"enabled": True}}, "scope": "turn"}),
-            ("question", {"type": "userInput", "answers": {"format": ["JSON"]}}),
+            ("approval", {"action": "respondApproval", "decision": "approve"}),
+            ("file", {"action": "respondApproval", "decision": "decline"}),
+            ("permissions", {"action": "respondPermissions", "permissions": {"network": {"enabled": True}}, "scope": "turn"}),
+            ("question", {"action": "respondUserInput", "answers": {"format": ["JSON"]}}),
         ]:
             work = self.start(scenario)
             pending = self.wait(work)["pendingActions"][0]
-            self.client.call("codex.action.respond", {"requestId": pending["requestId"], **answer})
+            self.client.call("codex.act", {"requestId": pending["requestId"], **answer})
             self.assertEqual(self.wait(work)["state"], "terminal")
 
         elicitation = self.start("form")
         pending = self.wait(elicitation)["pendingActions"][0]
         self.assertEqual(pending["type"], "elicitation")
-        self.client.call("codex.action.respond", {
-            "type": "elicitation", "requestId": pending["requestId"],
-            "action": "accept", "content": {"name": "Operator"},
+        self.client.call("codex.act", {
+            "action": "respondElicitation", "requestId": pending["requestId"],
+            "disposition": "accept", "content": {"name": "Operator"},
         })
         self.assertEqual(self.wait(elicitation)["state"], "terminal")
 
-        self.client.call("codex.info", {"queries":[
+        self.client.call("codex.query", {"queries":[
             {"type":"models"}, {"type":"skills"}, {"type":"usage"},
         ]})
 

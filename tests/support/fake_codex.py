@@ -68,6 +68,9 @@ def validate(value, schema):
 
 lock = threading.RLock()
 threads = {}
+archived_threads = {}
+background_terminals = {}
+next_thread_number = 1
 subscriptions = set()
 unsubscribe_failures = set()
 slow_turn_list_at = {}
@@ -79,6 +82,13 @@ command_sessions = {}
 initialized = False
 handshake = False
 coverage_file = os.environ.get("CODEX_CONNECT_FAKE_COVERAGE_FILE")
+
+
+def allocate_thread_id():
+    global next_thread_number
+    thread_id = f"thread-{next_thread_number}"
+    next_thread_number += 1
+    return thread_id
 
 
 def record_coverage(kind, name, params=None):
@@ -208,7 +218,7 @@ for line in sys.stdin:
         continue
     assert initialized
     if method == "thread/start":
-        thread_id = f"thread-{len(threads) + 1}"
+        thread_id = allocate_thread_id()
         thread = result["thread"]
         now = int(time.time())
         thread.update(
@@ -216,6 +226,12 @@ for line in sys.stdin:
             cwd=params.get("cwd", os.getcwd()),
             model=params.get("model", "fixture-model-1"),
             reasoningEffort="medium",
+            sessionId=thread_id,
+            forkedFromId=None,
+            parentThreadId=None,
+            preview="fixture thread",
+            name=None,
+            status={"type": "idle"},
             createdAt=now,
             updatedAt=now,
             turns=[],
@@ -223,8 +239,84 @@ for line in sys.stdin:
         threads[thread_id] = thread
         subscriptions.add(thread_id)
         result["cwd"] = thread["cwd"]
+    elif method == "thread/fork":
+        source_id = params["threadId"]
+        source = copy.deepcopy(threads.get(source_id) or archived_threads[source_id])
+        thread_id = allocate_thread_id()
+        source["id"] = thread_id
+        source["sessionId"] = source.get("sessionId") or source_id
+        source["forkedFromId"] = source_id
+        source["status"] = {"type": "idle"}
+        now = int(time.time())
+        source["createdAt"] = now
+        source["updatedAt"] = now
+        if params.get("lastTurnId"):
+            keep = []
+            for turn in source["turns"]:
+                keep.append(turn)
+                if turn["id"] == params["lastTurnId"]:
+                    break
+            source["turns"] = keep
+        threads[thread_id] = source
+        subscriptions.add(thread_id)
+        result["thread"] = copy.deepcopy(source)
+        if params.get("excludeTurns"):
+            result["thread"]["turns"] = []
+        result["cwd"] = source["cwd"]
+    elif method == "thread/list":
+        store = archived_threads if params.get("archived") else threads
+        data = [copy.deepcopy(thread) for thread in store.values()]
+        if params.get("cwd"):
+            data = [thread for thread in data if thread["cwd"] == params["cwd"]]
+        if params.get("searchTerm"):
+            term = params["searchTerm"].lower()
+            data = [
+                thread for thread in data
+                if term in (thread.get("name") or "").lower()
+                or term in (thread.get("preview") or "").lower()
+            ]
+        data.sort(key=lambda thread: thread.get("updatedAt", 0), reverse=params.get("sortDirection", "desc") == "desc")
+        start = int(params.get("cursor") or 0)
+        limit = params.get("limit") or 50
+        result["data"] = data[start:start + limit]
+        result["nextCursor"] = str(start + limit) if start + limit < len(data) else None
+        result["backwardsCursor"] = None
+    elif method == "thread/archive":
+        thread_id = params["threadId"]
+        if thread_id not in threads:
+            send({"id": message["id"], "error": {"code": -32004, "message": "fixture thread not found"}})
+            continue
+        archived_threads[thread_id] = threads.pop(thread_id)
+        subscriptions.discard(thread_id)
+    elif method == "thread/unarchive":
+        thread_id = params["threadId"]
+        if thread_id not in archived_threads:
+            send({"id": message["id"], "error": {"code": -32004, "message": "fixture archived thread not found"}})
+            continue
+        threads[thread_id] = archived_threads.pop(thread_id)
+    elif method == "thread/delete":
+        thread_id = params["threadId"]
+        threads.pop(thread_id, None)
+        archived_threads.pop(thread_id, None)
+        background_terminals.pop(thread_id, None)
+        subscriptions.discard(thread_id)
+    elif method == "thread/backgroundTerminals/list":
+        entries = copy.deepcopy(background_terminals.get(params["threadId"], []))
+        start = int(params.get("cursor") or 0)
+        limit = params.get("limit") or 50
+        result["data"] = entries[start:start + limit]
+        result["nextCursor"] = str(start + limit) if start + limit < len(entries) else None
+    elif method == "thread/backgroundTerminals/terminate":
+        entries = background_terminals.get(params["threadId"], [])
+        before = len(entries)
+        entries[:] = [entry for entry in entries if entry["processId"] != params["processId"]]
+        result["terminated"] = len(entries) != before
     elif method in ("thread/resume", "thread/read"):
-        thread = copy.deepcopy(threads[params["threadId"]])
+        stored = threads.get(params["threadId"]) or archived_threads.get(params["threadId"])
+        if stored is None:
+            send({"id": message["id"], "error": {"code": -32004, "message": "fixture thread not found"}})
+            continue
+        thread = copy.deepcopy(stored)
         if method == "thread/read":
             assert params["includeTurns"] is False
             thread["turns"] = []
@@ -432,6 +524,17 @@ for line in sys.stdin:
             notify("turn/completed", {"threadId": thread_id, "turn": turn})
         elif scenario == "unsubscribe_error":
             unsubscribe_failures.add(thread_id)
+            complete(thread_id, turn_id)
+        elif scenario == "background_terminal":
+            background_terminals[thread_id] = [{
+                "itemId": "terminal-item-1",
+                "processId": "background-process-1",
+                "command": "python worker.py",
+                "cwd": thread["cwd"],
+                "osPid": 4242,
+                "cpuPercent": 1.5,
+                "rssKb": 2048,
+            }]
             complete(thread_id, turn_id)
         elif scenario == "expire_thread":
             complete(thread_id, turn_id)

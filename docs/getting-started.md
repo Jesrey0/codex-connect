@@ -89,7 +89,7 @@ Private status/health endpoints and undeclared routes must remain inaccessible.
    ID/secret fields empty.
 4. Complete the browser operator login and consent. The login uses the existing
    host-ingress credential; do not put it in the MCP URL or ChatGPT client fields.
-5. Scan/discover tools and enable the app. Expect exactly 14 tools.
+5. Scan/discover tools and enable the app. Expect exactly 13 tools.
 
 Backend deployment and connector refresh are separate. Refresh/rediscover after
 tool metadata changes; a running service does not prove the connector snapshot is current.
