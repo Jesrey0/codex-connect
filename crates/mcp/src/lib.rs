@@ -1,12 +1,14 @@
 //! ChatGPT-native MCP surface over Codex App Server and the operator host.
 
 mod catalog;
-use catalog::{host_plane_reports_worker_events, tool_catalog};
+use catalog::{OAUTH_SCOPE, host_plane_reports_worker_events, tool_catalog};
 
-use axum::Router;
+use axum::body::{Body, HttpBody, to_bytes};
 use axum::extract::Path;
-use axum::http::StatusCode;
-use axum::response::Json;
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Json, Response};
+use axum::{Router, extract::Request};
 use codex_connect_host::Host;
 use codex_connect_relay::{
     ApprovalDecision, CommandExec, CommandExecTerminalSize, ElicitationAction, PermissionGrant,
@@ -15,8 +17,9 @@ use codex_connect_relay::{
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ImageContent, Implementation, JsonObject,
-    ListToolsResult, MetaObject, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    CacheScope, CallToolRequestParams, CallToolResult, ContentBlock, ImageContent, Implementation,
+    JsonObject, ListToolsResult, MetaObject, PaginatedRequestParams, ProtocolVersion,
+    ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::StreamableHttpServerConfig;
@@ -42,6 +45,7 @@ const CODEX_WAIT_GUARD_MS: u64 = codex_connect_relay::WORK_WAIT_OPERATION_MS + 5
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_CONCURRENCY: usize = 4;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_TOOL_LIST_RESPONSE_BYTES: usize = 512 * 1024;
 const SERVER_INSTRUCTIONS: &str = "Codex Connect operates on the connected host. HostPlane handles host files/processes; WorkerPlane uses codex.*; PlatformPlane is ChatGPT-native and separate. Host tools use OS-account authority; cwd only selects a directory. Codex threads are cache-bounded workstreams: new threads set cwd/model/settings; resume related work only while the server accepts its conservative 30-minute cache policy. Revalidate mutable host state. Workers own scope until terminal/action/input/interrupt/redirect; timeout does not release scope. After caller interruption, use status to recover active/recent worker handles before starting replacements. Use codex.* for Codex lifecycle, never host commands invoking Codex CLI. Create Git workflow state only when requested.";
 
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -184,6 +188,7 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
     );
     Router::new()
         .nest_service("/mcp", service)
+        .layer(middleware::from_fn(project_openai_tool_descriptors))
         .route("/healthz", axum::routing::get(|| async { StatusCode::OK }))
         .route(
             "/runtime",
@@ -240,6 +245,82 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
                 }
             }),
         )
+}
+
+async fn project_openai_tool_descriptors(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    let small_enough = response
+        .body()
+        .size_hint()
+        .upper()
+        .is_some_and(|length| length <= MAX_TOOL_LIST_RESPONSE_BYTES as u64);
+    if !is_json || !small_enough {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, MAX_TOOL_LIST_RESPONSE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to project MCP response metadata: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let mut value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Response::from_parts(parts, Body::from(bytes)),
+    };
+    if !inject_openai_security_schemes(&mut value) {
+        return Response::from_parts(parts, Body::from(bytes));
+    }
+    let projected = match serde_json::to_vec(&value) {
+        Ok(projected) => projected,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to serialize MCP response metadata: {error}"),
+            )
+                .into_response();
+        }
+    };
+    parts.headers.insert(
+        header::CONTENT_LENGTH,
+        projected.len().to_string().parse().unwrap(),
+    );
+    Response::from_parts(parts, Body::from(projected))
+}
+
+fn inject_openai_security_schemes(value: &mut Value) -> bool {
+    let Some(tools) = value
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let security_schemes = json!([{"type":"oauth2","scopes":[OAUTH_SCOPE]}]);
+    for tool in tools {
+        if let Some(tool) = tool.as_object_mut() {
+            tool.insert("securitySchemes".into(), security_schemes.clone());
+        }
+    }
+    true
+}
+
+fn tool_list_result(protocol_version: Option<ProtocolVersion>) -> ListToolsResult {
+    let mut result = ListToolsResult::with_all_items(tool_catalog());
+    if protocol_version.is_some_and(|version| version >= ProtocolVersion::V_2026_07_28) {
+        result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Private);
+    }
+    result
 }
 
 pub async fn serve_router(listener: TcpListener, router: Router) -> anyhow::Result<()> {
@@ -364,8 +445,8 @@ impl McpHandler {
 }
 
 impl ServerHandler for McpHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "codex-connect",
                 env!("CARGO_PKG_VERSION"),
@@ -376,9 +457,9 @@ impl ServerHandler for McpHandler {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(tool_catalog()))
+        Ok(tool_list_result(context.protocol_version()))
     }
 
     async fn call_tool(
@@ -1604,6 +1685,34 @@ mod tests {
         for plane in ["HostPlane", "WorkerPlane", "PlatformPlane"] {
             assert!(SERVER_INSTRUCTIONS.contains(plane));
         }
+    }
+
+    #[test]
+    fn openai_tool_projection_mirrors_security_schemes_at_descriptor_root() {
+        let mut response = json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":{"tools":serde_json::to_value(tool_catalog()).unwrap()}
+        });
+        assert!(inject_openai_security_schemes(&mut response));
+        for tool in response["result"]["tools"].as_array().unwrap() {
+            assert_eq!(
+                tool["securitySchemes"],
+                json!([{"type":"oauth2","scopes":[OAUTH_SCOPE]}])
+            );
+            assert_eq!(tool["securitySchemes"], tool["_meta"]["securitySchemes"]);
+        }
+    }
+
+    #[test]
+    fn tool_list_cache_hints_follow_protocol_generation() {
+        let legacy = tool_list_result(Some(ProtocolVersion::V_2025_11_25));
+        assert_eq!(legacy.ttl_ms, None);
+        assert_eq!(legacy.cache_scope, None);
+
+        let modern = tool_list_result(Some(ProtocolVersion::V_2026_07_28));
+        assert_eq!(modern.ttl_ms, Some(0));
+        assert_eq!(modern.cache_scope, Some(CacheScope::Private));
     }
 
     #[test]

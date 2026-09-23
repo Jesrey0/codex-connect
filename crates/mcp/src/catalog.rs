@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::sync::Arc;
 
-const OAUTH_SCOPE: &str = "codex-connect:access";
+pub(super) const OAUTH_SCOPE: &str = "codex-connect:access";
 
 #[derive(Clone, Copy)]
 struct ToolMetadata {
@@ -399,9 +399,6 @@ fn empty_schema() -> Value {
 fn object_schema(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
-fn union_object_schema(branches: Vec<Value>) -> Value {
-    json!({"type":"object","oneOf":branches})
-}
 fn rpc_id_schema() -> Value {
     json!({"oneOf":[{"type":"string","minLength":1},{"type":"integer"}]})
 }
@@ -576,36 +573,30 @@ fn semantic_event_schema() -> Value {
     )
 }
 fn codex_inspect_output_schema() -> Value {
-    let base = |detail: &str, event: Value| {
-        object_schema(
-            json!({
-                "threadId":{"type":"string"},
-                "turnId":{"type":"string"},
-                "status":{"enum":["inProgress","completed","failed","interrupted"]},
-                "detail":{"const":detail},
-                "currentActivity":nullable(current_activity_schema()),
-                "cursor":{"type":"integer","minimum":0},
-                "historyLost":{"type":"boolean"},
-                "hasMore":{"type":"boolean"},
-                "events":{"type":"array","items":event}
-            }),
-            &[
-                "threadId",
-                "turnId",
-                "status",
-                "detail",
-                "currentActivity",
-                "cursor",
-                "historyLost",
-                "hasMore",
-                "events",
-            ],
-        )
-    };
-    union_object_schema(vec![
-        base("semantic", semantic_event_schema()),
-        base("raw", event_schema()),
-    ])
+    object_schema(
+        json!({
+            "threadId":{"type":"string"},
+            "turnId":{"type":"string"},
+            "status":{"enum":["inProgress","completed","failed","interrupted"]},
+            "detail":{"type":"string","enum":["semantic","raw"]},
+            "currentActivity":nullable(current_activity_schema()),
+            "cursor":{"type":"integer","minimum":0},
+            "historyLost":{"type":"boolean"},
+            "hasMore":{"type":"boolean"},
+            "events":{"type":"array","items":{"oneOf":[semantic_event_schema(),event_schema()]}}
+        }),
+        &[
+            "threadId",
+            "turnId",
+            "status",
+            "detail",
+            "currentActivity",
+            "cursor",
+            "historyLost",
+            "hasMore",
+            "events",
+        ],
+    )
 }
 fn inspect_schema() -> Value {
     object_schema(
@@ -701,49 +692,29 @@ fn command_read_output_schema() -> Value {
     )
 }
 fn command_control_schema() -> Value {
-    union_object_schema(vec![
-        object_schema(
-            json!({
-                "action":{"const":"write"},
-                "processId":{"type":"string","minLength":1,"description":"Process handle returned by command.start."},
-                "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES,"description":"Exact UTF-8 bytes to write to stdin. Omit/null when only closing stdin."},
-                "closeStdin":{"type":"boolean","default":false,"description":"Close stdin after any supplied input is written."}
-            }),
-            &["action", "processId"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"resize"},
-                "processId":{"type":"string","minLength":1,"description":"PTY-backed process handle returned by command.start."},
-                "rows":{"type":"integer","minimum":1,"maximum":65535},
-                "cols":{"type":"integer","minimum":1,"maximum":65535}
-            }),
-            &["action", "processId", "rows", "cols"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"terminate"},
-                "processId":{"type":"string","minLength":1,"description":"Process handle returned by command.start. Termination is a request; follow with command.read for final state."}
-            }),
-            &["action", "processId"],
-        ),
-    ])
+    object_schema(
+        json!({
+            "action":{"type":"string","enum":["write","resize","terminate"],"description":"Control action. write accepts input/closeStdin; resize requires rows and cols; terminate requests process termination."},
+            "processId":{"type":"string","minLength":1,"description":"Process handle returned by command.start."},
+            "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES,"description":"For action=write, exact UTF-8 bytes to write. Omit/null when only closing stdin."},
+            "closeStdin":{"type":"boolean","default":false,"description":"For action=write, close stdin after any supplied input is written."},
+            "rows":{"type":"integer","minimum":1,"maximum":65535,"description":"Required for action=resize. PTY rows."},
+            "cols":{"type":"integer","minimum":1,"maximum":65535,"description":"Required for action=resize. PTY columns."}
+        }),
+        &["action", "processId"],
+    )
 }
 fn command_control_output_schema() -> Value {
-    union_object_schema(vec![
-        object_schema(
-            json!({"processId":{"type":"string"},"written":{"const":true},"stdinClosed":{"type":"boolean"}}),
-            &["processId", "written", "stdinClosed"],
-        ),
-        object_schema(
-            json!({"processId":{"type":"string"},"resized":{"const":true}}),
-            &["processId", "resized"],
-        ),
-        object_schema(
-            json!({"processId":{"type":"string"},"terminationRequested":{"const":true}}),
-            &["processId", "terminationRequested"],
-        ),
-    ])
+    object_schema(
+        json!({
+            "processId":{"type":"string"},
+            "written":{"type":"boolean","description":"Present for action=write."},
+            "stdinClosed":{"type":"boolean","description":"Present for action=write."},
+            "resized":{"type":"boolean","description":"Present for action=resize."},
+            "terminationRequested":{"type":"boolean","description":"Present for action=terminate."}
+        }),
+        &["processId"],
+    )
 }
 fn review_target_schema() -> Value {
     json!({"description":"Official Codex review target.","oneOf":[
@@ -754,53 +725,21 @@ fn review_target_schema() -> Value {
     ]})
 }
 fn codex_start_schema() -> Value {
-    union_object_schema(vec![
-        object_schema(
-            json!({
-                "mode":{"const":"work"},
-                "task":{"type":"string","minLength":1,"description":"Self-contained objective with host paths, context, constraints, and acceptance criteria."},
-                "cwd":{"type":"string","description":"Codex Connect host working directory for this workstream. Omit to use the backend navigation cwd."},
-                "model":{"type":"string","description":"Initial workstream model. Discover IDs with a models query to codex.query; omit to use Codex defaults."},
-                "effort":{"type":"string","description":"Initial workstream reasoning effort. Discover supported values with codex.query; omit to use the upstream default."},
-                "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Initial workstream access. workspace permits workspace writes and network access; full grants unrestricted host access. Approval prompts are disabled within the selected sandbox."}
-            }),
-            &["mode", "task"],
-        ),
-        object_schema(
-            json!({
-                "mode":{"const":"work"},
-                "task":{"type":"string","minLength":1,"description":"Next objective/delta for an existing workstream. Revalidate mutable state when current reality matters."},
-                "threadId":{"type":"string","description":"Existing workstream to resume. Its cwd, model, reasoning effort, and access are fixed. Codex Connect conservatively rejects resume outside the minimum 30-minute guaranteed-cache policy; start fresh instead."}
-            }),
-            &["mode", "task", "threadId"],
-        ),
-        object_schema(
-            json!({
-                "mode":{"const":"work"},
-                "task":{"type":"string","minLength":1,"description":"Objective for a new workstream forked from durable thread context."},
-                "forkFromThreadId":{"type":"string","description":"Source thread whose persisted context is copied into a new workstream. Forking is not subject to the resume cache-age cutoff."},
-                "lastTurnId":{"type":"string","description":"Optional source turn to fork through, inclusive. Omit to fork the current persisted source history."}
-            }),
-            &["mode", "task", "forkFromThreadId"],
-        ),
-        object_schema(
-            json!({
-                "mode":{"const":"review"},
-                "cwd":{"type":"string","description":"Codex Connect host working directory for the review. Omit to use the backend navigation cwd."},
-                "target":review_target_schema(),
-                "model":{"type":"string","description":"Model ID for a new review thread; discover with codex.query. Omit to use Codex defaults."}
-            }),
-            &["mode", "target"],
-        ),
-        object_schema(
-            json!({
-                "mode":{"const":"review"},
-                "threadId":{"type":"string","description":"Existing review workstream to resume with its cwd/model/settings. Codex Connect conservatively rejects resume outside the minimum 30-minute guaranteed-cache policy; start a fresh independent review instead."},
-                "target":review_target_schema()
-            }),
-            &["mode", "threadId", "target"],
-        ),
-    ])
+    object_schema(
+        json!({
+            "mode":{"type":"string","enum":["work","review"],"description":"Start or resume a work turn, or run a review."},
+            "task":{"type":"string","minLength":1,"description":"Required for mode=work. Self-contained objective or next delta for the workstream."},
+            "cwd":{"type":"string","description":"Host working directory for a new workstream or review. Omit to use the backend navigation cwd. Existing threads retain their cwd."},
+            "threadId":{"type":"string","description":"Existing work/review thread to resume. Resume retains its cwd, model, reasoning effort, and access and is subject to the server cache-age policy."},
+            "forkFromThreadId":{"type":"string","description":"For mode=work, source thread whose durable context should be copied into a new workstream instead of resuming it."},
+            "lastTurnId":{"type":"string","description":"With forkFromThreadId, optional source turn to fork through, inclusive."},
+            "model":{"type":"string","description":"Model ID for a new workstream or review; discover IDs with codex.query. Existing threads retain their model."},
+            "effort":{"type":"string","description":"Reasoning effort for a new work workstream; discover supported values with codex.query."},
+            "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Access for a new work workstream. workspace permits workspace writes and network access; full grants unrestricted host access."},
+            "target":review_target_schema()
+        }),
+        &["mode"],
+    )
 }
 fn codex_wait_schema() -> Value {
     object_schema(
@@ -1038,137 +977,52 @@ fn thread_ids_schema() -> Value {
 }
 
 fn codex_act_schema() -> Value {
-    union_object_schema(vec![
-        object_schema(
-            json!({
-                "action":{"const":"steer"},
-                "threadId":{"type":"string"},
-                "expectedTurnId":{"type":"string"},
-                "instruction":{"type":"string","minLength":1}
-            }),
-            &["action", "threadId", "expectedTurnId", "instruction"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"interrupt"},
-                "threadId":{"type":"string"},
-                "turnId":{"type":"string"}
-            }),
-            &["action", "threadId", "turnId"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"respondApproval"},
-                "requestId":{"oneOf":rpc_id_schema()["oneOf"].clone()},
-                "decision":{"enum":["approve","approveForSession","decline","cancel"]}
-            }),
-            &["action", "requestId", "decision"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"respondPermissions"},
-                "requestId":{"oneOf":rpc_id_schema()["oneOf"].clone()},
-                "permissions":permissions_schema(),
-                "scope":{"enum":["turn","session"]}
-            }),
-            &["action", "requestId", "permissions"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"respondUserInput"},
-                "requestId":{"oneOf":rpc_id_schema()["oneOf"].clone()},
-                "answers":{"type":"object","minProperties":1,"additionalProperties":{"type":"array","items":{"type":"string"}}}
-            }),
-            &["action", "requestId", "answers"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"respondElicitation"},
-                "requestId":{"oneOf":rpc_id_schema()["oneOf"].clone()},
-                "disposition":{"enum":["accept","decline","cancel"]},
-                "content":{"description":"Accepted elicitation payload. Omit for decline/cancel."}
-            }),
-            &["action", "requestId", "disposition"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"setArchived"},
-                "threadIds":thread_ids_schema(),
-                "archived":{"type":"boolean"}
-            }),
-            &["action", "threadIds", "archived"],
-        ),
-        object_schema(
-            json!({"action":{"const":"delete"},"threadIds":thread_ids_schema()}),
-            &["action", "threadIds"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"terminateBackgroundTerminal"},
-                "threadId":{"type":"string"},
-                "processId":{"type":"string"}
-            }),
-            &["action", "threadId", "processId"],
-        ),
-    ])
+    object_schema(
+        json!({
+            "action":{"type":"string","enum":["steer","interrupt","respondApproval","respondPermissions","respondUserInput","respondElicitation","setArchived","delete","terminateBackgroundTerminal"],"description":"Codex-state action. Only fields relevant to the selected action should be supplied."},
+            "threadId":{"type":"string","description":"Required for steer, interrupt, and terminateBackgroundTerminal."},
+            "expectedTurnId":{"type":"string","description":"Required for action=steer."},
+            "instruction":{"type":"string","minLength":1,"description":"Required for action=steer."},
+            "turnId":{"type":"string","description":"Required for action=interrupt."},
+            "requestId":rpc_id_schema(),
+            "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"],"description":"Required for action=respondApproval."},
+            "permissions":permissions_schema(),
+            "scope":{"type":"string","enum":["turn","session"],"description":"Optional for action=respondPermissions."},
+            "answers":{"type":"object","minProperties":1,"additionalProperties":{"type":"array","items":{"type":"string"}},"description":"Required for action=respondUserInput."},
+            "disposition":{"type":"string","enum":["accept","decline","cancel"],"description":"Required for action=respondElicitation."},
+            "content":{"description":"Accepted elicitation payload for action=respondElicitation. Omit for decline/cancel.","type":["object","array","string","number","boolean","null"]},
+            "threadIds":thread_ids_schema(),
+            "archived":{"type":"boolean","description":"Required for action=setArchived."},
+            "processId":{"type":"string","description":"Required for action=terminateBackgroundTerminal."}
+        }),
+        &["action"],
+    )
 }
 
 fn codex_act_output_schema() -> Value {
-    let response = |action: &'static str| {
-        object_schema(
-            json!({
-                "action":{"const":action},
-                "requestId":rpc_id_schema(),
-                "accepted":{"const":true}
-            }),
-            &["action", "requestId", "accepted"],
-        )
-    };
-    let archive_row = json!({"oneOf":[
-        object_schema(json!({"threadId":{"type":"string"},"archived":{"type":"boolean"}}), &["threadId","archived"]),
-        object_schema(json!({"threadId":{"type":"string"},"error":{"type":"string"}}), &["threadId","error"])
-    ]});
-    let delete_row = json!({"oneOf":[
-        object_schema(json!({"threadId":{"type":"string"},"deleted":{"const":true}}), &["threadId","deleted"]),
-        object_schema(json!({"threadId":{"type":"string"},"error":{"type":"string"}}), &["threadId","error"])
-    ]});
-    union_object_schema(vec![
-        object_schema(
-            json!({"action":{"const":"steer"},"turnId":{"type":"string"}}),
-            &["action", "turnId"],
-        ),
-        object_schema(
-            json!({"action":{"const":"interrupt"},"turnId":{"type":"string"},"interrupted":{"const":true}}),
-            &["action", "turnId", "interrupted"],
-        ),
-        response("respondApproval"),
-        response("respondPermissions"),
-        response("respondUserInput"),
-        response("respondElicitation"),
-        object_schema(
-            json!({
-                "action":{"const":"setArchived"},
-                "results":{"type":"array","items":archive_row}
-            }),
-            &["action", "results"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"delete"},
-                "results":{"type":"array","items":delete_row}
-            }),
-            &["action", "results"],
-        ),
-        object_schema(
-            json!({
-                "action":{"const":"terminateBackgroundTerminal"},
-                "threadId":{"type":"string"},
-                "processId":{"type":"string"},
-                "terminated":{"type":"boolean"}
-            }),
-            &["action", "threadId", "processId", "terminated"],
-        ),
-    ])
+    let result_row = object_schema(
+        json!({
+            "threadId":{"type":"string"},
+            "archived":{"type":"boolean"},
+            "deleted":{"type":"boolean"},
+            "error":{"type":"string"}
+        }),
+        &["threadId"],
+    );
+    object_schema(
+        json!({
+            "action":{"type":"string","enum":["steer","interrupt","respondApproval","respondPermissions","respondUserInput","respondElicitation","setArchived","delete","terminateBackgroundTerminal"]},
+            "turnId":{"type":"string"},
+            "interrupted":{"type":"boolean"},
+            "requestId":rpc_id_schema(),
+            "accepted":{"type":"boolean"},
+            "results":{"type":"array","items":result_row},
+            "threadId":{"type":"string"},
+            "processId":{"type":"string"},
+            "terminated":{"type":"boolean"}
+        }),
+        &["action"],
+    )
 }
 
 fn nullable(schema: Value) -> Value {
@@ -1194,7 +1048,7 @@ fn event_schema() -> Value {
         json!({
             "cursor":{"type":"integer","minimum":0},"method":{"type":"string"},
             "threadId":{"type":["string","null"]},"turnId":{"type":["string","null"]},
-            "params":{"description":"App Server notification data, or omittedBytes for an oversized event."},
+            "params":{"description":"App Server notification data, or omittedBytes for an oversized event.","type":["object","array","string","number","boolean","null"]},
             "truncated":{"type":"boolean"}
         }),
         &[
@@ -1338,23 +1192,11 @@ mod tests {
                 .is_none()
         );
         let start = codex_start_schema();
-        let branches = start["oneOf"].as_array().unwrap();
-        let find = |mode: &str, field: &str, present: bool| {
-            branches
-                .iter()
-                .find(|branch| {
-                    branch["properties"]["mode"]["const"].as_str() == Some(mode)
-                        && branch["properties"].get(field).is_some() == present
-                })
-                .unwrap()
-        };
-        let new_work = find("work", "threadId", false);
-        let resumed_work = find("work", "threadId", true);
-        let new_review = find("review", "threadId", false);
-        let resumed_review = find("review", "threadId", true);
-        assert_eq!(new_work["properties"]["access"]["default"], "workspace");
+        let start_properties = start["properties"].as_object().unwrap();
+        assert_eq!(start_properties["mode"]["enum"], json!(["work", "review"]));
+        assert_eq!(start_properties["access"]["default"], "workspace");
         assert_eq!(
-            new_work["properties"]["access"]["enum"],
+            start_properties["access"]["enum"],
             json!(["workspace", "full"])
         );
         for hidden in [
@@ -1363,32 +1205,23 @@ mod tests {
             "serviceTier",
             "approvalPolicy",
         ] {
-            assert!(new_work["properties"].get(hidden).is_none(), "{hidden}");
+            assert!(start_properties.get(hidden).is_none(), "{hidden}");
         }
-        assert!(
-            !new_work["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "access")
-        );
-        for setting in ["cwd", "model", "effort", "access"] {
-            assert!(
-                resumed_work["properties"].get(setting).is_none(),
-                "{setting}"
-            );
+        assert_eq!(start["required"], json!(["mode"]));
+        assert_eq!(start["additionalProperties"], false);
+        for exposed in [
+            "task",
+            "cwd",
+            "threadId",
+            "forkFromThreadId",
+            "lastTurnId",
+            "model",
+            "effort",
+            "access",
+            "target",
+        ] {
+            assert!(start_properties.get(exposed).is_some(), "{exposed}");
         }
-        assert!(
-            new_review["properties"]
-                .get("developerInstructions")
-                .is_none()
-        );
-        assert!(new_review["properties"].get("sandboxPolicy").is_none());
-        assert!(new_review["properties"].get("effort").is_none());
-        assert!(new_review["properties"].get("serviceTier").is_none());
-        assert_eq!(new_review["properties"]["model"]["type"], "string");
-        assert!(resumed_review["properties"].get("cwd").is_none());
-        assert!(resumed_review["properties"].get("model").is_none());
     }
 
     #[test]
@@ -1516,7 +1349,14 @@ mod tests {
         let output = codex_inspect_output_schema().to_string();
         assert!(output.contains("currentActivity"));
         assert!(output.contains("hasMore"));
-        let raw = &codex_inspect_output_schema()["oneOf"][1]["properties"]["events"]["items"];
+        let output = codex_inspect_output_schema();
+        let variants = output["properties"]["events"]["items"]["oneOf"]
+            .as_array()
+            .unwrap();
+        let raw = variants
+            .iter()
+            .find(|variant| variant["properties"].get("method").is_some())
+            .unwrap();
         for field in ["method", "params", "truncated"] {
             assert!(raw["properties"].get(field).is_some());
         }
@@ -1627,6 +1467,15 @@ mod tests {
             assert!(tool["outputSchema"].is_object());
             assert_eq!(tool["inputSchema"]["type"], "object");
             assert_eq!(tool["outputSchema"]["type"], "object");
+            for root in [&tool["inputSchema"], &tool["outputSchema"]] {
+                for combinator in ["oneOf", "anyOf", "allOf"] {
+                    assert!(
+                        root.get(combinator).is_none(),
+                        "{} exposes root-level {combinator}",
+                        tool["name"]
+                    );
+                }
+            }
             let meta = tool["_meta"].as_object().unwrap();
             for key in [
                 "openai/toolInvocation/invoking",
@@ -1662,11 +1511,11 @@ mod tests {
         assert_eq!(annotations["openWorldHint"], false);
         assert_eq!(annotations["idempotentHint"], false);
         let schema = &tool["inputSchema"];
-        let actions = schema["oneOf"]
+        let actions = schema["properties"]["action"]["enum"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|branch| branch["properties"]["action"]["const"].as_str().unwrap())
+            .map(|action| action.as_str().unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(
             actions,
