@@ -36,7 +36,7 @@ The live public catalog contains exactly 14 tools:
 
 `status`, `inspect`, `view_image`, `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control`, `codex.start`, `codex.wait`, `codex.inspect`, `codex.control`, `codex.action.respond`, and `codex.info`.
 
-Use `command.exec` for short commands, `command.start/read/control` for persistent or interactive processes, and `codex.start` for delegated work/review. `status` is also the recovery anchor for retained persistent-command handles. Discover compact model, skill, and usage choices with `codex.info`. The live schemas define inputs and limits.
+Use `command.exec` for short commands, `command.start/read/control` for persistent or interactive processes, and `codex.start` for delegated work/review. `status` is the recovery anchor for retained command handles and active/recent worker handles after caller interruption. Discover compact model, skill, and usage choices with `codex.info`. The live schemas define inputs and limits.
 
 ## Install and operate
 

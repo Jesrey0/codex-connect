@@ -1,7 +1,9 @@
 use crate::artifact;
 use crate::backend::{BACKEND_ADDR, BackendClient};
 use crate::deployment;
-use crate::paths::{cache_root, home_dir, state_root};
+use crate::paths::{
+    cache_root, home_dir, managed_build_root, managed_install_root, operator_path, state_root,
+};
 use crate::service::{BACKEND_SERVICE, SystemdManager, UnitState, backend_unit};
 use crate::{ServeConfig, serve_mcp};
 use anyhow::{Context, Result, bail};
@@ -159,7 +161,7 @@ pub async fn uninstall() -> Result<()> {
             operator.display()
         );
     }
-    remove_tree_if_present(&user_local_root()?.join("lib/codex-connect"))?;
+    remove_tree_if_present(&managed_install_root()?)?;
     remove_tree_if_present(&state_root()?.join("codex-connect"))?;
     remove_tree_if_present(&cache_root()?.join("codex-connect"))?;
 
@@ -231,13 +233,13 @@ async fn prepare_deployment_inner(operation_id: &str, source: &Path) -> Result<(
         }
         let built = build_root.join("release/codex-connect");
         let identity = artifact::for_path(&built)?;
-        let installed = install_artifact(&built, &identity.sha256)?;
-        Ok((identity, installed))
+        install_artifact(&built, &identity.sha256)?;
+        Ok(identity)
     })();
 
     match build {
-        Ok((identity, installed)) => {
-            let record = deployment::mark_prepared(operation_id, &identity, &installed)?;
+        Ok(identity) => {
+            let record = deployment::mark_prepared(operation_id, &identity)?;
             println!(
                 "✓ Deployment operation {} prepared build {}.",
                 record.operation_id, identity.build_id
@@ -292,8 +294,8 @@ pub async fn deploy_status(operation_id: &str) -> Result<()> {
     if let Some(sha256) = &record.sha256 {
         println!("SHA-256: {sha256}");
     }
-    if let Some(executable) = &record.executable {
-        println!("Artifact: {executable}");
+    if let Some(executable) = record.artifact_path()? {
+        println!("Artifact: {}", executable.display());
     }
     if let Some(error) = &record.error {
         println!("Error: {error}");
@@ -697,18 +699,6 @@ fn source_tree() -> Result<PathBuf> {
     bail!("current directory is not inside the Codex Connect source tree")
 }
 
-fn user_local_root() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".local"))
-}
-
-fn operator_path() -> Result<PathBuf> {
-    Ok(user_local_root()?.join("bin/codex-connect"))
-}
-
-fn managed_build_root() -> Result<PathBuf> {
-    Ok(user_local_root()?.join("lib/codex-connect/builds"))
-}
-
 fn operator_path_is_owned(path: &Path, build_root: &Path) -> Result<bool> {
     let metadata = match path.symlink_metadata() {
         Ok(metadata) => metadata,
@@ -831,9 +821,11 @@ fn install_artifact(built: &Path, sha256: &str) -> Result<PathBuf> {
     Ok(destination.canonicalize()?)
 }
 fn preflight_operator_path() -> Result<Option<PathBuf>> {
-    let directory = user_local_root()?.join("bin");
-    fs::create_dir_all(&directory)?;
-    let destination = directory.join("codex-connect");
+    let destination = operator_path()?;
+    let directory = destination
+        .parent()
+        .context("operator path has no parent directory")?;
+    fs::create_dir_all(directory)?;
     let build_root = managed_build_root()?;
     preflight_operator_path_at(&destination, &build_root)
 }

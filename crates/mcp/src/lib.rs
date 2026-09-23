@@ -42,7 +42,7 @@ const CODEX_WAIT_GUARD_MS: u64 = codex_connect_relay::WORK_WAIT_OPERATION_MS + 5
 const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_CONCURRENCY: usize = 4;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
-const SERVER_INSTRUCTIONS: &str = "Codex Connect operates on the connected host. HostPlane handles host files/processes; WorkerPlane uses codex.*; PlatformPlane is ChatGPT-native and not shared. Host tools use OS-account authority; cwd only selects a directory. Codex threads are cache-bounded workstreams: new threads set cwd/model/settings; resume related work with delta instructions only while the server accepts its conservative 30-minute guaranteed-cache policy. Setting changes require a fresh thread. Revalidate mutable host state. Workers own scope until terminal/action/input/interrupt/redirect; timeout does not release scope. Use codex.* for Codex lifecycle, never host commands invoking Codex CLI. Create Git workflow state only when requested.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect operates on the connected host. HostPlane handles host files/processes; WorkerPlane uses codex.*; PlatformPlane is ChatGPT-native and separate. Host tools use OS-account authority; cwd only selects a directory. Codex threads are cache-bounded workstreams: new threads set cwd/model/settings; resume related work only while the server accepts its conservative 30-minute cache policy. Revalidate mutable host state. Workers own scope until terminal/action/input/interrupt/redirect; timeout does not release scope. After caller interruption, use status to recover active/recent worker handles before starting replacements. Use codex.* for Codex lifecycle, never host commands invoking Codex CLI. Create Git workflow state only when requested.";
 
 struct CancelOnDrop(Arc<AtomicBool>);
 
@@ -670,6 +670,7 @@ async fn dispatch(
             ensure_empty(arguments)?;
             let mut value = serde_json::to_value(McpStatus::read(relay, runtime))?;
             value["commands"] = Value::Array(relay.command_handles().await);
+            value["workers"] = Value::Array(relay.worker_handles().await);
             Ok(value)
         }
         "inspect" => inspect(relay, host, parse(arguments)?, context, operation_cancelled).await,
@@ -1193,13 +1194,7 @@ fn approval_choices(params: &Value) -> Vec<Value> {
     choices
         .iter()
         .filter_map(Value::as_str)
-        .filter_map(|value| match value {
-            "accept" => Some("approve"),
-            "acceptForSession" => Some("approveForSession"),
-            "decline" => Some("decline"),
-            "cancel" => Some("cancel"),
-            _ => None,
-        })
+        .filter_map(codex_connect_relay::operator_approval_decision)
         .map(|value| Value::String(value.into()))
         .collect()
 }

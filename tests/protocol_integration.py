@@ -150,8 +150,9 @@ class OperatorProtocolTests(unittest.TestCase):
                 {"workerStarted", "turnTerminal", "actionRequired", "historyLost"},
             )
         self.assertTrue(status["ready"])
-        self.assertEqual(set(status), {"ready", "cwd", "buildId", "commands", "codex"})
+        self.assertEqual(set(status), {"ready", "cwd", "buildId", "commands", "workers", "codex"})
         self.assertIsInstance(status["commands"], list)
+        self.assertIsInstance(status["workers"], list)
         self.assertEqual(status["cwd"], str(self.workspace))
         self.assertEqual(set(status["codex"]), {"release", "defaults"})
         self.assertEqual(set(status["codex"]["defaults"]), {
@@ -213,24 +214,38 @@ class OperatorProtocolTests(unittest.TestCase):
         )
         self.assertTrue(event["threadId"])
         self.assertTrue(event["turnId"])
-        replay = self.client.call("status").get("workerEvents", [])
+        recovered_status = self.client.call("status")
+        replay = recovered_status.get("workerEvents", [])
         self.assertTrue(any(
             candidate.get("kind") == "workerStarted"
             and candidate.get("threadId") == event["threadId"]
             and candidate.get("turnId") == event["turnId"]
             for candidate in replay
         ))
+        recovered = next(
+            worker for worker in recovered_status["workers"]
+            if worker["threadId"] == event["threadId"] and worker["turnId"] == event["turnId"]
+        )
+        self.assertEqual(recovered["mode"], "work")
+        self.assertIn(recovered["status"], {"inProgress", "completed"})
+        self.assertEqual(recovered["prompt"], "delayed_start_response")
         result = self.client.call("codex.wait", {
             "threadId":event["threadId"],
             "turnId":event["turnId"],
         })
         self.assertEqual(result["state"], "terminal")
+        joined_status = self.client.call("status")
         self.assertFalse(any(
             candidate.get("kind") == "workerStarted"
             and candidate.get("threadId") == event["threadId"]
             and candidate.get("turnId") == event["turnId"]
-            for candidate in self.client.call("status").get("workerEvents", [])
+            for candidate in joined_status.get("workerEvents", [])
         ))
+        terminal = next(
+            worker for worker in joined_status["workers"]
+            if worker["threadId"] == event["threadId"] and worker["turnId"] == event["turnId"]
+        )
+        self.assertEqual(terminal["status"], "completed")
 
     def test_observer_wait_is_event_driven_and_projects_live_worker_state(self):
         with urllib.request.urlopen(self.url + "/observe") as response:

@@ -19,7 +19,11 @@ pub(crate) struct DeploymentLock {
 
 pub(crate) fn verify_prepared_artifact(record: &DeploymentRecord) -> Result<()> {
     let (sha256, executable) = prepared_artifact(record)?;
-    let actual = crate::artifact::for_path(&executable)
+    verify_artifact_at(&sha256, &executable)
+}
+
+fn verify_artifact_at(sha256: &str, executable: &Path) -> Result<()> {
+    let actual = crate::artifact::for_path(executable)
         .with_context(|| format!("prepared artifact is unavailable: {}", executable.display()))?;
     if actual.sha256 != sha256 {
         bail!(
@@ -110,8 +114,6 @@ pub(crate) struct DeploymentRecord {
     pub state: DeploymentState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub executable: Option<String>,
     pub no_start: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -119,7 +121,18 @@ pub(crate) struct DeploymentRecord {
 
 impl DeploymentRecord {
     pub(crate) fn build_id(&self) -> Option<&str> {
-        self.sha256.as_deref().map(|sha256| &sha256[..12])
+        self.sha256.as_deref().and_then(|sha256| sha256.get(..12))
+    }
+
+    pub(crate) fn artifact_path(&self) -> Result<Option<PathBuf>> {
+        let Some(build_id) = self.build_id() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::paths::managed_build_root()?
+                .join(build_id)
+                .join("codex-connect"),
+        ))
     }
 }
 
@@ -159,7 +172,6 @@ pub(crate) fn queue_prepare(source: &Path) -> Result<DeploymentRecord> {
         source: source.display().to_string(),
         state: DeploymentState::Building,
         sha256: None,
-        executable: None,
         no_start: false,
         error: None,
     };
@@ -203,7 +215,6 @@ pub(crate) fn queue_prepare(source: &Path) -> Result<DeploymentRecord> {
 pub(crate) fn mark_prepared(
     operation_id: &str,
     identity: &ArtifactIdentity,
-    installed: &Path,
 ) -> Result<DeploymentRecord> {
     let _lock = acquire_operation_lock(operation_id)?;
     let mut record = load_unlocked(operation_id)?;
@@ -215,7 +226,6 @@ pub(crate) fn mark_prepared(
     }
     record.state = DeploymentState::Prepared;
     record.sha256 = Some(identity.sha256.clone());
-    record.executable = Some(installed.display().to_string());
     record.error = None;
     save_unlocked(&record)?;
     Ok(record)
@@ -455,10 +465,8 @@ fn prepared_artifact(record: &DeploymentRecord) -> Result<(String, PathBuf)> {
         .context("deployment record has no prepared SHA-256")?;
     validate_sha256(&sha256)?;
     let executable = record
-        .executable
-        .as_ref()
-        .map(PathBuf::from)
-        .context("deployment record has no prepared executable")?;
+        .artifact_path()?
+        .context("deployment record has no prepared artifact")?;
     Ok((sha256, executable))
 }
 
@@ -627,15 +635,7 @@ fn validate_record(record: &DeploymentRecord) -> Result<()> {
     if let Some(sha256) = &record.sha256 {
         validate_sha256(sha256)?;
     }
-    if record.sha256.is_some() != record.executable.is_some() {
-        bail!("deployment artifact identity must be complete or absent");
-    }
     let has_artifact = record.sha256.is_some();
-    if let Some(executable) = &record.executable
-        && !Path::new(executable).is_absolute()
-    {
-        bail!("deployment executable must be an absolute path");
-    }
     match record.state {
         DeploymentState::Building => {
             if has_artifact || record.no_start || record.error.is_some() {
@@ -708,7 +708,6 @@ mod tests {
             source: "/work/codex-connect".into(),
             state: DeploymentState::Prepared,
             sha256: Some("a".repeat(64)),
-            executable: Some("/opt/codex-connect/builds/aaaaaaaaaaaa/codex-connect".into()),
             no_start: false,
             error: None,
         }
@@ -761,7 +760,6 @@ mod tests {
         let mut record = prepared_record();
         record.state = DeploymentState::Building;
         record.sha256 = None;
-        record.executable = None;
         let command = prepare_command(
             &record,
             Path::new("/opt/codex-connect/operator"),
@@ -806,6 +804,7 @@ mod tests {
     #[test]
     fn activation_command_is_complete_and_deterministic() {
         let record = prepared_record();
+        let artifact = record.artifact_path().unwrap().unwrap();
         let command = activation_command(
             &record,
             true,
@@ -840,7 +839,7 @@ mod tests {
                 "XDG_STATE_HOME=/tmp/state",
                 "--setenv",
                 "XDG_CACHE_HOME=/tmp/cache",
-                "/opt/codex-connect/builds/aaaaaaaaaaaa/codex-connect",
+                artifact.to_str().unwrap(),
                 "activate-deployment",
                 "--operation-id",
                 "0123456789abcdef01234567",
@@ -852,11 +851,14 @@ mod tests {
     }
 
     #[test]
-    fn deployment_record_requires_complete_artifact_identity() {
-        let mut record = prepared_record();
+    fn deployment_record_derives_artifact_path_from_digest() {
+        let record = prepared_record();
         validate_record(&record).unwrap();
-        record.executable = None;
-        assert!(validate_record(&record).is_err());
+        let artifact = record.artifact_path().unwrap().unwrap();
+        assert!(artifact.ends_with("builds/aaaaaaaaaaaa/codex-connect"));
+        let serialized = serde_json::to_string(&record).unwrap();
+        assert!(!serialized.contains("buildId"));
+        assert!(!serialized.contains("executable"));
     }
 
     #[test]
@@ -891,13 +893,9 @@ mod tests {
     }
 
     #[test]
-    fn deployment_record_requires_absolute_paths() {
+    fn deployment_record_requires_absolute_source_path() {
         let mut record = prepared_record();
         record.source = "relative/source".into();
-        assert!(validate_record(&record).is_err());
-
-        record = prepared_record();
-        record.executable = Some("relative/codex-connect".into());
         assert!(validate_record(&record).is_err());
     }
 
@@ -907,15 +905,11 @@ mod tests {
         let executable = directory.path().join("codex-connect");
         std::fs::write(&executable, b"prepared bytes").unwrap();
         let identity = crate::artifact::for_path(&executable).unwrap();
-        let mut record = prepared_record();
-        record.sha256 = Some(identity.sha256);
-        record.executable = Some(executable.display().to_string());
-
-        verify_prepared_artifact(&record).unwrap();
+        verify_artifact_at(&identity.sha256, &executable).unwrap();
 
         std::fs::write(&executable, b"changed bytes").unwrap();
         assert!(
-            verify_prepared_artifact(&record)
+            verify_artifact_at(&identity.sha256, &executable)
                 .unwrap_err()
                 .to_string()
                 .contains("hash mismatch")
@@ -923,7 +917,7 @@ mod tests {
 
         std::fs::remove_file(&executable).unwrap();
         assert!(
-            verify_prepared_artifact(&record)
+            verify_artifact_at(&identity.sha256, &executable)
                 .unwrap_err()
                 .to_string()
                 .contains("prepared artifact is unavailable")

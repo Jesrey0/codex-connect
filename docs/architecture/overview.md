@@ -70,7 +70,7 @@ codex.start → codex.wait ─┬─ terminal
                          └─ lease expiry → codex.inspect or another bounded wait
 ```
 
-Workers own delegated scope until terminal state, required action/input, interruption, or user redirect. Start completion survives caller loss, with unclaimed handles delivered in `workerStarted` events on host calls. `codex.wait` has a fixed server budget and wakes on terminal state or required action/input; expiry leaves the worker active. See [Operations](../operations.md#worker-lifecycle) for recovery.
+Workers own delegated scope until terminal state, required action/input, interruption, or user redirect. Start completion survives caller loss, with unclaimed handles delivered in `workerStarted` events on host calls. `status.workers` also exposes active and recent delegated handles so a fresh operator turn can rehydrate after frontend/caller interruption without duplicating work. `codex.wait` has a fixed server budget and wakes on terminal state or required action/input; expiry leaves the worker active. See [Operations](../operations.md#worker-lifecycle) for recovery.
 
 Events drive live state. Every authoritative observation of a terminal turn passes through the same relay reconciliation path, which updates the observer projection, deduplicates terminal notification, and releases thread subscription ownership. Active delegated turns are never retention-eviction candidates; recent terminal observations are bounded separately. Reads hydrate existing turns, restore subscriptions, reconcile history loss or wait expiry, and load bounded terminal output. No periodic App Server read is used to observe progress.
 

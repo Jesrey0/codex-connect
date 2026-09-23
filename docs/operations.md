@@ -21,7 +21,7 @@ codex-connect console
 codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-project
 ```
 
-`status` reports readiness, live build identity, navigation cwd, Codex defaults, and retained persistent-command handles. `doctor` provides local diagnostics. `console` follows worker activity, quota, pending actions, and transcripts without changing worker state.
+`status` reports readiness, live build identity, navigation cwd, Codex defaults, retained persistent-command handles, and active/recent worker handles for operator rehydration. `doctor` provides local diagnostics. `console` follows worker activity, quota, pending actions, and transcripts without changing worker state.
 
 ## Host commands
 
@@ -70,12 +70,17 @@ call `codex.wait` with those IDs. It uses a fixed server wait and returns:
 Use `codex.inspect` and its cursor for activity/history, `codex.control` to steer
 or interrupt, and `codex.wait` to confirm terminal state after interruption.
 
+If the ChatGPT caller/frontend is interrupted while the backend remains healthy, call
+`status` in the next turn before starting replacement work. Its `workers` projection lists
+active workers first and newest retained terminal workers after them. Reattach with the
+reported `threadId`/`turnId` and reconcile through `codex.wait` or `codex.inspect`.
+
 A lost `codex.start` response does not cancel creation. Do not retry immediately.
 HostPlane responses can carry a `workerStarted` recovery receipt with the missing
 thread/turn IDs. Receipts are reconciled from the relay's bounded retained-worker
 state and replay until `codex.wait`, `codex.inspect`, or another known-turn control
-operation claims them. Their absence is inconclusive, so observe another HostPlane
-response before considering a retry. `workerEvents` can also report completion or
+operation claims them. `status.workers` is the deterministic recovery projection once
+the worker is registered, so consult it before considering a retry. `workerEvents` can also report completion or
 required action; those notifications take delivery priority over start receipts.
 `historyLost` means older notification or recovery state was evicted. After a
 backend restart, use retained thread/turn IDs to reconcile through `codex.wait`.

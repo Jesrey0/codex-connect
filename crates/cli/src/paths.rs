@@ -30,6 +30,15 @@ pub fn cache_root() -> Result<PathBuf> {
         home_dir()?.join(".cache"),
     ))
 }
+pub fn operator_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".local/bin/codex-connect"))
+}
+pub fn managed_install_root() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".local/lib/codex-connect"))
+}
+pub fn managed_build_root() -> Result<PathBuf> {
+    Ok(managed_install_root()?.join("builds"))
+}
 fn resolve_xdg_root(value: Option<OsString>, fallback: PathBuf) -> PathBuf {
     value
         .map(PathBuf::from)

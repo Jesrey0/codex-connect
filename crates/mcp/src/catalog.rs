@@ -25,7 +25,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "status",
                 "Read Operator Status",
-                "Read backend readiness, live build identity, host cwd, Codex defaults, and retained persistent-command handles for lost-call recovery. Use codex-connect doctor on the host for detailed diagnostics.",
+                "Read backend readiness, live build identity, host cwd, Codex defaults, and retained command/worker handles for recovery or operator rehydration. Use codex-connect doctor on the host for detailed diagnostics.",
                 true,
                 false,
                 false,
@@ -162,7 +162,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Delegate work or a read-only review. A new thread establishes cwd/model/settings; a resumed thread keeps them fixed and is accepted only inside Codex Connect's conservative 30-minute guaranteed-cache policy. Use fresh threads for unrelated work, setting changes, workstreams outside that cutoff, or intentionally independent review. If the call is lost, do not retry immediately: recover threadId/turnId from a replayed workerStarted event on a HostPlane response; absence is inconclusive and historyLost means retained recovery history was exceeded.",
+                "Delegate work or a read-only review. A new thread establishes cwd/model/settings; a resumed thread keeps them fixed and is accepted only inside Codex Connect's conservative 30-minute guaranteed-cache policy. Use fresh threads for unrelated work, setting changes, workstreams outside that cutoff, or intentionally independent review. If the call is lost, do not retry immediately: recover the handle from status.workers or a replayed workerStarted event; historyLost means retained notification history was exceeded.",
                 false,
                 true,
                 true,
@@ -397,7 +397,7 @@ fn worker_events_schema() -> Value {
     json!({
         "type":"array",
         "maxItems":8,
-        "description":"Worker notifications on HostPlane calls. workerStarted is replayed until claimed while the worker remains in bounded retained state; other notifications are one-shot. actionRequired and turnTerminal are delivered ahead of start receipts. historyLost means notification or recovery history was evicted. Absence gives no worker status; use codex.wait for a known turn.",
+        "description":"Worker notifications on HostPlane calls. workerStarted is replayed until claimed while the worker remains in bounded retained state; other notifications are one-shot. actionRequired and turnTerminal are delivered ahead of start receipts. historyLost means notification history was evicted. These events are hints, not worker authority: use status.workers to discover retained handles and codex.wait for a known turn.",
         "items":{"oneOf":[started,terminal,action,lost]}
     })
 }
@@ -511,6 +511,17 @@ fn status_schema() -> Value {
                 "state":{"enum":["running","exited","failed"]},
                 "tty":{"type":"boolean"}
             }), &["processId","state","tty"])},
+            "workers":{"type":"array","description":"Active workers followed by newest retained terminal workers. Use these handles to rehydrate after a caller/frontend interruption before starting replacement work.","items":object_schema(json!({
+                "threadId":{"type":"string"},
+                "turnId":{"type":"string"},
+                "status":{"enum":["inProgress","completed","failed","interrupted"]},
+                "mode":{"enum":["work","review"]},
+                "prompt":{"type":["string","null"]},
+                "terminalAtMs":{"type":["integer","null"],"minimum":0},
+                "lastActivityAtMs":{"type":"integer","minimum":0},
+                "activityKind":{"type":"string"},
+                "activitySummary":{"type":["string","null"]}
+            }), &["threadId","turnId","status","mode","prompt","terminalAtMs","lastActivityAtMs","activityKind","activitySummary"])},
             "codex":object_schema(json!({
                 "release":{"type":"string"},
                 "defaults":object_schema(json!({
@@ -521,7 +532,7 @@ fn status_schema() -> Value {
                 }), &["model","reasoningEffort","serviceTier","source"])
             }), &["release","defaults"])
         }),
-        &["ready", "cwd", "buildId", "commands", "codex"],
+        &["ready", "cwd", "buildId", "commands", "workers", "codex"],
     )
 }
 fn work_started_schema() -> Value {
@@ -1144,6 +1155,11 @@ mod tests {
         assert_eq!(properties["cwd"]["type"], "string");
         assert_eq!(properties["buildId"]["type"], "string");
         assert_eq!(properties["commands"]["type"], "array");
+        assert_eq!(properties["workers"]["type"], "array");
+        assert_eq!(
+            properties["workers"]["items"]["properties"]["status"]["enum"],
+            json!(["inProgress", "completed", "failed", "interrupted"])
+        );
         assert_eq!(properties["codex"]["type"], "object");
         assert_eq!(
             properties["codex"]["properties"]["defaults"]["properties"]["source"]["enum"],

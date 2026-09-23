@@ -1658,10 +1658,10 @@ fn render_action_card(action: &Value, width: usize) -> Vec<String> {
                             .and_then(|object| object.keys().next().cloned())
                     })
                 })
-                .map(|decision| match decision.as_str() {
-                    "accept" => "approve".to_string(),
-                    "acceptForSession" => "approveForSession".to_string(),
-                    _ => decision,
+                .map(|decision| {
+                    codex_connect_relay::operator_approval_decision(&decision)
+                        .unwrap_or(&decision)
+                        .to_string()
                 })
                 .collect::<Vec<_>>()
                 .join(" / ");

@@ -7,7 +7,10 @@ mod event_journal;
 mod thread_subscriptions;
 mod worker_notifications;
 
-pub use actions::{ApprovalDecision, ElicitationAction, PermissionGrant, PermissionScope};
+pub use actions::{
+    ApprovalDecision, ElicitationAction, PermissionGrant, PermissionScope,
+    operator_approval_decision,
+};
 use activity::{activity, compact_text};
 use base64::Engine;
 pub use codex_connect_app_server::APP_SERVER_LAUNCH_OVERRIDES;
@@ -563,6 +566,26 @@ impl LiveTurns {
         active
     }
 
+    fn operator_worker_handles(&self) -> Vec<Value> {
+        let mut active = Vec::new();
+        for (thread_id, turn_id) in &self.order {
+            let Some(observed) = self.turns.get(&(thread_id.clone(), turn_id.clone())) else {
+                continue;
+            };
+            if observed.mode.is_none() || observed.turn.status.is_terminal() {
+                continue;
+            }
+            active.push(operator_worker_handle_value(thread_id, observed));
+        }
+        active.extend(
+            self.recent
+                .iter()
+                .rev()
+                .map(|(thread_id, _, observed)| operator_worker_handle_value(thread_id, observed)),
+        );
+        active
+    }
+
     fn observer_context_value(&self, thread_id: &str, turn_id: &str) -> Option<Value> {
         self.turns
             .get(&(thread_id.to_string(), turn_id.to_string()))
@@ -626,6 +649,20 @@ fn observer_worker_summary_value(thread_id: &str, observed: &ObservedTurn) -> Va
         "activitySummary": observed.activity_summary,
         "transcriptRevision": observed.transcript_revision,
         "tokenUsage": token_usage_value(observed),
+    })
+}
+
+fn operator_worker_handle_value(thread_id: &str, observed: &ObservedTurn) -> Value {
+    json!({
+        "threadId": thread_id,
+        "turnId": observed.turn.id,
+        "status": observed.turn.status,
+        "mode": observed.mode,
+        "prompt": observed.prompt.as_deref().map(|value| observer_clip(value, MAX_OBSERVER_SUMMARY_PROMPT_CHARS)),
+        "terminalAtMs": observed.terminal_at_ms,
+        "lastActivityAtMs": observed.last_activity_at_ms,
+        "activityKind": observed.activity_kind,
+        "activitySummary": observed.activity_summary,
     })
 }
 
@@ -811,7 +848,7 @@ impl Relay {
         }
     }
 
-    async fn observe_terminal_turn(&self, thread_id: &str, turn_id: &str) {
+    async fn release_terminal_subscription(&self, thread_id: &str, turn_id: &str) {
         let should_unsubscribe = self
             .thread_subscriptions
             .lock()
@@ -838,7 +875,8 @@ impl Relay {
         if let Some(observed) = observed {
             self.push_terminal_worker_event(thread_id, &observed).await;
         }
-        self.observe_terminal_turn(thread_id, &turn.id).await;
+        self.release_terminal_subscription(thread_id, &turn.id)
+            .await;
         if changed {
             self.journal
                 .push(
@@ -2552,6 +2590,10 @@ impl Relay {
         })
     }
 
+    pub async fn worker_handles(&self) -> Vec<Value> {
+        self.live_turns.lock().await.operator_worker_handles()
+    }
+
     pub async fn observer_wait(&self, after_cursor: u64) -> Result<Value, RelayError> {
         let mut changes = self.journal.changes();
         let current = self.journal.cursor().await;
@@ -3348,6 +3390,13 @@ mod tests {
         assert_eq!(workers[0]["turnId"], "turn-0");
         assert_eq!(workers[1]["turnId"], "turn-9");
         assert!(!workers.iter().any(|worker| worker["turnId"] == "turn-1"));
+
+        let handles = live.operator_worker_handles();
+        assert_eq!(handles.len(), 8);
+        assert_eq!(handles[0]["turnId"], "turn-0");
+        assert_eq!(handles[1]["turnId"], "turn-9");
+        assert!(handles[0].get("tokenUsage").is_none());
+        assert!(handles[0].get("transcriptRevision").is_none());
     }
 
     #[test]

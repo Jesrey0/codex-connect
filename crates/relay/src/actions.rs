@@ -15,6 +15,16 @@ pub enum ApprovalDecision {
     Cancel,
 }
 
+pub fn operator_approval_decision(upstream: &str) -> Option<&'static str> {
+    match upstream {
+        "accept" => Some("approve"),
+        "acceptForSession" => Some("approveForSession"),
+        "decline" => Some("decline"),
+        "cancel" => Some("cancel"),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ElicitationAction {
@@ -301,6 +311,15 @@ mod tests {
 
     #[test]
     fn approval_decisions_match_official_wire_values_and_offered_choices() {
+        assert_eq!(operator_approval_decision("accept"), Some("approve"));
+        assert_eq!(
+            operator_approval_decision("acceptForSession"),
+            Some("approveForSession")
+        );
+        assert_eq!(operator_approval_decision("decline"), Some("decline"));
+        assert_eq!(operator_approval_decision("cancel"), Some("cancel"));
+        assert_eq!(operator_approval_decision("unknown"), None);
+
         let mut request = request(PendingActionKind::Approval, json!({}));
         for (decision, expected) in [
             (ApprovalDecision::Approve, "accept"),
