@@ -16,13 +16,13 @@ ChatGPT is the primary technical operator and orchestrator. Keep these planes di
 
 HostPlane is authoritative for host work. WorkerPlane is authoritative for delegated Codex lifecycle and cognition. PlatformPlane does not acquire host authority, and host or worker tools do not acquire connected-account authority. Workers do not inherit ChatGPT conversation, files, native tools, plugins, or scheduled tasks; delegated tasks must carry their own context and acceptance criteria.
 
-The remote path is ChatGPT → ngrok HTTPS → host ingress with OAuth → loopback Codex Connect. Codex CLI/App Server and host ingress are independently managed. Connect owns its backend, configuration, state, cache, and installed artifacts.
+The remote path is ChatGPT → ngrok HTTPS → host ingress with OAuth → loopback Codex Connect. Codex CLI/App Server and host ingress are independently managed. Connect owns its backend service, deployment state/cache, and installed artifacts.
 
 Tools advertise the `codex-connect:access` OAuth scope; host ingress validates tokens before forwarding to the backend.
 
 ## Authority and delegation
 
-Deterministic host tools run with the OS account's authority. The configured `default_cwd` is navigation only, not an authorization boundary; absolute host paths are valid. The dedicated App Server uses a process-local `danger-full-access` launch override for HostPlane.
+Deterministic host tools run with the OS account's authority. The managed backend uses the home directory as its navigation cwd; it is not an authorization boundary, and absolute host paths are valid. The dedicated App Server uses a process-local `danger-full-access` launch override for HostPlane.
 
 `codex.start(mode=work)` defaults to a writable workspace sandbox with network access; `access="full"` grants unrestricted host access. Approval prompts are disabled within the selected sandbox. Reviews are read-only. Workers use the normal Codex config and AGENTS.md instruction sources.
 
@@ -36,7 +36,7 @@ The live public catalog contains exactly 14 tools:
 
 `status`, `inspect`, `view_image`, `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control`, `codex.start`, `codex.wait`, `codex.inspect`, `codex.control`, `codex.action.respond`, and `codex.info`.
 
-Use `command.exec` for short commands, `command.start/read/control` for persistent or interactive processes, and `codex.start` for delegated work/review. Discover models, skills, and usage with `codex.info`. The live schemas define inputs and limits.
+Use `command.exec` for short commands, `command.start/read/control` for persistent or interactive processes, and `codex.start` for delegated work/review. `status` is also the recovery anchor for retained persistent-command handles. Discover compact model, skill, and usage choices with `codex.info`. The live schemas define inputs and limits.
 
 ## Install and operate
 

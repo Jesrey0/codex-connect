@@ -4,11 +4,13 @@ mod actions;
 mod activity;
 mod command_sessions;
 mod event_journal;
-mod operator_inbox;
+mod thread_subscriptions;
+mod worker_notifications;
 
 pub use actions::{ApprovalDecision, ElicitationAction, PermissionGrant, PermissionScope};
 use activity::{activity, compact_text};
 use base64::Engine;
+pub use codex_connect_app_server::APP_SERVER_LAUNCH_OVERRIDES;
 pub use codex_connect_app_server::protocol::{
     ApprovalPolicy, CommandExec, CommandExecTerminalSize, ModelList, ReviewTarget, RpcId,
     SandboxMode, SandboxPolicy,
@@ -26,17 +28,18 @@ use codex_connect_app_server::{
     MAX_WIRE_BYTES,
 };
 pub use codex_connect_app_server::{PendingActionKind, PendingServerRequest};
+pub const CODEX_RELEASE: &str = codex_connect_app_server::protocol::CODEX_PIN;
 use codex_connect_host::{Host, HostError, MAX_IMAGE_BYTES};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::futures::OwnedNotified;
-use tokio::sync::{Mutex, Notify, oneshot};
+use thread_subscriptions::ThreadSubscriptions;
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::{Duration, Instant};
 
 const WORK_WAIT_MS: u64 = 40_000;
@@ -53,8 +56,16 @@ const MAX_TRANSCRIPT_SCAN_ITEMS: usize = 4_096;
 const MAX_LIVE_MESSAGE_CHARS: usize = 8 * 1024;
 const MAX_OBSERVER_PROMPT_CHARS: usize = 8 * 1024;
 const MAX_OBSERVER_SUMMARY_PROMPT_CHARS: usize = 512;
-const MAX_LIVE_TURNS: usize = 256;
+const MAX_UNANNOTATED_TERMINALS: usize = 256;
 const MAX_RECENT_WORKERS: usize = 8;
+const MAX_WAIT_SCAN_ITEMS: usize = 512;
+const MAX_WAIT_OUTPUT_ITEMS: usize = 16;
+const MAX_WAIT_OUTPUT_CHARS: usize = 64 * 1024;
+const MAX_WAIT_OUTPUT_PAGES: usize = 32;
+const MAX_TRANSCRIPT_PAGES: usize = 128;
+const MAX_TURN_LOOKUP_PAGES: usize = 1_024;
+const THREAD_REUSE_POLICY_MS: u64 = 30 * 60 * 1000;
+const THREAD_REUSE_POLICY_SECS: i64 = 30 * 60;
 const TURN_PAGE_SIZE: u32 = 50;
 const ITEM_PAGE_SIZE: u32 = 100;
 pub const COMMAND_EXEC_RESPONSE_ALLOWANCE_MS: u64 = 10_000;
@@ -68,12 +79,6 @@ pub const MAX_COMMAND_WRITE_BYTES: usize = 64 * 1024;
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
 const MAX_APP_SERVER_RESPONSE_BYTES: usize = MAX_WIRE_BYTES - APP_SERVER_RESPONSE_HEADROOM_BYTES;
 const MAX_FS_READ_FILE_BYTES: u64 = ((MAX_APP_SERVER_RESPONSE_BYTES / 4) * 3) as u64;
-
-#[derive(Clone, Debug)]
-pub struct RelayConfig {
-    pub codex_bin: PathBuf,
-    pub default_cwd: PathBuf,
-}
 
 fn review_target_prompt(target: &ReviewTarget) -> String {
     match target {
@@ -168,12 +173,27 @@ fn is_unflushed_thread_store(error: &RelayError) -> bool {
     )
 }
 
+fn checked_next_cursor(
+    seen: &mut HashSet<String>,
+    next: Option<String>,
+    method: &str,
+) -> Result<Option<String>, RelayError> {
+    if let Some(next) = next.as_ref()
+        && !seen.insert(next.clone())
+    {
+        return Err(RelayError::Invalid(format!(
+            "{method} returned a repeated pagination cursor"
+        )));
+    }
+    Ok(next)
+}
+
 #[derive(Clone)]
 pub struct Relay {
     app_server: Arc<AppServerClient>,
     host: Host,
     journal: event_journal::EventJournal,
-    operator_inbox: operator_inbox::OperatorInbox,
+    worker_notifications: worker_notifications::WorkerNotifications,
     live_turns: Arc<Mutex<LiveTurns>>,
     thread_subscriptions: Arc<Mutex<ThreadSubscriptions>>,
     observer_usage: Arc<Mutex<ObserverUsageState>>,
@@ -184,8 +204,11 @@ pub struct Relay {
 
 #[derive(Default)]
 struct LiveTurns {
+    // Active turns stay here until terminal. An unannotated terminal may stay briefly
+    // while its turn/start response catches up with an early completion event.
     turns: HashMap<(String, String), ObservedTurn>,
     order: VecDeque<(String, String)>,
+    // Only the newest delegated terminal observations remain in the console view.
     recent: VecDeque<(String, String, ObservedTurn)>,
 }
 
@@ -205,12 +228,16 @@ struct ObservedTurn {
     message_excerpt: String,
     token_usage_total: Option<u64>,
     model_context_window: Option<u64>,
+    last_input_tokens: Option<u64>,
+    last_cached_input_tokens: Option<u64>,
+    last_model_usage_at_ms: Option<u64>,
 }
 
 #[derive(Default)]
 struct ObserverUsageState {
     value: Option<Value>,
     error: Option<String>,
+    updated_at_ms: Option<u64>,
     refresh_running: bool,
     refresh_pending: bool,
 }
@@ -223,131 +250,67 @@ struct WorkerAnnotation {
     prompt: Option<String>,
 }
 
-#[derive(Default)]
-struct ThreadSubscriptions {
-    threads: HashMap<String, ThreadSubscription>,
+struct PreparedThread {
+    id: String,
+    cwd: String,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
-struct ThreadSubscription {
-    starting: usize,
-    active_turns: HashSet<String>,
-    subscribed: bool,
-    unsubscribing: bool,
-    notify: Arc<Notify>,
+struct TerminalOutput {
+    items: Vec<Value>,
+    history_truncated: bool,
 }
 
-impl Default for ThreadSubscription {
-    fn default() -> Self {
-        Self {
-            starting: 0,
-            active_turns: HashSet::new(),
-            subscribed: false,
-            unsubscribing: false,
-            notify: Arc::new(Notify::new()),
-        }
-    }
-}
-
-impl ThreadSubscriptions {
-    fn is_subscribed(&self, thread_id: &str) -> bool {
-        self.threads
-            .get(thread_id)
-            .is_some_and(|state| state.subscribed && !state.unsubscribing)
-    }
-
-    fn begin_start(&mut self, thread_id: &str) -> Option<OwnedNotified> {
-        let state = self.threads.entry(thread_id.to_string()).or_default();
-        if state.unsubscribing {
-            return Some(state.notify.clone().notified_owned());
-        }
-        state.starting += 1;
-        None
-    }
-
-    fn mark_subscribed(&mut self, thread_id: &str) {
-        self.threads
-            .entry(thread_id.to_string())
-            .or_default()
-            .subscribed = true;
-    }
-
-    fn finish_start(&mut self, thread_id: &str, turn_id: Option<&str>) -> bool {
-        let (should_unsubscribe, remove_inactive) = {
-            let Some(state) = self.threads.get_mut(thread_id) else {
-                return false;
-            };
-            state.starting = state.starting.saturating_sub(1);
-            if let Some(turn_id) = turn_id {
-                state.active_turns.insert(turn_id.to_string());
-            }
-            let should_unsubscribe = Self::claim_unsubscribe(state);
-            let remove_inactive = !state.subscribed
-                && !state.unsubscribing
-                && state.starting == 0
-                && state.active_turns.is_empty();
-            (should_unsubscribe, remove_inactive)
-        };
-        if remove_inactive {
-            self.threads.remove(thread_id);
-        }
-        should_unsubscribe
-    }
-
-    fn finish_turn(&mut self, thread_id: &str, turn_id: &str) -> bool {
-        let Some(state) = self.threads.get_mut(thread_id) else {
-            return false;
-        };
-        state.active_turns.remove(turn_id);
-        Self::claim_unsubscribe(state)
-    }
-
-    fn claim_unsubscribe(state: &mut ThreadSubscription) -> bool {
-        if state.subscribed
-            && !state.unsubscribing
-            && state.starting == 0
-            && state.active_turns.is_empty()
-        {
-            state.unsubscribing = true;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn finish_unsubscribe(&mut self, thread_id: &str, success: bool) -> Option<Arc<Notify>> {
-        let state = self.threads.get_mut(thread_id)?;
-        state.unsubscribing = false;
-        let notify = state.notify.clone();
-        if success {
-            self.threads.remove(thread_id);
-        }
-        Some(notify)
+fn turn_metadata(
+    turn: &codex_connect_app_server::protocol::Turn,
+) -> codex_connect_app_server::protocol::Turn {
+    codex_connect_app_server::protocol::Turn {
+        id: turn.id.clone(),
+        status: turn.status,
+        items: Vec::new(),
+        error: turn.error.clone(),
+        completed_at: turn.completed_at,
     }
 }
 
 impl LiveTurns {
-    fn insert(&mut self, thread_id: &str, mut turn: codex_connect_app_server::protocol::Turn) {
+    fn insert(
+        &mut self,
+        thread_id: &str,
+        mut turn: codex_connect_app_server::protocol::Turn,
+    ) -> bool {
         // Live observer state owns lifecycle/presentation metadata, not App Server-owned
         // turn history. Never retain potentially multi-megabyte item payloads here.
         turn.items.clear();
         let key = (thread_id.to_string(), turn.id.clone());
+        if let Some((_, _, observed)) =
+            self.recent
+                .iter_mut()
+                .find(|(recent_thread, recent_turn, _)| {
+                    recent_thread == thread_id && recent_turn == &turn.id
+                })
+        {
+            if turn.status.is_terminal() {
+                observed.turn = turn;
+            }
+            return false;
+        }
         if let Some(existing) = self.turns.get_mut(&key) {
             // App Server notifications can race ahead of the turn/start response. Once a
             // terminal lifecycle event has been observed, a later stale inProgress response
             // must not regress the local projection back to active forever.
             if existing.turn.status.is_terminal() && !turn.status.is_terminal() {
-                return;
+                return false;
             }
             let became_terminal = !existing.turn.status.is_terminal() && turn.status.is_terminal();
             existing.turn = turn;
             if became_terminal {
                 existing.terminal_at_ms = Some(now_epoch_ms());
             }
-            return;
+            return self.prune_unannotated_terminals();
         }
-        if !self.turns.contains_key(&key) {
-            self.order.push_back(key.clone());
-        }
+        self.order.push_back(key.clone());
         let terminal_at_ms = turn.status.is_terminal().then(now_epoch_ms);
         self.turns.insert(
             key,
@@ -366,13 +329,36 @@ impl LiveTurns {
                 message_excerpt: String::new(),
                 token_usage_total: None,
                 model_context_window: None,
+                last_input_tokens: None,
+                last_cached_input_tokens: None,
+                last_model_usage_at_ms: None,
             },
         );
-        while self.turns.len() > MAX_LIVE_TURNS {
-            if let Some(oldest) = self.order.pop_front() {
-                self.turns.remove(&oldest);
+        self.prune_unannotated_terminals()
+    }
+
+    fn prune_unannotated_terminals(&mut self) -> bool {
+        let mut terminal_count = self
+            .turns
+            .values()
+            .filter(|turn| turn.mode.is_none() && turn.turn.status.is_terminal())
+            .count();
+        let mut history_lost = false;
+        while terminal_count > MAX_UNANNOTATED_TERMINALS {
+            let Some(index) = self.order.iter().position(|key| {
+                self.turns
+                    .get(key)
+                    .is_some_and(|turn| turn.mode.is_none() && turn.turn.status.is_terminal())
+            }) else {
+                break;
+            };
+            if let Some(key) = self.order.remove(index) {
+                self.turns.remove(&key);
+                terminal_count -= 1;
+                history_lost = true;
             }
         }
+        history_lost
     }
 
     fn get(
@@ -380,16 +366,36 @@ impl LiveTurns {
         thread_id: &str,
         turn_id: &str,
     ) -> Option<codex_connect_app_server::protocol::Turn> {
-        self.turns
-            .get(&(thread_id.to_string(), turn_id.to_string()))
+        self.observed(thread_id, turn_id)
             .map(|observed| observed.turn.clone())
     }
 
+    fn observed(&self, thread_id: &str, turn_id: &str) -> Option<&ObservedTurn> {
+        self.turns
+            .get(&(thread_id.to_string(), turn_id.to_string()))
+            .or_else(|| {
+                self.recent
+                    .iter()
+                    .find(|(recent_thread, recent_turn, _)| {
+                        recent_thread == thread_id && recent_turn == turn_id
+                    })
+                    .map(|(_, _, observed)| observed)
+            })
+    }
+
     fn annotate(&mut self, thread_id: &str, turn_id: &str, annotation: WorkerAnnotation) {
-        if let Some(observed) = self
+        let observed = self
             .turns
             .get_mut(&(thread_id.to_string(), turn_id.to_string()))
-        {
+            .or_else(|| {
+                self.recent
+                    .iter_mut()
+                    .find(|(recent_thread, recent_turn, _)| {
+                        recent_thread == thread_id && recent_turn == turn_id
+                    })
+                    .map(|(_, _, observed)| observed)
+            });
+        if let Some(observed) = observed {
             observed.mode = Some(annotation.mode);
             observed.model = annotation.model;
             observed.effort = annotation.effort;
@@ -412,10 +418,18 @@ impl LiveTurns {
         let Some(turn_id) = turn_id else {
             return;
         };
-        let Some(observed) = self
+        let observed = self
             .turns
             .get_mut(&(thread_id.to_string(), turn_id.to_string()))
-        else {
+            .or_else(|| {
+                self.recent
+                    .iter_mut()
+                    .find(|(recent_thread, recent_turn, _)| {
+                        recent_thread == thread_id && recent_turn == turn_id
+                    })
+                    .map(|(_, _, observed)| observed)
+            });
+        let Some(observed) = observed else {
             return;
         };
 
@@ -433,6 +447,10 @@ impl LiveTurns {
             let usage = &params["tokenUsage"];
             observed.token_usage_total = usage["total"]["totalTokens"].as_u64();
             observed.model_context_window = usage["modelContextWindow"].as_u64();
+            let last = &usage["last"];
+            observed.last_input_tokens = last["inputTokens"].as_u64();
+            observed.last_cached_input_tokens = last["cachedInputTokens"].as_u64();
+            observed.last_model_usage_at_ms = Some(now_epoch_ms());
             return;
         }
 
@@ -467,41 +485,57 @@ impl LiveTurns {
         &mut self,
         thread_id: &str,
         turn: &codex_connect_app_server::protocol::Turn,
-    ) {
+    ) -> (Option<ObservedTurn>, bool) {
         if !turn.status.is_terminal() {
-            return;
+            return (None, false);
         }
-        let Some(observed) = self
+        let changed;
+        if let Some(observed) = self
             .turns
             .get_mut(&(thread_id.to_string(), turn.id.clone()))
-        else {
-            return;
-        };
-        observed.turn = turn.clone();
-        observed.turn.items.clear();
-        observed.terminal_at_ms.get_or_insert_with(now_epoch_ms);
+        {
+            changed = observed.mode.is_some()
+                || observed.turn.status != turn.status
+                || observed.turn.error != turn.error;
+            observed.turn = turn_metadata(turn);
+            observed.terminal_at_ms.get_or_insert_with(now_epoch_ms);
+        } else if let Some((_, _, observed)) =
+            self.recent
+                .iter_mut()
+                .find(|(recent_thread, recent_turn, _)| {
+                    recent_thread == thread_id && recent_turn == &turn.id
+                })
+        {
+            changed = observed.turn.status != turn.status || observed.turn.error != turn.error;
+            observed.turn = turn_metadata(turn);
+        } else {
+            return (None, false);
+        }
         self.record_recent(thread_id, &turn.id);
+        (
+            self.recent
+                .iter()
+                .find(|(recent_thread, recent_turn, _)| {
+                    recent_thread == thread_id && recent_turn == &turn.id
+                })
+                .map(|(_, _, observed)| observed.clone()),
+            changed,
+        )
     }
 
     fn record_recent(&mut self, thread_id: &str, turn_id: &str) {
         let key = (thread_id.to_string(), turn_id.to_string());
-        let Some(mut observed) = self.turns.get(&key).cloned() else {
+        let Some(observed) = self.turns.get(&key) else {
             return;
         };
         if observed.mode.is_none() || !observed.turn.status.is_terminal() {
             return;
         }
-        observed.turn.items.clear();
-        if let Some(index) = self
-            .recent
-            .iter()
-            .position(|(recent_thread, recent_turn, _)| {
-                recent_thread == thread_id && recent_turn == turn_id
-            })
-        {
-            self.recent[index] = (thread_id.to_string(), turn_id.to_string(), observed);
+        let Some(mut observed) = self.turns.remove(&key) else {
             return;
-        }
+        };
+        self.order.retain(|candidate| candidate != &key);
+        observed.turn.items.clear();
         self.recent
             .push_back((thread_id.to_string(), turn_id.to_string(), observed));
         while self.recent.len() > MAX_RECENT_WORKERS {
@@ -573,10 +607,7 @@ fn observer_worker_value(thread_id: &str, observed: &ObservedTurn) -> Value {
         "activityKind": observed.activity_kind,
         "activitySummary": observed.activity_summary,
         "transcriptRevision": observed.transcript_revision,
-        "tokenUsage": {
-            "totalTokens": observed.token_usage_total,
-            "modelContextWindow": observed.model_context_window,
-        },
+        "tokenUsage": token_usage_value(observed),
     })
 }
 
@@ -594,10 +625,33 @@ fn observer_worker_summary_value(thread_id: &str, observed: &ObservedTurn) -> Va
         "activityKind": observed.activity_kind,
         "activitySummary": observed.activity_summary,
         "transcriptRevision": observed.transcript_revision,
-        "tokenUsage": {
-            "totalTokens": observed.token_usage_total,
-            "modelContextWindow": observed.model_context_window,
-        },
+        "tokenUsage": token_usage_value(observed),
+    })
+}
+
+fn token_usage_value(observed: &ObservedTurn) -> Value {
+    let cache_hit_percent = match (
+        observed.last_input_tokens,
+        observed.last_cached_input_tokens,
+    ) {
+        (Some(input), Some(cached)) if input > 0 => {
+            Some(((u128::from(cached) * 100 / u128::from(input)).min(100)) as u64)
+        }
+        _ => None,
+    };
+    let cache_guaranteed_until_ms = observed
+        .last_model_usage_at_ms
+        .map(|timestamp| timestamp.saturating_add(THREAD_REUSE_POLICY_MS));
+    let cache_guarantee_active = cache_guaranteed_until_ms.map(|until| now_epoch_ms() < until);
+    json!({
+        "totalTokens": observed.token_usage_total,
+        "modelContextWindow": observed.model_context_window,
+        "lastInputTokens": observed.last_input_tokens,
+        "lastCachedInputTokens": observed.last_cached_input_tokens,
+        "cacheHitPercent": cache_hit_percent,
+        "lastModelUsageAtMs": observed.last_model_usage_at_ms,
+        "cacheGuaranteedUntilMs": cache_guaranteed_until_ms,
+        "cacheGuaranteeActive": cache_guarantee_active,
     })
 }
 
@@ -621,11 +675,10 @@ pub struct TextRead {
 }
 
 impl Relay {
-    pub async fn start(config: RelayConfig) -> Result<Self, RelayError> {
-        let host = Host::open(config.default_cwd)?;
+    pub async fn start(codex_bin: impl AsRef<Path>, host: Host) -> Result<Self, RelayError> {
         let app_server = Arc::new(
             AppServerClient::start(AppServerConfig {
-                codex_bin: config.codex_bin,
+                codex_bin: codex_bin.as_ref().to_path_buf(),
                 working_directory: host.default_cwd().to_path_buf(),
                 client_name: "codex-connect".into(),
                 request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -636,7 +689,7 @@ impl Relay {
             app_server,
             host,
             journal: event_journal::EventJournal::default(),
-            operator_inbox: operator_inbox::OperatorInbox::default(),
+            worker_notifications: worker_notifications::WorkerNotifications::default(),
             live_turns: Arc::new(Mutex::new(LiveTurns::default())),
             thread_subscriptions: Arc::new(Mutex::new(ThreadSubscriptions::default())),
             observer_usage: Arc::new(Mutex::new(ObserverUsageState::default())),
@@ -661,7 +714,15 @@ impl Relay {
         thread_id: &str,
         turn: &codex_connect_app_server::protocol::Turn,
     ) {
-        self.live_turns.lock().await.insert(thread_id, turn.clone());
+        if self
+            .live_turns
+            .lock()
+            .await
+            .insert(thread_id, turn_metadata(turn))
+        {
+            self.journal.mark_gap().await;
+            self.worker_notifications.mark_history_lost().await;
+        }
     }
 
     async fn annotate_live_turn(
@@ -673,22 +734,19 @@ impl Relay {
         let terminal = {
             let mut live = self.live_turns.lock().await;
             live.annotate(thread_id, turn_id, annotation);
-            live.record_recent(thread_id, turn_id);
-            live.turns
-                .get(&(thread_id.to_string(), turn_id.to_string()))
-                .cloned()
-                .filter(|observed| observed.turn.status.is_terminal())
+            live.get(thread_id, turn_id)
+                .filter(|turn| turn.status.is_terminal())
         };
-        if let Some(observed) = terminal {
-            self.push_terminal_worker_event(thread_id, &observed).await;
-            self.observe_terminal_turn(thread_id, turn_id).await;
+        if let Some(turn) = terminal {
+            self.reconcile_terminal_turn(thread_id, &turn).await;
+        } else {
+            self.journal
+                .push(
+                    "codexConnect/observerWorkerChanged",
+                    &json!({"threadId":thread_id,"turnId":turn_id}),
+                )
+                .await;
         }
-        self.journal
-            .push(
-                "codexConnect/observerWorkerChanged",
-                &json!({"threadId":thread_id,"turnId":turn_id}),
-            )
-            .await;
         self.trigger_observer_usage_refresh().await;
     }
 
@@ -700,14 +758,15 @@ impl Relay {
     ) {
         self.finish_thread_start(thread_id, Some(&turn.id)).await;
         self.remember_live_turn(thread_id, turn).await;
-        self.push_started_worker_event(thread_id, &turn.id, &annotation.mode)
-            .await;
+        let mode = annotation.mode.clone();
         self.annotate_live_turn(thread_id, &turn.id, annotation)
+            .await;
+        self.push_started_worker_event(thread_id, &turn.id, &mode)
             .await;
     }
 
     async fn push_started_worker_event(&self, thread_id: &str, turn_id: &str, mode: &str) {
-        self.operator_inbox
+        self.worker_notifications
             .push_once(
                 format!("started:{thread_id}:{turn_id}"),
                 json!({
@@ -760,6 +819,33 @@ impl Relay {
             .finish_turn(thread_id, turn_id);
         if should_unsubscribe {
             self.spawn_thread_unsubscribe(thread_id.to_string());
+        }
+    }
+
+    async fn reconcile_terminal_turn(
+        &self,
+        thread_id: &str,
+        turn: &codex_connect_app_server::protocol::Turn,
+    ) {
+        if !turn.status.is_terminal() {
+            return;
+        }
+        let (observed, changed) = self
+            .live_turns
+            .lock()
+            .await
+            .reconcile_terminal(thread_id, turn);
+        if let Some(observed) = observed {
+            self.push_terminal_worker_event(thread_id, &observed).await;
+        }
+        self.observe_terminal_turn(thread_id, &turn.id).await;
+        if changed {
+            self.journal
+                .push(
+                    "codexConnect/observerWorkerChanged",
+                    &json!({"threadId":thread_id,"turnId":turn.id}),
+                )
+                .await;
         }
     }
 
@@ -869,29 +955,20 @@ impl Relay {
 
     async fn current_activity_value(&self, thread_id: &str, turn_id: &str) -> Value {
         let live = self.live_turns.lock().await;
-        let Some(observed) = live
-            .turns
-            .get(&(thread_id.to_string(), turn_id.to_string()))
-        else {
+        let Some(observed) = live.observed(thread_id, turn_id) else {
             return Value::Null;
         };
         json!({
             "kind": observed.activity_kind,
             "summary": observed.activity_summary,
             "lastActivityAtMs": observed.last_activity_at_ms,
-            "tokenUsage": {
-                "totalTokens": observed.token_usage_total,
-                "modelContextWindow": observed.model_context_window,
-            }
+            "tokenUsage": token_usage_value(observed)
         })
     }
 
     async fn observer_activity_value(&self, thread_id: &str, turn_id: &str) -> Value {
         let live = self.live_turns.lock().await;
-        let Some(observed) = live
-            .turns
-            .get(&(thread_id.to_string(), turn_id.to_string()))
-        else {
+        let Some(observed) = live.observed(thread_id, turn_id) else {
             return Value::Null;
         };
         let summary = if observed.activity_kind == "message" && !observed.message_excerpt.is_empty()
@@ -904,10 +981,7 @@ impl Relay {
             "kind": observed.activity_kind,
             "summary": summary,
             "lastActivityAtMs": observed.last_activity_at_ms,
-            "tokenUsage": {
-                "totalTokens": observed.token_usage_total,
-                "modelContextWindow": observed.model_context_window,
-            }
+            "tokenUsage": token_usage_value(observed)
         })
     }
 
@@ -1203,6 +1277,11 @@ impl Relay {
         }
     }
 
+    /// Retained handles for recovering a command.start response lost by the caller.
+    pub async fn command_handles(&self) -> Vec<Value> {
+        self.command_sessions.handles().await
+    }
+
     pub async fn command_write(
         &self,
         process_id: String,
@@ -1291,12 +1370,25 @@ impl Relay {
         thread_id: Option<String>,
         model: Option<String>,
         effort: Option<String>,
-        sandbox_policy: SandboxPolicy,
+        sandbox_policy: Option<SandboxPolicy>,
     ) -> Result<Value, RelayError> {
         if task.trim().is_empty() {
             return Err(RelayError::Invalid("task must not be empty".into()));
         }
-        validate_work_sandbox_policy(&sandbox_policy)?;
+        if thread_id.is_some()
+            && (cwd.is_some() || model.is_some() || effort.is_some() || sandbox_policy.is_some())
+        {
+            return Err(RelayError::Invalid(
+                "resumed work inherits cwd, model, effort, and access; start a fresh thread to change workstream settings".into(),
+            ));
+        }
+        if let Some(policy) = sandbox_policy.as_ref() {
+            validate_work_sandbox_policy(policy)?;
+        } else if thread_id.is_none() {
+            return Err(RelayError::Invalid(
+                "new work requires an explicit sandbox policy".into(),
+            ));
+        }
         let relay = self.clone();
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
@@ -1318,56 +1410,67 @@ impl Relay {
         thread_id: Option<String>,
         model: Option<String>,
         effort: Option<String>,
-        sandbox_policy: SandboxPolicy,
+        sandbox_policy: Option<SandboxPolicy>,
     ) -> Result<Value, RelayError> {
         let observer_prompt = task.clone();
-        let thread_sandbox = sandbox_mode(&sandbox_policy);
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
-        let (thread_id, cwd) = self
-            .prepare_thread(cwd, thread_id, None, Some(thread_sandbox))
+        let thread_sandbox = sandbox_policy.as_ref().map(sandbox_mode);
+        let prepared = self
+            .prepare_thread(
+                cwd,
+                thread_id,
+                model.clone(),
+                thread_sandbox,
+                created.then_some(ApprovalPolicy::Never),
+            )
             .await?;
+        let effective_model = model.or(prepared.model.clone());
+        let effective_effort = effort.or(prepared.effort.clone());
         let annotation = WorkerAnnotation {
             mode: "work".into(),
-            model,
-            effort,
+            model: effective_model.clone(),
+            effort: effective_effort.clone(),
             prompt: Some(observer_prompt),
         };
+        let turn_sandbox = if created { sandbox_policy } else { None };
         let response = match self
             .app_server
             .start_request(TurnStart {
-                thread_id: thread_id.clone(),
+                thread_id: prepared.id.clone(),
                 input: vec![TextInput::Text { text: task }],
-                cwd,
-                approval_policy: Some(ApprovalPolicy::Never),
-                sandbox_policy: Some(sandbox_policy),
-                model: annotation.model.clone(),
-                effort: annotation.effort.clone(),
+                cwd: prepared.cwd,
+                approval_policy: None,
+                sandbox_policy: turn_sandbox,
+                model: effective_model.clone(),
+                effort: effective_effort.clone(),
                 service_tier_for_turn: None,
             })
             .await
         {
             Ok(deferred) => deferred.wait().await,
             Err(error) => {
-                self.finish_thread_start(&thread_id, None).await;
+                self.finish_thread_start(&prepared.id, None).await;
                 return Err(error.into());
             }
         };
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                self.finish_thread_start(&thread_id, None).await;
+                self.finish_thread_start(&prepared.id, None).await;
                 return Err(error.into());
             }
         };
         let turn_id = response.turn.id.clone();
-        self.register_worker_turn(&thread_id, &response.turn, annotation)
+        self.register_worker_turn(&prepared.id, &response.turn, annotation)
             .await;
         Ok(json!({
-            "threadId":thread_id,
+            "threadId":prepared.id,
             "turnId":turn_id,
             "createdThread":created,
             "cursor":cursor,
+            "model":effective_model,
+            "effort":effective_effort,
         }))
     }
 
@@ -1377,15 +1480,29 @@ impl Relay {
         thread_id: Option<String>,
         new_thread_model: Option<String>,
         new_thread_sandbox: Option<SandboxMode>,
-    ) -> Result<(String, String), RelayError> {
+        new_thread_approval: Option<ApprovalPolicy>,
+    ) -> Result<PreparedThread, RelayError> {
         let cwd = cwd
             .map(|v| self.host.resolve_app_server_directory(&v))
             .transpose()?;
         let response = if let Some(id) = thread_id {
+            if cwd.is_some() {
+                return Err(RelayError::Invalid(
+                    "resumed threads keep their existing cwd; start a fresh thread to change it"
+                        .into(),
+                ));
+            }
             self.begin_thread_start(&id).await;
             // Serialize the whole resume preparation against an in-flight unsubscribe, then
             // verify the stored cwd before resume can load hooks or tools for it.
-            if let Err(error) = self.read_thread_metadata(id.clone()).await {
+            let metadata = match self.read_thread_metadata(id.clone()).await {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.finish_thread_start(&id, None).await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.ensure_thread_reuse_policy(&metadata).await {
                 self.finish_thread_start(&id, None).await;
                 return Err(error);
             }
@@ -1393,7 +1510,7 @@ impl Relay {
                 .app_server
                 .start_request(ThreadResume {
                     thread_id: id.clone(),
-                    cwd,
+                    cwd: None,
                     developer_instructions: None,
                     exclude_turns: true,
                 })
@@ -1418,6 +1535,7 @@ impl Relay {
                 .start_request(ThreadStart {
                     model: new_thread_model,
                     sandbox: new_thread_sandbox,
+                    approval_policy: new_thread_approval,
                     cwd: Some(cwd.unwrap_or_else(|| self.default_cwd())),
                     service_name: Some("codex-connect".into()),
                     ..ThreadStart::default()
@@ -1428,7 +1546,7 @@ impl Relay {
             self.mark_thread_subscribed(&response.thread.id).await;
             response
         };
-        let thread_id = response.thread.id;
+        let thread_id = response.thread.id.clone();
         let cwd = match self.host.resolve_app_server_directory(&response.cwd) {
             Ok(cwd) => cwd,
             Err(error) => {
@@ -1436,7 +1554,12 @@ impl Relay {
                 return Err(error.into());
             }
         };
-        Ok((thread_id, cwd))
+        Ok(PreparedThread {
+            id: thread_id,
+            cwd,
+            model: response.thread.model,
+            effort: response.thread.reasoning_effort,
+        })
     }
 
     async fn read_thread_metadata(&self, thread_id: String) -> Result<Thread, RelayError> {
@@ -1452,24 +1575,76 @@ impl Relay {
         Ok(response.thread)
     }
 
+    async fn ensure_thread_reuse_policy(&self, thread: &Thread) -> Result<(), RelayError> {
+        let observed_model_usage_at_ms = {
+            let live = self.live_turns.lock().await;
+            let active = live
+                .turns
+                .iter()
+                .filter(|((thread_id, _), _)| thread_id == &thread.id)
+                .filter_map(|(_, observed)| observed.last_model_usage_at_ms);
+            let recent = live
+                .recent
+                .iter()
+                .filter(|(thread_id, _, _)| thread_id == &thread.id)
+                .filter_map(|(_, _, observed)| observed.last_model_usage_at_ms);
+            active.chain(recent).max()
+        };
+        if let Some(last_model_usage_at_ms) = observed_model_usage_at_ms {
+            if now_epoch_ms().saturating_sub(last_model_usage_at_ms) >= THREAD_REUSE_POLICY_MS {
+                return Err(RelayError::Invalid(format!(
+                    "thread {} is outside Codex Connect's conservative 30-minute guaranteed-cache reuse policy; start a fresh thread without threadId and provide self-contained context",
+                    thread.id
+                )));
+            }
+            return Ok(());
+        }
+        let latest = self
+            .app_server
+            .request(ThreadTurnsList {
+                thread_id: thread.id.clone(),
+                cursor: None,
+                limit: Some(1),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::NotLoaded),
+            })
+            .await?
+            .data
+            .into_iter()
+            .next();
+        let last_model_turn_at = latest
+            .and_then(|turn| turn.completed_at)
+            .unwrap_or(thread.updated_at);
+        let now_secs = (now_epoch_ms() / 1000).min(i64::MAX as u64) as i64;
+        let age_secs = now_secs.saturating_sub(last_model_turn_at);
+        if age_secs >= THREAD_REUSE_POLICY_SECS {
+            return Err(RelayError::Invalid(format!(
+                "thread {} is outside Codex Connect's conservative 30-minute guaranteed-cache reuse policy; start a fresh thread without threadId and provide self-contained context",
+                thread.id
+            )));
+        }
+        Ok(())
+    }
+
     async fn hydrate_turn_items(
         &self,
         thread_id: &str,
         turn: &mut codex_connect_app_server::protocol::Turn,
-    ) -> Result<(), RelayError> {
-        turn.items = self.read_turn_items(thread_id, &turn.id).await?;
-        Ok(())
+    ) -> Result<bool, RelayError> {
+        let output = self.read_terminal_output(thread_id, &turn.id).await?;
+        turn.items = output.items;
+        Ok(output.history_truncated)
     }
 
     async fn hydrate_turn_items_when_ready(
         &self,
         thread_id: &str,
         turn: &mut codex_connect_app_server::protocol::Turn,
-    ) -> Result<(), RelayError> {
+    ) -> Result<bool, RelayError> {
         let mut retry_ms = WAIT_STORAGE_RETRY_MS;
         loop {
             match self.hydrate_turn_items(thread_id, turn).await {
-                Ok(()) => return Ok(()),
+                Ok(truncated) => return Ok(truncated),
                 Err(error) if is_unflushed_thread_store(&error) => {
                     tokio::time::sleep(Duration::from_millis(retry_ms)).await;
                     retry_ms = retry_ms.saturating_mul(2).min(WAIT_STORAGE_RETRY_MAX_MS);
@@ -1479,29 +1654,25 @@ impl Relay {
         }
     }
 
-    async fn read_turn_items(
+    async fn read_terminal_output(
         &self,
         thread_id: &str,
         turn_id: &str,
-    ) -> Result<Vec<Value>, RelayError> {
-        self.read_turn_items_limited(thread_id, turn_id, None).await
-    }
-
-    async fn read_turn_items_limited(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        max_items: Option<usize>,
-    ) -> Result<Vec<Value>, RelayError> {
+    ) -> Result<TerminalOutput, RelayError> {
         let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
         let mut items = Vec::new();
-        loop {
-            let page_limit = max_items
-                .map(|max| max.saturating_sub(items.len()).min(ITEM_PAGE_SIZE as usize) as u32)
-                .unwrap_or(ITEM_PAGE_SIZE);
-            if page_limit == 0 {
+        let mut scanned = 0usize;
+        let mut pages = 0usize;
+        let mut remaining_chars = MAX_WAIT_OUTPUT_CHARS;
+        let mut history_truncated = false;
+        'pages: loop {
+            if pages >= MAX_WAIT_OUTPUT_PAGES {
+                history_truncated = true;
                 break;
             }
+            pages += 1;
+            let page_limit = (MAX_WAIT_SCAN_ITEMS - scanned).min(ITEM_PAGE_SIZE as usize) as u32;
             let response = self
                 .app_server
                 .request(ThreadItemsList {
@@ -1509,19 +1680,69 @@ impl Relay {
                     turn_id: Some(turn_id.to_string()),
                     cursor,
                     limit: Some(page_limit),
-                    sort_direction: Some(SortDirection::Asc),
+                    sort_direction: Some(SortDirection::Desc),
                 })
                 .await?;
-            items.extend(response.data.into_iter().map(|entry| entry.item));
-            if max_items.is_some_and(|max| items.len() >= max) {
-                break;
+            let page_len = response.data.len();
+            let next_cursor =
+                checked_next_cursor(&mut seen_cursors, response.next_cursor, "thread/items/list")?;
+            for (index, entry) in response.data.into_iter().enumerate() {
+                if entry.turn_id != turn_id {
+                    return Err(RelayError::Invalid(
+                        "thread/items/list returned an item from another turn".into(),
+                    ));
+                }
+                scanned += 1;
+                if matches!(
+                    entry.item.get("type").and_then(Value::as_str),
+                    Some("agentMessage" | "exitedReviewMode")
+                ) {
+                    if items.len() >= MAX_WAIT_OUTPUT_ITEMS || remaining_chars == 0 {
+                        history_truncated = true;
+                        break 'pages;
+                    }
+                    let text = entry
+                        .item
+                        .get("text")
+                        .or_else(|| entry.item.get("review"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let final_output = entry.item.get("phase").and_then(Value::as_str)
+                        == Some("final_answer")
+                        || entry.item.get("type").and_then(Value::as_str)
+                            == Some("exitedReviewMode");
+                    let limit = remaining_chars.min(if final_output {
+                        MAX_WAIT_OUTPUT_CHARS
+                    } else {
+                        4_000
+                    });
+                    let mut characters = text.chars();
+                    let clipped = characters.by_ref().take(limit).collect::<String>();
+                    let truncated = characters.next().is_some();
+                    remaining_chars = remaining_chars.saturating_sub(clipped.chars().count());
+                    items.push(json!({
+                        "id":entry.item.get("id"),
+                        "type":entry.item.get("type"),
+                        "phase":entry.item.get("phase"),
+                        "text":clipped,
+                        "truncated":truncated,
+                    }));
+                }
+                if scanned >= MAX_WAIT_SCAN_ITEMS {
+                    history_truncated = index + 1 < page_len || next_cursor.is_some();
+                    break 'pages;
+                }
             }
-            match response.next_cursor {
+            match next_cursor {
                 Some(next) => cursor = Some(next),
                 None => break,
             }
         }
-        Ok(items)
+        items.reverse();
+        Ok(TerminalOutput {
+            items,
+            history_truncated,
+        })
     }
 
     async fn read_recent_transcript_entries(
@@ -1530,16 +1751,19 @@ impl Relay {
         turn_id: &str,
     ) -> Result<(Vec<Value>, bool), RelayError> {
         let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
         let mut entries = Vec::new();
         let mut remaining_chars = MAX_TRANSCRIPT_TOTAL_CHARS;
         let mut scanned = 0usize;
+        let mut pages = 0usize;
         let mut truncated = false;
         let mut reached_history_start = false;
         'pages: loop {
-            if scanned >= MAX_TRANSCRIPT_SCAN_ITEMS {
+            if scanned >= MAX_TRANSCRIPT_SCAN_ITEMS || pages >= MAX_TRANSCRIPT_PAGES {
                 truncated = true;
                 break;
             }
+            pages += 1;
             let page_limit = (MAX_TRANSCRIPT_SCAN_ITEMS - scanned).min(ITEM_PAGE_SIZE as usize);
             let response = self
                 .app_server
@@ -1551,9 +1775,15 @@ impl Relay {
                     sort_direction: Some(SortDirection::Desc),
                 })
                 .await?;
-            let next_cursor = response.next_cursor;
+            let next_cursor =
+                checked_next_cursor(&mut seen_cursors, response.next_cursor, "thread/items/list")?;
             let page_len = response.data.len();
             for (index, entry) in response.data.into_iter().enumerate() {
+                if entry.turn_id != turn_id {
+                    return Err(RelayError::Invalid(
+                        "thread/items/list returned an item from another turn".into(),
+                    ));
+                }
                 scanned += 1;
                 if entries.len() >= MAX_TRANSCRIPT_ENTRIES {
                     truncated = true;
@@ -1602,7 +1832,15 @@ impl Relay {
         turn_id: &str,
     ) -> Result<Option<codex_connect_app_server::protocol::Turn>, RelayError> {
         let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut pages = 0usize;
         loop {
+            if pages >= MAX_TURN_LOOKUP_PAGES {
+                return Err(RelayError::Invalid(
+                    "thread/turns/list exceeded the turn lookup page limit".into(),
+                ));
+            }
+            pages += 1;
             let response = self
                 .app_server
                 .request(ThreadTurnsList {
@@ -1616,7 +1854,8 @@ impl Relay {
             if let Some(turn) = response.data.into_iter().find(|turn| turn.id == turn_id) {
                 return Ok(Some(turn));
             }
-            match response.next_cursor {
+            match checked_next_cursor(&mut seen_cursors, response.next_cursor, "thread/turns/list")?
+            {
                 Some(next) => cursor = Some(next),
                 None => return Ok(None),
             }
@@ -1689,6 +1928,10 @@ impl Relay {
                     )));
                 }
             };
+            if selected.status.is_terminal() {
+                self.reconcile_terminal_turn(&thread_id, &selected).await;
+            }
+            let mut output_truncated = false;
             if selected.status.is_terminal() && selected.items.is_empty() {
                 match tokio::time::timeout_at(
                     operation_deadline,
@@ -1696,7 +1939,7 @@ impl Relay {
                 )
                 .await
                 {
-                    Ok(result) => result?,
+                    Ok(result) => output_truncated = result?,
                     Err(_) => {
                         return Err(RelayError::BudgetExceeded(
                             "codex.wait reached terminal state but terminal output hydration exceeded the reserved finalization budget; inspect the completed turn explicitly"
@@ -1704,12 +1947,6 @@ impl Relay {
                         ));
                     }
                 }
-            }
-            if selected.status.is_terminal() {
-                self.live_turns
-                    .lock()
-                    .await
-                    .reconcile_terminal(&thread_id, &selected);
             }
             let selected_id = Some(selected.id.as_str());
             let pending = self
@@ -1726,15 +1963,12 @@ impl Relay {
             if let Some((state, wake_reason)) = wait_wake(Some(selected.status), &pending) {
                 let result = json!({
                     "threadId":thread_id,"turnId":selected_id,"state":state,"wakeReason":wake_reason,
-                    "turn":turn_snapshot(&selected), "currentActivity":activity,
+                    "turn":turn_snapshot(&selected, output_truncated), "currentActivity":activity,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 });
                 self.acknowledge_wait_result(&result).await;
-                if selected.status.is_terminal() {
-                    if stored_terminal {
-                        self.forget_live_turn(&thread_id, &turn_id).await;
-                    }
-                    self.observe_terminal_turn(&thread_id, &turn_id).await;
+                if selected.status.is_terminal() && stored_terminal {
+                    self.forget_live_turn(&thread_id, &turn_id).await;
                 }
                 return Ok(result);
             }
@@ -1760,7 +1994,7 @@ impl Relay {
                 }
                 let result = json!({
                     "threadId":thread_id,"turnId":selected_id,"state":"active","wakeReason":"timeout",
-                    "turn":turn_snapshot(&selected), "currentActivity":activity,
+                    "turn":turn_snapshot(&selected, false), "currentActivity":activity,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 });
                 self.acknowledge_wait_result(&result).await;
@@ -1860,15 +2094,17 @@ impl Relay {
                 )));
             }
         };
+        if selected.status.is_terminal() {
+            self.reconcile_terminal_turn(&thread_id, &selected).await;
+        }
         let activity = self.current_activity_value(&thread_id, &turn_id).await;
-        self.acknowledge_worker_started(&thread_id, &turn_id).await;
-        if raw {
+        let result = if raw {
             let batch = self
                 .journal
                 .read_after(after_cursor, &thread_id, Some(&turn_id))
                 .await
                 .map_err(RelayError::Invalid)?;
-            Ok(json!({
+            json!({
                 "threadId":thread_id,
                 "turnId":turn_id,
                 "status":selected.status,
@@ -1878,7 +2114,7 @@ impl Relay {
                 "historyLost":batch.history_lost,
                 "hasMore":batch.has_more,
                 "events":batch.events,
-            }))
+            })
         } else {
             let batch = self
                 .journal
@@ -1890,7 +2126,7 @@ impl Relay {
                 )
                 .await
                 .map_err(RelayError::Invalid)?;
-            Ok(json!({
+            json!({
                 "threadId":thread_id,
                 "turnId":turn_id,
                 "status":selected.status,
@@ -1900,8 +2136,15 @@ impl Relay {
                 "historyLost":batch.history_lost,
                 "hasMore":batch.has_more,
                 "events":batch.events,
-            }))
+            })
+        };
+        self.acknowledge_worker_started(&thread_id, &turn_id).await;
+        if selected.status.is_terminal() {
+            self.worker_notifications
+                .acknowledge_once(format!("turn:{thread_id}:{turn_id}"))
+                .await;
         }
+        Ok(result)
     }
 
     async fn acknowledge_wait_result(&self, result: &Value) {
@@ -1917,14 +2160,14 @@ impl Relay {
             })
             .and_then(|turn| turn.get("id").and_then(Value::as_str));
         if let (Some(thread_id), Some(turn_id)) = (thread_id, terminal_turn) {
-            self.operator_inbox
+            self.worker_notifications
                 .acknowledge_once(format!("turn:{thread_id}:{turn_id}"))
                 .await;
         }
         if let (Some(thread_id), Some(turn_id)) =
             (thread_id, result.get("turnId").and_then(Value::as_str))
         {
-            self.operator_inbox
+            self.worker_notifications
                 .acknowledge_once(format!("started:{thread_id}:{turn_id}"))
                 .await;
         }
@@ -1937,11 +2180,11 @@ impl Relay {
             .filter_map(|action| action.get("requestId"))
             .map(|request_id| format!("action:{request_id}"))
             .collect::<Vec<_>>();
-        self.operator_inbox.acknowledge_actions(actions).await;
+        self.worker_notifications.acknowledge_actions(actions).await;
     }
 
     async fn acknowledge_worker_started(&self, thread_id: &str, turn_id: &str) {
-        self.operator_inbox
+        self.worker_notifications
             .acknowledge_once(format!("started:{thread_id}:{turn_id}"))
             .await;
     }
@@ -1992,9 +2235,9 @@ impl Relay {
         target: ReviewTarget,
         model: Option<String>,
     ) -> Result<Value, RelayError> {
-        if thread_id.is_some() && model.is_some() {
+        if thread_id.is_some() && (model.is_some() || cwd.is_some()) {
             return Err(RelayError::Invalid(
-                "model applies to new review threads only; omit threadId or omit model".into(),
+                "resumed reviews inherit cwd and model; start a fresh review thread to change workstream settings".into(),
             ));
         }
         let relay = self.clone();
@@ -2017,26 +2260,28 @@ impl Relay {
     ) -> Result<Value, RelayError> {
         let cursor = self.journal.cursor().await;
         let created = thread_id.is_none();
-        let observer_model = model.clone();
         let observer_prompt = review_target_prompt(&target);
-        let (thread_id, _) = self
+        let prepared = self
             .prepare_thread(
                 cwd,
                 thread_id,
-                model,
+                model.clone(),
                 created.then_some(SandboxMode::ReadOnly),
+                None,
             )
             .await?;
+        let effective_model = model.or(prepared.model.clone());
+        let effective_effort = prepared.effort.clone();
         let annotation = WorkerAnnotation {
             mode: "review".into(),
-            model: observer_model,
-            effort: None,
+            model: effective_model.clone(),
+            effort: effective_effort.clone(),
             prompt: Some(observer_prompt),
         };
         let response = match self
             .app_server
             .start_request(ReviewStart {
-                thread_id: thread_id.clone(),
+                thread_id: prepared.id.clone(),
                 target,
                 delivery: "inline",
             })
@@ -2044,27 +2289,29 @@ impl Relay {
         {
             Ok(deferred) => deferred.wait().await,
             Err(error) => {
-                self.finish_thread_start(&thread_id, None).await;
+                self.finish_thread_start(&prepared.id, None).await;
                 return Err(error.into());
             }
         };
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                self.finish_thread_start(&thread_id, None).await;
+                self.finish_thread_start(&prepared.id, None).await;
                 return Err(error.into());
             }
         };
         let turn_id = response.turn.id.clone();
-        self.register_worker_turn(&thread_id, &response.turn, annotation)
+        self.register_worker_turn(&prepared.id, &response.turn, annotation)
             .await;
         // The pinned App Server returns the inline review turn on the source thread even when
         // reviewThreadId names the internal reviewer thread. work.wait needs that pair.
         Ok(json!({
-            "threadId":thread_id,
+            "threadId":prepared.id,
             "turnId":turn_id,
             "createdThread":created,
             "cursor":cursor,
+            "model":effective_model,
+            "effort":effective_effort,
         }))
     }
 
@@ -2076,6 +2323,28 @@ impl Relay {
             .collect()
     }
 
+    pub fn verify_pending_action_target(
+        &self,
+        request_id: &RpcId,
+        kind: PendingActionKind,
+        thread_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<(), RelayError> {
+        if self
+            .app_server
+            .pending_requests(Some(thread_id))
+            .iter()
+            .any(|request| pending_action_matches(request, request_id, kind, thread_id, turn_id))
+        {
+            Ok(())
+        } else {
+            Err(RelayError::Invalid(
+                "pending action no longer matches this thread and turn; call codex.wait again"
+                    .into(),
+            ))
+        }
+    }
+
     async fn push_terminal_worker_event(&self, thread_id: &str, observed: &ObservedTurn) {
         let Some(mode) = observed.mode.as_deref() else {
             return;
@@ -2084,7 +2353,7 @@ impl Relay {
             return;
         }
         let turn_id = observed.turn.id.clone();
-        self.operator_inbox
+        self.worker_notifications
             .push_once(
                 format!("turn:{thread_id}:{turn_id}"),
                 json!({
@@ -2129,9 +2398,10 @@ impl Relay {
                 )
             })
             .collect::<Vec<_>>();
+        self.worker_notifications.sync_actions(actions).await;
+        let events = self.worker_notifications.take().await;
         drop(delegated);
-        self.operator_inbox.sync_actions(actions).await;
-        self.operator_inbox.take().await
+        events
     }
 
     pub async fn model_list(&self) -> Result<Value, RelayError> {
@@ -2195,6 +2465,7 @@ impl Relay {
                 Ok(value) => {
                     state.value = Some(value);
                     state.error = None;
+                    state.updated_at_ms = Some(now_epoch_ms());
                     (true, None)
                 }
                 Err(error) => {
@@ -2248,11 +2519,12 @@ impl Relay {
     }
 
     async fn observer_projection(&self) -> Value {
-        let (usage, usage_error) = {
+        let (usage, usage_error, usage_updated_at_ms) = {
             let cached = self.observer_usage.lock().await;
             (
                 cached.value.clone().unwrap_or(Value::Null),
                 cached.error.clone(),
+                cached.updated_at_ms,
             )
         };
         let workers = {
@@ -2265,6 +2537,7 @@ impl Relay {
             "cwd": self.default_cwd(),
             "usage": usage,
             "usageError": usage_error,
+            "usageUpdatedAtMs": usage_updated_at_ms,
             "workers": workers,
             "pendingActions": pending_actions,
             "notices": notices,
@@ -2322,10 +2595,7 @@ impl Relay {
             }
         };
         if selected.status.is_terminal() {
-            self.live_turns
-                .lock()
-                .await
-                .reconcile_terminal(&thread_id, &selected);
+            self.reconcile_terminal_turn(&thread_id, &selected).await;
         }
         let (entries, truncated) = self
             .read_recent_transcript_entries(&thread_id, &turn_id)
@@ -2359,7 +2629,7 @@ impl Relay {
     fn start_event_loop(&self) {
         let journal = self.journal.clone();
         let live_turns = self.live_turns.clone();
-        let operator_inbox = self.operator_inbox.clone();
+        let worker_notifications = self.worker_notifications.clone();
         let relay = self.clone();
         let mut events = self.app_server.subscribe();
         tokio::spawn(async move {
@@ -2369,13 +2639,14 @@ impl Relay {
                         if let Some(method) = event.get("method").and_then(Value::as_str) {
                             if method == "codexConnect/appServerHistoryGap" {
                                 journal.mark_gap().await;
-                                operator_inbox.mark_history_lost().await;
+                                worker_notifications.mark_history_lost().await;
                                 continue;
                             }
                             if method == "command/exec/outputDelta" {
                                 continue;
                             }
                             let mut terminal_turn = None;
+                            let mut history_lost = false;
                             if matches!(method, "turn/started" | "turn/completed") {
                                 let params = event.get("params").unwrap_or(&Value::Null);
                                 if let (Some(thread_id), Some(turn)) = (
@@ -2385,43 +2656,23 @@ impl Relay {
                                     codex_connect_app_server::protocol::Turn,
                                 >(turn)
                                 {
-                                    let turn_id = turn.id.clone();
-                                    let terminal = {
-                                        let mut live = live_turns.lock().await;
-                                        live.insert(thread_id, turn);
-                                        live.turns
-                                            .get(&(thread_id.to_string(), turn_id))
-                                            .cloned()
-                                            .filter(|observed| {
-                                                observed.mode.is_some()
-                                                    && observed.turn.status.is_terminal()
-                                            })
-                                    };
-                                    if let Some(observed) = terminal {
-                                        let turn_id = observed.turn.id.clone();
-                                        operator_inbox
-                                            .push_once(
-                                                format!("turn:{thread_id}:{turn_id}"),
-                                                json!({
-                                                    "kind":"turnTerminal",
-                                                    "threadId":thread_id,
-                                                    "turnId":turn_id,
-                                                    "mode":observed.mode,
-                                                    "status":observed.turn.status,
-                                                }),
-                                            )
-                                            .await;
-                                        terminal_turn = Some((thread_id.to_string(), turn_id));
+                                    history_lost = live_turns
+                                        .lock()
+                                        .await
+                                        .insert(thread_id, turn_metadata(&turn));
+                                    if turn.status.is_terminal() {
+                                        terminal_turn = Some((thread_id.to_string(), turn));
                                     }
                                 }
+                            }
+                            if history_lost {
+                                journal.mark_gap().await;
+                                worker_notifications.mark_history_lost().await;
                             }
                             live_turns
                                 .lock()
                                 .await
                                 .observe_event(method, event.get("params").unwrap_or(&Value::Null));
-                            if let Some((thread_id, turn_id)) = terminal_turn.as_ref() {
-                                live_turns.lock().await.record_recent(thread_id, turn_id);
-                            }
                             let params = event.get("params").unwrap_or(&Value::Null);
                             journal.push(method, params).await;
                             let refresh_usage = method == "turn/completed"
@@ -2433,8 +2684,8 @@ impl Relay {
                             if refresh_usage {
                                 relay.trigger_observer_usage_refresh().await;
                             }
-                            if let Some((thread_id, turn_id)) = terminal_turn {
-                                relay.observe_terminal_turn(&thread_id, &turn_id).await;
+                            if let Some((thread_id, turn)) = terminal_turn {
+                                relay.reconcile_terminal_turn(&thread_id, &turn).await;
                             }
                             if method == "codexConnect/appServerStopped" {
                                 break;
@@ -2443,13 +2694,26 @@ impl Relay {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         journal.mark_gap().await;
-                        operator_inbox.mark_history_lost().await;
+                        worker_notifications.mark_history_lost().await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
     }
+}
+
+fn pending_action_matches(
+    request: &PendingServerRequest,
+    request_id: &RpcId,
+    kind: PendingActionKind,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> bool {
+    &request.request_id == request_id
+        && request.kind == kind
+        && request.thread_id == thread_id
+        && request.turn_id.as_deref() == turn_id
 }
 
 fn validate_work_sandbox_policy(policy: &SandboxPolicy) -> Result<(), RelayError> {
@@ -2580,36 +2844,66 @@ fn validate_command_argv(command: &[String]) -> Result<(), RelayError> {
     Ok(())
 }
 
-fn turn_snapshot(turn: &codex_connect_app_server::protocol::Turn) -> Value {
-    let output = turn
-        .items
-        .iter()
-        .filter(|item| {
-            matches!(
-                item.get("type").and_then(Value::as_str),
-                Some("agentMessage" | "exitedReviewMode")
-            )
-        })
-        .map(|item| {
-            let text = item
-                .get("text")
-                .or_else(|| item.get("review"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let phase = item.get("phase").and_then(Value::as_str);
-            let final_output = phase == Some("final_answer")
-                || item.get("type").and_then(Value::as_str) == Some("exitedReviewMode");
-            let limit = if final_output { usize::MAX } else { 4_000 };
-            let text_chars = text.chars().count();
+fn turn_snapshot(
+    turn: &codex_connect_app_server::protocol::Turn,
+    history_truncated: bool,
+) -> Value {
+    let mut remaining_chars = MAX_WAIT_OUTPUT_CHARS;
+    let mut omitted_older = history_truncated;
+    let mut newest_first = Vec::new();
+    for item in turn.items.iter().rev().filter(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("agentMessage" | "exitedReviewMode")
+        )
+    }) {
+        if newest_first.len() >= MAX_WAIT_OUTPUT_ITEMS || remaining_chars == 0 {
+            omitted_older = true;
+            break;
+        }
+        let text = item
+            .get("text")
+            .or_else(|| item.get("review"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let phase = item.get("phase").and_then(Value::as_str);
+        let final_output = phase == Some("final_answer")
+            || item.get("type").and_then(Value::as_str) == Some("exitedReviewMode");
+        let limit = remaining_chars.min(if final_output {
+            MAX_WAIT_OUTPUT_CHARS
+        } else {
+            4_000
+        });
+        let mut characters = text.chars();
+        let clipped = characters.by_ref().take(limit).collect::<String>();
+        let truncated = item
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || characters.next().is_some();
+        remaining_chars = remaining_chars.saturating_sub(clipped.chars().count());
+        newest_first.push(json!({
+            "id":item.get("id").cloned().unwrap_or(Value::Null),
+            "type":item.get("type"),
+            "phase":phase,
+            "text":clipped,
+            "truncated":truncated
+        }));
+    }
+    newest_first.reverse();
+    if omitted_older {
+        newest_first.insert(
+            0,
             json!({
-                "id":item.get("id").cloned().unwrap_or(Value::Null),
-                "type":item.get("type"),
-                "phase":phase,
-                "text":text.chars().take(limit).collect::<String>(),
-                "truncated":text_chars > limit
-            })
-        })
-        .collect::<Vec<_>>();
+                "id":null,
+                "type":"agentMessage",
+                "phase":null,
+                "text":"[Earlier output omitted from this bounded terminal result.]",
+                "truncated":true
+            }),
+        );
+    }
+    let output = newest_first;
     json!({"id":turn.id,"status":turn.status,"error":turn.error,"output":output})
 }
 
@@ -2746,6 +3040,7 @@ mod tests {
             status,
             items: Vec::new(),
             error: None,
+            completed_at: None,
         }
     }
 
@@ -2823,6 +3118,49 @@ mod tests {
         let prompt = observed.prompt.as_ref().unwrap();
         assert_eq!(prompt.chars().count(), MAX_OBSERVER_PROMPT_CHARS);
         assert!(prompt.ends_with('…'));
+    }
+
+    #[test]
+    fn observer_projects_latest_prompt_cache_usage() {
+        let mut live = LiveTurns::default();
+        live.insert("thread", test_turn("turn", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "turn",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: Some("gpt-6-luna".into()),
+                effort: Some("low".into()),
+                prompt: Some("inspect cache telemetry".into()),
+            },
+        );
+        live.observe_event(
+            "thread/tokenUsage/updated",
+            &json!({
+                "threadId":"thread",
+                "turnId":"turn",
+                "tokenUsage":{
+                    "modelContextWindow":828400,
+                    "last":{
+                        "cacheWriteInputTokens":0,
+                        "cachedInputTokens":15104,
+                        "inputTokens":16314,
+                        "outputTokens":19,
+                        "reasoningOutputTokens":0,
+                        "totalTokens":16333
+                    },
+                    "total":{"totalTokens":32270}
+                }
+            }),
+        );
+        let usage = &live.observer_workers()[0]["tokenUsage"];
+        assert_eq!(usage["totalTokens"], 32270);
+        assert_eq!(usage["lastInputTokens"], 16314);
+        assert_eq!(usage["lastCachedInputTokens"], 15104);
+        assert_eq!(usage["cacheHitPercent"], 92);
+        assert!(usage["lastModelUsageAtMs"].as_u64().is_some());
+        assert!(usage["cacheGuaranteedUntilMs"].as_u64().is_some());
+        assert_eq!(usage["cacheGuaranteeActive"], true);
     }
 
     #[test]
@@ -3031,5 +3369,119 @@ mod tests {
         );
         live.record_recent("thread", "turn");
         assert!(live.recent.back().unwrap().2.turn.items.is_empty());
+    }
+
+    #[test]
+    fn active_turns_survive_both_terminal_retention_bounds() {
+        let mut live = LiveTurns::default();
+        live.insert("thread", test_turn("active", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "active",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: None,
+                effort: None,
+                prompt: Some("long task".into()),
+            },
+        );
+        for index in 0..MAX_UNANNOTATED_TERMINALS + 20 {
+            let id = format!("recent-{index}");
+            live.insert("thread", test_turn(&id, TurnStatus::Completed));
+            live.annotate(
+                "thread",
+                &id,
+                WorkerAnnotation {
+                    mode: "work".into(),
+                    model: None,
+                    effort: None,
+                    prompt: None,
+                },
+            );
+            live.record_recent("thread", &id);
+        }
+        assert_eq!(live.recent.len(), MAX_RECENT_WORKERS);
+        assert_eq!(live.turns.len(), 1);
+        for index in 0..MAX_UNANNOTATED_TERMINALS + 20 {
+            live.insert(
+                "auxiliary",
+                test_turn(&format!("unannotated-{index}"), TurnStatus::Completed),
+            );
+        }
+        assert_eq!(live.turns.len(), MAX_UNANNOTATED_TERMINALS + 1);
+        assert_eq!(
+            live.get("thread", "active").unwrap().status,
+            TurnStatus::InProgress
+        );
+        assert_eq!(live.observer_workers()[0]["turnId"], "active");
+
+        let (observed, changed) =
+            live.reconcile_terminal("thread", &test_turn("active", TurnStatus::Completed));
+        assert!(changed);
+        assert_eq!(observed.unwrap().turn.status, TurnStatus::Completed);
+        assert!(!live.turns.contains_key(&("thread".into(), "active".into())));
+        assert_eq!(live.recent.len(), MAX_RECENT_WORKERS);
+        let (_, changed_again) =
+            live.reconcile_terminal("thread", &test_turn("active", TurnStatus::Completed));
+        assert!(!changed_again);
+        assert_eq!(live.recent.len(), MAX_RECENT_WORKERS);
+    }
+
+    #[test]
+    fn wait_projection_preserves_latest_final_and_marks_omission() {
+        let mut turn = test_turn("turn", TurnStatus::Completed);
+        turn.items = (0..MAX_WAIT_OUTPUT_ITEMS + 1)
+            .map(|index| {
+                json!({
+                    "type":"agentMessage",
+                    "id":format!("message-{index}"),
+                    "phase":"commentary",
+                    "text":"earlier commentary",
+                })
+            })
+            .collect();
+        turn.items.push(json!({
+            "type":"agentMessage",
+            "id":"final",
+            "phase":"final_answer",
+            "text":"x".repeat(MAX_WAIT_OUTPUT_CHARS + 1),
+        }));
+        let output = turn_snapshot(&turn, false)["output"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(output[0]["truncated"], true);
+        assert!(output[0]["text"].as_str().unwrap().contains("omitted"));
+        assert_eq!(output.last().unwrap()["id"], "final");
+        assert_eq!(output.last().unwrap()["truncated"], true);
+        assert_eq!(
+            output.last().unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_WAIT_OUTPUT_CHARS
+        );
+
+        turn.items.last_mut().unwrap()["text"] = json!("final");
+        let output = turn_snapshot(&turn, false)["output"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(output.len(), MAX_WAIT_OUTPUT_ITEMS + 1);
+        assert_eq!(output[0]["truncated"], true);
+        assert_eq!(output.last().unwrap()["text"], "final");
+    }
+
+    #[test]
+    fn repeated_pagination_cursor_fails_visibly() {
+        let mut seen = HashSet::new();
+        assert_eq!(
+            checked_next_cursor(&mut seen, Some("page-2".into()), "thread/items/list").unwrap(),
+            Some("page-2".into())
+        );
+        assert!(
+            checked_next_cursor(&mut seen, Some("page-2".into()), "thread/items/list").is_err()
+        );
     }
 }

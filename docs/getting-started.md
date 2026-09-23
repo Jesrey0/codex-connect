@@ -19,7 +19,7 @@ host bridge. Its port must remain on loopback; authentication belongs to host in
   Availability and UI labels vary by account and workspace; check current settings
   and [OpenAI's developer-mode guide](https://developers.openai.com/api/docs/guides/developer-mode).
 
-Codex CLI and host ingress are independently managed. Codex Connect owns its backend, configuration, deployment records, and installed artifacts.
+Codex CLI and host ingress are independently managed. Codex Connect owns its backend service, deployment records/cache, and installed artifacts.
 
 ## 1. Check the host and install Codex
 
@@ -54,12 +54,14 @@ codex-connect status
 
 `setup` installs the running binary into the content-addressed build store under
 `~/.local/lib/codex-connect/builds/`, selects it through `~/.local/bin/codex-connect`,
-installs/enables the user service, and waits for private backend health. It resolves
-the user-global Codex executable and persists its absolute path.
+installs/enables the user service, and waits for private backend health. The managed
+backend resolves `codex` from its captured service PATH; App Server verifies the
+pinned release during startup.
 
-Configuration uses `$XDG_CONFIG_HOME/codex-connect` or `~/.config/codex-connect`;
-state and cache use the equivalent XDG locations. The default navigation cwd is
-`~`, which is navigation context, not an authorization boundary.
+Codex Connect has no product configuration file. The managed backend binds
+`127.0.0.1:8767`, uses `~` as its navigation cwd, and resolves `codex` from the
+service PATH captured by setup. Deployment state and cache use the standard XDG
+state/cache locations.
 
 Expected private endpoint: `http://127.0.0.1:8767/mcp`. Never enter this localhost
 address as the remote ChatGPT connector URL.

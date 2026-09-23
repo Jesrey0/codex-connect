@@ -112,6 +112,27 @@ impl CommandSessions {
         self.changed.subscribe()
     }
 
+    pub async fn handles(&self) -> Vec<Value> {
+        let state = self.state.lock().await;
+        state
+            .order
+            .iter()
+            .filter_map(|process_id| {
+                let session = state.sessions.get(process_id)?;
+                let status = match &session.terminal {
+                    None => "running",
+                    Some(TerminalState::Exited { .. }) => "exited",
+                    Some(TerminalState::Failed { .. }) => "failed",
+                };
+                Some(json!({
+                    "processId":process_id,
+                    "state":status,
+                    "tty":session.tty,
+                }))
+            })
+            .collect()
+    }
+
     fn wake(&self) {
         self.changed
             .send_modify(|value| *value = value.wrapping_add(1));
@@ -412,5 +433,33 @@ mod tests {
         let result = sessions.read_after("process", 0).await.unwrap();
         assert_eq!(result.value["stderr"], "�");
         assert_eq!(result.value["drained"], true);
+    }
+
+    #[tokio::test]
+    async fn handle_snapshot_is_compact_and_includes_terminal_sessions() {
+        let sessions = CommandSessions::default();
+        sessions.insert("running".into(), true).await.unwrap();
+        sessions.insert("exited".into(), false).await.unwrap();
+        sessions.insert("failed".into(), false).await.unwrap();
+        sessions
+            .complete(
+                "exited",
+                CommandExecResponse {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .await;
+        sessions.fail("failed", "secret diagnostic".into()).await;
+
+        assert_eq!(
+            sessions.handles().await,
+            vec![
+                json!({"processId":"running","state":"running","tty":true}),
+                json!({"processId":"exited","state":"exited","tty":false}),
+                json!({"processId":"failed","state":"failed","tty":false}),
+            ]
+        );
     }
 }

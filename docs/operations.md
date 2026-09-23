@@ -4,7 +4,7 @@ Use [Getting Started](getting-started.md) for a fresh installation. This guide c
 
 ## Ownership
 
-Codex Connect owns its backend service, user-global configuration/state/cache, deployment records, and installed content-addressed artifacts. Codex CLI/App Server and host ingress have independent user-global lifecycles. Host ingress is the sole owner of public routing and OAuth.
+Codex Connect owns its backend service, deployment state/cache, and installed content-addressed artifacts. Codex CLI/App Server and host ingress have independent user-global lifecycles. Host ingress is the sole owner of public routing and OAuth.
 
 The backend listens on loopback at `127.0.0.1:8767/mcp`. Public calls use `${NGROK_URL}/codex-connect/mcp` through ngrok and the OAuth-protected host ingress. Never expose the backend port directly.
 
@@ -21,7 +21,7 @@ codex-connect console
 codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-project
 ```
 
-`status` reports readiness, live build identity, navigation cwd, and Codex defaults. `doctor` provides local diagnostics. `console` follows worker activity, quota, pending actions, and transcripts without changing worker state.
+`status` reports readiness, live build identity, navigation cwd, Codex defaults, and retained persistent-command handles. `doctor` provides local diagnostics. `console` follows worker activity, quota, pending actions, and transcripts without changing worker state.
 
 ## Host commands
 
@@ -29,8 +29,9 @@ Use `command.exec` for short, non-interactive commands and `command.start` for
 long-running or interactive work. Commands take argv; invoke a shell explicitly
 for pipes, redirects, or expansion. Set `tty=true` only when a terminal is needed.
 
-After `command.start`, retain `processId` and pass each returned cursor to
-`command.read`. `timeoutMs=0` reads immediately; otherwise the read waits for output
+After `command.start`, retain `processId`; the first `command.read` starts at cursor `0`, then
+passes each returned cursor to the next read. If the start response is lost, `status.commands`
+lists retained `processId`, state, and TTY mode for recovery. `timeoutMs=0` reads immediately; otherwise the read waits for output
 or exit. Timeout does not terminate the process. Continue until `drained=true` for
 final output; `historyLost=true` means older output was evicted. Termination can be
 forceful: confirm exit with `command.read`. Process handles belong to the backend's
@@ -38,10 +39,24 @@ App Server connection and do not survive its restart.
 
 ## Worker lifecycle
 
-Supply `codex.start` with a self-contained task, host paths, constraints, and
-acceptance criteria. Use `codex.info` to discover model IDs and supported effort.
-Work can resume a thread and override model, effort, and access for that turn;
-review retains an existing thread's settings and rejects a model override.
+Treat a Codex thread as a cache-bounded workstream. A new work thread receives a
+self-contained task and may select cwd, model, reasoning effort, and access. Those settings
+become workstream state. A resumed work turn supplies only `threadId` plus the next
+objective/delta; Connect explicitly resends the canonical thread model and effort while
+keeping cwd/access fixed. Review follows the same shape: cwd/model are creation-time choices,
+while a resumed review supplies only its thread and target.
+
+Connect conservatively accepts resume only inside OpenAI's minimum 30-minute prompt-cache
+guarantee, even though the cache may survive longer. Live model-usage telemetry drives that
+cutoff when available; after restart/history loss, latest completed-turn time is the fallback.
+Outside that cutoff, or when cwd/model/effort/access must change, start a fresh thread with
+self-contained context. Revalidate mutable repository, Git, runtime, and external state even
+inside a reused thread.
+
+Use `codex.info` to discover model IDs and supported effort. `codex.start` returns the
+effective model/effort reported for the workstream. `codex.wait` and semantic inspection
+surface compact context/cache telemetry: total/context-window tokens, latest cache-hit
+percentage, the minimum cache-guarantee deadline, and whether that guarantee is active.
 
 Retain `threadId` and `turnId`. Continue only non-overlapping operator work, then
 call `codex.wait` with those IDs. It uses a fixed server wait and returns:
@@ -55,10 +70,14 @@ call `codex.wait` with those IDs. It uses a fixed server wait and returns:
 Use `codex.inspect` and its cursor for activity/history, `codex.control` to steer
 or interrupt, and `codex.wait` to confirm terminal state after interruption.
 
-A lost `codex.start` response does not cancel creation. Before retrying, check a
-host tool response (for example `status`) for a one-shot `workerStarted` event and
-save its IDs. `workerEvents` can also report completion or required action. Their
-absence provides no worker status; `historyLost` means notifications are missing. After a
+A lost `codex.start` response does not cancel creation. Do not retry immediately.
+HostPlane responses can carry a `workerStarted` recovery receipt with the missing
+thread/turn IDs. Receipts are reconciled from the relay's bounded retained-worker
+state and replay until `codex.wait`, `codex.inspect`, or another known-turn control
+operation claims them. Their absence is inconclusive, so observe another HostPlane
+response before considering a retry. `workerEvents` can also report completion or
+required action; those notifications take delivery priority over start receipts.
+`historyLost` means older notification or recovery state was evicted. After a
 backend restart, use retained thread/turn IDs to reconcile through `codex.wait`.
 
 ## Ingress lifecycle
@@ -72,10 +91,6 @@ CHECK_PUBLIC=1 ./scripts/check
 ```
 
 Host ingress owns `host-ngrok`, `host-ingress` (Caddy), and `host-oauth` services, their startup ordering, public URL, credentials, and reconnect behavior. Codex Connect readiness describes the local backend; it does not assert public reachability or a valid ChatGPT connection. Backend restart/deployment/uninstall do not manage ingress. Rediscover/refresh the ChatGPT app separately when its tool catalog changes.
-
-### Secondary fallback
-
-An independently configured OpenAI Secure MCP Tunnel can provide recovery access. Manage it with `tunnel-client`, outside Connect configuration/state, and keep it inactive unless needed. Backend health and deployment do not manage it.
 
 ## Restart recovery
 
@@ -103,27 +118,20 @@ codex-connect deploy status <operation-id>
 
 `prepare` queues a detached release build and records a durable operation. Wait for `prepared`; `activate` queues the backend restart; the final `status` verifies the exact prepared artifact is live. The deployment build cache at `~/.cache/codex-connect/deploy/build` is a compiler cache, not runtime authority. Deployment does not restart ingress or refresh the connector.
 
+Deployment records and managed unit files use the same durable atomic-write primitive. Deployment build, activation, and per-operation transitions use one file-lock mechanism with separate lock keys; these locks serialize local state changes but do not create a second runtime authority. Activation preflights the managed operator link before touching the backend, stages its replacement, and commits the service, operator link, and deployment record under the activation lock; a failed commit restores the previous link and service state, reporting any partial rollback explicitly.
+
 Verify source, Git, prepared artifact, live build identity, connector discovery, and CI separately. Deployment does not commit or push.
 
-## Configuration and uninstall
+## Runtime defaults and uninstall
 
-The canonical configuration is small:
+The managed backend intentionally has no Codex Connect configuration file. Its loopback endpoint is `127.0.0.1:8767`, its navigation cwd comes from the service HOME, and `codex` is resolved from the service PATH and verified against the pinned release at App Server startup. Project-specific paths belong in tool-call `cwd` values rather than persistent backend state.
 
-```toml
-[workspace]
-default_cwd = "~"
-
-[backend]
-listen = "127.0.0.1:8767"
-codex_bin = "/home/you/.local/bin/codex"
-```
-
-`default_cwd` is navigation/startup context only. Worker defaults may be reported by `status` with provenance `userConfig` or `upstream`; worker instruction sources remain the normal Codex config and AGENTS.md chain.
+Worker defaults may be reported by `status` from the normal Codex global config; worker instruction sources remain the Codex config and AGENTS.md chain.
 
 ```bash
 codex-connect uninstall
 ```
 
-Uninstall removes Codex Connect's service, configuration, state/cache, operator symlink, and installed artifacts. It leaves the source tree, Codex CLI/App Server, and host ingress state untouched.
+Uninstall removes Codex Connect's service, state/cache, operator symlink, and installed artifacts. It leaves the source tree, Codex CLI/App Server, and host ingress state untouched.
 
 For security implications, see [Security](../SECURITY.md).

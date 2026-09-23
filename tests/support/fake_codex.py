@@ -133,6 +133,9 @@ def complete(thread_id, turn_id, status="completed", emit_notification=True):
         turn = next(t for t in threads[thread_id]["turns"] if t["id"] == turn_id)
         turn["status"] = status
         turn["items"] = [{"type": "agentMessage", "id": "answer", "text": "fixture complete", "phase": "final_answer"}]
+        completed_at = int(time.time())
+        turn["completedAt"] = completed_at
+        threads[thread_id]["updatedAt"] = completed_at
         if emit_notification:
             notify("turn/completed", {"threadId": thread_id, "turn": turn})
 
@@ -207,7 +210,16 @@ for line in sys.stdin:
     if method == "thread/start":
         thread_id = f"thread-{len(threads) + 1}"
         thread = result["thread"]
-        thread.update(id=thread_id, cwd=params.get("cwd", os.getcwd()), turns=[])
+        now = int(time.time())
+        thread.update(
+            id=thread_id,
+            cwd=params.get("cwd", os.getcwd()),
+            model=params.get("model", "fixture-model-1"),
+            reasoningEffort="medium",
+            createdAt=now,
+            updatedAt=now,
+            turns=[],
+        )
         threads[thread_id] = thread
         subscriptions.add(thread_id)
         result["cwd"] = thread["cwd"]
@@ -311,6 +323,12 @@ for line in sys.stdin:
                 model=f"fixture-model-{index}",
                 displayName=f"Fixture Model {index}",
                 description=f"Fixture model {index}",
+                defaultReasoningEffort="medium",
+                supportedReasoningEfforts=[
+                    {"description": "Low", "reasoningEffort": "low"},
+                    {"description": "Medium", "reasoningEffort": "medium"},
+                    {"description": "High", "reasoningEffort": "high"},
+                ],
             )
             models.append(model)
         start = int(params.get("cursor") or 0)
@@ -318,11 +336,15 @@ for line in sys.stdin:
         result["data"] = models[start:start + page_size]
         result["nextCursor"] = str(start + page_size) if start + page_size < len(models) else None
     elif method == "turn/start":
-        assert "sandboxPolicy" in params
         assert "serviceTier" not in params
         thread_id = params["threadId"]
         assert thread_id in subscriptions
         thread = threads[thread_id]
+        if params.get("model") is not None:
+            thread["model"] = params["model"]
+        if params.get("effort") is not None:
+            thread["reasoningEffort"] = params["effort"]
+        thread["updatedAt"] = int(time.time())
         scenario = params["input"][0]["text"]
         if scenario == "start_error":
             send({"id": message["id"], "error": {"code": -32001, "message": "fixture turn/start failure"}})
@@ -411,6 +433,11 @@ for line in sys.stdin:
         elif scenario == "unsubscribe_error":
             unsubscribe_failures.add(thread_id)
             complete(thread_id, turn_id)
+        elif scenario == "expire_thread":
+            complete(thread_id, turn_id)
+            expired_at = int(time.time()) - (31 * 60)
+            turn["completedAt"] = expired_at
+            thread["updatedAt"] = expired_at
         elif scenario == "delayed_question":
             timer = threading.Timer(0.25, action, (thread_id, turn_id, "question"))
             timer.daemon = True

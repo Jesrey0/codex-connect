@@ -48,50 +48,11 @@ impl<R: Request> DeferredRequest<R> {
     }
 }
 
-#[cfg(test)]
-mod launch_tests {
-    use super::APP_SERVER_ARGS;
-
-    #[test]
-    fn app_server_launch_enables_required_operator_features() {
-        assert_eq!(
-            APP_SERVER_ARGS,
-            [
-                "app-server",
-                "-c",
-                "sandbox_mode=\"danger-full-access\"",
-                "-c",
-                "features.default_mode_request_user_input=true",
-                "-c",
-                "features.request_permissions_tool=true",
-                "-c",
-                "features.exec_permission_approvals=true",
-                "--listen",
-                "stdio://",
-            ]
-        );
-    }
-}
-
 pub const APP_SERVER_LAUNCH_OVERRIDES: &[&str] = &[
     "sandbox_mode=\"danger-full-access\"",
     "features.default_mode_request_user_input=true",
     "features.request_permissions_tool=true",
     "features.exec_permission_approvals=true",
-];
-
-const APP_SERVER_ARGS: &[&str] = &[
-    "app-server",
-    "-c",
-    "sandbox_mode=\"danger-full-access\"",
-    "-c",
-    "features.default_mode_request_user_input=true",
-    "-c",
-    "features.request_permissions_tool=true",
-    "-c",
-    "features.exec_permission_approvals=true",
-    "--listen",
-    "stdio://",
 ];
 
 #[derive(Debug, Error)]
@@ -155,8 +116,13 @@ pub struct AppServerClient {
 impl AppServerClient {
     pub async fn start(config: AppServerConfig) -> Result<Self, AppServerError> {
         verify_codex_pin(&config.codex_bin).await?;
-        let mut child = codex_command(&config.codex_bin)
-            .args(APP_SERVER_ARGS)
+        let mut command = codex_command(&config.codex_bin);
+        command.arg("app-server");
+        for value in APP_SERVER_LAUNCH_OVERRIDES {
+            command.args(["-c", value]);
+        }
+        let mut child = command
+            .args(["--listen", "stdio://"])
             .current_dir(config.working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

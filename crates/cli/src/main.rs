@@ -1,15 +1,16 @@
 mod artifact;
-mod config;
+mod backend;
 mod console;
 mod deployment;
 mod management;
+mod paths;
 mod service;
+mod storage;
 
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
-use codex_connect_app_server::APP_SERVER_LAUNCH_OVERRIDES;
 use codex_connect_app_server::AppServerClient;
 use codex_connect_app_server::AppServerConfig;
 use codex_connect_app_server::DEFAULT_REQUEST_TIMEOUT;
@@ -21,7 +22,6 @@ use codex_connect_mcp::RuntimeIdentity;
 use codex_connect_mcp::router as mcp_router;
 use codex_connect_mcp::serve_router;
 use codex_connect_relay::Relay;
-use codex_connect_relay::RelayConfig;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
@@ -38,7 +38,7 @@ fn codex_home() -> Result<(PathBuf, String)> {
     if let Some(path) = env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
         return Ok((PathBuf::from(path), "CODEX_HOME".to_string()));
     }
-    Ok((config::home_dir()?.join(".codex"), "default".to_string()))
+    Ok((paths::home_dir()?.join(".codex"), "default".to_string()))
 }
 
 fn codex_global_config_summary(codex_home: &Path) -> CodexGlobalConfigSummary {
@@ -89,9 +89,9 @@ enum CommandName {
         #[command(subcommand)]
         command: DeployCommand,
     },
-    /// One-time backend configuration and managed-service installation.
+    /// Install or refresh the managed backend service.
     Setup {
-        /// Install configuration and units without starting services.
+        /// Install the service without starting it.
         #[arg(long)]
         no_start: bool,
     },
@@ -157,7 +157,7 @@ enum CommandName {
         default_cwd: PathBuf,
 
         /// Local TCP address for the Streamable HTTP MCP endpoint.
-        #[arg(long, default_value = "127.0.0.1:8767")]
+        #[arg(long, default_value_t = backend::BACKEND_ADDR)]
         listen: std::net::SocketAddr,
     },
 }
@@ -169,7 +169,7 @@ enum DeployCommand {
     /// Queue detached activation of a prepared build and return before restart begins.
     Activate {
         operation_id: String,
-        /// Install configuration and units without starting services.
+        /// Install the service without starting it.
         #[arg(long)]
         no_start: bool,
     },
@@ -235,20 +235,17 @@ async fn serve_mcp(config: ServeConfig) -> Result<()> {
     let default_cwd = (if default_cwd.to_string_lossy() == "~"
         || default_cwd.to_string_lossy().starts_with("~/")
     {
-        config::expand_path(&default_cwd.to_string_lossy())?
+        paths::expand_path(&default_cwd.to_string_lossy())?
     } else {
         default_cwd
     })
     .canonicalize()
     .context("unable to access default cwd")?;
     let codex_binary = codex_bin.display().to_string();
-    let relay = Relay::start(RelayConfig {
-        codex_bin,
-        default_cwd: default_cwd.clone(),
-    })
-    .await
-    .context("unable to start Codex Connect relay")?;
     let host = Host::open(&default_cwd).context("unable to open default cwd")?;
+    let relay = Relay::start(codex_bin, host.clone())
+        .await
+        .context("unable to start Codex Connect relay")?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("unable to listen on {listen}"))?;
@@ -261,17 +258,9 @@ async fn serve_mcp(config: ServeConfig) -> Result<()> {
         executable: artifact.executable.display().to_string(),
         endpoint: format!("http://{listen}/mcp"),
         codex_binary,
-        codex_release: codex_connect_app_server::protocol::CODEX_PIN
-            .trim()
-            .to_string(),
         codex_home: codex_home.display().to_string(),
         codex_home_source,
         codex_global_config,
-        app_server_working_directory: default_cwd.display().to_string(),
-        app_server_launch_overrides: APP_SERVER_LAUNCH_OVERRIDES
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
     };
     let mut changes = relay.changes();
     let router = mcp_router(relay.clone(), host, runtime);
@@ -425,15 +414,6 @@ bearer_token = "must-not-surface"
         assert_eq!(codex_bin, PathBuf::from("codex"));
         assert_eq!(default_cwd, PathBuf::from("~"));
         assert_eq!(listen, "127.0.0.1:8767".parse().unwrap());
-    }
-
-    #[test]
-    fn retired_cli_names_are_rejected() {
-        assert!(Cli::try_parse_from(["codex-connect", "tui"]).is_err());
-        assert!(
-            Cli::try_parse_from(["codex-connect", "serve", "--scope-root", "/tmp/retired"])
-                .is_err()
-        );
     }
 
     #[test]

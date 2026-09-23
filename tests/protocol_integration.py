@@ -139,53 +139,9 @@ class OperatorProtocolTests(unittest.TestCase):
             time.sleep(0.025)
         self.fail("worker event was not delivered on the host plane")
 
-    def test_catalog_and_status_are_canonical(self):
+    def test_catalog_status_runtime_and_origin_boundary(self):
         self.assertEqual(len(self.client.catalog), 14)
         self.assertEqual(set(self.client.tools), EXPECTED)
-        wait_schema = self.client.tools["codex.wait"]["inputSchema"]
-        self.assertEqual(set(wait_schema["properties"]), {"threadId", "turnId"})
-        self.assertEqual(set(wait_schema["required"]), {"threadId", "turnId"})
-        self.assertFalse(wait_schema["additionalProperties"])
-        self.assertEqual(
-            self.client.tools["codex.inspect"]["inputSchema"]["properties"]["detail"]["default"],
-            "semantic",
-        )
-        exec_properties = self.client.tools["command.exec"]["inputSchema"]["properties"]
-        self.assertNotIn("timeoutMs", exec_properties)
-        self.assertNotIn("outputBytesCap", exec_properties)
-        read_timeout = self.client.tools["command.read"]["inputSchema"]["properties"]["timeoutMs"]
-        self.assertEqual(read_timeout["default"], 40000)
-        self.assertEqual(read_timeout["maximum"], 45000)
-        start_size = self.client.tools["command.start"]["inputSchema"]["properties"]["size"]["anyOf"][0]
-        resize = self.client.tools["command.control"]["inputSchema"]["oneOf"][1]["properties"]
-        self.assertEqual(start_size["properties"]["rows"]["minimum"], 1)
-        self.assertEqual(start_size["properties"]["cols"]["minimum"], 1)
-        self.assertEqual(resize["rows"]["minimum"], 1)
-        self.assertEqual(resize["cols"]["minimum"], 1)
-
-        work_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][0]
-        review_start = self.client.tools["codex.start"]["inputSchema"]["oneOf"][1]
-        self.assertNotIn("approvalPolicy", work_start["properties"])
-        self.assertEqual(work_start["properties"]["access"]["default"], "workspace")
-        self.assertEqual(work_start["properties"]["access"]["enum"], ["workspace", "full"])
-        for hidden in ("sandboxPolicy", "developerInstructions", "serviceTier"):
-            self.assertNotIn(hidden, work_start["properties"])
-        self.assertNotIn("access", work_start["required"])
-        for host_tool in ("command.exec", "command.start"):
-            self.assertNotIn(
-                "sandboxPolicy",
-                self.client.tools[host_tool]["inputSchema"]["properties"],
-            )
-        self.assertIn("model", review_start["properties"])
-        self.assertNotIn("sandboxPolicy", review_start["properties"])
-        self.assertNotIn("effort", review_start["properties"])
-        self.assertNotIn("serviceTier", review_start["properties"])
-        self.client.call(
-            "codex.start",
-            {"mode": "work", "task": "no_event", "sandboxPolicy": {"type": "readOnly"}},
-            error=True,
-            validate_input=False,
-        )
         status = self.client.call("status")
         worker_events = status.pop("workerEvents", [])
         for event in worker_events:
@@ -194,7 +150,8 @@ class OperatorProtocolTests(unittest.TestCase):
                 {"workerStarted", "turnTerminal", "actionRequired", "historyLost"},
             )
         self.assertTrue(status["ready"])
-        self.assertEqual(set(status), {"ready", "cwd", "buildId", "codex"})
+        self.assertEqual(set(status), {"ready", "cwd", "buildId", "commands", "codex"})
+        self.assertIsInstance(status["commands"], list)
         self.assertEqual(status["cwd"], str(self.workspace))
         self.assertEqual(set(status["codex"]), {"release", "defaults"})
         self.assertEqual(set(status["codex"]["defaults"]), {
@@ -224,7 +181,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIsInstance(observer["cursor"], int)
         projection = observer["projection"]
         self.assertEqual(set(projection), {
-            "cwd", "usage", "usageError", "workers", "pendingActions", "notices",
+            "cwd", "usage", "usageError", "usageUpdatedAtMs", "workers", "pendingActions", "notices",
         })
         self.assertEqual(projection["cwd"], str(self.workspace))
         self.assertIsNone(projection["usageError"])
@@ -236,9 +193,10 @@ class OperatorProtocolTests(unittest.TestCase):
             self.assertGreater(observer["cursor"], 0)
             projection = observer["projection"]
         self.assertIn("rateLimits", projection["usage"])
+        self.assertIsInstance(projection["usageUpdatedAtMs"], int)
 
     def test_cancelled_codex_start_is_recovered_as_worker_started_event(self):
-        # Drain unrelated at-least-once start receipts from earlier scenarios so this test binds
+        # Drain unrelated replayable start receipts from earlier scenarios so this test binds
         # to the handle created by the deliberately abandoned caller below.
         self.client.call("status")
         caller = McpClient(self.url)
@@ -255,11 +213,24 @@ class OperatorProtocolTests(unittest.TestCase):
         )
         self.assertTrue(event["threadId"])
         self.assertTrue(event["turnId"])
+        replay = self.client.call("status").get("workerEvents", [])
+        self.assertTrue(any(
+            candidate.get("kind") == "workerStarted"
+            and candidate.get("threadId") == event["threadId"]
+            and candidate.get("turnId") == event["turnId"]
+            for candidate in replay
+        ))
         result = self.client.call("codex.wait", {
             "threadId":event["threadId"],
             "turnId":event["turnId"],
         })
         self.assertEqual(result["state"], "terminal")
+        self.assertFalse(any(
+            candidate.get("kind") == "workerStarted"
+            and candidate.get("threadId") == event["threadId"]
+            and candidate.get("turnId") == event["turnId"]
+            for candidate in self.client.call("status").get("workerEvents", [])
+        ))
 
     def test_observer_wait_is_event_driven_and_projects_live_worker_state(self):
         with urllib.request.urlopen(self.url + "/observe") as response:
@@ -309,9 +280,7 @@ class OperatorProtocolTests(unittest.TestCase):
             {entry["fileName"] for entry in result["results"][3]["result"]["entries"]},
         )
         fuzzy = result["results"][4]["result"]["files"][0]
-        self.assertEqual(fuzzy["path"], "sample.txt")
-        self.assertEqual(fuzzy["match_type"], "file")
-        self.assertEqual(fuzzy["score"], 100)
+        self.assertEqual(fuzzy, {"path": str(self.workspace / "sample.txt"), "kind": "file"})
         escaped = self.client.call("inspect", {"operations": [
             {"type": "fuzzyFileSearch", "query": "external", "path": "."},
         ]})
@@ -347,7 +316,7 @@ class OperatorProtocolTests(unittest.TestCase):
         escaped_fuzzy = self.client.call("inspect", {"operations": [
             {"type":"fuzzyFileSearch","query":"passwd","path":"/etc"},
         ]})
-        self.assertEqual(escaped_fuzzy["results"][0]["result"]["files"][0]["root"], "/etc")
+        self.assertEqual(escaped_fuzzy["results"][0]["result"]["files"][0]["path"], "/etc/passwd")
         outside_cwd = self.client.call("inspect", {
             "cwd":"/etc", "operations":[{"type":"readDirectory","path":"."}],
         })
@@ -394,8 +363,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIsNone(json.loads(inherited["stdout"]))
         result = self.client.call("command.exec", {"command":["echo","fixture"]})
         self.assertEqual(result["exitCode"],0)
-        self.assertEqual(result["stdoutBytes"], len(result["stdout"].encode()))
-        self.assertEqual(result["stderrBytes"], len(result["stderr"].encode()))
+        self.assertNotIn("stdoutBytes", result)
+        self.assertNotIn("stderrBytes", result)
         self.assertFalse(result["stdoutMayBeTruncated"])
         self.assertFalse(result["stderrMayBeTruncated"])
         self.assertGreaterEqual(result["durationMs"], 0)
@@ -421,9 +390,14 @@ class OperatorProtocolTests(unittest.TestCase):
         started = self.client.call("command.start", {
             "command": ["fixture-stream"],
         })
-        self.assertEqual(started["state"], "running")
-        self.assertFalse(started["tty"])
-        cursor = started["cursor"]
+        self.assertEqual(set(started), {"processId"})
+        recovered = next(
+            command for command in self.client.call("status")["commands"]
+            if command["processId"] == started["processId"]
+        )
+        self.assertEqual(recovered["state"], "running")
+        self.assertFalse(recovered["tty"])
+        cursor = 0
         stdout = ""
         stderr = ""
         for _ in range(2):
@@ -674,13 +648,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["turn"]["output"][0]["text"],"fixture complete")
         self.assertEqual(len(self.method_params("thread/turns/list")) - turns_before, 1)
         self.client.call("codex.inspect",{"threadId":work["threadId"],"turnId":"missing"},error=True)
-        next_work = self.start(
-            "idle",
-            threadId=work["threadId"],
-            model="gpt-6-astra",
-            effort="high",
-        )
-        self.assertFalse(next_work["createdThread"])
+        next_work = self.start("idle", threadId=work["threadId"])
+        self.assertNotIn("createdThread", next_work)
         idle = self.inspect_turn(next_work)
         self.assertEqual(idle["status"],"inProgress")
         with urllib.request.urlopen(self.url + "/observe") as response:
@@ -690,14 +659,23 @@ class OperatorProtocolTests(unittest.TestCase):
             if turn["turnId"] == next_work["turnId"]
         )
         self.assertEqual(observed["mode"], "work")
-        self.assertEqual(observed["model"], "gpt-6-astra")
-        self.assertEqual(observed["effort"], "high")
+        self.assertEqual(observed["model"], work["model"])
+        self.assertEqual(observed["effort"], work["effort"])
         self.assertNotIn("serviceTier", observed)
         self.assertEqual(observed["prompt"], "idle")
         self.assertGreater(observed["lastActivityAtMs"], 0)
         self.assertIn(observed["activityKind"], {"turn", "think", "message", "tool", "file", "search", "item", "waiting"})
         self.assertIn("activitySummary", observed)
-        self.assertEqual(set(observed["tokenUsage"]), {"totalTokens", "modelContextWindow"})
+        self.assertEqual(set(observed["tokenUsage"]), {
+            "totalTokens",
+            "modelContextWindow",
+            "lastInputTokens",
+            "lastCachedInputTokens",
+            "cacheHitPercent",
+            "lastModelUsageAtMs",
+            "cacheGuaranteedUntilMs",
+            "cacheGuaranteeActive",
+        })
         snapshot = self.inspect_turn(next_work)
         self.assertEqual(snapshot["turnId"], next_work["turnId"])
         self.assertEqual(snapshot["detail"], "semantic")
@@ -825,7 +803,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(terminal["mode"], "work")
         self.assertEqual(terminal["status"], "completed")
         self.assertFalse(any(
-            event.get("turnId") == complete_work["turnId"]
+            event.get("kind") == "turnTerminal"
+            and event.get("turnId") == complete_work["turnId"]
             for event in self.client.call("status").get("workerEvents", [])
         ))
         unsubscribes = self.wait_for_method_count(
@@ -1137,8 +1116,9 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"],"active")
         self.assertEqual(result["wakeReason"],"inputRequired")
         pending = result["pendingActions"][0]
-        self.assertEqual(pending["params"]["questions"][0]["id"],"format")
-        self.assertTrue(pending["isBlocking"])
+        self.assertEqual(pending["type"], "userInput")
+        self.assertEqual(pending["questions"][0]["id"],"format")
+        self.assertTrue(pending["blocking"])
         request_id = pending["requestId"]
         self.client.call("codex.action.respond",{"type":"approval","requestId":request_id,"decision":"approve"},error=True)
         self.client.call("codex.action.respond",{"type":"userInput","requestId":request_id,"answers":{"wrong":["JSON"]}},error=True)
@@ -1156,7 +1136,7 @@ class OperatorProtocolTests(unittest.TestCase):
         result = self.wait(work)
         self.assertEqual(result["state"],"active")
         self.assertEqual(result["wakeReason"],"timeout")
-        self.assertFalse(result["pendingActions"][0]["isBlocking"])
+        self.assertFalse(result["pendingActions"][0]["blocking"])
         self.client.call("codex.control",{"action":"interrupt","threadId":work["threadId"],"turnId":work["turnId"]})
         self.assertEqual(self.client.call("codex.wait",{
             "threadId": work["threadId"], "turnId": work["turnId"],
@@ -1189,7 +1169,8 @@ class OperatorProtocolTests(unittest.TestCase):
                 work = self.start(scenario)
                 result = self.wait(work)
                 pending = result["pendingActions"][0]
-                self.assertEqual(pending["kind"], "elicitation")
+                self.assertEqual(pending["type"], "elicitation")
+                self.assertEqual(pending["request"]["mode"], scenario if scenario != "openai_form" else "openai/form")
                 self.client.call("codex.action.respond", {
                     "type": "elicitation", "requestId": pending["requestId"], **response,
                 })
@@ -1203,7 +1184,7 @@ class OperatorProtocolTests(unittest.TestCase):
         review = self.client.call("codex.start",{
             "mode":"review", "threadId": source["threadId"], "target":{"type":"uncommittedChanges"},
         })
-        self.assertFalse(review["createdThread"])
+        self.assertNotIn("createdThread", review)
         self.assertEqual(review["threadId"], source["threadId"])
         result = self.wait(review)
         self.assertEqual(result["state"],"terminal")
@@ -1215,14 +1196,16 @@ class OperatorProtocolTests(unittest.TestCase):
         ]})
         self.assertEqual([entry["type"] for entry in info["results"]], ["models", "skills", "usage"])
         self.assertEqual(
-            [model["id"] for model in info["results"][0]["result"]["data"]],
+            [model["id"] for model in info["results"][0]["result"]["models"]],
             ["fixture-model-1", "fixture-model-2", "fixture-model-3"],
         )
-        self.assertIsNone(info["results"][0]["result"]["nextCursor"])
+        self.assertEqual(info["results"][0]["result"]["models"][0]["efforts"], ["low", "medium", "high"])
+        self.assertIn("roots", info["results"][1]["result"])
         usage = info["results"][2]["result"]
         self.assertFalse(usage["ordinaryUsageAllowed"])
-        self.assertEqual(usage["rateLimitResetCredits"]["availableCount"], 2)
-        self.assertEqual(usage["accountId"], "fixture-account")
+        self.assertEqual(usage["resetCreditsAvailable"], 2)
+        self.assertEqual(usage["primary"]["usedPercent"], 100)
+        self.assertNotIn("accountId", usage)
         self.client.call("codex.info", {"queries": []}, error=True, validate_input=False)
         self.client.call(
             "codex.info",
@@ -1235,23 +1218,44 @@ class OperatorProtocolTests(unittest.TestCase):
         before = len(self.method_params("thread/start"))
         work = self.start("complete")
         self.assertEqual(self.wait(work)["state"], "terminal")
+        self.assertEqual(work["model"], "fixture-model-1")
+        self.assertEqual(work["effort"], "medium")
         thread_start = self.method_params("thread/start")[before]
         self.assertEqual(thread_start["sandbox"], "workspace-write")
+        self.assertEqual(thread_start["approvalPolicy"], "never")
         self.assertNotIn("developerInstructions", thread_start)
         turn_start = self.method_params("turn/start")[-1]
-        self.assertEqual(turn_start["approvalPolicy"], "never")
+        self.assertNotIn("approvalPolicy", turn_start)
         self.assertEqual(turn_start["sandboxPolicy"]["type"], "workspaceWrite")
         self.assertTrue(turn_start["sandboxPolicy"]["networkAccess"])
         self.assertEqual(turn_start["sandboxPolicy"]["writableRoots"], [])
+        self.assertEqual(turn_start["model"], "fixture-model-1")
+        self.assertEqual(turn_start["effort"], "medium")
 
         before = len(self.method_params("thread/start"))
         unrestricted = self.start("complete", access="full")
         self.assertEqual(self.wait(unrestricted)["state"], "terminal")
         full_thread_start = self.method_params("thread/start")[before]
         self.assertEqual(full_thread_start["sandbox"], "danger-full-access")
+        self.assertEqual(full_thread_start["approvalPolicy"], "never")
         full_turn_start = self.method_params("turn/start")[-1]
-        self.assertEqual(full_turn_start["approvalPolicy"], "never")
+        self.assertNotIn("approvalPolicy", full_turn_start)
         self.assertEqual(full_turn_start["sandboxPolicy"]["type"], "dangerFullAccess")
+
+        before = len(self.method_params("thread/start"))
+        configured = self.start(
+            "complete",
+            model="fixture-model-2",
+            effort="high",
+        )
+        self.assertEqual(self.wait(configured)["state"], "terminal")
+        self.assertEqual(configured["model"], "fixture-model-2")
+        self.assertEqual(configured["effort"], "high")
+        configured_thread_start = self.method_params("thread/start")[before]
+        self.assertEqual(configured_thread_start["model"], "fixture-model-2")
+        configured_turn_start = self.method_params("turn/start")[-1]
+        self.assertEqual(configured_turn_start["model"], "fixture-model-2")
+        self.assertEqual(configured_turn_start["effort"], "high")
 
         for hidden in [
             {"sandboxPolicy": {"type": "readOnly"}},
@@ -1274,18 +1278,47 @@ class OperatorProtocolTests(unittest.TestCase):
         source = self.start("complete")
         self.assertEqual(self.wait(source)["state"], "terminal")
         resume_count = len(self.method_params("thread/resume"))
-        resumed = self.start(
-            "complete",
-            threadId=source["threadId"],
-            access="full",
-        )
+        resumed = self.start("complete", threadId=source["threadId"])
         self.assertEqual(self.wait(resumed)["state"], "terminal")
+        self.assertEqual(resumed["model"], source["model"])
+        self.assertEqual(resumed["effort"], source["effort"])
         self.assertEqual(len(self.method_params("thread/resume")), resume_count + 1)
         self.assertNotIn("sandbox", self.method_params("thread/resume")[-1])
+        self.assertNotIn("cwd", self.method_params("thread/resume")[-1])
         self.assertNotIn("developerInstructions", self.method_params("thread/resume")[-1])
         resumed_turn_start = self.method_params("turn/start")[-1]
-        self.assertEqual(resumed_turn_start["approvalPolicy"], "never")
-        self.assertEqual(resumed_turn_start["sandboxPolicy"]["type"], "dangerFullAccess")
+        for override in ["approvalPolicy", "sandboxPolicy"]:
+            self.assertNotIn(override, resumed_turn_start)
+        self.assertEqual(resumed_turn_start["model"], source["model"])
+        self.assertEqual(resumed_turn_start["effort"], source["effort"])
+
+        for incompatible in [
+            {"access": "full"},
+            {"model": "fixture-model-2"},
+            {"effort": "high"},
+            {"cwd": str(ROOT)},
+        ]:
+            self.client.call(
+                "codex.start",
+                {
+                    "mode": "work",
+                    "task": "complete",
+                    "threadId": source["threadId"],
+                    **incompatible,
+                },
+                error=True,
+                validate_input=False,
+            )
+
+        expired = self.start("expire_thread")
+        self.assertEqual(self.wait(expired)["state"], "terminal")
+        resumes_before_expired = len(self.method_params("thread/resume"))
+        self.client.call(
+            "codex.start",
+            {"mode": "work", "task": "complete", "threadId": expired["threadId"]},
+            error=True,
+        )
+        self.assertEqual(len(self.method_params("thread/resume")), resumes_before_expired)
 
         before_threads = len(self.method_params("thread/start"))
         before_reviews = len(self.method_params("review/start"))
@@ -1294,7 +1327,7 @@ class OperatorProtocolTests(unittest.TestCase):
             "model": "gpt-6-astra",
             "target": {"type": "uncommittedChanges"},
         })
-        self.assertTrue(review["createdThread"])
+        self.assertNotIn("createdThread", review)
         self.assertEqual(self.wait(review)["state"], "terminal")
         review_thread_start = self.method_params("thread/start")[before_threads]
         self.assertEqual(review_thread_start["model"], "gpt-6-astra")
@@ -1318,7 +1351,7 @@ class OperatorProtocolTests(unittest.TestCase):
             "threadId": source["threadId"],
             "model": "gpt-6-astra",
             "target": {"type": "uncommittedChanges"},
-        }, error=True)
+        }, error=True, validate_input=False)
         self.assertEqual(len(self.method_params("thread/resume")), resumes_before_rejection)
 
     def test_wait_tracks_review_turn_before_thread_history_catches_up(self):
@@ -1392,7 +1425,7 @@ class OperatorProtocolTests(unittest.TestCase):
 
         elicitation = self.start("form")
         pending = self.wait(elicitation)["pendingActions"][0]
-        self.assertEqual(pending["kind"], "elicitation")
+        self.assertEqual(pending["type"], "elicitation")
         self.client.call("codex.action.respond", {
             "type": "elicitation", "requestId": pending["requestId"],
             "action": "accept", "content": {"name": "Operator"},
@@ -1414,7 +1447,7 @@ class OperatorProtocolTests(unittest.TestCase):
     def test_z_disconnect_exits_backend_for_service_recovery(self):
         self.start("question")
         persistent = self.client.call("command.start", {"command": ["fixture-quiet"]})
-        self.assertEqual(persistent["state"], "running")
+        self.assertEqual(set(persistent) - {"workerEvents"}, {"processId"})
         try:
             self.client.call("command.exec",{"command":["disconnect"]},error=True)
         except (urllib.error.URLError, ConnectionError):

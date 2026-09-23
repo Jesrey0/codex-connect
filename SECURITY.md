@@ -1,6 +1,6 @@
 # Security
 
-Codex Connect is a high-trust local execution bridge. A compromise or unsafe configuration may be equivalent to code execution as the OS account running the backend.
+Codex Connect is a high-trust local execution bridge. A compromise or unsafe exposure may be equivalent to code execution as the OS account running the backend.
 
 ## Reporting
 
@@ -8,17 +8,15 @@ Use GitHub **Security → Report a vulnerability** when private reporting is ava
 
 <https://github.com/Jesrey0/codex-connect/security/advisories/new>
 
-If it is unavailable, open only a minimal public issue requesting a private channel. Do not include exploit details, credentials, tunnel IDs, account identifiers, private source, or sensitive paths.
+If it is unavailable, open only a minimal public issue requesting a private channel. Do not include exploit details, credentials, account identifiers, private source, or sensitive paths.
 
 ## Trust boundary
 
 The MCP listener is loopback-only and has no application-level authentication. Any local process able to reach it can invoke HostPlane and WorkerPlane capabilities. Do not expose port 8767 to a LAN or the internet. On shared or untrusted hosts, use OS isolation or a dedicated account.
 
-ChatGPT is the primary technical operator. HostPlane intentionally uses the OS account's host filesystem/process authority; `default_cwd` is navigation, not an authorization boundary. The dedicated App Server has a process-local `danger-full-access` launch override. WorkerPlane is separately bounded: omitted work `access` uses the canonical writable workspace sandbox, while `access="full"` selects `danger-full-access`; reviews are read-only. `approvalPolicy="never"` prevents mechanical approval stalls but does not expand the sandbox.
+ChatGPT is the primary technical operator. HostPlane intentionally uses the OS account's host filesystem/process authority; the managed backend's home-directory cwd is navigation, not an authorization boundary. The dedicated App Server has a process-local `danger-full-access` launch override. WorkerPlane is separately bounded: omitted work `access` uses the canonical writable workspace sandbox, while `access="full"` selects `danger-full-access`; reviews are read-only. `approvalPolicy="never"` prevents mechanical approval stalls but does not expand the sandbox.
 
 The canonical remote boundary is ngrok HTTPS → host ingress → loopback MCP. ngrok owns public TLS. Host ingress owns routing and OAuth authorization: ChatGPT authorization-code flow with S256 PKCE, signed client assertions, and resource-bound Bearer tokens. The human operator authenticates and consents at ingress. Missing, invalid, expired, wrong-audience, or insufficient-scope tokens must be rejected before reaching Codex Connect. Public health/status and internal authentication endpoints remain closed.
-
-OpenAI Secure MCP Tunnel is optional secondary recovery only. If retained, keep its configuration and lifecycle outside this repository and operate it through the upstream `tunnel-client`; it must not change the loopback-only backend invariant or become a Codex Connect health dependency.
 
 Host ingress owns OAuth signing keys, the operator login, token/grant persistence, refresh, revocation, and credential-safe logging. Keep credentials out of project files, logs, issues, and MCP URLs. Codex CLI/App Server and ingress have independent lifecycles; Codex Connect must not rewrite their state. See the [host-ingress security contract](https://github.com/Jesrey0/host-ingress).
 
@@ -26,7 +24,7 @@ Do not use an OS account whose sudo or filesystem privileges exceed what you int
 
 ## Operational guidance
 
-- Keep the backend bound to loopback. The normal public route is the authenticated host-ingress path; any explicitly retained Secure MCP Tunnel is secondary recovery only.
+- Keep the backend bound to loopback. The public route is the authenticated host-ingress path.
 - Run `codex-connect doctor` after installation or upgrades.
 - Verify the exact live build and navigation cwd with `status`; verify public routing, OAuth, and the ChatGPT connection independently.
 - Treat HostPlane, WorkerPlane, and PlatformPlane permissions as non-transitive.

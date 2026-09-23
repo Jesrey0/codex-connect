@@ -4,11 +4,9 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pin="$(tr -d '[:space:]' < "$repo_root/config/codex-cli-pin")"
 failures=0
-warnings=0
 
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; failures=$((failures + 1)); }
-warn() { printf 'WARN  %s\n' "$*"; warnings=$((warnings + 1)); }
 
 if [[ "$(uname -s)" == "Linux" ]]; then
   pass "Linux host"
@@ -45,25 +43,15 @@ fi
 if command -v codex >/dev/null 2>&1; then
   codex_release="$(codex --version 2>/dev/null | awk '{print $NF}')"
   if [[ "$codex_release" == "$pin" ]]; then
-    pass "Codex CLI release matches project pin"
+    pass "Codex CLI release in current shell matches project pin"
   else
-    fail "Codex CLI release does not match project pin $pin"
+    fail "Codex CLI release in current shell does not match project pin $pin"
   fi
 else
   fail "Codex CLI missing (required release: $pin)"
 fi
 
-config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-if [[ "$config_home" != /* ]]; then
-  config_home="$HOME/.config"
-fi
-if [[ -f "$config_home/codex-connect/config.toml" ]]; then
-  pass "existing Codex Connect configuration found"
-else
-  warn "Codex Connect is not configured yet; this is expected before codex-connect setup"
-fi
-
-printf '\nSummary: %d failure(s), %d warning(s).\n' "$failures" "$warnings"
+printf '\nSummary: %d failure(s).\n' "$failures"
 if (( failures > 0 )); then
   exit 1
 fi

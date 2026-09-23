@@ -25,7 +25,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "status",
                 "Read Operator Status",
-                "Read backend readiness, live build identity, host cwd, and Codex defaults. Use codex-connect doctor on the host for detailed diagnostics.",
+                "Read backend readiness, live build identity, host cwd, Codex defaults, and retained persistent-command handles for lost-call recovery. Use codex-connect doctor on the host for detailed diagnostics.",
                 true,
                 false,
                 false,
@@ -144,8 +144,6 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
                     "exitCode":{"type":"integer"},
                     "stdout":{"type":"string"},
                     "stderr":{"type":"string"},
-                    "stdoutBytes":{"type":"integer","minimum":0},
-                    "stderrBytes":{"type":"integer","minimum":0},
                     "stdoutMayBeTruncated":{"type":"boolean","description":"stdout reached the output cap; truncation is possible."},
                     "stderrMayBeTruncated":{"type":"boolean","description":"stderr reached the output cap; truncation is possible."},
                     "durationMs":{"type":"integer","minimum":0,"description":"Elapsed App Server command request time."}
@@ -154,8 +152,6 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
                     "exitCode",
                     "stdout",
                     "stderr",
-                    "stdoutBytes",
-                    "stderrBytes",
                     "stdoutMayBeTruncated",
                     "stderrMayBeTruncated",
                     "durationMs",
@@ -166,7 +162,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Delegate work or a read-only review. Supply self-contained context. If the call is lost, creation continues: recover threadId/turnId from a workerStarted event on a host tool response before retrying.",
+                "Delegate work or a read-only review. A new thread establishes cwd/model/settings; a resumed thread keeps them fixed and is accepted only inside Codex Connect's conservative 30-minute guaranteed-cache policy. Use fresh threads for unrelated work, setting changes, workstreams outside that cutoff, or intentionally independent review. If the call is lost, do not retry immediately: recover threadId/turnId from a replayed workerStarted event on a HostPlane response; absence is inconclusive and historyLost means retained recovery history was exceeded.",
                 false,
                 true,
                 true,
@@ -401,7 +397,7 @@ fn worker_events_schema() -> Value {
     json!({
         "type":"array",
         "maxItems":8,
-        "description":"One-shot worker notifications on host calls. workerStarted recovers an unclaimed start handle; historyLost means notifications are missing. Absence gives no worker status; use codex.wait for a known turn.",
+        "description":"Worker notifications on HostPlane calls. workerStarted is replayed until claimed while the worker remains in bounded retained state; other notifications are one-shot. actionRequired and turnTerminal are delivered ahead of start receipts. historyLost means notification or recovery history was evicted. Absence gives no worker status; use codex.wait for a known turn.",
         "items":{"oneOf":[started,terminal,action,lost]}
     })
 }
@@ -471,13 +467,9 @@ fn results_schema() -> Value {
     );
     let fuzzy_file_search = object_schema(
         json!({"files":{"type":"array","items":object_schema(json!({
-            "root":{"type":"string"},
             "path":{"type":"string"},
-            "match_type":{"enum":["file","directory"]},
-            "file_name":{"type":"string"},
-            "score":{"type":"integer","minimum":0},
-            "indices":{"type":["array","null"],"items":{"type":"integer","minimum":0}}
-        }), &["root","path","match_type","file_name","score","indices"])}}),
+            "kind":{"enum":["file","directory"]}
+        }), &["path","kind"])}}),
         &["files"],
     );
     let success = |kind: &'static str, result: Value| {
@@ -514,6 +506,11 @@ fn status_schema() -> Value {
             "ready":{"type":"boolean"},
             "cwd":{"type":"string"},
             "buildId":{"type":"string"},
+            "commands":{"type":"array","description":"Retained persistent-command handles. Use these to recover a command.start response lost by the caller.","items":object_schema(json!({
+                "processId":{"type":"string"},
+                "state":{"enum":["running","exited","failed"]},
+                "tty":{"type":"boolean"}
+            }), &["processId","state","tty"])},
             "codex":object_schema(json!({
                 "release":{"type":"string"},
                 "defaults":object_schema(json!({
@@ -524,13 +521,19 @@ fn status_schema() -> Value {
                 }), &["model","reasoningEffort","serviceTier","source"])
             }), &["release","defaults"])
         }),
-        &["ready", "cwd", "buildId", "codex"],
+        &["ready", "cwd", "buildId", "commands", "codex"],
     )
 }
 fn work_started_schema() -> Value {
     object_schema(
-        json!({"threadId":{"type":"string"},"turnId":{"type":"string"},"createdThread":{"type":"boolean"},"cursor":{"type":"integer","minimum":0}}),
-        &["threadId", "turnId", "cursor"],
+        json!({
+            "threadId":{"type":"string"},
+            "turnId":{"type":"string"},
+            "cursor":{"type":"integer","minimum":0},
+            "model":{"type":["string","null"],"description":"Effective thread model reported by App Server."},
+            "effort":{"type":["string","null"],"description":"Effective thread reasoning effort when available."}
+        }),
+        &["threadId", "turnId", "cursor", "model", "effort"],
     )
 }
 fn work_wait_output_schema() -> Value {
@@ -553,8 +556,17 @@ fn current_activity_schema() -> Value {
             "lastActivityAtMs":{"type":"integer","minimum":0},
             "tokenUsage":object_schema(json!({
                 "totalTokens":{"type":["integer","null"],"minimum":0},
-                "modelContextWindow":{"type":["integer","null"],"minimum":0}
-            }), &["totalTokens","modelContextWindow"])
+                "modelContextWindow":{"type":["integer","null"],"minimum":0},
+                "cacheHitPercent":{"type":["integer","null"],"minimum":0,"maximum":100,"description":"Latest-request cached-input share, computed server-side."},
+                "cacheGuaranteedUntilMs":{"type":["integer","null"],"minimum":0,"description":"End of OpenAI's minimum 30-minute prompt-cache reuse guarantee measured from the latest observed model usage. Cache entries may survive longer."},
+                "cacheGuaranteeActive":{"type":["boolean","null"],"description":"Whether this observed turn is still inside the minimum guaranteed cache-reuse window."}
+            }), &[
+                "totalTokens",
+                "modelContextWindow",
+                "cacheHitPercent",
+                "cacheGuaranteedUntilMs",
+                "cacheGuaranteeActive"
+            ])
         }),
         &["kind", "summary", "lastActivityAtMs", "tokenUsage"],
     )
@@ -617,7 +629,7 @@ fn inspect_schema() -> Value {
     )
 }
 fn cwd_schema() -> Value {
-    json!({"type":["string","null"],"description":"Host working directory. Relative paths resolve from configured default_cwd; omitted/null uses that default. Absolute paths are accepted."})
+    json!({"type":["string","null"],"description":"Host working directory. Relative paths resolve from the backend default cwd; omitted/null uses that default. Absolute paths are accepted."})
 }
 fn command_schema() -> Value {
     object_schema(
@@ -651,15 +663,7 @@ fn command_start_schema() -> Value {
     )
 }
 fn command_started_schema() -> Value {
-    object_schema(
-        json!({
-            "processId":{"type":"string"},
-            "state":{"const":"running"},
-            "tty":{"type":"boolean"},
-            "cursor":{"const":0}
-        }),
-        &["processId", "state", "tty", "cursor"],
-    )
+    object_schema(json!({"processId":{"type":"string"}}), &["processId"])
 }
 fn command_read_schema() -> Value {
     object_schema(
@@ -763,24 +767,38 @@ fn codex_start_schema() -> Value {
         object_schema(
             json!({
                 "mode":{"const":"work"},
-                "task":{"type":"string","minLength":1,"description":"Self-contained task with host paths, context, constraints, and acceptance criteria."},
-                "cwd":{"type":"string","description":"Codex Connect host working directory for the delegated turn. Omit to use the configured navigation cwd."},
-                "threadId":{"type":"string","description":"Thread to resume; omit to create one. Model, effort, and access apply to this turn."},
-                "model":{"type":"string","description":"Model ID for this turn. Discover IDs with a models query to codex.info; omit to use Codex defaults."},
-                "effort":{"type":"string","description":"Effort supported by the selected model; discover with codex.info. Omit to use Codex defaults."},
-                "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"workspace permits workspace writes and network access; full grants unrestricted host access. Approval prompts are disabled within the selected sandbox."}
+                "task":{"type":"string","minLength":1,"description":"Self-contained objective with host paths, context, constraints, and acceptance criteria."},
+                "cwd":{"type":"string","description":"Codex Connect host working directory for this workstream. Omit to use the backend navigation cwd."},
+                "model":{"type":"string","description":"Initial workstream model. Discover IDs with a models query to codex.info; omit to use Codex defaults."},
+                "effort":{"type":"string","description":"Initial workstream reasoning effort. Discover supported values with codex.info; omit to use the upstream default."},
+                "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Initial workstream access. workspace permits workspace writes and network access; full grants unrestricted host access. Approval prompts are disabled within the selected sandbox."}
             }),
             &["mode", "task"],
         ),
         object_schema(
             json!({
+                "mode":{"const":"work"},
+                "task":{"type":"string","minLength":1,"description":"Next objective/delta for an existing workstream. Revalidate mutable state when current reality matters."},
+                "threadId":{"type":"string","description":"Existing workstream to resume. Its cwd, model, reasoning effort, and access are fixed. Codex Connect conservatively rejects resume outside the minimum 30-minute guaranteed-cache policy; start fresh instead."}
+            }),
+            &["mode", "task", "threadId"],
+        ),
+        object_schema(
+            json!({
                 "mode":{"const":"review"},
-                "cwd":{"type":"string","description":"Codex Connect host working directory for the review. Omit to use the configured navigation cwd."},
-                "threadId":{"type":"string","description":"Thread to review. Retains its model/settings; model cannot be supplied with threadId."},
+                "cwd":{"type":"string","description":"Codex Connect host working directory for the review. Omit to use the backend navigation cwd."},
                 "target":review_target_schema(),
                 "model":{"type":"string","description":"Model ID for a new review thread; discover with codex.info. Omit to use Codex defaults."}
             }),
             &["mode", "target"],
+        ),
+        object_schema(
+            json!({
+                "mode":{"const":"review"},
+                "threadId":{"type":"string","description":"Existing review workstream to resume with its cwd/model/settings. Codex Connect conservatively rejects resume outside the minimum 30-minute guaranteed-cache policy; start a fresh independent review instead."},
+                "target":review_target_schema()
+            }),
+            &["mode", "threadId", "target"],
         ),
     ])
 }
@@ -887,14 +905,90 @@ fn codex_info_schema() -> Value {
     )
 }
 fn codex_info_output_schema() -> Value {
-    let success = object_schema(
+    let model = object_schema(
         json!({
-            "index":{"type":"integer","minimum":0},
-            "type":{"enum":["models","skills","usage"]},
-            "result":{"type":"object"}
+            "id":{"type":"string"},
+            "name":{"type":"string"},
+            "description":{"type":"string"},
+            "default":{"type":"boolean"},
+            "defaultEffort":{"type":"string"},
+            "efforts":{"type":"array","items":{"type":"string"}},
+            "upgradeTo":{"type":["string","null"]},
+            "retiresAt":{"type":["integer","null"]}
         }),
-        &["index", "type", "result"],
+        &[
+            "id",
+            "name",
+            "description",
+            "default",
+            "defaultEffort",
+            "efforts",
+            "upgradeTo",
+            "retiresAt",
+        ],
     );
+    let models = object_schema(
+        json!({"models":{"type":"array","items":model}}),
+        &["models"],
+    );
+    let skill = object_schema(
+        json!({
+            "name":{"type":"string"},
+            "description":{"type":"string"},
+            "scope":{"type":["string","null"]},
+            "enabled":{"type":"boolean"}
+        }),
+        &["name", "description", "scope", "enabled"],
+    );
+    let skill_root = object_schema(
+        json!({
+            "cwd":{"type":"string"},
+            "skills":{"type":"array","items":skill}
+        }),
+        &["cwd", "skills"],
+    );
+    let skills = object_schema(
+        json!({"roots":{"type":"array","items":skill_root}}),
+        &["roots"],
+    );
+    let rate_window = object_schema(
+        json!({
+            "usedPercent":{"type":"integer"},
+            "resetsAt":{"type":["integer","null"]},
+            "windowDurationMins":{"type":["integer","null"]}
+        }),
+        &["usedPercent"],
+    );
+    let usage = object_schema(
+        json!({
+            "ordinaryUsageAllowed":{"type":["boolean","null"]},
+            "planType":{"type":["string","null"]},
+            "primary":nullable(rate_window.clone()),
+            "secondary":nullable(rate_window),
+            "rateLimitReachedType":{"type":["string","null"]},
+            "spendControlReached":{"type":["boolean","null"]},
+            "resetCreditsAvailable":{"type":["integer","null"]}
+        }),
+        &[
+            "ordinaryUsageAllowed",
+            "planType",
+            "primary",
+            "secondary",
+            "rateLimitReachedType",
+            "spendControlReached",
+            "resetCreditsAvailable",
+        ],
+    );
+    let success = |kind: &'static str, result: Value| {
+        object_schema(
+            json!({
+                "index":{"type":"integer","minimum":0},
+                "type":{"const":kind},
+                "result":result
+            }),
+            &["index", "type", "result"],
+        )
+    };
     let error = object_schema(
         json!({
             "index":{"type":"integer","minimum":0},
@@ -904,7 +998,12 @@ fn codex_info_output_schema() -> Value {
         &["index", "type", "error"],
     );
     object_schema(
-        json!({"results":{"type":"array","items":{"oneOf":[success,error]}}}),
+        json!({"results":{"type":"array","items":{"oneOf":[
+            success("models", models),
+            success("skills", skills),
+            success("usage", usage),
+            error
+        ]}}}),
         &["results"],
     )
 }
@@ -947,24 +1046,64 @@ fn event_schema() -> Value {
 }
 
 fn pending_schema() -> Value {
-    object_schema(
+    let common = |kind: &'static str, extra: Value, required: &[&str]| {
+        let mut properties = json!({
+            "requestId":rpc_id_schema(),
+            "type":{"const":kind},
+            "threadId":{"type":"string"},
+            "turnId":{"type":["string","null"]},
+            "blocking":{"type":"boolean"}
+        });
+        properties.as_object_mut().unwrap().extend(
+            extra
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        let mut all_required = vec!["requestId", "type", "threadId", "turnId", "blocking"];
+        all_required.extend_from_slice(required);
+        object_schema(properties, &all_required)
+    };
+    let approval = common(
+        "approval",
         json!({
-            "requestId":rpc_id_schema(),"method":{"type":"string"},
-            "kind":{"enum":["approval","permissions","elicitation","userInput"]},
-            "threadId":{"type":"string"},"turnId":{"type":["string","null"]},
-            "isBlocking":{"type":"boolean"},
-            "params":{"type":"object","description":"Request data: questions, decisions, permissions, or elicitation form/URL."}
+            "reason":{"type":["string","null"]},
+            "command":{"type":["string","null"]},
+            "cwd":{"type":["string","null"]},
+            "grantRoot":{"type":["string","null"]},
+            "requestedPermissions":{},
+            "choices":{"type":"array","items":{"enum":["approve","approveForSession","decline","cancel"]}}
         }),
         &[
-            "requestId",
-            "method",
-            "kind",
-            "threadId",
-            "turnId",
-            "isBlocking",
-            "params",
+            "reason",
+            "command",
+            "cwd",
+            "grantRoot",
+            "requestedPermissions",
+            "choices",
         ],
-    )
+    );
+    let permissions = common(
+        "permissions",
+        json!({
+            "reason":{"type":["string","null"]},
+            "cwd":{"type":"string"},
+            "permissions":{"type":"object"}
+        }),
+        &["reason", "cwd", "permissions"],
+    );
+    let user_input = common(
+        "userInput",
+        json!({"questions":{"type":"array","items":{"type":"object"}}}),
+        &["questions"],
+    );
+    let elicitation = common(
+        "elicitation",
+        json!({"request":{"type":"object","description":"Elicitation form, URL, or verification request with thread/turn routing removed."}}),
+        &["request"],
+    );
+    json!({"oneOf":[approval,permissions,user_input,elicitation]})
 }
 
 fn permissions_schema() -> Value {
@@ -1004,6 +1143,7 @@ mod tests {
         assert_eq!(properties["ready"]["type"], "boolean");
         assert_eq!(properties["cwd"]["type"], "string");
         assert_eq!(properties["buildId"]["type"], "string");
+        assert_eq!(properties["commands"]["type"], "array");
         assert_eq!(properties["codex"]["type"], "object");
         assert_eq!(
             properties["codex"]["properties"]["defaults"]["properties"]["source"]["enum"],
@@ -1030,11 +1170,13 @@ mod tests {
                 .is_none()
         );
         let start = codex_start_schema();
-        let work = &start["oneOf"][0];
-        let review = &start["oneOf"][1];
-        assert_eq!(work["properties"]["access"]["default"], "workspace");
+        let new_work = &start["oneOf"][0];
+        let resumed_work = &start["oneOf"][1];
+        let new_review = &start["oneOf"][2];
+        let resumed_review = &start["oneOf"][3];
+        assert_eq!(new_work["properties"]["access"]["default"], "workspace");
         assert_eq!(
-            work["properties"]["access"]["enum"],
+            new_work["properties"]["access"]["enum"],
             json!(["workspace", "full"])
         );
         for hidden in [
@@ -1043,21 +1185,32 @@ mod tests {
             "serviceTier",
             "approvalPolicy",
         ] {
-            assert!(work["properties"].get(hidden).is_none(), "{hidden}");
+            assert!(new_work["properties"].get(hidden).is_none(), "{hidden}");
         }
         assert!(
-            !work["required"]
+            !new_work["required"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|value| value == "access")
         );
-        assert!(work["properties"].get("approvalPolicy").is_none());
-        assert!(review["properties"].get("developerInstructions").is_none());
-        assert!(review["properties"].get("sandboxPolicy").is_none());
-        assert!(review["properties"].get("effort").is_none());
-        assert!(review["properties"].get("serviceTier").is_none());
-        assert_eq!(review["properties"]["model"]["type"], "string");
+        for setting in ["cwd", "model", "effort", "access"] {
+            assert!(
+                resumed_work["properties"].get(setting).is_none(),
+                "{setting}"
+            );
+        }
+        assert!(
+            new_review["properties"]
+                .get("developerInstructions")
+                .is_none()
+        );
+        assert!(new_review["properties"].get("sandboxPolicy").is_none());
+        assert!(new_review["properties"].get("effort").is_none());
+        assert!(new_review["properties"].get("serviceTier").is_none());
+        assert_eq!(new_review["properties"]["model"]["type"], "string");
+        assert!(resumed_review["properties"].get("cwd").is_none());
+        assert!(resumed_review["properties"].get("model").is_none());
     }
 
     #[test]
@@ -1140,15 +1293,11 @@ mod tests {
             .find(|tool| tool.name == "command.exec")
             .unwrap();
         let exec_output = exec.output_schema.as_ref().unwrap();
-        for field in [
-            "stdoutBytes",
-            "stderrBytes",
-            "stdoutMayBeTruncated",
-            "stderrMayBeTruncated",
-            "durationMs",
-        ] {
+        for field in ["stdoutMayBeTruncated", "stderrMayBeTruncated", "durationMs"] {
             assert!(exec_output["properties"].get(field).is_some());
         }
+        assert!(exec_output["properties"].get("stdoutBytes").is_none());
+        assert!(exec_output["properties"].get("stderrBytes").is_none());
     }
 
     #[test]
@@ -1272,10 +1421,15 @@ mod tests {
             .unwrap();
         let fuzzy_properties =
             &fuzzy["properties"]["result"]["properties"]["files"]["items"]["properties"];
-        assert!(fuzzy_properties.get("match_type").is_some());
-        assert!(fuzzy_properties.get("file_name").is_some());
-        assert!(fuzzy_properties.get("matchType").is_none());
-        assert!(fuzzy_properties.get("fileName").is_none());
+        assert_eq!(
+            fuzzy_properties
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["kind".to_string(), "path".to_string()])
+        );
     }
 
     #[test]

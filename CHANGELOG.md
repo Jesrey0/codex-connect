@@ -7,8 +7,9 @@ Notable project-level changes are recorded for tagged releases. Codex Connect is
 ### Changed
 
 - The canonical ChatGPT path is now ngrok HTTPS → host ingress (routing + OAuth) → loopback Codex Connect.
-- OpenAI Secure MCP Tunnel is retained only as an independently managed secondary fallback and is no longer a setup, health, deployment, timeout, or application-architecture dependency.
+- OpenAI Secure MCP Tunnel is no longer part of the current supported architecture; ngrok plus host ingress is the single remote path.
 - Transport-specific tunnel configuration is no longer project-owned; client response deadlines remain independent from Codex Connect operation budgets.
+- The ChatGPT-facing MCP surface now projects operator intent rather than upstream transport detail, with compact discovery, normalized pending actions, persistent-command recovery through `status`, bounded terminal output, and one terminal-turn reconciliation path.
 
 ## 0.1.0-alpha.1 — 2026-09-18
 

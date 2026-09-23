@@ -1,13 +1,14 @@
-use crate::config::{
-    cache_root, config_root, home_dir, runtime_path, set_file_mode, state_root, sync_directory,
-    systemd_registration_dir, systemd_user_dir,
+use crate::paths::{
+    cache_root, config_root, home_dir, runtime_path, state_root, systemd_registration_dir,
+    systemd_user_dir,
 };
+use crate::storage::{atomic_write, sync_directory};
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use tempfile::Builder;
+
+pub(crate) const BACKEND_SERVICE: &str = "codex-connect.service";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServiceStatus {
@@ -49,22 +50,6 @@ pub struct UnitState {
     pub unit_file_state: String,
 }
 
-pub trait ServiceManager {
-    fn available(&self) -> Result<()>;
-    fn unit_state(&self, unit: &str) -> Result<UnitState>;
-    fn unit_text(&self, unit: &str) -> Result<Option<String>>;
-    fn install_unit(&self, unit: &str, contents: &str) -> Result<()>;
-    fn remove_unit(&self, unit: &str) -> Result<()>;
-    fn daemon_reload(&self) -> Result<()>;
-    fn enable_start(&self, unit: &str) -> Result<()>;
-    fn enable(&self, unit: &str) -> Result<()>;
-    fn disable(&self, unit: &str) -> Result<()>;
-    fn start(&self, unit: &str) -> Result<()>;
-    fn stop(&self, unit: &str) -> Result<()>;
-    fn restart(&self, unit: &str) -> Result<()>;
-    fn logs(&self, unit: &str, lines: usize, follow: bool) -> Result<String>;
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct SystemdManager;
 
@@ -83,8 +68,8 @@ impl SystemdManager {
     }
 }
 
-impl ServiceManager for SystemdManager {
-    fn available(&self) -> Result<()> {
+impl SystemdManager {
+    pub(crate) fn available(&self) -> Result<()> {
         let output = self.run_systemctl(&["show-environment"])?;
         if output.status.success() {
             Ok(())
@@ -96,7 +81,7 @@ impl ServiceManager for SystemdManager {
         }
     }
 
-    fn unit_state(&self, unit: &str) -> Result<UnitState> {
+    pub(crate) fn unit_state(&self, unit: &str) -> Result<UnitState> {
         let output = self.run_systemctl(&[
             "show",
             unit,
@@ -125,7 +110,7 @@ impl ServiceManager for SystemdManager {
         })
     }
 
-    fn unit_text(&self, unit: &str) -> Result<Option<String>> {
+    pub(crate) fn unit_text(&self, unit: &str) -> Result<Option<String>> {
         let path = self.unit_path(unit)?;
         if path.is_file() {
             return Ok(Some(fs::read_to_string(path)?));
@@ -138,25 +123,11 @@ impl ServiceManager for SystemdManager {
         Ok((!text.trim().is_empty()).then_some(text))
     }
 
-    fn install_unit(&self, unit: &str, contents: &str) -> Result<()> {
+    pub(crate) fn install_unit(&self, unit: &str, contents: &str) -> Result<()> {
         let directory = systemd_user_dir()?;
-        fs::create_dir_all(&directory)
-            .with_context(|| format!("unable to create {}", directory.display()))?;
         let path = directory.join(unit);
-        let mut temporary = Builder::new()
-            .prefix(".unit-")
-            .tempfile_in(&directory)
-            .with_context(|| {
-                format!("unable to create temporary unit in {}", directory.display())
-            })?;
-        set_file_mode(temporary.as_file(), 0o644)?;
-        temporary.write_all(contents.as_bytes())?;
-        temporary.as_file().sync_all()?;
-        temporary
-            .persist(&path)
-            .map_err(|error| error.error)
+        atomic_write(&path, ".unit-", 0o644, contents.as_bytes())
             .with_context(|| format!("unable to install {}", path.display()))?;
-        sync_directory(&directory)?;
 
         let registration_directory = systemd_registration_dir()?;
         fs::create_dir_all(&registration_directory).with_context(|| {
@@ -183,7 +154,7 @@ impl ServiceManager for SystemdManager {
         Ok(())
     }
 
-    fn remove_unit(&self, unit: &str) -> Result<()> {
+    pub(crate) fn remove_unit(&self, unit: &str) -> Result<()> {
         let path = self.unit_path(unit)?;
         if path.exists() || path.symlink_metadata().is_ok() {
             fs::remove_file(path)?;
@@ -195,42 +166,42 @@ impl ServiceManager for SystemdManager {
         Ok(())
     }
 
-    fn daemon_reload(&self) -> Result<()> {
+    pub(crate) fn daemon_reload(&self) -> Result<()> {
         let output = self.run_systemctl(&["daemon-reload"])?;
         command_success(&output, "reload the systemd user manager")
     }
 
-    fn enable_start(&self, unit: &str) -> Result<()> {
+    pub(crate) fn enable_start(&self, unit: &str) -> Result<()> {
         let output = self.run_systemctl(&["enable", "--now", unit])?;
         command_success(&output, &format!("enable and start {unit}"))
     }
 
-    fn enable(&self, unit: &str) -> Result<()> {
+    pub(crate) fn enable(&self, unit: &str) -> Result<()> {
         let output = self.run_systemctl(&["enable", unit])?;
         command_success(&output, &format!("enable {unit}"))
     }
 
-    fn disable(&self, unit: &str) -> Result<()> {
+    pub(crate) fn disable(&self, unit: &str) -> Result<()> {
         let output = self.run_systemctl(&["disable", unit])?;
         command_success(&output, &format!("disable {unit}"))
     }
 
-    fn start(&self, unit: &str) -> Result<()> {
+    pub(crate) fn start(&self, unit: &str) -> Result<()> {
         let output = self.run_systemctl(&["start", unit])?;
         command_success(&output, &format!("start {unit}"))
     }
 
-    fn stop(&self, unit: &str) -> Result<()> {
+    pub(crate) fn stop(&self, unit: &str) -> Result<()> {
         let output = self.run_systemctl(&["stop", unit])?;
         command_success(&output, &format!("stop {unit}"))
     }
 
-    fn restart(&self, unit: &str) -> Result<()> {
+    pub(crate) fn restart(&self, unit: &str) -> Result<()> {
         let output = self.run_systemctl(&["restart", unit])?;
         command_success(&output, &format!("restart {unit}"))
     }
 
-    fn logs(&self, unit: &str, lines: usize, follow: bool) -> Result<String> {
+    pub(crate) fn logs(&self, unit: &str, lines: usize, follow: bool) -> Result<String> {
         let line_count = lines.clamp(1, 10_000).to_string();
         if follow {
             let status = Command::new("journalctl")
@@ -464,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_service_reads_backend_configuration_at_runtime() {
+    fn backend_unit_delegates_runtime_defaults_to_run_backend() {
         let directory = tempfile::tempdir().unwrap();
         let binary = directory.path().join("codex-connect");
         std::fs::write(&binary, b"binary").unwrap();

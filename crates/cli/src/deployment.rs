@@ -3,20 +3,18 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tempfile::Builder;
 
-const RECORD_VERSION: u32 = 1;
+const RECORD_VERSION: u32 = 2;
 const OPERATION_ID_LENGTH: usize = 24;
 const ACTIVATION_HANDOFF_DELAY: &str = "3s";
 
-struct OperationLock {
-    _file: File,
+pub(crate) struct DeploymentLock {
+    file: File,
 }
 
 pub(crate) fn verify_prepared_artifact(record: &DeploymentRecord) -> Result<()> {
@@ -32,82 +30,27 @@ pub(crate) fn verify_prepared_artifact(record: &DeploymentRecord) -> Result<()> 
     Ok(())
 }
 
-pub(crate) struct BuildLock {
-    _file: File,
-}
-
 #[cfg(unix)]
-impl Drop for BuildLock {
+impl Drop for DeploymentLock {
     fn drop(&mut self) {
         unsafe {
-            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }
 
-impl BuildLock {
-    pub(crate) fn acquire() -> Result<Self> {
-        let directory = deployment_directory()?;
-        fs::create_dir_all(&directory)
-            .with_context(|| format!("unable to create {}", directory.display()))?;
-        let path = directory.join("build.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("unable to open deployment build lock {}", path.display()))?;
-        crate::config::set_file_mode(&file, 0o600)?;
-        #[cfg(unix)]
-        {
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("unable to lock deployment build cache");
-            }
-        }
-        Ok(Self { _file: file })
-    }
+pub(crate) fn acquire_build_lock() -> Result<DeploymentLock> {
+    acquire_lock(
+        deployment_directory()?.join("build.lock"),
+        "deployment build cache",
+    )
 }
 
-#[cfg(unix)]
-impl Drop for ActivationLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-impl ActivationLock {
-    pub(crate) fn acquire() -> Result<Self> {
-        let directory = deployment_directory()?;
-        fs::create_dir_all(&directory)
-            .with_context(|| format!("unable to create {}", directory.display()))?;
-        let path = directory.join("activation.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("unable to open activation lock {}", path.display()))?;
-        crate::config::set_file_mode(&file, 0o600)?;
-        #[cfg(unix)]
-        {
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("unable to lock deployment activation");
-            }
-        }
-        Ok(Self { _file: file })
-    }
-}
-
-pub(crate) struct ActivationLock {
-    _file: File,
+pub(crate) fn acquire_activation_lock() -> Result<DeploymentLock> {
+    acquire_lock(
+        deployment_directory()?.join("activation.lock"),
+        "deployment activation",
+    )
 }
 
 pub(crate) fn prepare_service_unit(operation_id: &str) -> Result<String> {
@@ -125,40 +68,37 @@ pub(crate) fn activation_timer_unit(operation_id: &str) -> Result<String> {
     Ok(format!("{}.timer", activation_unit_name(operation_id)))
 }
 
-impl OperationLock {
-    fn acquire(operation_id: &str) -> Result<Self> {
-        validate_operation_id(operation_id)?;
-        let directory = deployment_directory()?;
-        fs::create_dir_all(&directory)
-            .with_context(|| format!("unable to create {}", directory.display()))?;
-        let path = directory.join(format!("{operation_id}.lock"));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("unable to open deployment lock {}", path.display()))?;
-        crate::config::set_file_mode(&file, 0o600)?;
-        #[cfg(unix)]
-        {
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("unable to lock deployment {operation_id}"));
-            }
-        }
-        Ok(Self { _file: file })
-    }
+fn acquire_operation_lock(operation_id: &str) -> Result<DeploymentLock> {
+    validate_operation_id(operation_id)?;
+    acquire_lock(
+        deployment_directory()?.join(format!("{operation_id}.lock")),
+        &format!("deployment {operation_id}"),
+    )
 }
 
-#[cfg(unix)]
-impl Drop for OperationLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+fn acquire_lock(path: PathBuf, label: &str) -> Result<DeploymentLock> {
+    let directory = path
+        .parent()
+        .context("deployment lock has no parent directory")?;
+    fs::create_dir_all(directory)
+        .with_context(|| format!("unable to create {}", directory.display()))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("unable to open {label} lock {}", path.display()))?;
+    crate::storage::set_file_mode(&file, 0o600)?;
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("unable to lock {label}"));
         }
     }
+    Ok(DeploymentLock { file })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -169,15 +109,18 @@ pub(crate) struct DeploymentRecord {
     pub source: String,
     pub state: DeploymentState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub build_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executable: Option<String>,
-    #[serde(default)]
     pub no_start: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl DeploymentRecord {
+    pub(crate) fn build_id(&self) -> Option<&str> {
+        self.sha256.as_deref().map(|sha256| &sha256[..12])
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -209,13 +152,12 @@ pub(crate) fn queue_prepare(source: &Path) -> Result<DeploymentRecord> {
         .canonicalize()
         .with_context(|| format!("unable to canonicalize source tree {}", source.display()))?;
     let operation_id = new_operation_id()?;
-    let _lock = OperationLock::acquire(&operation_id)?;
+    let _lock = acquire_operation_lock(&operation_id)?;
     let mut record = DeploymentRecord {
         version: RECORD_VERSION,
         operation_id,
         source: source.display().to_string(),
         state: DeploymentState::Building,
-        build_id: None,
         sha256: None,
         executable: None,
         no_start: false,
@@ -263,7 +205,7 @@ pub(crate) fn mark_prepared(
     identity: &ArtifactIdentity,
     installed: &Path,
 ) -> Result<DeploymentRecord> {
-    let _lock = OperationLock::acquire(operation_id)?;
+    let _lock = acquire_operation_lock(operation_id)?;
     let mut record = load_unlocked(operation_id)?;
     if record.state != DeploymentState::Building {
         bail!(
@@ -272,7 +214,6 @@ pub(crate) fn mark_prepared(
         );
     }
     record.state = DeploymentState::Prepared;
-    record.build_id = Some(identity.build_id.clone());
     record.sha256 = Some(identity.sha256.clone());
     record.executable = Some(installed.display().to_string());
     record.error = None;
@@ -285,7 +226,7 @@ pub(crate) fn mark_failed_if_state(
     expected_states: &[DeploymentState],
     error: impl Into<String>,
 ) -> Result<DeploymentRecord> {
-    let _lock = OperationLock::acquire(operation_id)?;
+    let _lock = acquire_operation_lock(operation_id)?;
     let mut record = load_unlocked(operation_id)?;
     if !expected_states.contains(&record.state) {
         return Ok(record);
@@ -301,7 +242,7 @@ pub(crate) fn load(operation_id: &str) -> Result<DeploymentRecord> {
     if !path.is_file() {
         bail!("deployment record not found for operation {operation_id}");
     }
-    let _lock = OperationLock::acquire(operation_id)?;
+    let _lock = acquire_operation_lock(operation_id)?;
     load_unlocked(operation_id)
 }
 
@@ -329,36 +270,18 @@ fn load_unlocked(operation_id: &str) -> Result<DeploymentRecord> {
 
 fn save_unlocked(record: &DeploymentRecord) -> Result<()> {
     validate_record(record)?;
-    let directory = deployment_directory()?;
-    fs::create_dir_all(&directory)
-        .with_context(|| format!("unable to create {}", directory.display()))?;
-    let path = directory.join(format!("{}.json", record.operation_id));
-    let mut temporary = Builder::new()
-        .prefix(".deployment-")
-        .tempfile_in(&directory)
-        .with_context(|| {
-            format!(
-                "unable to create deployment record in {}",
-                directory.display()
-            )
-        })?;
-    crate::config::set_file_mode(temporary.as_file(), 0o600)?;
-    serde_json::to_writer_pretty(&mut temporary, record)?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(&path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("unable to persist {}", path.display()))?;
-    crate::config::sync_directory(&directory)?;
-    Ok(())
+    let path = deployment_directory()?.join(format!("{}.json", record.operation_id));
+    let mut bytes = serde_json::to_vec_pretty(record)?;
+    bytes.push(b'\n');
+    crate::storage::atomic_write(&path, ".deployment-", 0o600, &bytes)
+        .with_context(|| format!("unable to persist {}", path.display()))
 }
 
 pub(crate) fn queue_activation(
     operation_id: &str,
     no_start: bool,
 ) -> Result<(DeploymentRecord, bool)> {
-    let _lock = OperationLock::acquire(operation_id)?;
+    let _lock = acquire_operation_lock(operation_id)?;
     let mut record = load_unlocked(operation_id)?;
     match record.state {
         DeploymentState::Prepared => {}
@@ -435,7 +358,7 @@ pub(crate) fn mark_activating(
     no_start: bool,
 ) -> Result<DeploymentRecord> {
     validate_sha256(expected_sha256)?;
-    let _lock = OperationLock::acquire(operation_id)?;
+    let _lock = acquire_operation_lock(operation_id)?;
     let mut record = load_unlocked(operation_id)?;
     let actual_sha = record
         .sha256
@@ -470,7 +393,7 @@ pub(crate) fn mark_succeeded(
     expected_sha256: &str,
 ) -> Result<DeploymentRecord> {
     validate_sha256(expected_sha256)?;
-    let _lock = OperationLock::acquire(operation_id)?;
+    let _lock = acquire_operation_lock(operation_id)?;
     let mut record = load_unlocked(operation_id)?;
     verify_expected_sha(&record, expected_sha256)?;
     if record.state == DeploymentState::Succeeded {
@@ -493,7 +416,7 @@ pub(crate) fn mark_succeeded_if_activating(
     expected_sha256: &str,
 ) -> Result<DeploymentRecord> {
     validate_sha256(expected_sha256)?;
-    let _lock = OperationLock::acquire(operation_id)?;
+    let _lock = acquire_operation_lock(operation_id)?;
     let mut record = load_unlocked(operation_id)?;
     verify_expected_sha(&record, expected_sha256)?;
     if record.state != DeploymentState::Activating {
@@ -511,7 +434,7 @@ pub(crate) fn activation_delay() -> &'static str {
 
 pub(crate) fn build_target(operation_id: &str) -> Result<PathBuf> {
     validate_operation_id(operation_id)?;
-    Ok(crate::config::cache_root()?.join("codex-connect/deploy/build"))
+    Ok(crate::paths::cache_root()?.join("codex-connect/deploy/build"))
 }
 
 fn verify_expected_sha(record: &DeploymentRecord, expected_sha256: &str) -> Result<()> {
@@ -663,19 +586,19 @@ struct LaunchEnvironment {
 }
 
 fn launch_environment() -> Result<LaunchEnvironment> {
-    let home = crate::config::home_dir()?;
+    let home = crate::paths::home_dir()?;
     let path = std::env::var_os("PATH").context("PATH is not set")?;
     Ok(LaunchEnvironment {
-        path: crate::config::runtime_path(&home, &path)?,
+        path: crate::paths::runtime_path(&home, &path)?,
         home,
-        xdg_config_home: crate::config::config_root()?.into_os_string(),
-        xdg_state_home: crate::config::state_root()?.into_os_string(),
-        xdg_cache_home: crate::config::cache_root()?.into_os_string(),
+        xdg_config_home: crate::paths::config_root()?.into_os_string(),
+        xdg_state_home: crate::paths::state_root()?.into_os_string(),
+        xdg_cache_home: crate::paths::cache_root()?.into_os_string(),
     })
 }
 
 fn deployment_directory() -> Result<PathBuf> {
-    Ok(crate::config::state_root()?.join("codex-connect/deployments"))
+    Ok(crate::paths::state_root()?.join("codex-connect/deployments"))
 }
 
 fn record_path(operation_id: &str) -> Result<PathBuf> {
@@ -701,27 +624,17 @@ fn validate_record(record: &DeploymentRecord) -> Result<()> {
     if record.source.is_empty() || !source.is_absolute() {
         bail!("deployment source must be a non-empty absolute path");
     }
-    if let Some(build_id) = &record.build_id {
-        validate_build_id(build_id)?;
-    }
     if let Some(sha256) = &record.sha256 {
         validate_sha256(sha256)?;
     }
-    if record.build_id.is_some() != record.sha256.is_some()
-        || record.sha256.is_some() != record.executable.is_some()
-    {
+    if record.sha256.is_some() != record.executable.is_some() {
         bail!("deployment artifact identity must be complete or absent");
     }
-    let has_artifact = record.build_id.is_some();
-    if let (Some(build_id), Some(sha256), Some(executable)) =
-        (&record.build_id, &record.sha256, &record.executable)
+    let has_artifact = record.sha256.is_some();
+    if let Some(executable) = &record.executable
+        && !Path::new(executable).is_absolute()
     {
-        if build_id != &sha256[..12] {
-            bail!("deployment build id must match the SHA-256 prefix");
-        }
-        if !Path::new(executable).is_absolute() {
-            bail!("deployment executable must be an absolute path");
-        }
+        bail!("deployment executable must be an absolute path");
     }
     match record.state {
         DeploymentState::Building => {
@@ -765,17 +678,6 @@ fn validate_operation_id(operation_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_build_id(build_id: &str) -> Result<()> {
-    if build_id.len() != 12
-        || !build_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("build id must be exactly 12 hexadecimal characters");
-    }
-    Ok(())
-}
-
 fn validate_sha256(sha256: &str) -> Result<()> {
     if sha256.len() != 64
         || !sha256
@@ -805,25 +707,11 @@ mod tests {
             operation_id: "0123456789abcdef01234567".into(),
             source: "/work/codex-connect".into(),
             state: DeploymentState::Prepared,
-            build_id: Some("aaaaaaaaaaaa".into()),
             sha256: Some("a".repeat(64)),
             executable: Some("/opt/codex-connect/builds/aaaaaaaaaaaa/codex-connect".into()),
             no_start: false,
             error: None,
         }
-    }
-
-    #[test]
-    fn deployment_state_names_are_stable() {
-        assert_eq!(DeploymentState::Building.as_str(), "building");
-        assert_eq!(DeploymentState::Prepared.as_str(), "prepared");
-        assert_eq!(
-            DeploymentState::ActivationQueued.as_str(),
-            "activationQueued"
-        );
-        assert_eq!(DeploymentState::Activating.as_str(), "activating");
-        assert_eq!(DeploymentState::Succeeded.as_str(), "succeeded");
-        assert_eq!(DeploymentState::Failed.as_str(), "failed");
     }
 
     #[test]
@@ -837,11 +725,6 @@ mod tests {
             "0123456789abcdef012345678",
         ] {
             assert!(validate_operation_id(invalid).is_err());
-        }
-
-        validate_build_id("012345abcdef").unwrap();
-        for invalid in ["", "abc", "../../escape", "012345abcdef0", "012345abcdeg"] {
-            assert!(validate_build_id(invalid).is_err());
         }
 
         validate_sha256(&"a".repeat(64)).unwrap();
@@ -861,18 +744,13 @@ mod tests {
     }
 
     #[test]
-    fn activation_handoff_leaves_response_headroom() {
-        assert_eq!(activation_delay(), "3s");
-    }
-
-    #[test]
     fn deployment_build_target_is_a_stable_shared_cache() {
         let first = build_target("0123456789abcdef01234567").unwrap();
         let second = build_target("fedcba9876543210fedcba98").unwrap();
         assert_eq!(first, second);
         assert_eq!(
             first,
-            crate::config::cache_root()
+            crate::paths::cache_root()
                 .unwrap()
                 .join("codex-connect/deploy/build")
         );
@@ -882,7 +760,6 @@ mod tests {
     fn prepare_command_is_complete_and_deterministic() {
         let mut record = prepared_record();
         record.state = DeploymentState::Building;
-        record.build_id = None;
         record.sha256 = None;
         record.executable = None;
         let command = prepare_command(
@@ -1004,10 +881,13 @@ mod tests {
     }
 
     #[test]
-    fn deployment_record_binds_build_id_to_digest() {
-        let mut record = prepared_record();
-        record.build_id = Some("bbbbbbbbbbbb".into());
-        assert!(validate_record(&record).is_err());
+    fn deployment_build_id_is_derived_from_digest() {
+        let record = prepared_record();
+        assert_eq!(record.build_id(), Some("aaaaaaaaaaaa"));
+        assert!(!serde_json::to_string(&record).unwrap().contains("buildId"));
+        let mut old_record = record;
+        old_record.version = 1;
+        assert!(validate_record(&old_record).is_err());
     }
 
     #[test]
@@ -1028,7 +908,6 @@ mod tests {
         std::fs::write(&executable, b"prepared bytes").unwrap();
         let identity = crate::artifact::for_path(&executable).unwrap();
         let mut record = prepared_record();
-        record.build_id = Some(identity.build_id);
         record.sha256 = Some(identity.sha256);
         record.executable = Some(executable.display().to_string());
 

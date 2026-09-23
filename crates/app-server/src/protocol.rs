@@ -253,9 +253,13 @@ pub enum TurnItemsView {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: String,
     pub cwd: String,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub updated_at: i64,
     #[serde(default)]
     pub turns: Vec<Turn>,
 }
@@ -280,6 +284,12 @@ pub struct Turn {
     pub status: TurnStatus,
     pub items: Vec<Value>,
     pub error: Option<Value>,
+    #[serde(
+        rename = "completedAt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub completed_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

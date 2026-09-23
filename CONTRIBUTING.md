@@ -21,8 +21,8 @@ Preserve PTY support. Do not expose raw sandbox policy, service tier, developer 
 ## Operating rules
 
 - Keep Codex CLI/App Server and host ingress independently owned; public routing and OAuth belong to host ingress.
-- Keep `default_cwd` as navigation, never authorization.
-- Keep worker tasks self-contained and preserve delegated scope ownership until terminal/action/interrupt/redirect. A `codex.wait` timeout is not permission to take over.
+- Keep the managed backend's home-directory cwd as navigation, never authorization.
+- Treat worker threads as cache-bounded workstreams. New threads establish cwd/model/effort/access and need self-contained context. Resumed turns keep those settings fixed and carry only the current objective/delta, changed facts, and acceptance criteria while revalidating mutable state when necessary. Start fresh outside the conservative 30-minute guaranteed-cache cutoff, when settings must change, work is unrelated, or independent review is intentional. Preserve delegated scope ownership until terminal/action/interrupt/redirect; a `codex.wait` timeout is not permission to take over.
 - Keep live state event-driven; App Server remains authoritative. Reads may hydrate or reconcile state at explicit boundaries but must not periodically observe progress. Do not reintroduce timer-based worker, observer, transcript, or quota polling.
 - Keep timeout classes independent. App Server, host, worker-join, command, and client-response budgets follow their own semantics. Caller loss must not orphan durable worker starts, and a timed-out mutating host operation must not continue silently without cooperative cancellation/rollback.
 - Git actions are operator workflow, not application workflow.

@@ -1,34 +1,22 @@
 use crate::artifact;
-use crate::config::{
-    BACKEND_SERVICE, BackendConfig, Config, ConfigStore, cache_root, config_root, display_path,
-    expand_path, home_dir, state_root,
-};
+use crate::backend::{BACKEND_ADDR, BackendClient};
 use crate::deployment;
-use crate::service::{ServiceManager, SystemdManager, UnitState, backend_unit};
+use crate::paths::{cache_root, home_dir, state_root};
+use crate::service::{BACKEND_SERVICE, SystemdManager, UnitState, backend_unit};
 use crate::{ServeConfig, serve_mcp};
 use anyhow::{Context, Result, bail};
-use codex_connect_app_server::verify_codex_pin;
 use codex_connect_mcp::RuntimeStatus;
 use std::fs;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout};
-
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
-const HEALTH_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+use tokio::time::sleep;
 
 pub async fn run_backend() -> Result<()> {
-    let config = ConfigStore::default()?.load()?;
-    let default_cwd =
-        resolve_required_directory(&config.workspace.default_cwd, "default workspace")?;
     serve_mcp(ServeConfig {
-        codex_bin: resolve_executable(&config.backend.codex_bin)?,
-        default_cwd,
-        listen: config.backend.listen_addr()?,
+        codex_bin: find_executable("codex")?,
+        default_cwd: default_cwd()?,
+        listen: BACKEND_ADDR,
     })
     .await
 }
@@ -67,7 +55,7 @@ async fn reconcile_deployment(operation_id: &str) -> Result<deployment::Deployme
                 &[record.state],
                 format!(
                     "detached activation job ended before recording completion and build {} is not fully active",
-                    record.build_id.as_deref().unwrap_or("unknown")
+                    record.build_id().unwrap_or("unknown")
                 ),
             )
         }
@@ -124,8 +112,7 @@ async fn deployment_effect_visible(record: &deployment::DeploymentRecord) -> Res
     if record.no_start {
         return Ok(true);
     }
-    let (_, config) = load_config()?;
-    let runtime = match runtime_status_once(&config.backend).await {
+    let runtime = match runtime_status_once().await {
         Ok(runtime) => runtime,
         Err(_) => return Ok(false),
     };
@@ -173,12 +160,11 @@ pub async fn uninstall() -> Result<()> {
         );
     }
     remove_tree_if_present(&user_local_root()?.join("lib/codex-connect"))?;
-    remove_tree_if_present(&config_root()?.join("codex-connect"))?;
     remove_tree_if_present(&state_root()?.join("codex-connect"))?;
     remove_tree_if_present(&cache_root()?.join("codex-connect"))?;
 
     println!(
-        "✓ Removed Codex Connect-managed backend service, configuration, state, and installed binaries."
+        "✓ Removed Codex Connect-managed backend service, state, cache, and installed binaries."
     );
     println!("The source tree, Codex CLI, and host ingress state were not changed.");
     println!(
@@ -224,11 +210,11 @@ async fn prepare_deployment_inner(operation_id: &str, source: &Path) -> Result<(
         }
     }
 
-    let _build_lock = deployment::BuildLock::acquire()?;
+    let _build_lock = deployment::acquire_build_lock()?;
     let build_root = deployment::build_target(operation_id)?;
     let build = (|| -> Result<_> {
         let cargo = find_executable("cargo").or_else(|_| {
-            let candidate = crate::config::home_dir()?.join(".cargo/bin/cargo");
+            let candidate = crate::paths::home_dir()?.join(".cargo/bin/cargo");
             ensure_executable(&candidate)?;
             Ok::<PathBuf, anyhow::Error>(candidate)
         })?;
@@ -264,7 +250,7 @@ async fn prepare_deployment_inner(operation_id: &str, source: &Path) -> Result<(
 
 pub async fn deploy_activate(operation_id: &str, no_start: bool) -> Result<()> {
     let (record, newly_queued) = deployment::queue_activation(operation_id, no_start)?;
-    let build_id = record.build_id.as_deref().unwrap_or("pending");
+    let build_id = record.build_id().unwrap_or("pending");
     let sha256 = record.sha256.as_deref().unwrap_or("pending");
     if !newly_queued {
         println!(
@@ -300,7 +286,7 @@ pub async fn deploy_status(operation_id: &str) -> Result<()> {
     println!("Codex Connect deployment operation {}", record.operation_id);
     println!("State: {}", record.state.as_str());
     println!("Source: {}", record.source);
-    if let Some(build_id) = &record.build_id {
+    if let Some(build_id) = record.build_id() {
         println!("Build: {build_id}");
     }
     if let Some(sha256) = &record.sha256 {
@@ -326,7 +312,7 @@ pub async fn deploy_status(operation_id: &str) -> Result<()> {
             println!(
                 "DEPLOYMENT_STATUS operation_id={} state=prepared build_id={} sha256={} verified=false",
                 record.operation_id,
-                record.build_id.as_deref().unwrap_or("unknown"),
+                record.build_id().unwrap_or("unknown"),
                 record.sha256.as_deref().unwrap_or("unknown")
             );
             Ok(())
@@ -337,7 +323,7 @@ pub async fn deploy_status(operation_id: &str) -> Result<()> {
                 "DEPLOYMENT_STATUS operation_id={} state={} build_id={} verified=false",
                 record.operation_id,
                 record.state.as_str(),
-                record.build_id.as_deref().unwrap_or("unknown")
+                record.build_id().unwrap_or("unknown")
             );
             Ok(())
         }
@@ -361,7 +347,7 @@ pub async fn deploy_status(operation_id: &str) -> Result<()> {
                 println!(
                     "DEPLOYMENT_STATUS operation_id={} state=succeeded build_id={} verified=false no_start=true",
                     record.operation_id,
-                    record.build_id.as_deref().unwrap_or("unknown")
+                    record.build_id().unwrap_or("unknown")
                 );
                 return Ok(());
             }
@@ -369,8 +355,7 @@ pub async fn deploy_status(operation_id: &str) -> Result<()> {
                 .sha256
                 .as_deref()
                 .context("successful deployment has no SHA-256")?;
-            let (_, config) = load_config()?;
-            let runtime = runtime_status_once(&config.backend)
+            let runtime = runtime_status_once()
                 .await
                 .context("deployment succeeded but the backend health endpoint is unavailable")?;
             if !runtime.ready || runtime.binary_sha256 != expected_sha256 {
@@ -398,15 +383,20 @@ pub async fn activate_deployment(
 ) -> Result<()> {
     let result = activate_deployment_inner(operation_id, expected_sha256, no_start).await;
     if let Err(error) = result {
-        let message = error.to_string();
-        let _ = deployment::mark_failed_if_state(
+        let message = format!("{error:#}");
+        deployment::mark_failed_if_state(
             operation_id,
             &[
                 deployment::DeploymentState::ActivationQueued,
                 deployment::DeploymentState::Activating,
             ],
             message,
-        );
+        )
+        .with_context(|| {
+            format!(
+                "activation failed: {error:#}; deployment {operation_id} could not be marked failed"
+            )
+        })?;
         return Err(error);
     }
     Ok(())
@@ -417,9 +407,9 @@ async fn activate_deployment_inner(
     expected_sha256: &str,
     no_start: bool,
 ) -> Result<()> {
-    // All deployment operations mutate the same backend unit/config/operator symlink.
+    // All deployment operations mutate the same backend unit/operator symlink.
     // Serialize that shared activation boundary across operation ids.
-    let _activation_lock = deployment::ActivationLock::acquire()?;
+    let _activation_lock = deployment::acquire_activation_lock()?;
     let running = artifact::current()?;
     if running.sha256 != expected_sha256 {
         bail!(
@@ -427,96 +417,108 @@ async fn activate_deployment_inner(
             running.sha256
         );
     }
+    preflight_operator_path()?;
     deployment::mark_activating(operation_id, expected_sha256, no_start)?;
-    setup(no_start).await?;
-    activate_operator_symlink(&running.executable)?;
-    deployment::mark_succeeded(operation_id, expected_sha256)?;
-    Ok(())
+    setup_with_commit(no_start, || {
+        match deployment::mark_succeeded(operation_id, expected_sha256) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // Atomic record replacement may succeed before a directory sync fails.
+                // If success is already visible, keep the backend and link aligned with it.
+                let record = deployment::load(operation_id)?;
+                if record.state == deployment::DeploymentState::Succeeded {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    })
+    .await
 }
 
 pub async fn setup(no_start: bool) -> Result<()> {
+    let _activation_lock = deployment::acquire_activation_lock()?;
+    setup_with_commit(no_start, || Ok(())).await
+}
+
+async fn setup_with_commit(no_start: bool, commit: impl FnOnce() -> Result<()>) -> Result<()> {
     let manager = SystemdManager;
     manager.available()?;
-    let store = ConfigStore::default()?;
-    let original = store.exists().then(|| store.read_bytes()).transpose()?;
-    let mut config = if store.exists() {
-        store
-            .load()
-            .context("invalid configuration; correct the reported error before running setup")?
-    } else {
-        Config::new()
-    };
-    let root = expand_path(&config.workspace.default_cwd)?;
-    if !root.exists() {
-        fs::create_dir_all(&root)
-            .with_context(|| format!("unable to create default workspace {}", root.display()))?;
-    }
-    let root = root.canonicalize()?;
-    if !root.is_dir() {
-        bail!("default workspace is not a directory: {}", root.display());
-    }
-    config.workspace.default_cwd = display_path(&root);
-    let codex =
-        resolve_executable(&config.backend.codex_bin).or_else(|_| find_executable("codex"))?;
-    config.backend.codex_bin = codex.display().to_string();
-    let binary = install_artifact(
-        &artifact::current()?.executable,
-        &artifact::current()?.sha256,
-    )?;
+    let current = artifact::current()?;
+    let binary = install_artifact(&current.executable, &current.sha256)?;
+    // Resolve ownership and prepare the replacement before touching the service.
+    let old_operator = preflight_operator_path()?;
     let old_unit = manager.unit_text(BACKEND_SERVICE)?;
     let old_state = manager.unit_state(BACKEND_SERVICE)?;
-    let installation = (|| -> Result<()> {
-        store.save(&config)?;
-        manager.install_unit(BACKEND_SERVICE, &backend_unit(&binary)?)?;
-        manager.daemon_reload()
-    })();
-    if let Err(error) = installation {
-        rollback_setup(
-            &manager,
-            &store,
-            original.as_deref(),
-            old_unit.as_deref(),
-            &old_state,
-            false,
-        )?;
-        return Err(error);
+    let operator = operator_path()?;
+    let link = operator.with_file_name(format!(".codex-connect-link-{}", std::process::id()));
+    if link.symlink_metadata().is_ok() {
+        fs::remove_file(&link)?;
     }
-    if no_start {
-        activate_operator_symlink(&binary)?;
-        println!(
-            "Configuration saved to {}; backend service installed but not started.",
-            store.path().display()
-        );
-        return Ok(());
-    }
+    std::os::unix::fs::symlink(&binary, &link)?;
+    let mut link_activated = false;
+    let mut runtime_touched = false;
     let activation = async {
-        let state = manager.unit_state(BACKEND_SERVICE)?;
-        if state.status.is_running() && is_enabled(&state) {
-            manager.restart(BACKEND_SERVICE)?;
-        } else {
-            manager.enable_start(BACKEND_SERVICE)?;
+        manager.install_unit(BACKEND_SERVICE, &backend_unit(&binary)?)?;
+        manager.daemon_reload()?;
+        if !no_start {
+            let state = manager.unit_state(BACKEND_SERVICE)?;
+            runtime_touched = true;
+            if state.status.is_running() && is_enabled(&state) {
+                manager.restart(BACKEND_SERVICE)?;
+            } else {
+                manager.enable_start(BACKEND_SERVICE)?;
+            }
+            wait_for_backend_health(Some(&current.sha256)).await?;
         }
-        wait_for_backend_health(&config, Some(&artifact::current()?.sha256))
-            .await
-            .map(|_| ())
+        // The link and deployment record are the final commit steps. On failure,
+        // attempt restoration while the activation lock is still held.
+        if preflight_operator_path()? != old_operator {
+            bail!("operator path changed during backend activation");
+        }
+        fs::rename(&link, &operator)?;
+        link_activated = true;
+        commit()?;
+        Ok::<(), anyhow::Error>(())
     }
     .await;
     if let Err(error) = activation {
-        rollback_setup(
-            &manager,
-            &store,
-            original.as_deref(),
-            old_unit.as_deref(),
-            &old_state,
-            true,
-        )?;
-        return Err(error
-            .context("setup failed; the previous backend configuration, unit, and runtime state were restored"));
+        let link_cleanup = fs::remove_file(&link);
+        let operator_restore = if link_activated {
+            restore_operator_path(&operator, old_operator.as_deref())
+        } else {
+            Ok(())
+        };
+        let backend_restore =
+            rollback_setup(&manager, old_unit.as_deref(), &old_state, runtime_touched);
+        let mut restoration_failures = Vec::new();
+        if let Err(restore_error) = operator_restore {
+            restoration_failures.push(format!("operator path restoration failed: {restore_error}"));
+        }
+        if let Err(restore_error) = backend_restore {
+            restoration_failures.push(format!("backend restoration failed: {restore_error}"));
+        }
+        if let Err(cleanup_error) = link_cleanup
+            && cleanup_error.kind() != std::io::ErrorKind::NotFound
+        {
+            restoration_failures.push(format!("operator staging cleanup failed: {cleanup_error}"));
+        }
+        if !restoration_failures.is_empty() {
+            return Err(error.context(format!(
+                "partial rollback: {}",
+                restoration_failures.join("; ")
+            )));
+        }
+        return Err(error);
     }
-    activate_operator_symlink(&binary)?;
+    if no_start {
+        println!("Backend service installed but not started.");
+        return Ok(());
+    }
     println!(
         "✓ Backend installed and ready at http://{}/mcp",
-        config.backend.listen
+        BACKEND_ADDR
     );
     println!(
         "Connect ChatGPT to the authenticated public HTTPS MCP URL managed by host ingress. Verify ingress and OAuth separately from backend readiness."
@@ -525,7 +527,6 @@ pub async fn setup(no_start: bool) -> Result<()> {
 }
 
 pub async fn status() -> Result<()> {
-    let (_, config) = load_config()?;
     let manager = SystemdManager;
     manager.available()?;
     let operator = artifact::current()?;
@@ -536,13 +537,13 @@ pub async fn status() -> Result<()> {
         state.status.label(),
         state.unit_file_state
     );
-    println!("Private endpoint: http://{}/mcp", config.backend.listen);
+    println!("Private endpoint: http://{BACKEND_ADDR}/mcp");
     println!(
         "Public transport: ngrok HTTPS via host ingress (routing and OAuth checked by host ingress)"
     );
-    println!("Navigation cwd: {}", config.workspace.default_cwd);
-    match runtime_status_once(&config.backend).await {
+    match runtime_status_once().await {
         Ok(runtime) => {
+            println!("Navigation cwd: {}", runtime.cwd);
             println!(
                 "Ready: {}  build {}{}",
                 if runtime.ready { "yes ✓" } else { "no" },
@@ -553,7 +554,10 @@ pub async fn status() -> Result<()> {
                     " ≠"
                 }
             );
-            println!("Codex: {}", runtime.codex.release);
+            println!(
+                "Codex: {} ({})",
+                runtime.codex.release, runtime.codex.binary
+            );
             let defaults = &runtime.codex.global_config;
             println!(
                 "Worker defaults: model={}  reasoning={}  serviceTier={}",
@@ -562,13 +566,15 @@ pub async fn status() -> Result<()> {
                 defaults.service_tier.as_deref().unwrap_or("upstream")
             );
         }
-        Err(error) => println!("Ready: no ({error})"),
+        Err(error) => {
+            println!("Navigation cwd: unavailable");
+            println!("Ready: no ({error})");
+        }
     }
     Ok(())
 }
 
 pub async fn restart() -> Result<()> {
-    let (_, config) = load_config()?;
     let manager = SystemdManager;
     manager.available()?;
     let state = manager.unit_state(BACKEND_SERVICE)?;
@@ -577,7 +583,7 @@ pub async fn restart() -> Result<()> {
     } else {
         manager.enable_start(BACKEND_SERVICE)?;
     }
-    let runtime = wait_for_backend_health(&config, Some(&artifact::current()?.sha256)).await?;
+    let runtime = wait_for_backend_health(Some(&artifact::current()?.sha256)).await?;
     println!("✓ Restarted backend — ready build {}.", runtime.build_id);
     Ok(())
 }
@@ -593,7 +599,6 @@ pub async fn logs(lines: usize, follow: bool) -> Result<()> {
 }
 
 pub async fn doctor() -> Result<()> {
-    let (_, config) = load_config()?;
     let manager = SystemdManager;
     let mut failures = Vec::new();
     check(
@@ -602,29 +607,6 @@ pub async fn doctor() -> Result<()> {
         manager.available(),
         |_| "available".to_string(),
     );
-    check(
-        &mut failures,
-        "default workspace",
-        resolve_required_directory(&config.workspace.default_cwd, "default workspace"),
-        |path| display_path(path),
-    );
-    match resolve_executable(&config.backend.codex_bin).map(|path| (path.clone(), path)) {
-        Ok((display, path)) => match verify_codex_pin(&path).await {
-            Ok(()) => print_check(
-                "Codex binary",
-                true,
-                &format!("{} (contract matched)", display_path(&display)),
-            ),
-            Err(error) => {
-                print_check("Codex binary", false, &error.to_string());
-                failures.push("Codex binary".to_string());
-            }
-        },
-        Err(error) => {
-            print_check("Codex binary", false, &error.to_string());
-            failures.push("Codex binary".to_string());
-        }
-    }
     match manager.unit_state(BACKEND_SERVICE) {
         Ok(state) if state.status.is_running() && is_enabled(&state) => {
             print_check("Backend", true, "running and enabled")
@@ -638,19 +620,25 @@ pub async fn doctor() -> Result<()> {
             failures.push("backend".to_string());
         }
     }
-    let expected_default_cwd =
-        resolve_required_directory(&config.workspace.default_cwd, "default workspace")?;
     let expected_sha256 = artifact::current()?.sha256;
-    match runtime_status_once(&config.backend).await {
-        Ok(status) => {
-            match validate_runtime_status(&status, &expected_default_cwd, Some(&expected_sha256)) {
-                Ok(()) => print_check("App Server", true, "stdio ready; identity matched"),
-                Err(error) => {
-                    print_check("App Server", false, &error.to_string());
-                    failures.push("backend".to_string());
-                }
+    match runtime_status_once().await {
+        Ok(status) => match validate_runtime_status(&status, Some(&expected_sha256)) {
+            Ok(()) => {
+                print_check(
+                    "Runtime",
+                    true,
+                    &format!(
+                        "cwd={} codex={} ({})",
+                        status.cwd, status.codex.release, status.codex.binary
+                    ),
+                );
+                print_check("App Server", true, "stdio ready; identity matched");
             }
-        }
+            Err(error) => {
+                print_check("App Server", false, &error.to_string());
+                failures.push("backend".to_string());
+            }
+        },
         Err(error) => {
             print_check("Backend health", false, &error.to_string());
             failures.push("backend".to_string());
@@ -669,22 +657,15 @@ pub async fn doctor() -> Result<()> {
 
 fn rollback_setup(
     manager: &SystemdManager,
-    store: &ConfigStore,
-    original: Option<&[u8]>,
     old_unit: Option<&str>,
     old_state: &UnitState,
     restore_runtime: bool,
 ) -> Result<()> {
     if restore_runtime {
-        let _ = manager.stop(BACKEND_SERVICE);
+        manager.stop(BACKEND_SERVICE)?;
         if old_unit.is_none() {
-            let _ = manager.disable(BACKEND_SERVICE);
+            manager.disable(BACKEND_SERVICE)?;
         }
-    }
-    match original {
-        Some(bytes) => store.restore_bytes(bytes)?,
-        None if store.exists() => fs::remove_file(store.path())?,
-        None => {}
     }
     match old_unit {
         Some(unit) => manager.install_unit(BACKEND_SERVICE, unit)?,
@@ -702,18 +683,6 @@ fn rollback_setup(
         }
     }
     Ok(())
-}
-
-fn load_config() -> Result<(ConfigStore, Config)> {
-    let store = ConfigStore::default()?;
-    if !store.exists() {
-        bail!(
-            "configuration not found at {}; run `codex-connect setup`",
-            store.path().display()
-        );
-    }
-    let config = store.load()?;
-    Ok((store, config))
 }
 
 fn source_tree() -> Result<PathBuf> {
@@ -758,7 +727,17 @@ fn operator_path_is_owned(path: &Path, build_root: &Path) -> Result<bool> {
     } else {
         path.parent().unwrap_or(Path::new("/")).join(target)
     };
-    Ok(target.starts_with(build_root))
+    let target = match target.canonicalize() {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let root = match build_root.canonicalize() {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(target.starts_with(root))
 }
 
 fn remove_operator_if_owned(path: &Path, build_root: &Path) -> Result<bool> {
@@ -790,8 +769,28 @@ fn operator_ownership_only_accepts_managed_symlinks() {
     fs::write(&unmanaged, b"unmanaged").unwrap();
     std::os::unix::fs::symlink(&unmanaged, &operator).unwrap();
     assert!(!operator_path_is_owned(&operator, &build_root).unwrap());
+    assert!(
+        preflight_operator_path_at(&operator, &build_root)
+            .unwrap_err()
+            .to_string()
+            .contains("unmanaged operator path")
+    );
     assert!(!remove_operator_if_owned(&operator, &build_root).unwrap());
     assert!(operator.symlink_metadata().is_ok());
+}
+
+#[cfg(test)]
+#[test]
+fn operator_link_restores_previous_target_after_commit_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let operator = directory.path().join("codex-connect");
+    let previous = directory.path().join("previous");
+    let replacement = directory.path().join("replacement");
+    std::os::unix::fs::symlink(&previous, &operator).unwrap();
+    fs::remove_file(&operator).unwrap();
+    std::os::unix::fs::symlink(&replacement, &operator).unwrap();
+    restore_operator_path(&operator, Some(&previous)).unwrap();
+    assert_eq!(fs::read_link(&operator).unwrap(), previous);
 }
 
 fn remove_tree_if_present(path: &Path) -> Result<()> {
@@ -831,46 +830,51 @@ fn install_artifact(built: &Path, sha256: &str) -> Result<PathBuf> {
     fs::rename(&temporary, &destination)?;
     Ok(destination.canonicalize()?)
 }
-fn activate_operator_symlink(installed: &Path) -> Result<()> {
+fn preflight_operator_path() -> Result<Option<PathBuf>> {
     let directory = user_local_root()?.join("bin");
     fs::create_dir_all(&directory)?;
     let destination = directory.join("codex-connect");
     let build_root = managed_build_root()?;
-    if destination.symlink_metadata().is_ok() && !operator_path_is_owned(&destination, &build_root)?
-    {
-        bail!(
+    preflight_operator_path_at(&destination, &build_root)
+}
+
+fn preflight_operator_path_at(destination: &Path, build_root: &Path) -> Result<Option<PathBuf>> {
+    match destination.symlink_metadata() {
+        Ok(_) if !operator_path_is_owned(destination, build_root)? => bail!(
             "refusing to replace unmanaged operator path {}",
             destination.display()
-        );
+        ),
+        Ok(_) => Ok(Some(fs::read_link(destination)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
-    let temporary = directory.join(format!(".codex-connect-link-{}", std::process::id()));
-    if temporary.symlink_metadata().is_ok() {
-        fs::remove_file(&temporary)?;
+}
+
+fn restore_operator_path(destination: &Path, old_target: Option<&Path>) -> Result<()> {
+    if let Some(target) = old_target {
+        let temporary =
+            destination.with_file_name(format!(".codex-connect-restore-{}", std::process::id()));
+        if temporary.symlink_metadata().is_ok() {
+            fs::remove_file(&temporary)?;
+        }
+        std::os::unix::fs::symlink(target, &temporary)?;
+        if let Err(error) = fs::rename(&temporary, destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+    } else {
+        fs::remove_file(destination)?;
     }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(installed, &temporary)?;
-    #[cfg(not(unix))]
-    fs::copy(installed, &temporary)?;
-    fs::rename(temporary, destination)?;
     Ok(())
 }
-fn resolve_required_directory(value: &str, kind: &str) -> Result<PathBuf> {
-    let path = expand_path(value)?
+fn default_cwd() -> Result<PathBuf> {
+    let path = home_dir()?
         .canonicalize()
-        .with_context(|| format!("configured {kind} does not exist: {value}"))?;
+        .context("HOME does not resolve to an existing directory")?;
     if !path.is_dir() {
-        bail!("configured {kind} is not a directory: {}", path.display());
+        bail!("HOME is not a directory: {}", path.display());
     }
     Ok(path)
-}
-fn resolve_executable(value: &str) -> Result<PathBuf> {
-    if Path::new(value).is_absolute() || value.starts_with("~/") || value.contains('/') {
-        let path = expand_path(value)?;
-        ensure_executable(&path)?;
-        Ok(path)
-    } else {
-        find_executable(value)
-    }
 }
 fn find_executable(name: &str) -> Result<PathBuf> {
     let path_var = std::env::var_os("PATH").context("PATH is not set")?;
@@ -901,21 +905,14 @@ fn is_enabled(state: &UnitState) -> bool {
     )
 }
 
-async fn wait_for_backend_health(
-    config: &Config,
-    expected_sha256: Option<&str>,
-) -> Result<RuntimeStatus> {
-    let expected_default_cwd =
-        resolve_required_directory(&config.workspace.default_cwd, "default workspace")?;
+async fn wait_for_backend_health(expected_sha256: Option<&str>) -> Result<RuntimeStatus> {
     let mut last_error = None;
     for _ in 0..40 {
-        match runtime_status_once(&config.backend).await {
-            Ok(status) => {
-                match validate_runtime_status(&status, &expected_default_cwd, expected_sha256) {
-                    Ok(()) => return Ok(status),
-                    Err(error) => last_error = Some(error),
-                }
-            }
+        match runtime_status_once().await {
+            Ok(status) => match validate_runtime_status(&status, expected_sha256) {
+                Ok(()) => return Ok(status),
+                Err(error) => last_error = Some(error),
+            },
             Err(error) => last_error = Some(error),
         }
         sleep(Duration::from_millis(250)).await;
@@ -928,14 +925,7 @@ async fn wait_for_backend_health(
     )
 }
 
-fn validate_runtime_status(
-    status: &RuntimeStatus,
-    expected_default_cwd: &Path,
-    expected_sha256: Option<&str>,
-) -> Result<()> {
-    if PathBuf::from(&status.cwd).canonicalize()? != expected_default_cwd {
-        bail!("backend reports a different default cwd");
-    }
+fn validate_runtime_status(status: &RuntimeStatus, expected_sha256: Option<&str>) -> Result<()> {
     if expected_sha256.is_some_and(|hash| status.binary_sha256 != hash) {
         bail!("backend is running a stale build");
     }
@@ -951,133 +941,8 @@ fn validate_runtime_status(
     Ok(())
 }
 
-async fn runtime_status_once(config: &BackendConfig) -> Result<RuntimeStatus> {
-    let addr = config.listen_addr()?;
-    if http_get(addr, "/healthz").await?.0 != 200 {
-        bail!("health endpoint did not return HTTP 200");
-    }
-    let (status, body) = http_get(addr, "/runtime").await?;
-    if status != 200 {
-        bail!("runtime endpoint returned HTTP {status}");
-    }
-    Ok(serde_json::from_slice(&body)?)
-}
-
-pub(crate) async fn backend_observer_once(config: &BackendConfig) -> Result<serde_json::Value> {
-    let addr = config.listen_addr()?;
-    let (status, body) = http_get(addr, "/observe").await?;
-    if status != 200 {
-        bail!("observer endpoint returned HTTP {status}");
-    }
-    Ok(serde_json::from_slice(&body)?)
-}
-
-pub(crate) async fn backend_observer_wait(
-    config: &BackendConfig,
-    cursor: u64,
-) -> Result<serde_json::Value> {
-    let addr = config.listen_addr()?;
-    let path = format!("/observe/wait/{cursor}");
-    let (status, body) = http_get_wait(addr, &path).await?;
-    if status != 200 {
-        bail!("observer wait endpoint returned HTTP {status}");
-    }
-    Ok(serde_json::from_slice(&body)?)
-}
-
-pub(crate) async fn backend_transcript_once(
-    config: &BackendConfig,
-    thread_id: &str,
-    turn_id: &str,
-) -> Result<serde_json::Value> {
-    let addr = config.listen_addr()?;
-    let path = format!(
-        "/observe/transcript/{}/{}",
-        percent_encode_path_segment(thread_id),
-        percent_encode_path_segment(turn_id)
-    );
-    let (status, body) = http_get(addr, &path).await?;
-    if status != 200 {
-        bail!("transcript endpoint returned HTTP {status}");
-    }
-    Ok(serde_json::from_slice(&body)?)
-}
-
-fn percent_encode_path_segment(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(encoded, "%{byte:02X}");
-        }
-    }
-    encoded
-}
-
-async fn http_get(addr: SocketAddr, path: &str) -> Result<(u16, Vec<u8>)> {
-    http_get_inner(addr, path, Some(HEALTH_TIMEOUT)).await
-}
-
-async fn http_get_wait(addr: SocketAddr, path: &str) -> Result<(u16, Vec<u8>)> {
-    http_get_inner(addr, path, None).await
-}
-
-async fn http_get_inner(
-    addr: SocketAddr,
-    path: &str,
-    response_timeout: Option<Duration>,
-) -> Result<(u16, Vec<u8>)> {
-    let mut stream = timeout(HEALTH_TIMEOUT, TcpStream::connect(addr)).await??;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    timeout(HEALTH_TIMEOUT, stream.write_all(request.as_bytes()))
-        .await
-        .context("backend request timed out")??;
-    let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 8 * 1024];
-    loop {
-        let read = match response_timeout {
-            Some(duration) => timeout(duration, stream.read(&mut buffer))
-                .await
-                .context("backend response timed out")??,
-            None => stream.read(&mut buffer).await?,
-        };
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-        if bytes.len() > HEALTH_MAX_RESPONSE_BYTES {
-            bail!("backend response exceeded 1 MiB");
-        }
-        if response_complete(&bytes) {
-            break;
-        }
-    }
-    let header_end = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .context("backend returned incomplete HTTP response")?;
-    let status = String::from_utf8_lossy(&bytes[..header_end])
-        .split_whitespace()
-        .nth(1)
-        .context("backend returned invalid HTTP status")?
-        .parse()?;
-    Ok((status, bytes[header_end + 4..].to_vec()))
-}
-
-fn response_complete(bytes: &[u8]) -> bool {
-    let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
-    };
-    let header = String::from_utf8_lossy(&bytes[..header_end]);
-    let content_length = header.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        key.eq_ignore_ascii_case("content-length")
-            .then(|| value.trim().parse::<usize>().ok())
-            .flatten()
-    });
-    content_length.is_some_and(|length| bytes.len() >= header_end + 4 + length)
+async fn runtime_status_once() -> Result<RuntimeStatus> {
+    BackendClient::new().runtime().await
 }
 
 fn print_check(label: &str, passed: bool, detail: &str) {

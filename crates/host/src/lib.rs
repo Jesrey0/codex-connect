@@ -42,6 +42,8 @@ pub enum HostError {
     InvalidDefaultCwd,
     #[error("host path is not valid UTF-8 for App Server")]
     NonUtf8Path,
+    #[error("host path is not a directory: {0}")]
+    NotDirectory(String),
     #[error("host operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("search query must not be empty")]
@@ -134,9 +136,7 @@ impl Host {
     pub fn resolve_app_server_directory(&self, requested: &str) -> Result<String, HostError> {
         let candidate = self.resolve_app_server_existing(requested)?;
         if !Path::new(&candidate).is_dir() {
-            return Err(HostError::PatchFailed(format!(
-                "host path is not a directory: {requested}"
-            )));
+            return Err(HostError::NotDirectory(requested.to_string()));
         }
         Ok(candidate)
     }
@@ -309,6 +309,7 @@ impl Host {
         let mut actions = Vec::with_capacity(changes.len());
         let mut applied = Vec::with_capacity(changes.len());
         let mut touched = HashSet::new();
+        let mut snapshots = Vec::new();
         for change in changes {
             if is_cancelled() {
                 return Err(HostError::PatchCancelled);
@@ -316,8 +317,8 @@ impl Host {
             match change {
                 PatchChange::Add { path, content } => {
                     let path = self.resolve_mutation_path(&Self::path_from_cwd(cwd, &path)?)?;
-                    ensure_patch_destination(&path)?;
                     register_patch_path(&mut touched, &path)?;
+                    snapshots.push(PatchSnapshot::capture(&path)?);
                     applied.push(self.relative(&path));
                     actions.push(PatchAction::Write {
                         path,
@@ -327,8 +328,10 @@ impl Host {
                 }
                 PatchChange::Delete { path } => {
                     let path = self.resolve_mutation_path(&Self::path_from_cwd(cwd, &path)?)?;
-                    ensure_regular_file(&path)?;
                     register_patch_path(&mut touched, &path)?;
+                    let snapshot = PatchSnapshot::capture(&path)?;
+                    snapshot.require_file()?;
+                    snapshots.push(snapshot);
                     applied.push(self.relative(&path));
                     actions.push(PatchAction::Delete { path });
                 }
@@ -338,15 +341,16 @@ impl Host {
                     hunks,
                 } => {
                     let source = self.resolve_mutation_path(&Self::path_from_cwd(cwd, &path)?)?;
-                    ensure_regular_file(&source)?;
-                    let permissions = fs::metadata(&source)?.permissions();
-                    let original = fs::read(&source)?;
-                    let original = std::str::from_utf8(&original).map_err(|_| {
-                        HostError::PatchFailed(format!(
-                            "cannot update non-UTF-8 file: {}",
-                            self.relative(&source)
-                        ))
-                    })?;
+                    register_patch_path(&mut touched, &source)?;
+                    let source_snapshot = PatchSnapshot::capture(&source)?;
+                    let permissions = source_snapshot.require_file()?.permissions.clone();
+                    let original = std::str::from_utf8(&source_snapshot.require_file()?.bytes)
+                        .map_err(|_| {
+                            HostError::PatchFailed(format!(
+                                "cannot update non-UTF-8 file: {}",
+                                self.relative(&source)
+                            ))
+                        })?;
                     let content = apply_hunks(original, &hunks)?;
                     let destination = match move_path {
                         Some(path) => {
@@ -354,11 +358,11 @@ impl Host {
                         }
                         None => source.clone(),
                     };
-                    ensure_patch_destination(&destination)?;
-                    register_patch_path(&mut touched, &source)?;
                     if destination != source {
                         register_patch_path(&mut touched, &destination)?;
+                        snapshots.push(PatchSnapshot::capture(&destination)?);
                     }
+                    snapshots.push(source_snapshot);
                     applied.push(self.relative(&destination));
                     actions.push(PatchAction::Write {
                         path: destination.clone(),
@@ -371,7 +375,11 @@ impl Host {
                 }
             }
         }
-        Ok(PatchPlan { actions, applied })
+        Ok(PatchPlan {
+            actions,
+            applied,
+            snapshots,
+        })
     }
 
     fn apply_patch_plan(
@@ -382,32 +390,53 @@ impl Host {
         let mut completed = Vec::with_capacity(plan.actions.len());
         let mut created_directories = Vec::new();
         let result = (|| -> Result<(), HostError> {
+            for snapshot in &plan.snapshots {
+                self.revalidate_patch_snapshot(snapshot)?;
+            }
             for action in &plan.actions {
                 if is_cancelled() {
                     return Err(HostError::PatchCancelled);
                 }
                 let path = action.path();
+                let snapshot = plan
+                    .snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.path == path)
+                    .expect("every action has a planning snapshot");
                 match action {
                     PatchAction::Write {
                         content,
                         permissions,
                         ..
                     } => {
-                        created_directories.extend(create_missing_parent_directories(path)?);
+                        create_missing_parent_directories(path, &mut created_directories)?;
                         let stage = StagedPatchFile::new(path, content, permissions.as_ref())?;
-                        let backup = if path.exists() {
+                        let backup = if snapshot.file.is_some() {
                             let backup = reserve_patch_backup(path)?;
+                            if let Err(error) = self.revalidate_patch_snapshot(snapshot) {
+                                let _ = fs::remove_file(&backup);
+                                return Err(error);
+                            }
                             if let Err(error) = fs::rename(path, &backup) {
                                 let _ = fs::remove_file(&backup);
                                 return Err(error.into());
                             }
                             Some(backup)
                         } else {
+                            self.revalidate_patch_snapshot(snapshot)?;
                             None
                         };
-                        if let Err(error) = stage.install(path) {
+                        let installed = if backup.is_some() {
+                            stage.install(path)
+                        } else {
+                            stage.install_new(path)
+                        };
+                        if let Err(error) = installed {
                             if let Some(backup) = &backup {
-                                let _ = fs::rename(backup, path);
+                                completed.push(CompletedPatchAction::Delete {
+                                    path: path.to_path_buf(),
+                                    backup: backup.clone(),
+                                });
                             }
                             return Err(error.into());
                         }
@@ -418,6 +447,10 @@ impl Host {
                     }
                     PatchAction::Delete { .. } => {
                         let backup = reserve_patch_backup(path)?;
+                        if let Err(error) = self.revalidate_patch_snapshot(snapshot) {
+                            let _ = fs::remove_file(&backup);
+                            return Err(error);
+                        }
                         if let Err(error) = fs::rename(path, &backup) {
                             let _ = fs::remove_file(&backup);
                             return Err(error.into());
@@ -435,12 +468,33 @@ impl Host {
             Ok(())
         })();
         if let Err(error) = result {
-            rollback_patch(&completed);
-            remove_created_directories(&created_directories);
-            return Err(error);
+            let rollback_errors = rollback_patch(&completed);
+            let directory_errors = remove_created_directories(&created_directories);
+            if rollback_errors.is_empty() && directory_errors.is_empty() {
+                return Err(error);
+            }
+            return Err(HostError::PatchFailed(format!(
+                "{error}; partial rollback: {}",
+                rollback_errors
+                    .into_iter()
+                    .chain(directory_errors)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
         }
         cleanup_patch_backups(&completed);
         Ok(plan.applied)
+    }
+
+    fn revalidate_patch_snapshot(&self, snapshot: &PatchSnapshot) -> Result<(), HostError> {
+        let requested = snapshot.path.to_str().ok_or(HostError::NonUtf8Path)?;
+        if self.resolve_mutation_path(requested)? != snapshot.path || !snapshot.matches_current()? {
+            return Err(HostError::PatchFailed(format!(
+                "patch target changed after planning: {}",
+                snapshot.path.display()
+            )));
+        }
+        Ok(())
     }
 
     fn resolve_existing(&self, requested: &str) -> Result<PathBuf, HostError> {
@@ -685,6 +739,117 @@ enum PatchLine {
 struct PatchPlan {
     actions: Vec<PatchAction>,
     applied: Vec<String>,
+    snapshots: Vec<PatchSnapshot>,
+}
+
+struct PatchSnapshot {
+    path: PathBuf,
+    file: Option<PatchFileSnapshot>,
+}
+
+struct PatchFileSnapshot {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    bytes: Vec<u8>,
+    permissions: fs::Permissions,
+}
+
+impl PatchSnapshot {
+    fn capture(path: &Path) -> Result<Self, HostError> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    path: path.to_path_buf(),
+                    file: None,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(HostError::SymlinkMutation(path.display().to_string()));
+        }
+        if !metadata.is_file() {
+            return Err(HostError::PatchFailed(format!(
+                "expected a regular file: {}",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let mut file = options.open(path)?;
+        let opened = file.metadata()?;
+        if !opened.is_file() {
+            return Err(HostError::PatchFailed(format!(
+                "expected a regular file: {}",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+            return Err(HostError::PatchFailed(format!(
+                "patch target changed while reading: {}",
+                path.display()
+            )));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        #[cfg(unix)]
+        {
+            let current = fs::symlink_metadata(path)?;
+            if current.dev() != opened.dev() || current.ino() != opened.ino() {
+                return Err(HostError::PatchFailed(format!(
+                    "patch target changed while reading: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Some(PatchFileSnapshot {
+                #[cfg(unix)]
+                device: opened.dev(),
+                #[cfg(unix)]
+                inode: opened.ino(),
+                bytes,
+                permissions: opened.permissions(),
+            }),
+        })
+    }
+
+    fn require_file(&self) -> Result<&PatchFileSnapshot, HostError> {
+        if self.file.is_none() {
+            fs::symlink_metadata(&self.path)?;
+        }
+        Ok(self
+            .file
+            .as_ref()
+            .expect("existing snapshot is a regular file"))
+    }
+
+    fn matches_current(&self) -> Result<bool, HostError> {
+        let current = Self::capture(&self.path)?;
+        Ok(match (&self.file, &current.file) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) => {
+                #[cfg(unix)]
+                let same_identity =
+                    expected.device == actual.device && expected.inode == actual.inode;
+                #[cfg(not(unix))]
+                let same_identity = true;
+                same_identity
+                    && expected.bytes == actual.bytes
+                    && expected.permissions == actual.permissions
+            }
+            _ => false,
+        })
+    }
 }
 
 enum PatchAction {
@@ -1014,33 +1179,6 @@ fn find_lines(
         .or_else(|| (search_start..=last).find(|index| matches_trim(*index)))
 }
 
-fn ensure_regular_file(path: &Path) -> Result<(), HostError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Err(HostError::SymlinkMutation(path.display().to_string()));
-    }
-    if !metadata.is_file() {
-        return Err(HostError::PatchFailed(format!(
-            "expected a regular file: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn ensure_patch_destination(path: &Path) -> Result<(), HostError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err(HostError::SymlinkMutation(path.display().to_string()))
-        }
-        Ok(metadata) if !metadata.is_file() => Err(HostError::PatchFailed(format!(
-            "patch destination is not a regular file: {}",
-            path.display()
-        ))),
-        Ok(_) | Err(_) => Ok(()),
-    }
-}
-
 fn register_patch_path(touched: &mut HashSet<PathBuf>, path: &Path) -> Result<(), HostError> {
     if touched.insert(path.to_path_buf()) {
         Ok(())
@@ -1052,7 +1190,10 @@ fn register_patch_path(touched: &mut HashSet<PathBuf>, path: &Path) -> Result<()
     }
 }
 
-fn create_missing_parent_directories(path: &Path) -> Result<Vec<PathBuf>, HostError> {
+fn create_missing_parent_directories(
+    path: &Path,
+    created: &mut Vec<PathBuf>,
+) -> Result<(), HostError> {
     let mut missing = Vec::new();
     let mut current = path.parent().ok_or_else(|| {
         HostError::PatchFailed(format!(
@@ -1075,12 +1216,11 @@ fn create_missing_parent_directories(path: &Path) -> Result<Vec<PathBuf>, HostEr
             current.display()
         )));
     }
-    let mut created = Vec::with_capacity(missing.len());
     for directory in missing.iter().rev() {
         fs::create_dir(directory)?;
         created.push(directory.clone());
     }
-    Ok(created)
+    Ok(())
 }
 
 struct StagedPatchFile {
@@ -1127,6 +1267,12 @@ impl StagedPatchFile {
         self.armed = false;
         Ok(())
     }
+
+    fn install_new(self, destination: &Path) -> Result<(), std::io::Error> {
+        // The stage is in the destination directory, so linking it fails atomically
+        // if another writer created the new path after the snapshot check.
+        fs::hard_link(&self.path, destination)
+    }
 }
 
 impl Drop for StagedPatchFile {
@@ -1164,26 +1310,49 @@ fn cleanup_patch_backups(completed: &[CompletedPatchAction]) {
     }
 }
 
-fn rollback_patch(completed: &[CompletedPatchAction]) {
+fn rollback_patch(completed: &[CompletedPatchAction]) -> Vec<String> {
+    let mut errors = Vec::new();
     for action in completed.iter().rev() {
         match action {
             CompletedPatchAction::Write { path, backup } => {
-                let _ = fs::remove_file(path);
-                if let Some(backup) = backup {
-                    let _ = fs::rename(backup, path);
+                if let Err(error) = fs::remove_file(path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    errors.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+                if let Some(backup) = backup
+                    && let Err(error) = fs::rename(backup, path)
+                {
+                    errors.push(format!(
+                        "{}: {error}; backup at {}",
+                        path.display(),
+                        backup.display()
+                    ));
                 }
             }
             CompletedPatchAction::Delete { path, backup } => {
-                let _ = fs::rename(backup, path);
+                if let Err(error) = fs::rename(backup, path) {
+                    errors.push(format!(
+                        "{}: {error}; backup at {}",
+                        path.display(),
+                        backup.display()
+                    ));
+                }
             }
         }
     }
+    errors
 }
 
-fn remove_created_directories(directories: &[PathBuf]) {
+fn remove_created_directories(directories: &[PathBuf]) -> Vec<String> {
+    let mut errors = Vec::new();
     for directory in directories.iter().rev() {
-        let _ = fs::remove_dir(directory);
+        if let Err(error) = fs::remove_dir(directory) {
+            errors.push(format!("{}: {error}", directory.display()));
+        }
     }
+    errors
 }
 
 #[cfg(test)]
@@ -1191,8 +1360,110 @@ mod tests {
     use super::Host;
     use super::HostError;
     use super::StagedPatchFile;
+    use super::{CompletedPatchAction, parse_patch, rollback_patch};
     use base64::Engine;
     use std::fs;
+
+    #[test]
+    fn patch_rejects_changed_source_before_touching_any_file() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("first.txt"), "first\n").unwrap();
+        fs::write(directory.path().join("second.txt"), "before\n").unwrap();
+        let host = Host::open(directory.path()).unwrap();
+        let document = parse_patch("*** Begin Patch\n*** Update File: first.txt\n@@\n-first\n+updated\n*** Update File: second.txt\n@@\n-before\n+after\n*** End Patch").unwrap();
+        let plan = host
+            .plan_patch(
+                document.changes,
+                directory.path().to_str().unwrap(),
+                &|| false,
+            )
+            .unwrap();
+        fs::write(directory.path().join("second.txt"), "concurrent\n").unwrap();
+
+        let error = host.apply_patch_plan(plan, &|| false).unwrap_err();
+        assert!(error.to_string().contains("changed after planning"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("first.txt")).unwrap(),
+            "first\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("second.txt")).unwrap(),
+            "concurrent\n"
+        );
+    }
+
+    #[test]
+    fn patch_rejects_destination_created_after_planning() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = Host::open(directory.path()).unwrap();
+        let document =
+            parse_patch("*** Begin Patch\n*** Add File: new.txt\n+planned\n*** End Patch").unwrap();
+        let plan = host
+            .plan_patch(
+                document.changes,
+                directory.path().to_str().unwrap(),
+                &|| false,
+            )
+            .unwrap();
+        fs::write(directory.path().join("new.txt"), "concurrent").unwrap();
+
+        assert!(
+            host.apply_patch_plan(plan, &|| false)
+                .unwrap_err()
+                .to_string()
+                .contains("changed after planning")
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("new.txt")).unwrap(),
+            "concurrent"
+        );
+    }
+
+    #[test]
+    fn patch_rejects_same_content_replacement_after_planning() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.txt");
+        fs::write(&path, "before\n").unwrap();
+        let host = Host::open(directory.path()).unwrap();
+        let document = parse_patch(
+            "*** Begin Patch\n*** Update File: source.txt\n@@\n-before\n+after\n*** End Patch",
+        )
+        .unwrap();
+        let plan = host
+            .plan_patch(
+                document.changes,
+                directory.path().to_str().unwrap(),
+                &|| false,
+            )
+            .unwrap();
+        let replacement = directory.path().join("replacement");
+        fs::write(&replacement, "before\n").unwrap();
+        fs::rename(replacement, &path).unwrap();
+
+        assert!(
+            host.apply_patch_plan(plan, &|| false)
+                .unwrap_err()
+                .to_string()
+                .contains("changed after planning")
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), "before\n");
+    }
+
+    #[test]
+    fn rollback_reports_paths_it_cannot_restore() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("blocked");
+        fs::create_dir(&path).unwrap();
+        let backup = directory.path().join("backup");
+        fs::write(&backup, "original").unwrap();
+        let errors = rollback_patch(&[CompletedPatchAction::Write {
+            path: path.clone(),
+            backup: Some(backup.clone()),
+        }]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains(path.to_str().unwrap()));
+        assert!(backup.exists());
+    }
 
     #[test]
     fn app_server_paths_use_default_cwd_but_allow_absolute_host_paths() {
