@@ -53,3 +53,5 @@ For documentation changes, verify local Markdown links and search for stale cont
 Keep durable product behavior separate from diagnostics and scratch tooling. Prefer existing abstractions and standard library code for small changes. Review dependency and compile impact. When semantics change, rename the concept across code, schemas, tests, docs, comments, and examples; do not retain aliases, fallback readers, migration shims, deprecated names, or dual paths without an explicit current requirement.
 
 Prefer one concrete mechanism over speculative abstraction: share durable atomic-file writes, lock primitives, and validated authority objects instead of cloning their implementations. Split modules when they own a coherent state machine or boundary, not merely because a file is long. Do not add an interface with one implementation unless it creates a real testing or substitution boundary.
+
+Deployment activation is self-hosting: a newly prepared binary must be able to consume the immediately previous deployment-record version long enough to complete the handoff. Do not broaden that narrow transition into general legacy-format support.
