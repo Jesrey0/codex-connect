@@ -1,9 +1,6 @@
 //! Public operator catalog and compact MCP schemas.
 use super::MAX_INSPECT_OPERATIONS;
-use codex_connect_relay::{
-    DEFAULT_COMMAND_MS, DEFAULT_COMMAND_READ_MS, MAX_COMMAND_MS, MAX_COMMAND_READ_MS,
-    MAX_COMMAND_WRITE_BYTES,
-};
+use codex_connect_relay::{DEFAULT_COMMAND_READ_MS, MAX_COMMAND_READ_MS, MAX_COMMAND_WRITE_BYTES};
 use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -644,8 +641,7 @@ fn command_schema() -> Value {
         json!({
             "command":{"type":"array","minItems":1,"description":"Host argv. Invoke a shell explicitly for pipes, redirects, or shell expansion.","items":{"type":"string"}},
             "cwd":cwd_schema(),
-            "env":{"type":["object","null"],"description":"Child environment overrides; null values remove variables.","additionalProperties":{"type":["string","null"]}},
-            "timeoutMs":{"type":"integer","minimum":1,"maximum":MAX_COMMAND_MS,"default":DEFAULT_COMMAND_MS,"description":"Maximum App Server command execution time. App Server terminates the command when this timeout expires."}
+            "env":{"type":["object","null"],"description":"Child environment overrides; null values remove variables.","additionalProperties":{"type":["string","null"]}}
         }),
         &["command"],
     )
@@ -1225,8 +1221,7 @@ mod tests {
         let properties = schema["properties"].as_object().unwrap();
         assert!(!properties.contains_key("disableTimeout"));
         assert!(!properties.contains_key("disableOutputCap"));
-        assert_eq!(properties["timeoutMs"]["default"], DEFAULT_COMMAND_MS);
-        assert_eq!(properties["timeoutMs"]["maximum"], MAX_COMMAND_MS);
+        assert!(!properties.contains_key("timeoutMs"));
         assert!(!properties.contains_key("outputBytesCap"));
         assert_eq!(schema["additionalProperties"], false);
         assert!(properties.get("sandboxPolicy").is_none());

@@ -36,10 +36,9 @@ use tower_service::Service;
 
 const QUICK_TOOL_GUARD_MS: u64 = 45_000;
 const CODEX_START_GUARD_MS: u64 = 50_000;
-const COMMAND_EXEC_GUARD_ALLOWANCE_MS: u64 = 5_000;
-const COMMAND_EXEC_GUARD_MS: u64 = codex_connect_relay::MAX_COMMAND_MS
+const COMMAND_EXEC_GUARD_MS: u64 = codex_connect_relay::DEFAULT_COMMAND_MS
     + codex_connect_relay::COMMAND_EXEC_RESPONSE_ALLOWANCE_MS
-    + COMMAND_EXEC_GUARD_ALLOWANCE_MS;
+    + 5_000;
 const COMMAND_READ_GUARD_ALLOWANCE_MS: u64 = 5_000;
 const COMMAND_READ_GUARD_MS: u64 =
     codex_connect_relay::MAX_COMMAND_READ_MS + COMMAND_READ_GUARD_ALLOWANCE_MS;
@@ -133,7 +132,6 @@ struct HostCommandExecArgs {
     command: Vec<String>,
     cwd: Option<String>,
     env: Option<std::collections::BTreeMap<String, Option<String>>>,
-    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -699,17 +697,7 @@ fn tool_guard_ms(name: &str, arguments: &JsonObject) -> u64 {
                 .saturating_add(COMMAND_READ_GUARD_ALLOWANCE_MS)
                 .min(COMMAND_READ_GUARD_MS)
         }
-        "command.exec" => {
-            let requested = arguments
-                .get("timeoutMs")
-                .and_then(Value::as_u64)
-                .unwrap_or(codex_connect_relay::DEFAULT_COMMAND_MS)
-                .min(codex_connect_relay::MAX_COMMAND_MS);
-            requested
-                .saturating_add(codex_connect_relay::COMMAND_EXEC_RESPONSE_ALLOWANCE_MS)
-                .saturating_add(COMMAND_EXEC_GUARD_ALLOWANCE_MS)
-                .min(COMMAND_EXEC_GUARD_MS)
-        }
+        "command.exec" => COMMAND_EXEC_GUARD_MS,
         "codex.start" => CODEX_START_GUARD_MS,
         _ => QUICK_TOOL_GUARD_MS,
     }
@@ -950,7 +938,7 @@ async fn dispatch(
             relay
                 .command_exec(CommandExec {
                     command: a.command,
-                    timeout_ms: a.timeout_ms,
+                    timeout_ms: None,
                     output_bytes_cap: None,
                     cwd: a.cwd,
                     env: a.env,
@@ -1915,18 +1903,6 @@ mod tests {
                     + codex_connect_relay::COMMAND_EXEC_RESPONSE_ALLOWANCE_MS
         );
         for timeout in [
-            codex_connect_relay::DEFAULT_COMMAND_MS,
-            codex_connect_relay::MAX_COMMAND_MS,
-        ] {
-            let arguments = json!({"timeoutMs":timeout});
-            assert_eq!(
-                tool_guard_ms("command.exec", arguments.as_object().unwrap()),
-                timeout
-                    + codex_connect_relay::COMMAND_EXEC_RESPONSE_ALLOWANCE_MS
-                    + COMMAND_EXEC_GUARD_ALLOWANCE_MS
-            );
-        }
-        for timeout in [
             0,
             codex_connect_relay::DEFAULT_COMMAND_READ_MS,
             codex_connect_relay::MAX_COMMAND_READ_MS,
@@ -1941,12 +1917,7 @@ mod tests {
             tool_guard_ms("command.read", &empty),
             codex_connect_relay::DEFAULT_COMMAND_READ_MS + COMMAND_READ_GUARD_ALLOWANCE_MS
         );
-        assert_eq!(
-            tool_guard_ms("command.exec", &empty),
-            codex_connect_relay::DEFAULT_COMMAND_MS
-                + codex_connect_relay::COMMAND_EXEC_RESPONSE_ALLOWANCE_MS
-                + COMMAND_EXEC_GUARD_ALLOWANCE_MS
-        );
+        assert_eq!(tool_guard_ms("command.exec", &empty), COMMAND_EXEC_GUARD_MS);
         assert_eq!(tool_guard_ms("codex.start", &empty), CODEX_START_GUARD_MS);
         assert_eq!(tool_guard_ms("status", &empty), QUICK_TOOL_GUARD_MS);
     }
