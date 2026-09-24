@@ -16,6 +16,8 @@ Keep ownership one-way. `crates/host` owns host-path and Connect-native host mec
 
 Expose choices that control operator intent and project upstream protocol data into that vocabulary at the MCP boundary. Do not leak fields that merely repeat input, fixed constants, ranking internals, or account metadata that cannot drive an operator action. Keep execution limits and the worker wait budget in the relay; MCP guards must allow operations to finalize. `codex.wait` accepts only thread and turn IDs. `command.read.timeoutMs` supports immediate reads and bounded waits for interactive processes.
 
+In the measured ChatGPT chat/Code Mode connector path, the highest returned tool duration was 57.597 seconds and calls near 57.60 seconds failed. This is an observed boundary, not a platform contract. Keep synchronous operation budgets near 50 seconds with local guards no higher than 55 seconds: `codex.wait` uses a fixed 40-second join plus 10-second finalization reserve, `command.exec` uses a fixed 40-second command plus a 10-second response allowance, and `command.read.timeoutMs` is the only exposed wait setting (0–50 seconds). Use `codex.start` or `command.start` handles for longer work.
+
 Keep service tier, raw sandbox/approval policy, developer instructions, and cache controls internal. Preserve tool annotations, OAuth metadata, compact schemas, and PTY support. Test accepted inputs, outputs, and behavior without locking explanatory prose.
 
 ## Worker contract

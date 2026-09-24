@@ -10,16 +10,18 @@ The backend listens on loopback at `127.0.0.1:8767/mcp`. Public calls use `${NGR
 
 ## MCP streaming
 
-For the ChatGPT-compatible 2025-06-18 and 2025-11-25 Streamable HTTP transport, ordinary
-stateless requests, including tool calls, open a request-scoped SSE response immediately.
-The `tools/list` response stays JSON so the existing OpenAI `securitySchemes` projection
-can add its root-level descriptor field without buffering or rewriting SSE. SSE comments
-keep long-running tool calls active every 15 seconds. Origin validation remains enabled for
-the ChatGPT origins.
-This experiment adds no `Last-Event-ID` resumability state. It improves stream availability
-at the backend transport boundary; it has not been live-validated as a fix for ChatGPT
-frontend detachment. RMCP's negotiated 2026-07-28 request path can wait for handler output
-before opening SSE, so this behavior should not be assumed for that protocol path.
+The `tools/list` response stays JSON so the OpenAI `securitySchemes` projection can add its
+root-level descriptor field without buffering or rewriting SSE. For 2025-06-18 and 2025-11-25
+requests, ordinary stateless tool calls open a request-scoped SSE response immediately, with
+comments every 15 seconds during a quiet call.
+
+ChatGPT's observed `2026-07-28` requests take a different path in the pinned RMCP SDK:
+it waits for the first handler message before opening the response stream. A quiet tool call
+therefore receives neither SSE headers nor comments until its result is ready. Even when
+comments are sent, the MCP client ignores them; they are not ChatGPT conversation progress.
+The 2026 transport does not support `Last-Event-ID` resumability. Keep synchronous tools
+inside the caller's measured result window and use retained worker or command handles for
+long work. Origin validation remains enabled for the ChatGPT origins.
 
 ## Backend lifecycle
 
@@ -45,7 +47,7 @@ for pipes, redirects, or expansion. Set `tty=true` only when a terminal is neede
 After `command.start`, retain `processId`; the first `command.read` starts at cursor `0`, then
 passes each returned cursor to the next read. If the start response is lost, `status.commands`
 lists retained `processId`, state, and TTY mode for recovery. `timeoutMs=0` reads immediately; otherwise the read waits for output
-or exit. Timeout does not terminate the process. Continue until `drained=true` for
+or exit, up to 50 seconds per call. Timeout does not terminate the process. Continue until `drained=true` for
 final output; `historyLost=true` means older output was evicted. Termination can be
 forceful: confirm exit with `command.read`. Process handles belong to the backend's
 App Server connection and do not survive its restart.

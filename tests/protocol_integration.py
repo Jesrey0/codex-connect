@@ -480,7 +480,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(exited["wakeReason"], "exit")
         self.assertEqual(exited["exitCode"], 143)
         self.client.call("command.read", {
-            "processId": started["processId"], "timeoutMs": 300001,
+            "processId": started["processId"], "timeoutMs": 50001,
         }, error=True, validate_input=False)
 
         self.client.call("command.start", {
@@ -598,7 +598,7 @@ class OperatorProtocolTests(unittest.TestCase):
             "method": "tools/call",
             "params": {
                 "name": "command.read",
-                "arguments": {"processId": quiet["processId"], "timeoutMs": 55_000},
+                "arguments": {"processId": quiet["processId"], "timeoutMs": 45_000},
             },
         }
         started_at = time.monotonic()
@@ -636,14 +636,60 @@ class OperatorProtocolTests(unittest.TestCase):
                     frame.append(line.rstrip(b"\r\n"))
 
         self.assertIsNotNone(first_keepalive_at, "quiet tool read did not emit an SSE comment")
-        self.assertGreaterEqual(keepalive_count, 3)
+        self.assertGreaterEqual(keepalive_count, 2)
         self.assertIsNotNone(response_message, "quiet tool read did not return its JSON-RPC response")
         self.assertGreater(response_at, first_keepalive_at)
-        self.assertGreaterEqual(response_at - started_at, 53)
+        self.assertGreaterEqual(response_at - started_at, 43)
         self.assertLess(first_keepalive_at - started_at, 20)
         self.assertGreaterEqual(first_keepalive_at - started_at, 12)
         self.assertIn("result", response_message)
         self.assertFalse(response_message["result"].get("isError"))
+        self.client.call("command.control", {
+            "action": "terminate", "processId": quiet["processId"],
+        })
+
+    def test_2026_stateless_command_read_uses_bounded_tool_result(self):
+        self.assertEqual(
+            self.client.tools["command.read"]["inputSchema"]["properties"]["timeoutMs"]["maximum"],
+            50_000,
+        )
+        quiet = self.client.call("command.start", {"command": ["fixture-quiet"]})
+        request_id = next(self.client.ids)
+        request_value = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "command.read",
+                "arguments": {"processId": quiet["processId"], "timeoutMs": 1000},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "codex-connect-integration", "version": "1",
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            },
+        }
+        request = urllib.request.Request(
+            self.url + "/mcp", json.dumps(request_value).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": "2026-07-28",
+                "Mcp-Method": "tools/call",
+                "Mcp-Name": "command.read",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(response.headers.get("Content-Type"), "text/event-stream")
+            message = McpClient._event_stream_response(
+                response.read().decode(), request_id,
+            )
+        self.assertEqual(message["result"]["resultType"], "complete")
+        self.assertEqual(
+            message["result"]["structuredContent"]["wakeReason"], "timeout",
+        )
         self.client.call("command.control", {
             "action": "terminate", "processId": quiet["processId"],
         })
