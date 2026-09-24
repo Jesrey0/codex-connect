@@ -40,7 +40,8 @@ codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-projec
 
 Use `command.exec` for short, non-interactive commands and `command.start` for
 long-running or interactive work. Commands take argv; invoke a shell explicitly
-for pipes, redirects, or expansion. Set `tty=true` only when a terminal is needed.
+for pipes, redirects, or expansion. `command.exec.timeoutMs` defaults to 40 seconds
+and accepts up to 300 seconds. Set `tty=true` only when a terminal is needed.
 
 After `command.start`, retain `processId`; the first `command.read` starts at cursor `0`, then
 passes each returned cursor to the next read. If the start response is lost, `status.commands`
