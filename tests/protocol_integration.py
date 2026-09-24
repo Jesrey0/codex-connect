@@ -480,7 +480,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(exited["wakeReason"], "exit")
         self.assertEqual(exited["exitCode"], 143)
         self.client.call("command.read", {
-            "processId": started["processId"], "timeoutMs": 120001,
+            "processId": started["processId"], "timeoutMs": 300001,
         }, error=True, validate_input=False)
 
         self.client.call("command.start", {
@@ -598,7 +598,7 @@ class OperatorProtocolTests(unittest.TestCase):
             "method": "tools/call",
             "params": {
                 "name": "command.read",
-                "arguments": {"processId": quiet["processId"], "timeoutMs": 20_000},
+                "arguments": {"processId": quiet["processId"], "timeoutMs": 55_000},
             },
         }
         started_at = time.monotonic()
@@ -606,7 +606,8 @@ class OperatorProtocolTests(unittest.TestCase):
             self.assertEqual(response.headers.get("Content-Type"), "text/event-stream")
             self.assertEqual(response.headers.get("X-Accel-Buffering"), "no")
 
-            keepalive_at = None
+            first_keepalive_at = None
+            keepalive_count = 0
             response_message = None
             response_at = None
             frame = []
@@ -616,7 +617,9 @@ class OperatorProtocolTests(unittest.TestCase):
                     break
                 if line in (b"\n", b"\r\n"):
                     if any(item.startswith(b":") for item in frame):
-                        keepalive_at = time.monotonic()
+                        keepalive_count += 1
+                        if first_keepalive_at is None:
+                            first_keepalive_at = time.monotonic()
                     data = [
                         item[5:].strip().decode()
                         for item in frame
@@ -632,12 +635,13 @@ class OperatorProtocolTests(unittest.TestCase):
                 else:
                     frame.append(line.rstrip(b"\r\n"))
 
-        self.assertIsNotNone(keepalive_at, "quiet tool read did not emit an SSE comment")
+        self.assertIsNotNone(first_keepalive_at, "quiet tool read did not emit an SSE comment")
+        self.assertGreaterEqual(keepalive_count, 3)
         self.assertIsNotNone(response_message, "quiet tool read did not return its JSON-RPC response")
-        self.assertGreater(response_at, keepalive_at)
-        self.assertGreaterEqual(response_at - started_at, 18)
-        self.assertLess(keepalive_at - started_at, 20)
-        self.assertGreaterEqual(keepalive_at - started_at, 12)
+        self.assertGreater(response_at, first_keepalive_at)
+        self.assertGreaterEqual(response_at - started_at, 53)
+        self.assertLess(first_keepalive_at - started_at, 20)
+        self.assertGreaterEqual(first_keepalive_at - started_at, 12)
         self.assertIn("result", response_message)
         self.assertFalse(response_message["result"].get("isError"))
         self.client.call("command.control", {
