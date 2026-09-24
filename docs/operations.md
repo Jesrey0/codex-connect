@@ -66,13 +66,30 @@ promise prompt-cache reuse.
 Retain `threadId` and `turnId`. Continue only non-overlapping operator work, then
 call `codex.wait` with those IDs. It uses a fixed server wait and returns:
 
-- `terminal`: read the turn status, output, and error.
+- `terminal`: read the turn status, canonical handoff, and error. `turn.output` stays an
+  array and contains at most one message, chosen in this order: a `final_answer`
+  `agentMessage`, an `exitedReviewMode` item, then the newest `agentMessage`. Handoff
+  text is capped at 10,240 characters. `truncated` reports text clipping;
+  `selectionIncomplete` separately reports when the bounded scan could not establish
+  whether a handoff exists or whether a higher-priority item exists. For either case,
+  use `codex.inspect` with `detail: "result"` and `textOffset`. It searches persisted
+  turn items newest-first until it finds a final answer, exhausts the turn, or reaches
+  its internal time budget. The result is authoritative only when
+  `resultPage.selectionComplete` is true; false means it has only the best candidate
+  found so far. Text is returned in bounded 10,240-character chunks; follow
+  `resultPage.nextTextOffset` until `hasMoreText` is false. An item that itself exceeds
+  the App Server transport limit cannot be recovered by this mode, and leaves selection
+  incomplete. Result lookup works independently of relay journal retention and leaves
+  thread history intact.
 - `actionRequired` or `inputRequired`: respond with `codex.act`, matching
   the pending kind, requestId, and requested answers or decisions; then wait again.
 - `timeout`: the worker is active. Continue waiting or inspect activity; timeout
   does not establish a stall or authorize taking over its scope.
 
-Use `codex.inspect` and its cursor for activity/history, `codex.act` to steer
+Use `codex.inspect` semantic/raw details and `afterCursor` for activity and retained journal
+notifications; use `detail: "result"` and `textOffset` to retrieve the persisted handoff.
+Treat it as authoritative only when `resultPage.selectionComplete` is true. Raw
+notifications can be lost with the relay journal. Use `codex.act` to steer
 or interrupt, and `codex.wait` to confirm terminal state after interruption.
 
 `codex.query` also reads persisted thread metadata/listings and App Server background terminals.

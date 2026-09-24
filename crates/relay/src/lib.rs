@@ -24,9 +24,9 @@ use codex_connect_app_server::protocol::{
     FuzzyFileSearch, FuzzyFileSearchResponse, RateLimitsRead, ReviewStart, SkillsList,
     SortDirection, StreamingCommandExec, TextInput, Thread, ThreadArchive,
     ThreadBackgroundTerminalsList, ThreadBackgroundTerminalsTerminate, ThreadDelete, ThreadFork,
-    ThreadItemsList, ThreadList, ThreadRead, ThreadResume, ThreadSortKey, ThreadStart,
-    ThreadTurnsList, ThreadUnarchive, ThreadUnsubscribe, TurnInterrupt, TurnItemsView, TurnStart,
-    TurnSteer,
+    ThreadItemsList, ThreadItemsListResponse, ThreadList, ThreadRead, ThreadResume, ThreadSortKey,
+    ThreadStart, ThreadTurnsList, ThreadUnarchive, ThreadUnsubscribe, TurnInterrupt, TurnItemsView,
+    TurnStart, TurnSteer,
 };
 use codex_connect_app_server::{
     AppServerClient, AppServerConfig, AppServerError, DEFAULT_REQUEST_TIMEOUT, DeferredRequest,
@@ -64,9 +64,10 @@ const MAX_OBSERVER_SUMMARY_PROMPT_CHARS: usize = 512;
 const MAX_UNANNOTATED_TERMINALS: usize = 256;
 const MAX_RECENT_WORKERS: usize = 8;
 const MAX_WAIT_SCAN_ITEMS: usize = 512;
-const MAX_WAIT_OUTPUT_ITEMS: usize = 16;
-const MAX_WAIT_OUTPUT_CHARS: usize = 64 * 1024;
+// Keep the normal codex.wait handoff small enough for an operator context window.
+const MAX_WAIT_HANDOFF_CHARS: usize = 10 * 1024;
 const MAX_WAIT_OUTPUT_PAGES: usize = 32;
+const RESULT_SELECTION_BUDGET_MS: u64 = 30_000;
 const MAX_TRANSCRIPT_PAGES: usize = 128;
 const MAX_TURN_LOOKUP_PAGES: usize = 1_024;
 const THREAD_REUSE_POLICY_MS: u64 = 30 * 60 * 1000;
@@ -88,6 +89,10 @@ pub const MAX_COMMAND_WRITE_BYTES: usize = 64 * 1024;
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
 const MAX_APP_SERVER_RESPONSE_BYTES: usize = MAX_WIRE_BYTES - APP_SERVER_RESPONSE_HEADROOM_BYTES;
 const MAX_FS_READ_FILE_BYTES: u64 = ((MAX_APP_SERVER_RESPONSE_BYTES / 4) * 3) as u64;
+
+fn result_selection_deadline(started_at: Instant) -> Instant {
+    started_at + Duration::from_millis(RESULT_SELECTION_BUDGET_MS)
+}
 
 fn review_target_prompt(target: &ReviewTarget) -> String {
     match target {
@@ -267,8 +272,15 @@ struct PreparedThread {
 }
 
 struct TerminalOutput {
-    items: Vec<Value>,
-    history_truncated: bool,
+    handoff_item: Option<Value>,
+    selection_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InspectDetail {
+    Semantic,
+    Raw,
+    Result,
 }
 
 fn turn_metadata(
@@ -1748,30 +1760,63 @@ impl Relay {
         Ok(())
     }
 
-    async fn hydrate_turn_items(
-        &self,
-        thread_id: &str,
-        turn: &mut codex_connect_app_server::protocol::Turn,
-    ) -> Result<bool, RelayError> {
-        let output = self.read_terminal_output(thread_id, &turn.id).await?;
-        turn.items = output.items;
-        Ok(output.history_truncated)
-    }
-
     async fn hydrate_turn_items_when_ready(
         &self,
         thread_id: &str,
         turn: &mut codex_connect_app_server::protocol::Turn,
     ) -> Result<bool, RelayError> {
+        let output = self
+            .read_terminal_output_when_ready(thread_id, &turn.id)
+            .await?;
+        turn.items = output
+            .handoff_item
+            .as_ref()
+            .map(terminal_handoff_projection)
+            .into_iter()
+            .collect();
+        Ok(output.selection_complete)
+    }
+
+    async fn read_terminal_output_when_ready(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<TerminalOutput, RelayError> {
         let mut retry_ms = WAIT_STORAGE_RETRY_MS;
         loop {
-            match self.hydrate_turn_items(thread_id, turn).await {
-                Ok(truncated) => return Ok(truncated),
+            match self.read_terminal_output(thread_id, turn_id).await {
+                Ok(output) => return Ok(output),
                 Err(error) if is_unflushed_thread_store(&error) => {
                     tokio::time::sleep(Duration::from_millis(retry_ms)).await;
                     retry_ms = retry_ms.saturating_mul(2).min(WAIT_STORAGE_RETRY_MAX_MS);
                 }
                 Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn read_thread_items_page(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        cursor: Option<String>,
+        requested_limit: u32,
+    ) -> Result<ThreadItemsListResponse, RelayError> {
+        let mut limit = requested_limit.clamp(1, ITEM_PAGE_SIZE);
+        loop {
+            let request = ThreadItemsList {
+                thread_id: thread_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                cursor: cursor.clone(),
+                limit: Some(limit),
+                sort_direction: Some(SortDirection::Desc),
+            };
+            match self.app_server.request(request).await {
+                Ok(response) => return Ok(response),
+                Err(AppServerError::MessageTooLarge) if limit > 1 => {
+                    limit = (limit / 2).max(1);
+                }
+                Err(error) => return Err(error.into()),
             }
         }
     }
@@ -1786,7 +1831,6 @@ impl Relay {
         let mut items = Vec::new();
         let mut scanned = 0usize;
         let mut pages = 0usize;
-        let mut remaining_chars = MAX_WAIT_OUTPUT_CHARS;
         let mut history_truncated = false;
         'pages: loop {
             if pages >= MAX_WAIT_OUTPUT_PAGES {
@@ -1795,16 +1839,17 @@ impl Relay {
             }
             pages += 1;
             let page_limit = (MAX_WAIT_SCAN_ITEMS - scanned).min(ITEM_PAGE_SIZE as usize) as u32;
-            let response = self
-                .app_server
-                .request(ThreadItemsList {
-                    thread_id: thread_id.to_string(),
-                    turn_id: Some(turn_id.to_string()),
-                    cursor,
-                    limit: Some(page_limit),
-                    sort_direction: Some(SortDirection::Desc),
-                })
-                .await?;
+            let response = match self
+                .read_thread_items_page(thread_id, turn_id, cursor.clone(), page_limit)
+                .await
+            {
+                Ok(response) => response,
+                Err(RelayError::AppServer(AppServerError::MessageTooLarge)) => {
+                    history_truncated = true;
+                    break 'pages;
+                }
+                Err(error) => return Err(error),
+            };
             let page_len = response.data.len();
             let next_cursor =
                 checked_next_cursor(&mut seen_cursors, response.next_cursor, "thread/items/list")?;
@@ -1819,36 +1864,30 @@ impl Relay {
                     entry.item.get("type").and_then(Value::as_str),
                     Some("agentMessage" | "exitedReviewMode")
                 ) {
-                    if items.len() >= MAX_WAIT_OUTPUT_ITEMS || remaining_chars == 0 {
-                        history_truncated = true;
+                    let is_final_answer = entry.item.get("type").and_then(Value::as_str)
+                        == Some("agentMessage")
+                        && entry.item.get("phase").and_then(Value::as_str) == Some("final_answer");
+                    let is_review =
+                        entry.item.get("type").and_then(Value::as_str) == Some("exitedReviewMode");
+                    let is_agent_message =
+                        entry.item.get("type").and_then(Value::as_str) == Some("agentMessage");
+                    let already_have_review = items.iter().any(|item: &Value| {
+                        item.get("type").and_then(Value::as_str) == Some("exitedReviewMode")
+                    });
+                    let already_have_agent_message = items.iter().any(|item: &Value| {
+                        item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                    });
+                    if is_final_answer
+                        || (is_review && !already_have_review)
+                        || (is_agent_message && !already_have_agent_message)
+                    {
+                        items.push(entry.item);
+                    }
+                    // App Server items arrive newest first. Once the newest final answer is
+                    // found, no older item can supersede it under the handoff priority.
+                    if is_final_answer {
                         break 'pages;
                     }
-                    let text = entry
-                        .item
-                        .get("text")
-                        .or_else(|| entry.item.get("review"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let final_output = entry.item.get("phase").and_then(Value::as_str)
-                        == Some("final_answer")
-                        || entry.item.get("type").and_then(Value::as_str)
-                            == Some("exitedReviewMode");
-                    let limit = remaining_chars.min(if final_output {
-                        MAX_WAIT_OUTPUT_CHARS
-                    } else {
-                        4_000
-                    });
-                    let mut characters = text.chars();
-                    let clipped = characters.by_ref().take(limit).collect::<String>();
-                    let truncated = characters.next().is_some();
-                    remaining_chars = remaining_chars.saturating_sub(clipped.chars().count());
-                    items.push(json!({
-                        "id":entry.item.get("id"),
-                        "type":entry.item.get("type"),
-                        "phase":entry.item.get("phase"),
-                        "text":clipped,
-                        "truncated":truncated,
-                    }));
                 }
                 if scanned >= MAX_WAIT_SCAN_ITEMS {
                     history_truncated = index + 1 < page_len || next_cursor.is_some();
@@ -1860,10 +1899,98 @@ impl Relay {
                 None => break,
             }
         }
-        items.reverse();
+        let handoff_item = canonical_handoff_item(items.iter()).cloned();
         Ok(TerminalOutput {
-            items,
-            history_truncated,
+            handoff_item,
+            selection_complete: !history_truncated,
+        })
+    }
+
+    async fn read_canonical_terminal_result(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        deadline: Instant,
+    ) -> Result<TerminalOutput, RelayError> {
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut newest_review = None;
+        let mut newest_agent_message = None;
+        let mut retry_ms = WAIT_STORAGE_RETRY_MS;
+        'pages: loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let response = match tokio::time::timeout_at(
+                deadline,
+                self.read_thread_items_page(thread_id, turn_id, cursor.clone(), ITEM_PAGE_SIZE),
+            )
+            .await
+            {
+                Err(_) => break,
+                Ok(Ok(response)) => response,
+                Ok(Err(RelayError::AppServer(AppServerError::MessageTooLarge))) => break,
+                Ok(Err(error)) if is_unflushed_thread_store(&error) => {
+                    if tokio::time::timeout_at(
+                        deadline,
+                        tokio::time::sleep(Duration::from_millis(retry_ms)),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                    retry_ms = retry_ms.saturating_mul(2).min(WAIT_STORAGE_RETRY_MAX_MS);
+                    continue 'pages;
+                }
+                Ok(Err(error)) => return Err(error),
+            };
+            retry_ms = WAIT_STORAGE_RETRY_MS;
+            for entry in response.data {
+                if Instant::now() >= deadline {
+                    break 'pages;
+                }
+                if entry.turn_id != turn_id {
+                    return Err(RelayError::Invalid(
+                        "thread/items/list returned an item from another turn".into(),
+                    ));
+                }
+                match entry.item.get("type").and_then(Value::as_str) {
+                    Some("agentMessage")
+                        if entry.item.get("phase").and_then(Value::as_str)
+                            == Some("final_answer") =>
+                    {
+                        return Ok(TerminalOutput {
+                            handoff_item: Some(entry.item),
+                            selection_complete: true,
+                        });
+                    }
+                    Some("exitedReviewMode") if newest_review.is_none() => {
+                        newest_review = Some(entry.item)
+                    }
+                    Some("agentMessage") if newest_agent_message.is_none() => {
+                        newest_agent_message = Some(entry.item)
+                    }
+                    _ => {}
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            match checked_next_cursor(&mut seen_cursors, response.next_cursor, "thread/items/list")?
+            {
+                Some(next) => cursor = Some(next),
+                None => {
+                    return Ok(TerminalOutput {
+                        handoff_item: newest_review.or(newest_agent_message),
+                        selection_complete: true,
+                    });
+                }
+            }
+        }
+        Ok(TerminalOutput {
+            handoff_item: newest_review.or(newest_agent_message),
+            selection_complete: false,
         })
     }
 
@@ -1887,16 +2014,17 @@ impl Relay {
             }
             pages += 1;
             let page_limit = (MAX_TRANSCRIPT_SCAN_ITEMS - scanned).min(ITEM_PAGE_SIZE as usize);
-            let response = self
-                .app_server
-                .request(ThreadItemsList {
-                    thread_id: thread_id.to_string(),
-                    turn_id: Some(turn_id.to_string()),
-                    cursor,
-                    limit: Some(page_limit as u32),
-                    sort_direction: Some(SortDirection::Desc),
-                })
-                .await?;
+            let response = match self
+                .read_thread_items_page(thread_id, turn_id, cursor.clone(), page_limit as u32)
+                .await
+            {
+                Ok(response) => response,
+                Err(RelayError::AppServer(AppServerError::MessageTooLarge)) => {
+                    truncated = true;
+                    break 'pages;
+                }
+                Err(error) => return Err(error),
+            };
             let next_cursor =
                 checked_next_cursor(&mut seen_cursors, response.next_cursor, "thread/items/list")?;
             let page_len = response.data.len();
@@ -2053,7 +2181,7 @@ impl Relay {
             if selected.status.is_terminal() {
                 self.reconcile_terminal_turn(&thread_id, &selected).await;
             }
-            let mut output_truncated = false;
+            let mut selection_incomplete = selected.status.is_terminal().then_some(false);
             if selected.status.is_terminal() && selected.items.is_empty() {
                 match tokio::time::timeout_at(
                     operation_deadline,
@@ -2061,7 +2189,7 @@ impl Relay {
                 )
                 .await
                 {
-                    Ok(result) => output_truncated = result?,
+                    Ok(result) => selection_incomplete = Some(!result?),
                     Err(_) => {
                         return Err(RelayError::BudgetExceeded(
                             "codex.wait reached terminal state but terminal output hydration exceeded the reserved finalization budget; inspect the completed turn explicitly"
@@ -2085,7 +2213,7 @@ impl Relay {
             if let Some((state, wake_reason)) = wait_wake(Some(selected.status), &pending) {
                 let result = json!({
                     "threadId":thread_id,"turnId":selected_id,"state":state,"wakeReason":wake_reason,
-                    "turn":turn_snapshot(&selected, output_truncated), "currentActivity":activity,
+                    "turn":turn_snapshot(&selected, selection_incomplete), "currentActivity":activity,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 });
                 self.acknowledge_wait_result(&result).await;
@@ -2116,7 +2244,7 @@ impl Relay {
                 }
                 let result = json!({
                     "threadId":thread_id,"turnId":selected_id,"state":"active","wakeReason":"timeout",
-                    "turn":turn_snapshot(&selected, false), "currentActivity":activity,
+                    "turn":turn_snapshot(&selected, None), "currentActivity":activity,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 });
                 self.acknowledge_wait_result(&result).await;
@@ -2197,11 +2325,50 @@ impl Relay {
         thread_id: String,
         turn_id: String,
         after_cursor: u64,
-        raw: bool,
+        detail: InspectDetail,
+        text_offset: usize,
     ) -> Result<Value, RelayError> {
-        self.read_thread_metadata(thread_id.clone()).await?;
+        if text_offset != 0 && !matches!(detail, InspectDetail::Result) {
+            return Err(RelayError::Invalid(
+                "textOffset is only valid with detail=result".into(),
+            ));
+        }
+        let result_deadline = matches!(detail, InspectDetail::Result)
+            .then(|| result_selection_deadline(Instant::now()));
+        let _thread_metadata = if let Some(deadline) = result_deadline {
+            match tokio::time::timeout_at(deadline, self.read_thread_metadata(thread_id.clone()))
+                .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(RelayError::BudgetExceeded(
+                        "codex.inspect result selection budget expired before thread metadata was available"
+                            .into(),
+                    ));
+                }
+            }
+        } else {
+            self.read_thread_metadata(thread_id.clone()).await?
+        };
         let live = self.live_turn(&thread_id, &turn_id).await;
-        let stored = self.find_stored_turn_metadata(&thread_id, &turn_id).await?;
+        let stored = if let Some(deadline) = result_deadline {
+            match tokio::time::timeout_at(
+                deadline,
+                self.find_stored_turn_metadata(&thread_id, &turn_id),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(RelayError::BudgetExceeded(
+                        "codex.inspect result selection budget expired before turn metadata was available"
+                            .into(),
+                    ));
+                }
+            }
+        } else {
+            self.find_stored_turn_metadata(&thread_id, &turn_id).await?
+        };
         let selected = match (stored, live) {
             (Some(stored), Some(live))
                 if live.status.is_terminal() && !stored.status.is_terminal() =>
@@ -2220,45 +2387,76 @@ impl Relay {
             self.reconcile_terminal_turn(&thread_id, &selected).await;
         }
         let activity = self.current_activity_value(&thread_id, &turn_id).await;
-        let result = if raw {
-            let batch = self
-                .journal
-                .read_after(after_cursor, &thread_id, Some(&turn_id))
-                .await
-                .map_err(RelayError::Invalid)?;
-            json!({
-                "threadId":thread_id,
-                "turnId":turn_id,
-                "status":selected.status,
-                "detail":"raw",
-                "currentActivity":activity,
-                "cursor":batch.cursor,
-                "historyLost":batch.history_lost,
-                "hasMore":batch.has_more,
-                "events":batch.events,
-            })
-        } else {
-            let batch = self
-                .journal
-                .read_semantic_after(
-                    after_cursor,
-                    &thread_id,
-                    Some(&turn_id),
-                    MAX_SEMANTIC_EVENTS,
-                )
-                .await
-                .map_err(RelayError::Invalid)?;
-            json!({
-                "threadId":thread_id,
-                "turnId":turn_id,
-                "status":selected.status,
-                "detail":"semantic",
-                "currentActivity":activity,
-                "cursor":batch.cursor,
-                "historyLost":batch.history_lost,
-                "hasMore":batch.has_more,
-                "events":batch.events,
-            })
+        let result = match detail {
+            InspectDetail::Result => {
+                if text_offset != 0 && !selected.status.is_terminal() {
+                    return Err(RelayError::Invalid(
+                        "textOffset requires a terminal turn".into(),
+                    ));
+                }
+                let output = self
+                    .read_canonical_terminal_result(
+                        &thread_id,
+                        &turn_id,
+                        result_deadline.expect("result detail has a shared deadline"),
+                    )
+                    .await?;
+                let selection_complete = selected.status.is_terminal() && output.selection_complete;
+                let result_page = persisted_handoff_page(
+                    output.handoff_item.as_ref(),
+                    text_offset,
+                    selection_complete,
+                )?;
+                json!({
+                    "threadId":thread_id,
+                    "turnId":turn_id,
+                    "status":selected.status,
+                    "detail":"result",
+                    "currentActivity":activity,
+                    "resultPage":result_page,
+                })
+            }
+            InspectDetail::Raw => {
+                let batch = self
+                    .journal
+                    .read_after(after_cursor, &thread_id, Some(&turn_id))
+                    .await
+                    .map_err(RelayError::Invalid)?;
+                json!({
+                    "threadId":thread_id,
+                    "turnId":turn_id,
+                    "status":selected.status,
+                    "detail":"raw",
+                    "currentActivity":activity,
+                    "cursor":batch.cursor,
+                    "historyLost":batch.history_lost,
+                    "hasMore":batch.has_more,
+                    "events":batch.events,
+                })
+            }
+            InspectDetail::Semantic => {
+                let batch = self
+                    .journal
+                    .read_semantic_after(
+                        after_cursor,
+                        &thread_id,
+                        Some(&turn_id),
+                        MAX_SEMANTIC_EVENTS,
+                    )
+                    .await
+                    .map_err(RelayError::Invalid)?;
+                json!({
+                    "threadId":thread_id,
+                    "turnId":turn_id,
+                    "status":selected.status,
+                    "detail":"semantic",
+                    "currentActivity":activity,
+                    "cursor":batch.cursor,
+                    "historyLost":batch.history_lost,
+                    "hasMore":batch.has_more,
+                    "events":batch.events,
+                })
+            }
         };
         self.acknowledge_worker_started(&thread_id, &turn_id).await;
         if selected.status.is_terminal() {
@@ -3189,65 +3387,105 @@ fn validate_command_argv(command: &[String]) -> Result<(), RelayError> {
 
 fn turn_snapshot(
     turn: &codex_connect_app_server::protocol::Turn,
-    history_truncated: bool,
+    selection_incomplete: Option<bool>,
 ) -> Value {
-    let mut remaining_chars = MAX_WAIT_OUTPUT_CHARS;
-    let mut omitted_older = history_truncated;
-    let mut newest_first = Vec::new();
-    for item in turn.items.iter().rev().filter(|item| {
-        matches!(
-            item.get("type").and_then(Value::as_str),
-            Some("agentMessage" | "exitedReviewMode")
-        )
-    }) {
-        if newest_first.len() >= MAX_WAIT_OUTPUT_ITEMS || remaining_chars == 0 {
-            omitted_older = true;
-            break;
+    let output = canonical_handoff_item(turn.items.iter().rev())
+        .map(terminal_handoff_projection)
+        .into_iter()
+        .collect::<Vec<_>>();
+    json!({
+        "id":turn.id,
+        "status":turn.status,
+        "error":turn.error,
+        "output":output,
+        "selectionIncomplete":selection_incomplete
+    })
+}
+
+fn canonical_handoff_item<'a>(
+    items_newest_first: impl Iterator<Item = &'a Value>,
+) -> Option<&'a Value> {
+    let mut newest_review = None;
+    let mut newest_agent_message = None;
+    for item in items_newest_first {
+        match item.get("type").and_then(Value::as_str) {
+            Some("agentMessage")
+                if item.get("phase").and_then(Value::as_str) == Some("final_answer") =>
+            {
+                return Some(item);
+            }
+            Some("exitedReviewMode") if newest_review.is_none() => newest_review = Some(item),
+            Some("agentMessage") if newest_agent_message.is_none() => {
+                newest_agent_message = Some(item)
+            }
+            _ => {}
         }
-        let text = item
-            .get("text")
-            .or_else(|| item.get("review"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let phase = item.get("phase").and_then(Value::as_str);
-        let final_output = phase == Some("final_answer")
-            || item.get("type").and_then(Value::as_str) == Some("exitedReviewMode");
-        let limit = remaining_chars.min(if final_output {
-            MAX_WAIT_OUTPUT_CHARS
-        } else {
-            4_000
-        });
-        let mut characters = text.chars();
-        let clipped = characters.by_ref().take(limit).collect::<String>();
-        let truncated = item
-            .get("truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || characters.next().is_some();
-        remaining_chars = remaining_chars.saturating_sub(clipped.chars().count());
-        newest_first.push(json!({
+    }
+    newest_review.or(newest_agent_message)
+}
+
+fn terminal_handoff_projection(item: &Value) -> Value {
+    let text = item
+        .get("text")
+        .or_else(|| item.get("review"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut characters = text.chars();
+    let clipped = characters
+        .by_ref()
+        .take(MAX_WAIT_HANDOFF_CHARS)
+        .collect::<String>();
+    let truncated = item
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || characters.next().is_some();
+    json!({
+        "id":item.get("id").cloned().unwrap_or(Value::Null),
+        "type":item.get("type"),
+        "phase":item.get("phase"),
+        "text":clipped,
+        "truncated":truncated
+    })
+}
+
+fn persisted_handoff_page(
+    item: Option<&Value>,
+    text_offset: usize,
+    selection_complete: bool,
+) -> Result<Value, RelayError> {
+    let text = item
+        .and_then(|item| item.get("text").or_else(|| item.get("review")))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let text_len = text.chars().count();
+    if text_offset > text_len {
+        return Err(RelayError::Invalid(format!(
+            "textOffset {text_offset} exceeds the result length {text_len}"
+        )));
+    }
+    let mut characters = text.chars().skip(text_offset);
+    let page_text = characters
+        .by_ref()
+        .take(MAX_WAIT_HANDOFF_CHARS)
+        .collect::<String>();
+    let page_len = page_text.chars().count();
+    let next_text_offset = (text_offset + page_len < text_len).then_some(text_offset + page_len);
+    let item_metadata = item.map(|item| {
+        json!({
             "id":item.get("id").cloned().unwrap_or(Value::Null),
             "type":item.get("type"),
-            "phase":phase,
-            "text":clipped,
-            "truncated":truncated
-        }));
-    }
-    newest_first.reverse();
-    if omitted_older {
-        newest_first.insert(
-            0,
-            json!({
-                "id":null,
-                "type":"agentMessage",
-                "phase":null,
-                "text":"[Earlier output omitted from this bounded terminal result.]",
-                "truncated":true
-            }),
-        );
-    }
-    let output = newest_first;
-    json!({"id":turn.id,"status":turn.status,"error":turn.error,"output":output})
+            "phase":item.get("phase")
+        })
+    });
+    Ok(json!({
+        "item":item_metadata,
+        "text":page_text,
+        "textOffset":text_offset,
+        "nextTextOffset":next_text_offset,
+        "hasMoreText":next_text_offset.is_some(),
+        "selectionComplete":selection_complete
+    }))
 }
 
 fn transcript_entry(
@@ -3778,49 +4016,110 @@ mod tests {
     }
 
     #[test]
-    fn wait_projection_preserves_latest_final_and_marks_omission() {
+    fn wait_projection_returns_one_canonical_handoff_and_prefers_final_answer() {
         let mut turn = test_turn("turn", TurnStatus::Completed);
-        turn.items = (0..MAX_WAIT_OUTPUT_ITEMS + 1)
-            .map(|index| {
-                json!({
-                    "type":"agentMessage",
-                    "id":format!("message-{index}"),
-                    "phase":"commentary",
-                    "text":"earlier commentary",
-                })
-            })
-            .collect();
-        turn.items.push(json!({
+        turn.items = vec![
+            json!({"type":"agentMessage","id":"older","phase":"commentary","text":"older"}),
+            json!({"type":"exitedReviewMode","id":"review-1","review":"same terminal content"}),
+            json!({"type":"exitedReviewMode","id":"review-2","review":"same terminal content"}),
+            json!({"type":"agentMessage","id":"newest","phase":"commentary","text":"same terminal content"}),
+            json!({
             "type":"agentMessage",
             "id":"final",
             "phase":"final_answer",
-            "text":"x".repeat(MAX_WAIT_OUTPUT_CHARS + 1),
-        }));
-        let output = turn_snapshot(&turn, false)["output"]
-            .as_array()
-            .unwrap()
-            .clone();
-        assert_eq!(output[0]["truncated"], true);
-        assert!(output[0]["text"].as_str().unwrap().contains("omitted"));
-        assert_eq!(output.last().unwrap()["id"], "final");
-        assert_eq!(output.last().unwrap()["truncated"], true);
-        assert_eq!(
-            output.last().unwrap()["text"]
-                .as_str()
-                .unwrap()
-                .chars()
-                .count(),
-            MAX_WAIT_OUTPUT_CHARS
-        );
+                "text":"same terminal content",
+            }),
+        ];
+        let snapshot = turn_snapshot(&turn, Some(false));
+        let output = snapshot["output"].as_array().unwrap().clone();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["id"], "final");
+        assert_eq!(output[0]["phase"], "final_answer");
+        assert_eq!(output[0]["text"], "same terminal content");
+        assert_eq!(output[0]["truncated"], false);
+        assert_eq!(snapshot["selectionIncomplete"], false);
+    }
 
-        turn.items.last_mut().unwrap()["text"] = json!("final");
-        let output = turn_snapshot(&turn, false)["output"]
+    #[test]
+    fn wait_projection_prefers_review_then_newest_agent_message() {
+        let mut turn = test_turn("turn", TurnStatus::Completed);
+        turn.items = vec![
+            json!({"type":"agentMessage","id":"old","phase":"commentary","text":"old"}),
+            json!({"type":"exitedReviewMode","id":"review-old","review":"same review finding"}),
+            json!({"type":"exitedReviewMode","id":"review-newest","review":"same review finding"}),
+            json!({"type":"agentMessage","id":"newest","phase":"commentary","text":"newest"}),
+        ];
+        let output = turn_snapshot(&turn, Some(false))["output"]
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(output.len(), MAX_WAIT_OUTPUT_ITEMS + 1);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["id"], "review-newest");
+        assert_eq!(output[0]["text"], "same review finding");
+
+        turn.items
+            .retain(|item| item.get("type").and_then(Value::as_str) != Some("exitedReviewMode"));
+        let output = turn_snapshot(&turn, Some(false))["output"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["id"], "newest");
+    }
+
+    #[test]
+    fn wait_projection_caps_handoff_text_at_10240_characters() {
+        let mut turn = test_turn("turn", TurnStatus::Completed);
+        turn.items = vec![json!({
+            "type":"agentMessage",
+            "id":"final",
+            "phase":"final_answer",
+            "text":"x".repeat(MAX_WAIT_HANDOFF_CHARS + 1),
+        })];
+        let output = turn_snapshot(&turn, Some(false))["output"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(output.len(), 1);
         assert_eq!(output[0]["truncated"], true);
-        assert_eq!(output.last().unwrap()["text"], "final");
+        assert_eq!(
+            output[0]["text"].as_str().unwrap().chars().count(),
+            10 * 1024
+        );
+    }
+
+    #[test]
+    fn wait_projection_reports_incomplete_selection_even_without_output() {
+        let turn = test_turn("turn", TurnStatus::Completed);
+        let snapshot = turn_snapshot(&turn, Some(true));
+        assert_eq!(snapshot["output"], json!([]));
+        assert_eq!(snapshot["selectionIncomplete"], true);
+    }
+
+    #[test]
+    fn wait_text_truncation_does_not_mark_selection_incomplete() {
+        let mut turn = test_turn("turn", TurnStatus::Completed);
+        turn.items = vec![json!({
+            "type":"agentMessage",
+            "id":"final",
+            "phase":"final_answer",
+            "text":"x".repeat(MAX_WAIT_HANDOFF_CHARS + 1),
+        })];
+        let snapshot = turn_snapshot(&turn, Some(false));
+        assert_eq!(snapshot["output"][0]["truncated"], true);
+        assert_eq!(snapshot["selectionIncomplete"], false);
+    }
+
+    #[test]
+    fn result_inspection_deadline_is_not_reset_after_metadata() {
+        let started_at = Instant::now();
+        let deadline = result_selection_deadline(started_at);
+        let metadata_finished_at = started_at + Duration::from_secs(25);
+        assert_eq!(
+            deadline.duration_since(metadata_finished_at),
+            Duration::from_secs(5)
+        );
+        assert_eq!(result_selection_deadline(started_at), deadline);
     }
 
     #[test]

@@ -522,6 +522,69 @@ for line in sys.stdin:
                 ],
             ]
             notify("turn/completed", {"threadId": thread_id, "turn": turn})
+        elif scenario == "handoff_priority":
+            turn["status"] = "completed"
+            turn["items"] = [
+                {"type": "agentMessage", "id": "older", "text": "older", "phase": "commentary"},
+                {"type": "exitedReviewMode", "id": "review-1", "review": "shared terminal content"},
+                {"type": "exitedReviewMode", "id": "review-2", "review": "shared terminal content"},
+                {"type": "agentMessage", "id": "newest", "text": "shared terminal content", "phase": "commentary"},
+                {"type": "agentMessage", "id": "final", "text": "shared terminal content", "phase": "final_answer"},
+            ]
+            notify("turn/completed", {"threadId": thread_id, "turn": turn})
+        elif scenario == "handoff_review_duplicate":
+            turn["status"] = "completed"
+            turn["items"] = [
+                {"type": "agentMessage", "id": "older", "text": "older", "phase": "commentary"},
+                {"type": "exitedReviewMode", "id": "review-1", "review": "shared review content"},
+                {"type": "exitedReviewMode", "id": "review-2", "review": "shared review content"},
+                {"type": "agentMessage", "id": "newest", "text": "shared review content", "phase": "commentary"},
+            ]
+            notify("turn/completed", {"threadId": thread_id, "turn": turn})
+        elif scenario == "handoff_long_history_gap":
+            send({"method":"item/completed","params":{"threadId":thread_id,"turnId":turn_id,"data":"x"*(9*1024*1024)}})
+            turn["status"] = "completed"
+            turn["items"] = [{
+                "type": "agentMessage",
+                "id": "long-final",
+                "text": "abcdefghij" * 3_000,
+                "phase": "final_answer",
+            }]
+            notify("turn/completed", {"threadId": thread_id, "turn": turn})
+        elif scenario == "handoff_scan_incomplete_empty":
+            turn["status"] = "completed"
+            turn["items"] = [
+                {"type": "reasoning", "id": f"reason-{index}"}
+                for index in range(513)
+            ]
+            notify("turn/completed", {"threadId": thread_id, "turn": turn})
+        elif scenario == "handoff_scan_incomplete_priority":
+            turn["status"] = "completed"
+            turn["items"] = [
+                {"type": "agentMessage", "id": "older-final", "text": "older final", "phase": "final_answer"},
+                *[
+                    {"type": "agentMessage", "id": f"commentary-{index}", "text": f"commentary-{index}", "phase": "commentary"}
+                    for index in range(512)
+                ],
+            ]
+            notify("turn/completed", {"threadId": thread_id, "turn": turn})
+        elif scenario == "handoff_aggregate_oversized_page":
+            turn["status"] = "completed"
+            turn["items"] = [
+                {
+                    "type": "agentMessage",
+                    "id": f"large-{index}",
+                    "text": "x" * (90 * 1024),
+                    "phase": "final_answer" if index == 99 else "commentary",
+                }
+                for index in range(100)
+            ]
+            notification_turn = copy.deepcopy(turn)
+            notification_turn["items"] = []
+            notify("turn/completed", {"threadId": thread_id, "turn": notification_turn})
+        elif scenario == "result_slow_metadata":
+            complete(thread_id, turn_id)
+            slow_turn_list_at[thread_id] = 1
         elif scenario == "unsubscribe_error":
             unsubscribe_failures.add(thread_id)
             complete(thread_id, turn_id)

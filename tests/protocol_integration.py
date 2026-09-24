@@ -1103,6 +1103,135 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["turn"]["output"][0]["text"], "fixture complete")
         self.assertGreaterEqual(len(self.method_params("thread/items/list")) - items_before, 2)
 
+    def test_wait_returns_one_canonical_handoff_and_raw_inspect_keeps_full_items(self):
+        cases = [
+            ("handoff_priority", "final", "agentMessage", "shared terminal content", 5),
+            ("handoff_review_duplicate", "review-2", "exitedReviewMode", "shared review content", 4),
+        ]
+        for scenario, item_id, item_type, text, item_count in cases:
+            with self.subTest(scenario=scenario):
+                work = self.start(scenario)
+                result = self.wait(work)
+                self.assertEqual(result["state"], "terminal")
+                output = result["turn"]["output"]
+                self.assertEqual(len(output), 1)
+                self.assertEqual(output[0]["id"], item_id)
+                self.assertEqual(output[0]["type"], item_type)
+                self.assertEqual(output[0]["text"], text)
+                self.assertFalse(output[0]["truncated"])
+
+                inspected = self.inspect_turn(work, detail="raw")
+                completed = next(
+                    event for event in inspected["events"]
+                    if event.get("method") == "turn/completed"
+                )
+                original_items = completed["params"]["turn"]["items"]
+                self.assertEqual(len(original_items), item_count)
+                self.assertEqual(
+                    sum(item["type"] == "exitedReviewMode" for item in original_items),
+                    2,
+                )
+
+    def test_result_mode_recovers_clipped_text_after_journal_loss(self):
+        work = self.start("handoff_long_history_gap")
+        joined = self.wait(work)
+        handoff = joined["turn"]["output"][0]
+        self.assertEqual(joined["turn"]["selectionIncomplete"], False)
+        self.assertEqual(handoff["id"], "long-final")
+        self.assertTrue(handoff["truncated"])
+        self.assertEqual(len(handoff["text"]), 10_240)
+
+        raw = self.inspect_turn(work, detail="raw")
+        self.assertTrue(raw["historyLost"])
+
+        offset = 0
+        chunks = []
+        while True:
+            page = self.client.call("codex.inspect", {
+                "threadId": work["threadId"],
+                "turnId": work["turnId"],
+                "detail": "result",
+                "textOffset": offset,
+            })
+            self.assertEqual(page["detail"], "result")
+            self.assertTrue(page["resultPage"]["selectionComplete"])
+            chunks.append(page["resultPage"]["text"])
+            self.assertLessEqual(len(page["resultPage"]["text"]), 10_240)
+            next_offset = page["resultPage"]["nextTextOffset"]
+            if next_offset is None:
+                break
+            self.assertEqual(next_offset, offset + len(page["resultPage"]["text"]))
+            offset = next_offset
+        self.assertEqual("".join(chunks), "abcdefghij" * 3_000)
+
+        for arguments in [
+            {"detail": "result", "afterCursor": 0},
+            {"detail": "raw", "textOffset": 1},
+        ]:
+            with self.subTest(arguments=arguments):
+                error = self.client.call("codex.inspect", {
+                    "threadId": work["threadId"],
+                    "turnId": work["turnId"],
+                    **arguments,
+                }, error=True, validate_input=False)
+                self.assertIn("only valid", error["content"][0]["text"])
+
+    def test_result_search_shrinks_aggregate_oversized_item_pages(self):
+        before = len(self.method_params("thread/items/list"))
+        work = self.start("handoff_aggregate_oversized_page")
+        result = self.client.call("codex.inspect", {
+            "threadId": work["threadId"],
+            "turnId": work["turnId"],
+            "detail": "result",
+        })
+        self.assertTrue(result["resultPage"]["selectionComplete"])
+        self.assertEqual(result["resultPage"]["item"]["id"], "large-99")
+        calls = self.method_params("thread/items/list")[before:]
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls[0]["limit"], 100)
+        self.assertEqual(calls[1]["limit"], 50)
+        self.assertIsNone(calls[0].get("cursor"))
+        self.assertIsNone(calls[1].get("cursor"))
+
+    def test_result_mode_shares_budget_with_slow_turn_metadata_lookup(self):
+        work = self.start("result_slow_metadata")
+        started = time.monotonic()
+        result = self.client.call("codex.inspect", {
+            "threadId": work["threadId"],
+            "turnId": work["turnId"],
+            "detail": "result",
+        })
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 1.8)
+        self.assertLess(elapsed, 5.0)
+        self.assertTrue(result["resultPage"]["selectionComplete"])
+        self.assertEqual(result["resultPage"]["item"]["id"], "answer")
+
+    def test_wait_surfaces_incomplete_selection_with_and_without_a_candidate(self):
+        cases = [
+            ("handoff_scan_incomplete_empty", None),
+            ("handoff_scan_incomplete_priority", "commentary-511"),
+        ]
+        for scenario, expected_id in cases:
+            with self.subTest(scenario=scenario):
+                joined = self.wait(self.start(scenario))
+                turn = joined["turn"]
+                self.assertEqual(turn["selectionIncomplete"], True)
+                if expected_id is None:
+                    self.assertEqual(turn["output"], [])
+                else:
+                    self.assertEqual(len(turn["output"]), 1)
+                    self.assertEqual(turn["output"][0]["id"], expected_id)
+                    self.assertFalse(turn["output"][0]["truncated"])
+                    result = self.client.call("codex.inspect", {
+                        "threadId": joined["threadId"],
+                        "turnId": joined["turnId"],
+                        "detail": "result",
+                    })
+                    self.assertTrue(result["resultPage"]["selectionComplete"])
+                    self.assertEqual(result["resultPage"]["item"]["id"], "older-final")
+                    self.assertEqual(result["resultPage"]["text"], "older final")
+
     def test_oversized_wire_messages_are_contained(self):
         self.client.call("status")
         notification = self.start("wire_oversized")

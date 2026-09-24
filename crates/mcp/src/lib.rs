@@ -11,8 +11,8 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::{Router, extract::Request};
 use codex_connect_host::Host;
 use codex_connect_relay::{
-    ApprovalDecision, CommandExec, CommandExecTerminalSize, ElicitationAction, PermissionGrant,
-    PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
+    ApprovalDecision, CommandExec, CommandExecTerminalSize, ElicitationAction, InspectDetail,
+    PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
 };
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
@@ -657,6 +657,7 @@ enum CodexInspectDetail {
     #[default]
     Semantic,
     Raw,
+    Result,
 }
 
 #[derive(Deserialize)]
@@ -665,9 +666,11 @@ struct CodexInspectArgs {
     thread_id: String,
     turn_id: String,
     #[serde(default)]
-    after_cursor: u64,
+    after_cursor: Option<u64>,
     #[serde(default)]
     detail: CodexInspectDetail,
+    #[serde(default)]
+    text_offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -873,13 +876,30 @@ async fn dispatch(
         }
         "codex.inspect" => {
             let a: CodexInspectArgs = parse(arguments)?;
+            let (detail, after_cursor, text_offset) = match a.detail {
+                CodexInspectDetail::Semantic => {
+                    if a.text_offset.is_some() {
+                        anyhow::bail!("textOffset is only valid with detail=result");
+                    }
+                    (InspectDetail::Semantic, a.after_cursor.unwrap_or(0), 0)
+                }
+                CodexInspectDetail::Raw => {
+                    if a.text_offset.is_some() {
+                        anyhow::bail!("textOffset is only valid with detail=result");
+                    }
+                    (InspectDetail::Raw, a.after_cursor.unwrap_or(0), 0)
+                }
+                CodexInspectDetail::Result => {
+                    if a.after_cursor.is_some() {
+                        anyhow::bail!(
+                            "afterCursor is only valid with detail=semantic or detail=raw"
+                        );
+                    }
+                    (InspectDetail::Result, 0, a.text_offset.unwrap_or(0))
+                }
+            };
             relay
-                .work_inspect(
-                    a.thread_id,
-                    a.turn_id,
-                    a.after_cursor,
-                    matches!(a.detail, CodexInspectDetail::Raw),
-                )
+                .work_inspect(a.thread_id, a.turn_id, after_cursor, detail, text_offset)
                 .await
                 .map_err(Into::into)
         }

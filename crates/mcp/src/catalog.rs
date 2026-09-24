@@ -175,7 +175,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.wait",
                 "Wait for Codex Turn",
-                "Wait for a turn to finish or require operator action/input. Returns after a bounded wait if still active; timeout does not mean failure or loss of scope ownership. Use codex.inspect for activity/history.",
+                "Wait for a turn to finish or require operator action/input. Terminal output contains at most one canonical handoff message, capped at 10,240 characters: final_answer agentMessage, then exitedReviewMode, then the newest agentMessage. selectionIncomplete separately reports when the bounded scan could not establish that choice. Recover clipped text with codex.inspect detail=result and textOffset; treat that result as authoritative only when resultPage.selectionComplete is true. An individual App Server item above the transport limit remains incomplete. Returns after a bounded wait if still active; timeout does not mean failure or loss of scope ownership.",
                 true,
                 false,
                 false,
@@ -188,7 +188,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.inspect",
                 "Inspect Codex Turn",
-                "Read worker activity/history without waiting for completion. Use semantic detail for activity and raw for App Server notifications. Continue from the returned cursor.",
+                "Inspect a turn without waiting for completion. semantic reads activity summaries, raw pages relay journal notifications, and result searches App Server turn items newest-first in 10,240-character chunks. The result is authoritative only when resultPage.selectionComplete is true; a single item above the transport limit leaves it false. Continue raw/semantic with afterCursor or result text with textOffset and resultPage.nextTextOffset.",
                 true,
                 false,
                 false,
@@ -573,8 +573,34 @@ fn semantic_event_schema() -> Value {
     )
 }
 fn codex_inspect_output_schema() -> Value {
-    object_schema(
+    let item = object_schema(
         json!({
+            "id":{"type":["string","null"]},
+            "type":{"enum":["agentMessage","exitedReviewMode"]},
+            "phase":{"type":["string","null"]}
+        }),
+        &["id", "type", "phase"],
+    );
+    let result_page = object_schema(
+        json!({
+            "item":nullable(item),
+            "text":{"type":"string","maxLength":10240,"description":"At most 10,240 characters. Continue at nextTextOffset to recover the remainder of the selected result."},
+            "textOffset":{"type":"integer","minimum":0},
+            "nextTextOffset":{"type":["integer","null"],"minimum":0},
+            "hasMoreText":{"type":"boolean"},
+            "selectionComplete":{"type":"boolean","description":"True only when the newest final answer was found or the turn was exhausted. False when the internal search budget expires or an App Server item page remains too large at limit 1."}
+        }),
+        &[
+            "item",
+            "text",
+            "textOffset",
+            "nextTextOffset",
+            "hasMoreText",
+            "selectionComplete",
+        ],
+    );
+    json!({"type":"object","oneOf":[
+        object_schema(json!({
             "threadId":{"type":"string"},
             "turnId":{"type":"string"},
             "status":{"enum":["inProgress","completed","failed","interrupted"]},
@@ -583,20 +609,17 @@ fn codex_inspect_output_schema() -> Value {
             "cursor":{"type":"integer","minimum":0},
             "historyLost":{"type":"boolean"},
             "hasMore":{"type":"boolean"},
-            "events":{"type":"array","items":{"oneOf":[semantic_event_schema(),event_schema()]}}
-        }),
-        &[
-            "threadId",
-            "turnId",
-            "status",
-            "detail",
-            "currentActivity",
-            "cursor",
-            "historyLost",
-            "hasMore",
-            "events",
-        ],
-    )
+            "events":{"type":"array","description":"Semantic or raw relay journal events. Raw notifications can be lost with the relay journal.","items":{"oneOf":[semantic_event_schema(),event_schema()]}}
+        }), &["threadId", "turnId", "status", "detail", "currentActivity", "cursor", "historyLost", "hasMore", "events"]),
+        object_schema(json!({
+            "threadId":{"type":"string"},
+            "turnId":{"type":"string"},
+            "status":{"enum":["inProgress","completed","failed","interrupted"]},
+            "detail":{"const":"result"},
+            "currentActivity":nullable(current_activity_schema()),
+            "resultPage":result_page
+        }), &["threadId", "turnId", "status", "detail", "currentActivity", "resultPage"])
+    ]})
 }
 fn inspect_schema() -> Value {
     object_schema(
@@ -761,15 +784,20 @@ fn codex_wait_schema() -> Value {
     )
 }
 fn codex_inspect_schema() -> Value {
-    object_schema(
-        json!({
+    json!({"type":"object","oneOf":[
+        object_schema(json!({
             "threadId":{"type":"string","description":"Codex thread ID returned by codex.start."},
             "turnId":{"type":"string","description":"Specific delegated turn ID to inspect."},
             "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Cursor from codex.start or codex.inspect."},
-            "detail":{"type":"string","enum":["semantic","raw"],"default":"semantic","description":"semantic returns activity summaries; raw returns App Server notifications."}
-        }),
-        &["threadId", "turnId"],
-    )
+            "detail":{"type":"string","enum":["semantic","raw"],"default":"semantic","description":"semantic returns activity summaries; raw pages relay journal notifications."}
+        }), &["threadId", "turnId"]),
+        object_schema(json!({
+            "threadId":{"type":"string","description":"Codex thread ID returned by codex.start."},
+            "turnId":{"type":"string","description":"Specific delegated turn ID to inspect."},
+            "detail":{"const":"result","description":"Search persisted App Server turn items newest-first until the newest final answer, end of turn, or internal time budget. The selection is authoritative only when resultPage.selectionComplete is true."},
+            "textOffset":{"type":"integer","minimum":0,"default":0,"description":"Character offset into the selected result. Continue with resultPage.nextTextOffset; each response returns at most 10,240 characters."}
+        }), &["threadId", "turnId", "detail"])
+    ]})
 }
 fn thread_summary_schema() -> Value {
     object_schema(
@@ -1044,12 +1072,13 @@ fn turn_schema() -> Value {
         json!({
             "id":{"type":"string"},"status":{"enum":["inProgress","completed","failed","interrupted"]},
             "error":{"type":["object","null"]},
-            "output":{"type":"array","items":object_schema(json!({
+            "selectionIncomplete":{"type":["boolean","null"],"description":"For terminal turns, true means the bounded item scan could not establish whether a handoff exists or whether a higher-priority item exists. Null while the turn is active. Independent of text clipping."},
+            "output":{"type":"array","maxItems":1,"description":"Zero or one canonical terminal handoff message, preferring a final_answer agentMessage, then exitedReviewMode, then the newest agentMessage. Text is capped at 10,240 characters. Recover clipped text with codex.inspect detail=result and textOffset.","items":object_schema(json!({
                 "id":{"type":["string","null"]},"type":{"enum":["agentMessage","exitedReviewMode"]},
-                "phase":{"type":["string","null"]},"text":{"type":"string"},"truncated":{"type":"boolean"}
+                "phase":{"type":["string","null"]},"text":{"type":"string","maxLength":10240},"truncated":{"type":"boolean","description":"The returned handoff text was clipped. Does not report selection incompleteness."}
             }), &["id","type","phase","text","truncated"])}
         }),
-        &["id", "status", "error", "output"],
+        &["id", "status", "error", "selectionIncomplete", "output"],
     )
 }
 
@@ -1361,6 +1390,34 @@ mod tests {
         assert!(!output.to_string().contains("progress"));
         assert!(!output.to_string().contains("events"));
         assert!(output.to_string().contains("currentActivity"));
+        let turn = &output["properties"]["turn"]["anyOf"][0];
+        assert_eq!(turn["properties"]["output"]["maxItems"], 1);
+        assert_eq!(
+            turn["properties"]["output"]["items"]["properties"]["text"]["maxLength"],
+            10240
+        );
+        assert!(
+            turn["properties"]["output"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("10,240 characters")
+        );
+        assert!(
+            turn["properties"]["output"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("final_answer agentMessage, then exitedReviewMode")
+        );
+        assert_eq!(
+            turn["properties"]["selectionIncomplete"]["type"],
+            json!(["boolean", "null"])
+        );
+        assert!(
+            turn["properties"]["output"]["items"]["properties"]["truncated"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Does not report selection incompleteness")
+        );
 
         let input = codex_wait_schema();
         let properties = input["properties"].as_object().unwrap();
@@ -1376,26 +1433,59 @@ mod tests {
     }
 
     #[test]
-    fn codex_inspect_schema_separates_semantic_and_raw_observation() {
+    fn codex_inspect_schema_separates_journal_and_result_modes() {
         let input = codex_inspect_schema();
-        assert_eq!(input["properties"]["detail"]["default"], "semantic");
+        assert_eq!(input["type"], "object");
+        let input_modes = input["oneOf"].as_array().unwrap();
+        let journal_input = input_modes
+            .iter()
+            .find(|variant| variant["properties"]["detail"]["enum"].is_array())
+            .unwrap();
         assert_eq!(
-            input["properties"]["detail"]["enum"],
+            journal_input["properties"]["detail"]["enum"],
             json!(["semantic", "raw"])
         );
-        let output = codex_inspect_output_schema().to_string();
-        assert!(output.contains("currentActivity"));
-        assert!(output.contains("hasMore"));
+        assert_eq!(journal_input["properties"]["detail"]["default"], "semantic");
+        assert!(journal_input["properties"].get("afterCursor").is_some());
+        assert!(journal_input["properties"].get("textOffset").is_none());
+        assert_eq!(journal_input["additionalProperties"], false);
+        let result_input = input_modes
+            .iter()
+            .find(|variant| variant["properties"]["detail"]["const"] == "result")
+            .unwrap();
+        assert!(result_input["properties"].get("textOffset").is_some());
+        assert!(result_input["properties"].get("afterCursor").is_none());
+        assert_eq!(result_input["additionalProperties"], false);
+
         let output = codex_inspect_output_schema();
-        let variants = output["properties"]["events"]["items"]["oneOf"]
+        assert_eq!(output["type"], "object");
+        let output_modes = output["oneOf"].as_array().unwrap();
+        let raw_output = output_modes
+            .iter()
+            .find(|variant| variant["properties"]["detail"]["enum"].is_array())
+            .unwrap();
+        assert_eq!(raw_output["additionalProperties"], false);
+        let result_output = output_modes
+            .iter()
+            .find(|variant| variant["properties"]["detail"]["const"] == "result")
+            .unwrap();
+        assert_eq!(result_output["additionalProperties"], false);
+        assert!(result_output["properties"].get("resultPage").is_some());
+        assert!(
+            result_output["properties"]["resultPage"]
+                .to_string()
+                .contains("10,240")
+        );
+
+        let event_variants = raw_output["properties"]["events"]["items"]["oneOf"]
             .as_array()
             .unwrap();
-        let raw = variants
+        let raw_event = event_variants
             .iter()
             .find(|variant| variant["properties"].get("method").is_some())
             .unwrap();
         for field in ["method", "params", "truncated"] {
-            assert!(raw["properties"].get(field).is_some());
+            assert!(raw_event["properties"].get(field).is_some());
         }
     }
 
@@ -1509,10 +1599,10 @@ mod tests {
                 ("outputSchema", &tool["outputSchema"]),
             ] {
                 for combinator in ["oneOf", "anyOf", "allOf"] {
-                    if tool["name"] == "codex.start"
-                        && schema_name == "inputSchema"
-                        && combinator == "oneOf"
-                    {
+                    let mode_schema = combinator == "oneOf"
+                        && ((tool["name"] == "codex.start" && schema_name == "inputSchema")
+                            || tool["name"] == "codex.inspect");
+                    if mode_schema {
                         assert!(root.get(combinator).is_some());
                     } else {
                         assert!(
