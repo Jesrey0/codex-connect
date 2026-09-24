@@ -7,22 +7,21 @@ import urllib.request
 
 import jsonschema
 
+PROTOCOL_VERSION = "2026-07-28"
+
 
 class McpClient:
     def __init__(self, url, request_timeout=40):
         self.url = url.rstrip("/")
         self.request_timeout = request_timeout
         self.ids = itertools.count(1)
-        self.session = None
-        self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "codex-connect-smoke", "version": ""}})
-        self.request("notifications/initialized", notification=True)
+        discovery = self.request("server/discover")
+        assert discovery["supportedVersions"] == [PROTOCOL_VERSION], discovery
         self.catalog = self.request("tools/list")["tools"]
         self.tools = {t["name"]: t for t in self.catalog}
 
-    def request(self, method, params=None, notification=False, path="/mcp"):
-        value = {"jsonrpc": "2.0", "method": method}
-        if not notification:
-            value["id"] = next(self.ids)
+    def request(self, method, params=None, path="/mcp"):
+        value = {"jsonrpc": "2.0", "id": next(self.ids), "method": method}
         if params is not None:
             value["params"] = params
         response = self.open_request(value, path=path)
@@ -32,23 +31,37 @@ class McpClient:
             except http.client.IncompleteRead as error:
                 raise ConnectionError("MCP response stream ended before completion") from error
             content_type = response.headers.get("Content-Type", "")
-        if not raw:
-            return None
         if content_type.lower().startswith("text/event-stream"):
             value = self._event_stream_response(raw, value.get("id"))
         else:
             value = json.loads(raw)
         assert "error" not in value, value
-        return value["result"]
+        result = value["result"]
+        assert result["resultType"] == "complete", result
+        return result
 
     def open_request(self, value, path="/mcp"):
-        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18"}
-        if self.session:
-            headers["Mcp-Session-Id"] = self.session
+        params = {
+            **value.get("params", {}),
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "codex-connect-smoke", "version": "1",
+                },
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        }
+        value = {**value, "params": params}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": PROTOCOL_VERSION,
+            "Mcp-Method": value["method"],
+        }
+        if value["method"] == "tools/call":
+            headers["Mcp-Name"] = params["name"]
         request = urllib.request.Request(self.url + path, json.dumps(value).encode(), headers)
-        response = urllib.request.urlopen(request, timeout=self.request_timeout)
-        self.session = response.headers.get("Mcp-Session-Id", self.session)
-        return response
+        return urllib.request.urlopen(request, timeout=self.request_timeout)
 
     @staticmethod
     def _event_stream_response(raw, request_id):

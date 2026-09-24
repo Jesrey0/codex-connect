@@ -10,18 +10,17 @@ The backend listens on loopback at `127.0.0.1:8767/mcp`. Public calls use `${NGR
 
 ## MCP streaming
 
-The `tools/list` response stays JSON so the OpenAI `securitySchemes` projection can add its
-root-level descriptor field without buffering or rewriting SSE. For 2025-06-18 and 2025-11-25
-requests, ordinary stateless tool calls open a request-scoped SSE response immediately, with
-comments every 15 seconds during a quiet call.
+The public MCP endpoint accepts only `2026-07-28` requests with per-request metadata;
+`server/discover` advertises that version alone. Each request is independent; the backend
+does not use an `initialize` handshake or protocol-level sessions. The `tools/list` response
+stays JSON so the OpenAI `securitySchemes` projection can add its root-level descriptor field.
 
-ChatGPT's observed `2026-07-28` requests take a different path in the pinned RMCP SDK:
-it waits for the first handler message before opening the response stream. A quiet tool call
-therefore receives neither SSE headers nor comments until its result is ready. Even when
-comments are sent, the MCP client ignores them; they are not ChatGPT conversation progress.
-The 2026 transport does not support `Last-Event-ID` resumability. Keep synchronous tools
-inside the caller's measured result window and use retained worker or command handles for
-long work. Origin validation remains enabled for the ChatGPT origins.
+The pinned RMCP SDK waits for the first handler message before opening a `2026-07-28`
+response stream. A quiet tool call therefore receives neither SSE headers nor comments
+until its result is ready. SSE comments are not ChatGPT conversation progress. The transport
+does not support `Last-Event-ID` resumability. Keep synchronous tools inside the caller's
+measured result window and use retained worker or command handles for long work. Origin
+validation remains enabled for the ChatGPT origins.
 
 ## Backend lifecycle
 
@@ -150,7 +149,7 @@ codex-connect doctor
 CHECK_PUBLIC=1 ./scripts/check
 ```
 
-Restart only the failed service. User-systemd services are enabled independently; ngrok wants Caddy, and Caddy wants the OAuth service. OAuth grants/refresh state survive restarts. MCP clients initialize a new session after backend restart. Verify a real authenticated call after recovery rather than rerunning setup.
+Restart only the failed service. User-systemd services are enabled independently; ngrok wants Caddy, and Caddy wants the OAuth service. OAuth grants/refresh state survive restarts. MCP requests carry their own metadata; verify a real authenticated call after backend recovery rather than rerunning setup.
 
 ## Deployment
 

@@ -114,7 +114,7 @@ prepared artifact live. Deployment does not imply Git commit/push or connector r
 
 After reboot, check `codex-connect doctor` and host-ingress health separately. Repair
 the failed service rather than rerunning setup. OAuth state survives ingress restarts;
-MCP clients establish a new session after the backend restarts.
+MCP clients send independent `2026-07-28` requests after the backend restarts.
 
 `codex-connect uninstall` removes only its managed backend installation and state.
 Remove its public route and ChatGPT connector separately when retiring the service.
@@ -123,5 +123,5 @@ Remove its public route and ChatGPT connector separately when retiring the servi
 
 - [Codex releases](https://github.com/openai/codex/releases)
 - [OpenAI authentication](https://developers.openai.com/plugins/build/auth)
-- [MCP authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+- [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
 - [Host ingress](https://github.com/Jesrey0/host-ingress)

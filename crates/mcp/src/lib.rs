@@ -28,6 +28,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -184,6 +185,7 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
     let transcript = handler.clone();
     let transport_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
+        .with_stateless_protocol_metadata_required(true)
         .with_allowed_hosts(MCP_ALLOWED_HOSTS)
         .with_allowed_origins(MCP_ALLOWED_ORIGINS)
         .with_max_request_body_bytes(MAX_MCP_REQUEST_BODY_BYTES)
@@ -602,8 +604,13 @@ impl McpHandler {
 }
 
 impl ServerHandler for McpHandler {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(Implementation::new(
                 "codex-connect",
                 env!("CARGO_PKG_VERSION"),

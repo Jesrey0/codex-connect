@@ -12,6 +12,8 @@ The Codex CLI/App Server release is pinned in `config/codex-cli-pin`. `scripts/g
 
 The public catalog and schemas are owned by `crates/mcp/src/catalog.rs`; parsing and dispatch are in `crates/mcp/src/lib.rs`. Update both with protocol tests when changing inputs or outputs.
 
+The public endpoint supports only MCP `2026-07-28`: advertise that version in `server/discover` and require modern per-request metadata. The integration client exercises this stateless contract. The separate Codex App Server handshake is internal to the pinned upstream protocol.
+
 Keep ownership one-way. `crates/host` owns host-path and Connect-native host mechanics. `crates/app-server` owns pinned upstream protocol/transport. `crates/relay` composes those primitives into lifecycle behavior. `crates/mcp` projects that behavior into the public tool/HTTP surface. The CLI is the composition root and local management UI; it should not duplicate Host authority, App Server invariants, or observer protocol logic.
 
 Expose choices that control operator intent and project upstream protocol data into that vocabulary at the MCP boundary. Do not leak fields that merely repeat input, fixed constants, ranking internals, or account metadata that cannot drive an operator action. Keep execution limits and the worker wait budget in the relay; MCP guards must allow operations to finalize. `codex.wait` accepts only thread and turn IDs. `command.read.timeoutMs` supports immediate reads and bounded waits for interactive processes.

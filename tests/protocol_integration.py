@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from support.mcp_client import McpClient
+from support.mcp_client import McpClient, PROTOCOL_VERSION
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONTRACT = json.loads((ROOT / "config/app-server-tool-schemas.json").read_text())
@@ -180,7 +180,8 @@ class OperatorProtocolTests(unittest.TestCase):
         )
         with self.assertRaises(urllib.error.HTTPError) as rejected:
             urllib.request.urlopen(request)
-        self.assertEqual(rejected.exception.code, 403)
+        with rejected.exception:
+            self.assertEqual(rejected.exception.code, 403)
         with urllib.request.urlopen(self.url + "/observe") as response:
             observer = json.load(response)
         self.assertEqual(observer["runtime"], runtime)
@@ -589,66 +590,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(second["stderr"], "")
         self.client.call("command.read", {"processId": "missing", "timeoutMs": 0}, error=True)
 
-    def test_long_command_read_streams_sse_keepalive_before_response(self):
-        quiet = self.client.call("command.start", {"command": ["fixture-quiet"]})
-        request_id = next(self.client.ids)
-        request_value = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "tools/call",
-            "params": {
-                "name": "command.read",
-                "arguments": {"processId": quiet["processId"], "timeoutMs": 45_000},
-            },
-        }
-        started_at = time.monotonic()
-        with self.client.open_request(request_value) as response:
-            self.assertEqual(response.headers.get("Content-Type"), "text/event-stream")
-            self.assertEqual(response.headers.get("X-Accel-Buffering"), "no")
-
-            first_keepalive_at = None
-            keepalive_count = 0
-            response_message = None
-            response_at = None
-            frame = []
-            while True:
-                line = response.readline()
-                if not line:
-                    break
-                if line in (b"\n", b"\r\n"):
-                    if any(item.startswith(b":") for item in frame):
-                        keepalive_count += 1
-                        if first_keepalive_at is None:
-                            first_keepalive_at = time.monotonic()
-                    data = [
-                        item[5:].strip().decode()
-                        for item in frame
-                        if item.startswith(b"data:")
-                    ]
-                    if data:
-                        message = json.loads("\n".join(data))
-                        if message.get("id") == request_id:
-                            response_message = message
-                            response_at = time.monotonic()
-                            break
-                    frame = []
-                else:
-                    frame.append(line.rstrip(b"\r\n"))
-
-        self.assertIsNotNone(first_keepalive_at, "quiet tool read did not emit an SSE comment")
-        self.assertGreaterEqual(keepalive_count, 2)
-        self.assertIsNotNone(response_message, "quiet tool read did not return its JSON-RPC response")
-        self.assertGreater(response_at, first_keepalive_at)
-        self.assertGreaterEqual(response_at - started_at, 43)
-        self.assertLess(first_keepalive_at - started_at, 20)
-        self.assertGreaterEqual(first_keepalive_at - started_at, 12)
-        self.assertIn("result", response_message)
-        self.assertFalse(response_message["result"].get("isError"))
-        self.client.call("command.control", {
-            "action": "terminate", "processId": quiet["processId"],
-        })
-
-    def test_2026_stateless_command_read_uses_bounded_tool_result(self):
+    def test_modern_command_read_uses_bounded_tool_result(self):
         self.assertEqual(
             self.client.tools["command.read"]["inputSchema"]["properties"]["timeoutMs"]["maximum"],
             50_000,
@@ -662,26 +604,9 @@ class OperatorProtocolTests(unittest.TestCase):
             "params": {
                 "name": "command.read",
                 "arguments": {"processId": quiet["processId"], "timeoutMs": 1000},
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientInfo": {
-                        "name": "codex-connect-integration", "version": "1",
-                    },
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                },
             },
         }
-        request = urllib.request.Request(
-            self.url + "/mcp", json.dumps(request_value).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-                "MCP-Protocol-Version": "2026-07-28",
-                "Mcp-Method": "tools/call",
-                "Mcp-Name": "command.read",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with self.client.open_request(request_value) as response:
             self.assertEqual(response.headers.get("Content-Type"), "text/event-stream")
             message = McpClient._event_stream_response(
                 response.read().decode(), request_id,
@@ -693,6 +618,82 @@ class OperatorProtocolTests(unittest.TestCase):
         self.client.call("command.control", {
             "action": "terminate", "processId": quiet["processId"],
         })
+
+    def test_only_modern_mcp_is_advertised_and_accepted(self):
+        self.assertEqual(
+            self.client.request("server/discover")["supportedVersions"],
+            [PROTOCOL_VERSION],
+        )
+
+        def send(request_value, version):
+            request = urllib.request.Request(
+                self.url + "/mcp", json.dumps(request_value).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": version,
+                    "Mcp-Method": request_value["method"],
+                },
+            )
+            try:
+                response = urllib.request.urlopen(request, timeout=5)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                raw = response.read().decode()
+                if response.headers.get("Content-Type", "").startswith("text/event-stream"):
+                    return McpClient._event_stream_response(raw, request_value["id"])
+                return json.loads(raw)
+
+        for version in ("2025-06-18", "2025-11-25"):
+            with self.subTest(version=version):
+                request_id = next(self.client.ids)
+                request_value = {
+                    "jsonrpc": "2.0", "id": request_id, "method": "server/discover",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": version,
+                            "io.modelcontextprotocol/clientInfo": {
+                                "name": "legacy-probe", "version": "1",
+                            },
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    },
+                }
+                initialize = {
+                    "jsonrpc": "2.0", "id": next(self.client.ids),
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": version,
+                        "capabilities": {},
+                        "clientInfo": {"name": "legacy-probe", "version": "1"},
+                    },
+                }
+                for candidate in (request_value, initialize):
+                    message = send(candidate, version)
+                    self.assertIn("error", message, message)
+                    self.assertEqual(message["error"]["code"], -32022)
+                    self.assertEqual(message["error"]["data"]["supported"], [PROTOCOL_VERSION])
+
+        for headers in ({}, {"MCP-Protocol-Version": "2025-06-18"}):
+            with self.subTest(headers=headers):
+                request = urllib.request.Request(
+                    self.url + "/mcp",
+                    json.dumps({
+                        "jsonrpc": "2.0", "id": next(self.client.ids),
+                        "method": "tools/list",
+                    }).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream",
+                        "Mcp-Method": "tools/list",
+                        **headers,
+                    },
+                )
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    urllib.request.urlopen(request, timeout=5)
+                with rejected.exception:
+                    self.assertEqual(rejected.exception.code, 400)
 
     def test_persistent_output_retention_is_bounded(self):
         started = self.client.call("command.start", {"command": ["fixture-bounded"]})
