@@ -725,21 +725,31 @@ fn review_target_schema() -> Value {
     ]})
 }
 fn codex_start_schema() -> Value {
-    object_schema(
+    let work = object_schema(
         json!({
-            "mode":{"type":"string","enum":["work","review"],"description":"Start or resume a work turn, or run a review."},
-            "task":{"type":"string","minLength":1,"description":"Required for mode=work. Self-contained objective or next delta for the workstream."},
-            "cwd":{"type":"string","description":"Host working directory for a new workstream or review. Omit to use the backend navigation cwd. Existing threads retain their cwd."},
-            "threadId":{"type":"string","description":"Existing work/review thread to resume. Resume retains its cwd, model, reasoning effort, and access and is subject to the server cache-age policy."},
-            "forkFromThreadId":{"type":"string","description":"For mode=work, source thread whose durable context should be copied into a new workstream instead of resuming it."},
+            "mode":{"const":"work","description":"Start or resume a work turn."},
+            "task":{"type":"string","minLength":1,"description":"Self-contained objective or next delta for the workstream."},
+            "cwd":{"type":"string","description":"Host working directory for a new workstream. Omit to use the backend navigation cwd. Existing threads retain their cwd."},
+            "threadId":{"type":"string","description":"Existing work thread to resume. Resume retains its cwd, model, reasoning effort, and access and is subject to the server cache-age policy."},
+            "forkFromThreadId":{"type":"string","description":"Source thread whose durable context should be copied into a new workstream instead of resuming it."},
             "lastTurnId":{"type":"string","description":"With forkFromThreadId, optional source turn to fork through, inclusive."},
-            "model":{"type":"string","description":"Model ID for a new workstream or review; discover IDs with codex.query. Existing threads retain their model."},
-            "effort":{"type":"string","description":"Reasoning effort for a new work workstream; discover supported values with codex.query."},
-            "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Access for a new work workstream. workspace permits workspace writes and network access; full grants unrestricted host access."},
-            "target":review_target_schema()
+            "model":{"type":"string","description":"Model ID for a new workstream; discover IDs with codex.query. Existing threads retain their model."},
+            "effort":{"type":"string","description":"Reasoning effort for a new workstream; discover supported values with codex.query."},
+            "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Access for a new workstream. workspace permits workspace writes and network access; full grants unrestricted host access."}
         }),
-        &["mode"],
-    )
+        &["mode", "task"],
+    );
+    let review = object_schema(
+        json!({
+            "mode":{"const":"review","description":"Run a review."},
+            "cwd":{"type":"string","description":"Host working directory for a review. Omit to use the backend navigation cwd. Existing threads retain their cwd."},
+            "threadId":{"type":"string","description":"Existing review thread to resume. Resume retains its cwd and model and is subject to the server cache-age policy."},
+            "target":review_target_schema(),
+            "model":{"type":"string","description":"Model ID for a review; discover IDs with codex.query. Existing threads retain their model."}
+        }),
+        &["mode", "target"],
+    );
+    json!({"type":"object","oneOf":[work,review]})
 }
 fn codex_wait_schema() -> Value {
     object_schema(
@@ -1192,11 +1202,36 @@ mod tests {
                 .is_none()
         );
         let start = codex_start_schema();
-        let start_properties = start["properties"].as_object().unwrap();
-        assert_eq!(start_properties["mode"]["enum"], json!(["work", "review"]));
-        assert_eq!(start_properties["access"]["default"], "workspace");
+        assert_eq!(start["type"], "object");
+        let variants = start["oneOf"].as_array().unwrap();
+        assert_eq!(variants.len(), 2);
+        let work = variants
+            .iter()
+            .find(|variant| variant["properties"]["mode"]["const"] == "work")
+            .unwrap();
+        let work_properties = work["properties"].as_object().unwrap();
         assert_eq!(
-            start_properties["access"]["enum"],
+            work_properties
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "access",
+                "cwd",
+                "effort",
+                "forkFromThreadId",
+                "lastTurnId",
+                "mode",
+                "model",
+                "task",
+                "threadId",
+            ])
+        );
+        assert_eq!(work["required"], json!(["mode", "task"]));
+        assert_eq!(work["additionalProperties"], false);
+        assert_eq!(work_properties["access"]["default"], "workspace");
+        assert_eq!(
+            work_properties["access"]["enum"],
             json!(["workspace", "full"])
         );
         for hidden in [
@@ -1205,23 +1240,25 @@ mod tests {
             "serviceTier",
             "approvalPolicy",
         ] {
-            assert!(start_properties.get(hidden).is_none(), "{hidden}");
+            assert!(work_properties.get(hidden).is_none(), "{hidden}");
         }
-        assert_eq!(start["required"], json!(["mode"]));
-        assert_eq!(start["additionalProperties"], false);
-        for exposed in [
-            "task",
-            "cwd",
-            "threadId",
-            "forkFromThreadId",
-            "lastTurnId",
-            "model",
-            "effort",
-            "access",
-            "target",
-        ] {
-            assert!(start_properties.get(exposed).is_some(), "{exposed}");
-        }
+
+        let review = variants
+            .iter()
+            .find(|variant| variant["properties"]["mode"]["const"] == "review")
+            .unwrap();
+        let review_properties = review["properties"].as_object().unwrap();
+        assert_eq!(
+            review_properties
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["cwd", "mode", "model", "target", "threadId"])
+        );
+        assert_eq!(review["required"], json!(["mode", "target"]));
+        assert_eq!(review["additionalProperties"], false);
+        assert!(review_properties.get("access").is_none());
+        assert!(review_properties.get("effort").is_none());
     }
 
     #[test]
@@ -1467,13 +1504,24 @@ mod tests {
             assert!(tool["outputSchema"].is_object());
             assert_eq!(tool["inputSchema"]["type"], "object");
             assert_eq!(tool["outputSchema"]["type"], "object");
-            for root in [&tool["inputSchema"], &tool["outputSchema"]] {
+            for (schema_name, root) in [
+                ("inputSchema", &tool["inputSchema"]),
+                ("outputSchema", &tool["outputSchema"]),
+            ] {
                 for combinator in ["oneOf", "anyOf", "allOf"] {
-                    assert!(
-                        root.get(combinator).is_none(),
-                        "{} exposes root-level {combinator}",
-                        tool["name"]
-                    );
+                    if tool["name"] == "codex.start"
+                        && schema_name == "inputSchema"
+                        && combinator == "oneOf"
+                    {
+                        assert!(root.get(combinator).is_some());
+                    } else {
+                        assert!(
+                            root.get(combinator).is_none(),
+                            "{} {} exposes root-level {combinator}",
+                            tool["name"],
+                            schema_name
+                        );
+                    }
                 }
             }
             let meta = tool["_meta"].as_object().unwrap();
