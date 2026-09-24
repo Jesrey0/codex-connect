@@ -25,3 +25,4 @@ rmcp = { version = "=3.4.0", default-features = false, features = ["server", "tr
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tower-service = "0.3"

@@ -4,8 +4,8 @@ mod catalog;
 use catalog::{OAUTH_SCOPE, host_plane_reports_worker_events, tool_catalog};
 
 use axum::body::{Body, HttpBody, to_bytes};
-use axum::extract::Path;
-use axum::http::{StatusCode, header};
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::{Router, extract::Request};
@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tower_service::Service;
 
 const QUICK_TOOL_GUARD_MS: u64 = 45_000;
 const CODEX_START_GUARD_MS: u64 = 50_000;
@@ -46,6 +47,9 @@ const MAX_INSPECT_OPERATIONS: usize = 10;
 const MAX_INSPECT_CONCURRENCY: usize = 4;
 const MAX_INSPECT_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_LIST_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_MCP_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MCP_ALLOWED_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+const MCP_ALLOWED_ORIGINS: [&str; 2] = ["https://chatgpt.com", "https://chat.openai.com"];
 const SERVER_INSTRUCTIONS: &str = "Codex Connect operates on the connected host. HostPlane handles host files/processes; WorkerPlane uses codex.*; PlatformPlane is ChatGPT-native and separate. Host tools use OS-account authority; cwd only selects a directory. Codex threads are cache-bounded workstreams: new threads set cwd/model/settings; resume related work only while the server accepts its conservative 30-minute cache policy. Revalidate mutable host state. Workers own scope until terminal/action/input/interrupt/redirect; timeout does not release scope. After caller interruption, use status to recover active/recent worker handles before starting replacements. Use codex.* for Codex lifecycle, never host commands invoking Codex CLI. Create Git workflow state only when requested.";
 
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -178,17 +182,32 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
     let observer = handler.clone();
     let observer_wait = handler.clone();
     let transcript = handler.clone();
+    let transport_config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_allowed_hosts(MCP_ALLOWED_HOSTS)
+        .with_allowed_origins(MCP_ALLOWED_ORIGINS)
+        .with_max_request_body_bytes(MAX_MCP_REQUEST_BODY_BYTES)
+        .with_json_response(false)
+        .with_sse_keep_alive(Some(Duration::from_secs(15)));
+    let json_tool_list_service = StreamableHttpService::new(
+        {
+            let handler = handler.clone();
+            move || Ok(handler.clone())
+        },
+        Arc::new(LocalSessionManager::default()),
+        transport_config.clone().with_json_response(true),
+    );
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(false)
-            .with_allowed_origins(["https://chatgpt.com", "https://chat.openai.com"])
-            .with_json_response(true),
+        transport_config,
     );
     Router::new()
         .nest_service("/mcp", service)
-        .layer(middleware::from_fn(project_openai_tool_descriptors))
+        .layer(middleware::from_fn_with_state(
+            json_tool_list_service,
+            project_openai_tool_descriptors,
+        ))
         .route("/healthz", axum::routing::get(|| async { StatusCode::OK }))
         .route(
             "/runtime",
@@ -247,8 +266,48 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
         )
 }
 
-async fn project_openai_tool_descriptors(request: Request, next: Next) -> Response {
-    let response = next.run(request).await;
+type JsonToolListService = StreamableHttpService<McpHandler, LocalSessionManager>;
+
+async fn project_openai_tool_descriptors(
+    State(json_tool_list_service): State<JsonToolListService>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_mcp_post = request.method() == axum::http::Method::POST
+        && matches!(request.uri().path(), "/mcp" | "/mcp/");
+    if is_mcp_post && let Err((status, message)) = validate_mcp_dns_rebinding_headers(&request) {
+        return mcp_header_error_response(status, message);
+    }
+
+    let response = if is_mcp_post {
+        let (parts, body) = request.into_parts();
+        let bytes = match to_bytes(body, MAX_MCP_REQUEST_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        };
+        let is_tool_list = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|method| method == "tools/list");
+        let request = Request::from_parts(parts, Body::from(bytes));
+        if is_tool_list {
+            let mut service = json_tool_list_service;
+            service
+                .call(request)
+                .await
+                .expect("Streamable HTTP service is infallible")
+                .into_response()
+        } else {
+            next.run(request).await
+        }
+    } else {
+        next.run(request).await
+    };
     let is_json = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -296,6 +355,104 @@ async fn project_openai_tool_descriptors(request: Request, next: Next) -> Respon
         projected.len().to_string().parse().unwrap(),
     );
     Response::from_parts(parts, Body::from(projected))
+}
+
+// Keep this pre-body check aligned with StreamableHttpServerConfig above. RMCP performs the
+// same DNS-rebinding validation, but the request-aware tools/list split must validate headers
+// before reading a body that may exceed its size limit.
+fn validate_mcp_dns_rebinding_headers(request: &Request) -> Result<(), (StatusCode, &'static str)> {
+    let host = if let Some(value) = request.headers().get(header::HOST) {
+        let value = value.to_str().map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Bad Request: Invalid Host header encoding",
+            )
+        })?;
+        let authority = value
+            .parse::<axum::http::uri::Authority>()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Bad Request: Invalid Host header"))?;
+        normalize_mcp_host(authority.host())
+    } else if let Some(authority) = request.uri().authority() {
+        normalize_mcp_host(authority.host())
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Bad Request: missing Host header"));
+    };
+
+    if !MCP_ALLOWED_HOSTS
+        .iter()
+        .any(|allowed| normalize_mcp_host(allowed) == host)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Forbidden: Host header is not allowed",
+        ));
+    }
+
+    let Some(value) = request.headers().get(header::ORIGIN) else {
+        return Ok(());
+    };
+    let value = value.to_str().map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            "Forbidden: Invalid Origin header encoding",
+        )
+    })?;
+    if value.trim().eq_ignore_ascii_case("null") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Forbidden: Origin header is not allowed",
+        ));
+    }
+    let origin = value
+        .trim()
+        .parse::<Uri>()
+        .map_err(|_| (StatusCode::FORBIDDEN, "Forbidden: Invalid Origin header"))?;
+    let (Some(scheme), Some(authority)) = (origin.scheme_str(), origin.authority()) else {
+        return Err((StatusCode::FORBIDDEN, "Forbidden: Invalid Origin header"));
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let origin_host = normalize_mcp_host(authority.host());
+    if !MCP_ALLOWED_ORIGINS.iter().any(|allowed| {
+        allowed
+            .parse::<Uri>()
+            .ok()
+            .and_then(|allowed| {
+                Some((
+                    allowed.scheme_str()?.to_ascii_lowercase(),
+                    normalize_mcp_host(allowed.authority()?.host()),
+                    allowed.authority()?.port_u16(),
+                ))
+            })
+            .is_some_and(|(allowed_scheme, allowed_host, allowed_port)| {
+                allowed_scheme == scheme
+                    && allowed_host == origin_host
+                    && (allowed_port.is_none() || allowed_port == authority.port_u16())
+            })
+    }) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Forbidden: Origin header is not allowed",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_mcp_host(host: &str) -> String {
+    host.trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn mcp_header_error_response(status: StatusCode, message: &str) -> Response {
+    let mut response = Response::new(Body::from(message.to_owned()));
+    *response.status_mut() = status;
+    if status == StatusCode::BAD_REQUEST {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "text/plain; charset=utf-8".parse().unwrap(),
+        );
+    }
+    response
 }
 
 fn inject_openai_security_schemes(value: &mut Value) -> bool {

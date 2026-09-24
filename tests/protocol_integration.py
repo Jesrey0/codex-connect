@@ -5,6 +5,7 @@ Run after cargo build -p codex-connect. Requires Python jsonschema.
 """
 
 import base64
+import http.client
 import json
 import os
 import pathlib
@@ -142,6 +143,10 @@ class OperatorProtocolTests(unittest.TestCase):
     def test_catalog_status_runtime_and_origin_boundary(self):
         self.assertEqual(len(self.client.catalog), 13)
         self.assertEqual(set(self.client.tools), EXPECTED)
+        expected_security = [{"type": "oauth2", "scopes": ["codex-connect:access"]}]
+        for tool in self.client.catalog:
+            self.assertEqual(tool["securitySchemes"], expected_security)
+            self.assertEqual(tool["securitySchemes"], tool["_meta"]["securitySchemes"])
         status = self.client.call("status")
         worker_events = status.pop("workerEvents", [])
         for event in worker_events:
@@ -195,6 +200,43 @@ class OperatorProtocolTests(unittest.TestCase):
             projection = observer["projection"]
         self.assertIn("rateLimits", projection["usage"])
         self.assertIsInstance(projection["usageUpdatedAtMs"], int)
+
+    def test_trailing_slash_tools_list_preserves_root_security_schemes(self):
+        tools = self.client.request("tools/list", path="/mcp/")["tools"]
+        expected_security = [{"type": "oauth2", "scopes": ["codex-connect:access"]}]
+        for tool in tools:
+            self.assertEqual(tool["securitySchemes"], expected_security)
+            self.assertEqual(tool["securitySchemes"], tool["_meta"]["securitySchemes"])
+
+    def test_dns_rebinding_validation_precedes_oversized_body_limit(self):
+        server = urllib.parse.urlsplit(self.url)
+        oversized_content_length = 4 * 1024 * 1024 + 1
+        cases = [
+            ("disallowed origin", {"Origin": "https://evil.example"}, 403),
+            ("disallowed host", {"Host": "evil.example"}, 403),
+            ("malformed host", {"Host": "bad host"}, 400),
+        ]
+        for label, extra_headers, expected_status in cases:
+            with self.subTest(label=label):
+                connection = http.client.HTTPConnection(
+                    server.hostname, server.port, timeout=5,
+                )
+                headers = {
+                    "Host": server.netloc,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                    "Content-Length": str(oversized_content_length),
+                    **extra_headers,
+                }
+                try:
+                    connection.putrequest("POST", "/mcp", skip_host=True)
+                    for name, value in headers.items():
+                        connection.putheader(name, value)
+                    connection.endheaders()
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, expected_status)
+                finally:
+                    connection.close()
 
     def test_cancelled_codex_start_is_recovered_as_worker_started_event(self):
         # Drain unrelated replayable start receipts from earlier scenarios so this test binds
@@ -546,6 +588,61 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(second["stdout"], "")
         self.assertEqual(second["stderr"], "")
         self.client.call("command.read", {"processId": "missing", "timeoutMs": 0}, error=True)
+
+    def test_long_command_read_streams_sse_keepalive_before_response(self):
+        quiet = self.client.call("command.start", {"command": ["fixture-quiet"]})
+        request_id = next(self.client.ids)
+        request_value = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "command.read",
+                "arguments": {"processId": quiet["processId"], "timeoutMs": 20_000},
+            },
+        }
+        started_at = time.monotonic()
+        with self.client.open_request(request_value) as response:
+            self.assertEqual(response.headers.get("Content-Type"), "text/event-stream")
+            self.assertEqual(response.headers.get("X-Accel-Buffering"), "no")
+
+            keepalive_at = None
+            response_message = None
+            response_at = None
+            frame = []
+            while True:
+                line = response.readline()
+                if not line:
+                    break
+                if line in (b"\n", b"\r\n"):
+                    if any(item.startswith(b":") for item in frame):
+                        keepalive_at = time.monotonic()
+                    data = [
+                        item[5:].strip().decode()
+                        for item in frame
+                        if item.startswith(b"data:")
+                    ]
+                    if data:
+                        message = json.loads("\n".join(data))
+                        if message.get("id") == request_id:
+                            response_message = message
+                            response_at = time.monotonic()
+                            break
+                    frame = []
+                else:
+                    frame.append(line.rstrip(b"\r\n"))
+
+        self.assertIsNotNone(keepalive_at, "quiet tool read did not emit an SSE comment")
+        self.assertIsNotNone(response_message, "quiet tool read did not return its JSON-RPC response")
+        self.assertGreater(response_at, keepalive_at)
+        self.assertGreaterEqual(response_at - started_at, 18)
+        self.assertLess(keepalive_at - started_at, 20)
+        self.assertGreaterEqual(keepalive_at - started_at, 12)
+        self.assertIn("result", response_message)
+        self.assertFalse(response_message["result"].get("isError"))
+        self.client.call("command.control", {
+            "action": "terminate", "processId": quiet["processId"],
+        })
 
     def test_persistent_output_retention_is_bounded(self):
         started = self.client.call("command.start", {"command": ["fixture-bounded"]})

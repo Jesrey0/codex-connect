@@ -8,6 +8,19 @@ Codex Connect owns its backend service, deployment state/cache, and installed co
 
 The backend listens on loopback at `127.0.0.1:8767/mcp`. Public calls use `${NGROK_URL}/codex-connect/mcp` through ngrok and the OAuth-protected host ingress. Never expose the backend port directly.
 
+## MCP streaming
+
+For the ChatGPT-compatible 2025-06-18 and 2025-11-25 Streamable HTTP transport, ordinary
+stateless requests, including tool calls, open a request-scoped SSE response immediately.
+The `tools/list` response stays JSON so the existing OpenAI `securitySchemes` projection
+can add its root-level descriptor field without buffering or rewriting SSE. SSE comments
+keep long-running tool calls active every 15 seconds. Origin validation remains enabled for
+the ChatGPT origins.
+This experiment adds no `Last-Event-ID` resumability state. It improves stream availability
+at the backend transport boundary; it has not been live-validated as a fix for ChatGPT
+frontend detachment. RMCP's negotiated 2026-07-28 request path can wait for handler output
+before opening SSE, so this behavior should not be assumed for that protocol path.
+
 ## Backend lifecycle
 
 Initial setup is documented in [Getting Started](getting-started.md). Routine commands are:

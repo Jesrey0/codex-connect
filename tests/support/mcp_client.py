@@ -1,6 +1,7 @@
 """Small Streamable HTTP client used by protocol and live smoke tests."""
 
 import itertools
+import http.client
 import json
 import urllib.request
 
@@ -18,28 +19,55 @@ class McpClient:
         self.catalog = self.request("tools/list")["tools"]
         self.tools = {t["name"]: t for t in self.catalog}
 
-    def request(self, method, params=None, notification=False):
+    def request(self, method, params=None, notification=False, path="/mcp"):
         value = {"jsonrpc": "2.0", "method": method}
         if not notification:
             value["id"] = next(self.ids)
         if params is not None:
             value["params"] = params
-        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18"}
-        if self.session:
-            headers["Mcp-Session-Id"] = self.session
-        request = urllib.request.Request(self.url + "/mcp", json.dumps(value).encode(), headers)
-        with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
-            self.session = response.headers.get("Mcp-Session-Id", self.session)
-            raw = response.read().decode()
+        response = self.open_request(value, path=path)
+        with response:
+            try:
+                raw = response.read().decode()
+            except http.client.IncompleteRead as error:
+                raise ConnectionError("MCP response stream ended before completion") from error
+            content_type = response.headers.get("Content-Type", "")
         if not raw:
             return None
-        if raw.startswith("event:") or raw.startswith("data:"):
-            data = [json.loads(line[5:].strip()) for line in raw.splitlines() if line.startswith("data:")]
-            value = next(x for x in data if x.get("id") == value.get("id"))
+        if content_type.lower().startswith("text/event-stream"):
+            value = self._event_stream_response(raw, value.get("id"))
         else:
             value = json.loads(raw)
         assert "error" not in value, value
         return value["result"]
+
+    def open_request(self, value, path="/mcp"):
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18"}
+        if self.session:
+            headers["Mcp-Session-Id"] = self.session
+        request = urllib.request.Request(self.url + path, json.dumps(value).encode(), headers)
+        response = urllib.request.urlopen(request, timeout=self.request_timeout)
+        self.session = response.headers.get("Mcp-Session-Id", self.session)
+        return response
+
+    @staticmethod
+    def _event_stream_response(raw, request_id):
+        for frame in raw.replace("\r\n", "\n").split("\n\n"):
+            data = []
+            for line in frame.splitlines():
+                if not line or line.startswith(":"):
+                    continue
+                field, separator, value = line.partition(":")
+                if separator and value.startswith(" "):
+                    value = value[1:]
+                if field == "data":
+                    data.append(value)
+            payload = "\n".join(data).strip()
+            if payload:
+                message = json.loads(payload)
+                if message.get("id") == request_id:
+                    return message
+        raise AssertionError(f"MCP SSE response did not contain request id {request_id!r}")
 
     def call(self, name, arguments=None, error=False, validate_input=True):
         arguments = arguments or {}
