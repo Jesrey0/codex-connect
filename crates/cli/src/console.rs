@@ -6,6 +6,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{Instant, MissedTickBehavior, interval};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const UI_TICK_MS: u64 = 750;
 const RECONNECT_MS: u64 = 500;
@@ -27,7 +29,7 @@ pub async fn run() -> Result<()> {
         bail!("the console requires an interactive terminal");
     }
     let backend = BackendClient::new();
-    let _screen = ScreenGuard::enter()?;
+    let mut screen = ScreenGuard::enter()?;
     let mut input = TerminalInput::enter()?;
     let mut ticker = interval(Duration::from_millis(UI_TICK_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -53,6 +55,13 @@ pub async fn run() -> Result<()> {
             result = &mut observer_task => {
                 match result {
                     Ok(Ok(value)) => {
+                        if observer_cursor.is_none() {
+                            // Observer revisions restart with the backend. Re-read an open
+                            // transcript once after reconnect, even if its revision is lower.
+                            transcript_fetch.cancel();
+                            transcript_fetch.refresh_required = true;
+                            transcript_fetch.next_attempt = None;
+                        }
                         observer_cursor = value["cursor"].as_u64();
                         last_error = None;
                         let _ = sync_transcript_from_snapshot(&mut state, &value);
@@ -68,29 +77,33 @@ pub async fn run() -> Result<()> {
                     }
                 }
                 observer_task = spawn_observer_task(backend, observer_cursor);
-                draw(snapshot.as_ref(), last_error.as_deref(), &mut state, &transcript_fetch, frame)?;
+                screen.draw(snapshot.as_ref(), last_error.as_deref(), &mut state, &transcript_fetch, frame)?;
             }
             _ = ticker.tick() => {
-                draw(snapshot.as_ref(), last_error.as_deref(), &mut state, &transcript_fetch, frame)?;
+                screen.draw(snapshot.as_ref(), last_error.as_deref(), &mut state, &transcript_fetch, frame)?;
                 frame = frame.wrapping_add(1);
             }
             result = async { transcript_fetch.task.as_mut().expect("guarded transcript task").await }, if transcript_fetch.task.is_some() => {
                 transcript_fetch.finish(result, &mut state, snapshot.as_ref());
-                draw(snapshot.as_ref(), last_error.as_deref(), &mut state, &transcript_fetch, frame)?;
+                screen.draw(snapshot.as_ref(), last_error.as_deref(), &mut state, &transcript_fetch, frame)?;
             }
             keys = input.next_keys() => {
                 let mut changed = false;
                 for key in keys? {
                     changed |= state.handle_key(key, snapshot.as_ref());
                 }
+                if state.quit {
+                    break;
+                }
                 if changed {
                     transcript_fetch.reset_for_target(state.transcript_target());
-                    draw(snapshot.as_ref(), last_error.as_deref(), &mut state, &transcript_fetch, frame)?;
+                    screen.draw(snapshot.as_ref(), last_error.as_deref(), &mut state, &transcript_fetch, frame)?;
                 }
             }
         }
         transcript_fetch.schedule(backend, &state, snapshot.as_ref());
     }
+    observer_task.abort();
     transcript_fetch.cancel();
     Ok(())
 }
@@ -110,21 +123,56 @@ fn spawn_observer_task(
     })
 }
 
-struct ScreenGuard;
+#[derive(Default)]
+struct ScreenGuard {
+    lines: Vec<String>,
+    size: (usize, usize),
+}
 
 impl ScreenGuard {
     fn enter() -> Result<Self> {
         let mut stdout = io::stdout();
-        write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
+        write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[2J\x1b[H")?;
         stdout.flush()?;
-        Ok(Self)
+        Ok(Self::default())
+    }
+
+    fn draw(
+        &mut self,
+        snapshot: Option<&Value>,
+        last_error: Option<&str>,
+        state: &mut ConsoleState,
+        fetch: &TranscriptFetch,
+        frame: usize,
+    ) -> Result<()> {
+        let (width, height) = terminal_size();
+        let lines = render_frame(snapshot, last_error, state, fetch, frame, width, height);
+        let mut stdout = io::stdout().lock();
+        if self.size != (width, height) {
+            write!(stdout, "\x1b[2J")?;
+            self.lines.clear();
+            self.size = (width, height);
+        }
+        // Address rows explicitly: newline/autowrap at the bottom row can scroll
+        // the alternate screen. Unchanged rows need no repaint.
+        for (index, line) in lines.iter().enumerate() {
+            if self.lines.get(index) != Some(line) {
+                write!(stdout, "\x1b[{};1H{line}\x1b[K", index + 1)?;
+            }
+        }
+        if lines.len() < self.lines.len() {
+            write!(stdout, "\x1b[{};1H\x1b[J", lines.len() + 1)?;
+        }
+        stdout.flush()?;
+        self.lines = lines;
+        Ok(())
     }
 }
 
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = write!(stdout, "\x1b[?25h\x1b[?1049l");
+        let _ = write!(stdout, "{RESET}\x1b[?2004l\x1b[?25h\x1b[?1049l");
         let _ = stdout.flush();
     }
 }
@@ -153,6 +201,7 @@ impl TerminalInput {
         }
         let mut raw = original;
         raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_iflag &= !libc::IXON;
         // Keep ISIG enabled: Ctrl-C must continue to be delivered as SIGINT.
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
@@ -282,6 +331,10 @@ enum InputKey {
     Down,
     Left,
     Right,
+    PageUp,
+    PageDown,
+    Home,
+    End,
     Enter,
     Escape,
 }
@@ -289,6 +342,7 @@ enum InputKey {
 #[derive(Default)]
 struct InputDecoder {
     escape: Vec<u8>,
+    paste: bool,
 }
 
 impl InputDecoder {
@@ -297,53 +351,67 @@ impl InputDecoder {
     }
 
     fn push(&mut self, byte: u8) -> Vec<InputKey> {
-        match self.escape.as_slice() {
-            [] if byte == b'\x1b' => {
+        if self.escape.is_empty() {
+            if byte == b'\x1b' {
                 self.escape.push(byte);
-                Vec::new()
+                return Vec::new();
             }
-            [b'\x1b'] if byte == b'[' => {
-                self.escape.push(byte);
-                Vec::new()
-            }
-            [b'\x1b', b'['] if byte == b'A' => {
-                self.escape.clear();
-                vec![InputKey::Up]
-            }
-            [b'\x1b', b'['] if byte == b'B' => {
-                self.escape.clear();
-                vec![InputKey::Down]
-            }
-            [b'\x1b', b'['] if byte == b'C' => {
-                self.escape.clear();
-                vec![InputKey::Right]
-            }
-            [b'\x1b', b'['] if byte == b'D' => {
-                self.escape.clear();
-                vec![InputKey::Left]
-            }
-            [] => byte_to_key(byte).into_iter().collect(),
-            _ => {
-                self.escape.clear();
-                let mut keys = vec![InputKey::Escape];
-                keys.extend(byte_to_key(byte));
-                keys
-            }
+            return if self.paste { None } else { byte_to_key(byte) }
+                .into_iter()
+                .collect();
         }
+        if self.escape.len() == 1 {
+            if matches!(byte, b'[' | b'O') {
+                self.escape.push(byte);
+            } else {
+                // Consume Alt/unknown escape keys without replaying them as shortcuts.
+                self.escape.clear();
+            }
+            return Vec::new();
+        }
+        let complete = (0x40..=0x7e).contains(&byte);
+        if self.escape.len() < 32 {
+            self.escape.push(byte);
+        }
+        if !complete {
+            return Vec::new();
+        }
+        let key = match self.escape.as_slice() {
+            b"\x1b[200~" => {
+                self.paste = true;
+                None
+            }
+            b"\x1b[201~" => {
+                self.paste = false;
+                None
+            }
+            _ if self.paste => None,
+            b"\x1b[A" | b"\x1bOA" => Some(InputKey::Up),
+            b"\x1b[B" | b"\x1bOB" => Some(InputKey::Down),
+            b"\x1b[C" | b"\x1bOC" => Some(InputKey::Right),
+            b"\x1b[D" | b"\x1bOD" => Some(InputKey::Left),
+            b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" | b"\x1b[7~" => Some(InputKey::Home),
+            b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" | b"\x1b[8~" => Some(InputKey::End),
+            b"\x1b[5~" => Some(InputKey::PageUp),
+            b"\x1b[6~" => Some(InputKey::PageDown),
+            _ => None,
+        };
+        self.escape.clear();
+        key.into_iter().collect()
     }
 
     fn flush_escape(&mut self) -> Option<InputKey> {
-        (!self.escape.is_empty()).then(|| {
-            self.escape.clear();
-            InputKey::Escape
-        })
+        let standalone = self.escape == b"\x1b" && !self.paste;
+        self.escape.clear();
+        standalone.then_some(InputKey::Escape)
     }
 }
 
 fn byte_to_key(byte: u8) -> Option<InputKey> {
     match byte {
         b'\r' | b'\n' => Some(InputKey::Enter),
-        _ => char::from_u32(byte as u32).map(InputKey::Character),
+        b' '..=b'~' => Some(InputKey::Character(byte as char)),
+        _ => None,
     }
 }
 
@@ -368,6 +436,10 @@ struct ConsoleState {
     follow: bool,
     selected_worker: usize,
     selected_worker_target: Option<TranscriptTarget>,
+    active_only: bool,
+    help: bool,
+    quit: bool,
+    page_size: usize,
 }
 
 impl Default for ConsoleState {
@@ -381,6 +453,10 @@ impl Default for ConsoleState {
             follow: true,
             selected_worker: 0,
             selected_worker_target: None,
+            active_only: false,
+            help: false,
+            quit: false,
+            page_size: 1,
         }
     }
 }
@@ -394,73 +470,98 @@ impl ConsoleState {
     }
 
     fn handle_key(&mut self, key: InputKey, snapshot: Option<&Value>) -> bool {
+        if key == InputKey::Character('?') {
+            self.help = !self.help;
+            return true;
+        }
+        if self.help {
+            if matches!(key, InputKey::Escape | InputKey::Character('q')) {
+                self.help = false;
+                return true;
+            }
+            return false;
+        }
         match &self.view {
-            View::Dashboard => match key {
-                InputKey::Up | InputKey::Character('k') => {
-                    let next = self.selected_worker.saturating_sub(1);
-                    let changed = next != self.selected_worker;
-                    self.selected_worker = next;
-                    self.selected_worker_target = snapshot
-                        .and_then(workers)
-                        .and_then(|turns| turns.get(next))
-                        .and_then(transcript_target_for_turn);
-                    changed
+            View::Dashboard => {
+                if key == InputKey::Character('q') {
+                    self.quit = true;
+                    return true;
                 }
-                InputKey::Down | InputKey::Character('j') => {
-                    let count = snapshot.and_then(workers).map_or(0, Vec::len);
-                    let next = self
-                        .selected_worker
-                        .saturating_add(1)
-                        .min(count.saturating_sub(1));
-                    let changed = next != self.selected_worker;
-                    self.selected_worker = next;
-                    self.selected_worker_target = snapshot
-                        .and_then(workers)
-                        .and_then(|turns| turns.get(next))
-                        .and_then(transcript_target_for_turn);
-                    changed
+                if key == InputKey::Character('a') {
+                    self.active_only = !self.active_only;
                 }
-                InputKey::Enter | InputKey::Right => {
-                    let target = snapshot
-                        .and_then(workers)
-                        .and_then(|turns| turns.get(self.selected_worker))
-                        .and_then(transcript_target_for_turn);
-                    let Some(target) = target else {
-                        return false;
-                    };
-                    self.selected_worker_target = Some(target.clone());
-                    self.view = View::Transcript(target);
-                    self.transcript = None;
-                    self.transcript_error = None;
-                    self.transcript_revision = 0;
-                    self.scroll = 0;
-                    self.follow = true;
-                    true
+                let turns = visible_workers(snapshot, self.active_only);
+                sync_worker_selection(self, &turns);
+                let next = match key {
+                    InputKey::Up | InputKey::Character('k') => {
+                        self.selected_worker.saturating_sub(1)
+                    }
+                    InputKey::Down | InputKey::Character('j') => {
+                        self.selected_worker.saturating_add(1)
+                    }
+                    InputKey::PageUp => self.selected_worker.saturating_sub(self.page_size),
+                    InputKey::PageDown => self.selected_worker.saturating_add(self.page_size),
+                    InputKey::Home | InputKey::Character('g') => 0,
+                    InputKey::End | InputKey::Character('G') => turns.len().saturating_sub(1),
+                    InputKey::Enter | InputKey::Right => {
+                        let Some(target) = turns
+                            .get(self.selected_worker)
+                            .and_then(|turn| transcript_target_for_turn(turn))
+                        else {
+                            return false;
+                        };
+                        self.selected_worker_target = Some(target.clone());
+                        self.view = View::Transcript(target);
+                        self.transcript = None;
+                        self.transcript_error = None;
+                        self.transcript_revision = 0;
+                        self.scroll = 0;
+                        self.follow = true;
+                        return true;
+                    }
+                    InputKey::Character('a') => return true,
+                    _ => return false,
                 }
-                _ => false,
-            },
+                .min(turns.len().saturating_sub(1));
+                let changed = next != self.selected_worker;
+                self.selected_worker = next;
+                self.selected_worker_target = turns
+                    .get(next)
+                    .and_then(|turn| transcript_target_for_turn(turn));
+                changed
+            }
             View::Transcript(_) => match key {
-                InputKey::Escape | InputKey::Left | InputKey::Character('b') => {
+                InputKey::Escape | InputKey::Left | InputKey::Character('b' | 'q') => {
                     self.view = View::Dashboard;
                     self.transcript_error = None;
                     self.transcript_revision = 0;
                     true
                 }
-                InputKey::Character('j') | InputKey::Down => {
-                    self.scroll = self.scroll.saturating_add(1);
+                InputKey::Character('j') | InputKey::Down | InputKey::PageDown => {
+                    let step = if key == InputKey::PageDown {
+                        self.page_size
+                    } else {
+                        1
+                    };
+                    self.scroll = self.scroll.saturating_add(step);
                     self.follow = false;
                     true
                 }
-                InputKey::Character('k') | InputKey::Up => {
-                    self.scroll = self.scroll.saturating_sub(1);
+                InputKey::Character('k') | InputKey::Up | InputKey::PageUp => {
+                    let step = if key == InputKey::PageUp {
+                        self.page_size
+                    } else {
+                        1
+                    };
+                    self.scroll = self.scroll.saturating_sub(step);
                     self.follow = false;
                     true
                 }
-                InputKey::Character('G') => {
+                InputKey::Character('G') | InputKey::End => {
                     self.follow = true;
                     true
                 }
-                InputKey::Character('g') => {
+                InputKey::Character('g') | InputKey::Home => {
                     self.scroll = 0;
                     self.follow = false;
                     true
@@ -479,6 +580,7 @@ struct TranscriptFetch {
     last_success: Option<Instant>,
     next_attempt: Option<Instant>,
     failures: u32,
+    refresh_required: bool,
 }
 
 impl TranscriptFetch {
@@ -509,7 +611,10 @@ impl TranscriptFetch {
             .and_then(|snapshot| worker_for_target(snapshot, target))
             .and_then(|worker| worker["transcriptRevision"].as_u64())
             .unwrap_or_default();
-        self.failures > 0 || state.transcript.is_none() || revision > state.transcript_revision
+        self.refresh_required
+            || self.failures > 0
+            || state.transcript.is_none()
+            || revision > state.transcript_revision
     }
 
     fn schedule(&mut self, backend: BackendClient, state: &ConsoleState, snapshot: Option<&Value>) {
@@ -545,6 +650,7 @@ impl TranscriptFetch {
                 self.last_success = Some(Instant::now());
                 self.next_attempt = None;
                 self.failures = 0;
+                self.refresh_required = false;
                 if let Some(snapshot) = snapshot {
                     let _ = sync_transcript_from_snapshot(state, snapshot);
                 }
@@ -613,6 +719,15 @@ fn workers(snapshot: &Value) -> Option<&Vec<Value>> {
     snapshot["projection"]["workers"].as_array()
 }
 
+fn visible_workers(snapshot: Option<&Value>, active_only: bool) -> Vec<&Value> {
+    snapshot
+        .and_then(workers)
+        .into_iter()
+        .flatten()
+        .filter(|worker| !active_only || !is_terminal_status(worker["status"].as_str()))
+        .collect()
+}
+
 fn transcript_target_for_turn(turn: &Value) -> Option<TranscriptTarget> {
     Some(TranscriptTarget {
         thread_id: turn["threadId"].as_str()?.to_owned(),
@@ -625,7 +740,7 @@ fn same_worker(turn: &Value, target: &TranscriptTarget) -> bool {
         && turn["turnId"].as_str() == Some(target.turn_id.as_str())
 }
 
-fn sync_worker_selection(state: &mut ConsoleState, workers: &[Value]) {
+fn sync_worker_selection(state: &mut ConsoleState, workers: &[&Value]) {
     if workers.is_empty() {
         state.selected_worker = 0;
         state.selected_worker_target = None;
@@ -639,36 +754,14 @@ fn sync_worker_selection(state: &mut ConsoleState, workers: &[Value]) {
             state.selected_worker = state.selected_worker.min(workers.len() - 1);
             state.selected_worker_target = workers
                 .get(state.selected_worker)
-                .and_then(transcript_target_for_turn);
+                .and_then(|turn| transcript_target_for_turn(turn));
         }
     } else {
         state.selected_worker = state.selected_worker.min(workers.len() - 1);
         state.selected_worker_target = workers
             .get(state.selected_worker)
-            .and_then(transcript_target_for_turn);
+            .and_then(|turn| transcript_target_for_turn(turn));
     }
-}
-
-fn draw(
-    snapshot: Option<&Value>,
-    last_error: Option<&str>,
-    state: &mut ConsoleState,
-    fetch: &TranscriptFetch,
-    frame: usize,
-) -> Result<()> {
-    let (width, height) = terminal_size();
-    let lines = render_frame(snapshot, last_error, state, fetch, frame, width, height);
-    let mut stdout = io::stdout();
-    write!(stdout, "\x1b[H")?;
-    for (index, line) in lines.iter().enumerate() {
-        if index > 0 {
-            writeln!(stdout)?;
-        }
-        write!(stdout, "{line}")?;
-    }
-    write!(stdout, "\x1b[J")?;
-    stdout.flush()?;
-    Ok(())
 }
 
 fn render_frame(
@@ -680,11 +773,11 @@ fn render_frame(
     width: usize,
     height: usize,
 ) -> Vec<String> {
-    if width < 44 || height < 16 {
+    sync_worker_selection(state, &visible_workers(snapshot, state.active_only));
+    if width < 44 || height < 14 {
+        state.page_size = 1;
         return render_tiny(snapshot, last_error, state, fetch, width, height);
     }
-    let mut lines = Vec::new();
-    let pulse = ["◐", "◓", "◑", "◒"][frame % 4];
     let read_error = match (last_error, state.transcript_error.as_deref()) {
         (Some(backend), Some(transcript)) => {
             Some(format!("backend: {backend} · transcript: {transcript}"))
@@ -693,88 +786,119 @@ fn render_frame(
         (None, Some(transcript)) => Some(format!("transcript: {transcript}")),
         (None, None) => None,
     };
-
-    lines.push(styled(row("", width), TEXT));
-    lines.push(styled(
-        row_lr(
-            "  ◈  CODEX CONNECT",
-            &format!(
-                "{pulse} {}  ",
-                if snapshot.is_some() && last_error.is_none() {
-                    "LIVE"
-                } else {
-                    "RECONNECTING"
-                }
+    let connection = match (snapshot.is_some(), last_error.is_none()) {
+        (true, true) => "live",
+        (true, false) => "stale · reconnecting",
+        _ => "connecting",
+    };
+    let mut lines = vec![
+        styled(
+            row_lr(
+                " >_ codex connect",
+                &format!("read-only · {connection} "),
+                width,
             ),
-            width,
+            BOLD,
         ),
-        &format!("{BOLD}{TEXT}"),
-    ));
-    lines.push(styled(rule(width), DIM));
-
-    let body_height = height.saturating_sub(6 + if read_error.is_some() { 2 } else { 0 });
+        styled(rule(width), DIM),
+    ];
+    let body_height = height.saturating_sub(4 + if read_error.is_some() { 2 } else { 0 });
     let body_start = lines.len();
-
-    match &state.view {
-        View::Dashboard => match snapshot {
-            Some(snapshot) => {
-                render_snapshot(&mut lines, state, snapshot, width, body_height, frame)
+    if state.help {
+        render_help(&mut lines, width);
+    } else {
+        match &state.view {
+            View::Dashboard => match snapshot {
+                Some(snapshot) => {
+                    render_snapshot(&mut lines, state, snapshot, width, body_height, frame)
+                }
+                None => {
+                    lines.push(styled(
+                        row(" Connecting to the local backend…", width),
+                        TEXT,
+                    ));
+                    lines.push(styled(
+                        row(" Navigation stays available while reconnecting.", width),
+                        DIM,
+                    ));
+                }
+            },
+            View::Transcript(target) => {
+                let target = target.clone();
+                render_transcript(
+                    &mut lines,
+                    state,
+                    snapshot,
+                    fetch,
+                    &target,
+                    RenderArea {
+                        width,
+                        height: body_height,
+                        frame,
+                    },
+                );
             }
-            None => lines.push(styled(row(" acquiring backend projection…", width), YELLOW)),
-        },
-        View::Transcript(target) => {
-            let target = target.clone();
-            render_transcript(
-                &mut lines,
-                state,
-                snapshot,
-                fetch,
-                &target,
-                RenderArea {
-                    width,
-                    height: body_height,
-                    frame,
-                },
-            );
         }
     }
-    lines.truncate(body_start.saturating_add(body_height));
+    lines.truncate(body_start + body_height);
     while lines.len() < body_start + body_height {
         lines.push(row("", width));
     }
-
     if let Some(error) = read_error {
         lines.push(styled(rule(width), RED));
         lines.push(styled(
             row(
-                &format!(" ⚠ READ ERROR  {}", safe_terminal_text(&error)),
+                &format!(" Read error · {}", one_line_terminal_text(&error)),
                 width,
             ),
-            &format!("{BOLD}{RED}"),
+            RED,
         ));
     }
-
     lines.push(styled(rule(width), DIM));
-    lines.push(styled(
-        row_lr(
-            match state.view {
-                View::Dashboard => "  READ ONLY  ·  ↑/↓ select  ·  Enter open",
-                View::Transcript(_) if state.follow => {
-                    "  FOLLOWING  ·  ↑/↓ scroll  ·  g start  ·  Esc back"
+    let footer = if state.help {
+        " ? / Esc close help · Ctrl-C exit".to_string()
+    } else {
+        match state.view {
+            View::Dashboard if width >= 90 => {
+                " ↑/↓ select · Enter open · a active/all · PgUp/PgDn page · ? help · q exit"
+                    .to_string()
+            }
+            View::Dashboard => " ↑/↓ select · Enter open · ? help · q exit".to_string(),
+            View::Transcript(_) => format!(
+                " {} · ↑/↓ scroll · {}Esc back · ? help",
+                if state.follow {
+                    "Following"
+                } else {
+                    "Paused · G follow"
+                },
+                if width >= 90 {
+                    "PgUp/PgDn page · "
+                } else {
+                    ""
                 }
-                View::Transcript(_) => {
-                    "  PAUSED  ·  G live  ·  g start  ·  ↑/↓ scroll  ·  Esc back"
-                }
-            },
-            "Ctrl-C exit  ",
-            width,
-        ),
-        DIM,
-    ));
-    lines.push(styled(row("", width), TEXT));
-
-    lines.truncate(height);
+            ),
+        }
+    };
+    lines.push(styled(row(&footer, width), DIM));
     lines
+}
+
+fn render_help(lines: &mut Vec<String>, width: usize) {
+    for label in [
+        " Keyboard shortcuts",
+        "",
+        " Workers    ↑/↓ or j/k select · Enter open",
+        "            a active/all · Home/End or g/G first/last",
+        "            PgUp/PgDn move one page",
+        " Transcript ↑/↓ or j/k scroll · PgUp/PgDn page",
+        "            Home/g start · End/G follow latest",
+        "            Esc/←/b/q back to workers",
+        " General    ? help · q exit from workers · Ctrl-C exit",
+        "",
+        " Read-only. Resolve actions through ChatGPT.",
+    ] {
+        lines.push(styled(row(label, width), TEXT));
+    }
 }
 
 fn render_tiny(
@@ -788,7 +912,22 @@ fn render_tiny(
     if width == 0 || height == 0 {
         return Vec::new();
     }
-    let mut labels = vec!["CODEX CONNECT · observe only".to_string()];
+    if state.help {
+        return [
+            "Keyboard shortcuts",
+            "↑/↓ or j/k select · Enter open",
+            "a active/all · g/G first/last",
+            "PgUp/PgDn page",
+            "Transcript: g start · G follow",
+            "Esc back · q exit from workers",
+            "? / Esc close help · Ctrl-C exit",
+        ]
+        .into_iter()
+        .take(height)
+        .map(|line| elide(line, width))
+        .collect();
+    }
+    let mut labels = vec!["codex connect · read-only".to_string()];
     if let Some(error) = last_error {
         labels.push(format!("Backend: {}", one_line_terminal_text(error)));
     }
@@ -837,10 +976,16 @@ fn render_tiny(
             if let Some(error) = projection.and_then(|value| value["usageError"].as_str()) {
                 labels.push(format!("Usage stale: {}", one_line_terminal_text(error)));
             }
-            labels.push(format!("{workers} workers · {pending} actions"));
-            if let Some(worker) = projection
-                .and_then(|value| value["workers"].as_array())
-                .and_then(|workers| workers.get(state.selected_worker))
+            labels.push(format!(
+                "{workers} workers · {pending} actions{} ",
+                if state.active_only {
+                    " · active filter"
+                } else {
+                    ""
+                }
+            ));
+            if let Some(worker) =
+                visible_workers(snapshot, state.active_only).get(state.selected_worker)
             {
                 labels.push(format!(
                     "Selected {} · {}",
@@ -850,11 +995,12 @@ fn render_tiny(
             }
         }
     }
-    labels.push("Esc back · Ctrl-C exit".to_string());
+    labels.push("↑/↓ select · Enter open · Esc back · ? help".to_string());
+    labels.push("Ctrl-C exit".to_string());
     labels
         .into_iter()
         .take(height)
-        .map(|line| truncate_display_width(&line, width))
+        .map(|line| elide(&one_line_terminal_text(&line), width))
         .collect()
 }
 
@@ -866,115 +1012,201 @@ fn render_snapshot(
     height: usize,
     frame: usize,
 ) {
+    let start = lines.len();
     let runtime = &snapshot["runtime"];
     let projection = &snapshot["projection"];
     let ready = runtime["ready"].as_bool().unwrap_or(false);
-    let health = if ready { "● ONLINE" } else { "○ OFFLINE" };
-    let build = text(&runtime["buildId"], "unknown");
-    let release = text(&runtime["codex"]["release"], "unknown");
-    let health_style = if ready { TEXT } else { RED };
-
     lines.push(styled(
         row_lr(
-            &format!(" {health}   build {build}"),
-            &format!("Codex {release} "),
+            &format!(
+                " {} · {}",
+                if ready { "● Online" } else { "○ Offline" },
+                text(&projection["cwd"], "unknown workspace")
+            ),
+            &format!("build {} ", text(&runtime["buildId"], "unknown")),
             width,
         ),
-        health_style,
+        if ready { DIM } else { RED },
     ));
-    lines.push(styled(
-        row_lr(
-            &format!(" ⌂ {}", text(&projection["cwd"], "unknown")),
-            "event-driven ",
-            width,
-        ),
-        DIM,
-    ));
-    lines.push(styled(row(&account_line(projection, width), width), TEXT));
-
+    if width < 100 && height >= 12 && projection["usageError"].as_str().is_none() {
+        let limits = &projection["usage"]["rateLimits"];
+        lines.push(styled(
+            row(
+                &format!(
+                    " Quota · {}",
+                    quota_summary("Primary", &limits["primary"], false)
+                ),
+                width,
+            ),
+            TEXT,
+        ));
+        lines.push(styled(
+            row(
+                &format!(
+                    "         {} · usage {}",
+                    quota_summary("Secondary", &limits["secondary"], false),
+                    usage_access(projection)
+                ),
+                width,
+            ),
+            TEXT,
+        ));
+    } else {
+        lines.push(styled(row(&account_line(projection, width), width), TEXT));
+    }
+    if let Some(notice) = projection["notices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|notice| notice["kind"].as_str() == Some("error"))
+    {
+        lines.push(styled(
+            row(
+                &format!(" Error · {}", text(&notice["summary"], "observer error")),
+                width,
+            ),
+            RED,
+        ));
+    }
     let pending = projection["pendingActions"]
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let errors = projection["notices"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-        .iter()
-        .filter(|notice| notice["kind"].as_str() == Some("error"))
-        .collect::<Vec<_>>();
-    if !errors.is_empty() {
-        section(lines, "SYSTEM ATTENTION", width);
-        for notice in errors.iter().rev().take(2).rev() {
-            let summary = notice["summary"].as_str().unwrap_or("observer error");
-            lines.push(styled(
-                row(&format!(" ✕ {}", safe_terminal_text(summary)), width),
-                &format!("{BOLD}{RED}"),
-            ));
+    if !pending.is_empty() {
+        lines.push(styled(
+            row(
+                &format!(
+                    " Needs operator · {} pending · resolve in ChatGPT",
+                    pending.len()
+                ),
+                width,
+            ),
+            YELLOW,
+        ));
+        // Preserve room for a worker even when several actions and errors arrive together.
+        if height.saturating_sub(lines.len() - start) >= 6 {
+            lines.push(compact_action_row(&pending[0], width));
         }
     }
-    if !pending.is_empty() {
-        section(lines, "NEEDS OPERATOR", width);
-        for action in pending.iter().take(2) {
-            lines.push(compact_action_row(action, width));
-        }
-        if pending.len() > 2 {
-            lines.push(styled(
+    let turns = visible_workers(Some(snapshot), state.active_only);
+    let active = workers(snapshot)
+        .into_iter()
+        .flatten()
+        .filter(|worker| !is_terminal_status(worker["status"].as_str()))
+        .count();
+    let total = workers(snapshot).map_or(0, Vec::len);
+    if height >= 12 {
+        lines.push(row("", width));
+    }
+    lines.push(styled(
+        row_lr(
+            &format!(" Workers · {active} active · {} recent", total - active),
+            &format!(
+                "{} ",
+                if state.active_only {
+                    "active only"
+                } else {
+                    "all"
+                }
+            ),
+            width,
+        ),
+        BOLD,
+    ));
+    if turns.is_empty() {
+        lines.push(styled(
+            row(
+                if state.active_only {
+                    " No active workers. Press a to show recent work."
+                } else {
+                    " No workers observed yet. Start work through ChatGPT."
+                },
+                width,
+            ),
+            DIM,
+        ));
+        return;
+    }
+    let available = height.saturating_sub(lines.len() - start);
+    let detail = turns
+        .get(state.selected_worker)
+        .map(|worker| {
+            let mut detail = vec![styled(
                 row(
-                    &format!("   +{} more pending actions", pending.len() - 2),
+                    &format!(
+                        " {} / {}",
+                        text(&worker["threadId"], "?"),
+                        text(&worker["turnId"], "?")
+                    ),
                     width,
                 ),
                 DIM,
-            ));
-        }
-    }
-
-    let workers = projection["workers"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    sync_worker_selection(state, workers);
-    let active_count = workers
-        .iter()
-        .filter(|worker| !is_terminal_status(worker["status"].as_str()))
-        .count();
-    let recent_count = workers.len().saturating_sub(active_count);
-    section(
-        lines,
-        &format!(
-            "WORKERS · {active_count} active · {recent_count} recent{}",
-            if workers.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " · selected {}/{}",
-                    state.selected_worker + 1,
-                    workers.len()
-                )
+            )];
+            if let Some(tokens) = worker["tokenUsage"]["threadTotalTokens"].as_u64() {
+                detail.push(styled(
+                    row(
+                        &format!(
+                            " Thread total {} tok · cumulative across requests",
+                            compact_number(tokens)
+                        ),
+                        width,
+                    ),
+                    DIM,
+                ));
             }
-        ),
-        width,
-    );
-    if workers.is_empty() {
-        lines.push(styled(row(" ◌ IDLE · no observed workers", width), DIM));
+            if let Some(context) = worker_context_detail(&worker["tokenUsage"]) {
+                detail.extend(render_wrapped_text(&context, " ", width, DIM));
+            }
+            detail
+        })
+        .unwrap_or_default();
+    let detail_height = if available >= detail.len() + 6 {
+        detail.len() + 1
     } else {
-        let capacity = worker_capacity(height, pending.len());
-        let start = state
-            .selected_worker
-            .saturating_add(1)
-            .saturating_sub(capacity);
-        for (index, worker) in workers.iter().enumerate().skip(start).take(capacity) {
-            let waiting = pending
-                .iter()
-                .any(|action| action_matches_worker(action, worker));
-            lines.extend(worker_rows(
-                index == state.selected_worker,
-                worker,
-                waiting,
+        0
+    };
+    let list_height = available.saturating_sub(detail_height);
+    let capacity = (list_height.saturating_sub(1) / 2).max(1);
+    state.page_size = capacity;
+    let first = state
+        .selected_worker
+        .saturating_add(1)
+        .saturating_sub(capacity)
+        .min(turns.len().saturating_sub(capacity));
+    for (index, worker) in turns.iter().enumerate().skip(first).take(capacity) {
+        let waiting = pending
+            .iter()
+            .any(|action| action_matches_worker(action, worker));
+        lines.extend(worker_rows(
+            index == state.selected_worker,
+            worker,
+            waiting,
+            width,
+            frame,
+        ));
+    }
+    if list_height >= 3 {
+        lines.push(styled(
+            row(
+                &format!(
+                    " {}–{} of {} · selected {}",
+                    first + 1,
+                    (first + capacity).min(turns.len()),
+                    turns.len(),
+                    state.selected_worker + 1
+                ),
                 width,
-                frame,
-            ));
+            ),
+            DIM,
+        ));
+    }
+    if detail_height > 0 {
+        while lines.len() - start < height - detail_height {
+            lines.push(row("", width));
         }
+        lines.push(styled(rule(width), DIM));
+        lines.extend(detail);
     }
 }
 
@@ -1075,18 +1307,23 @@ fn render_transcript(
             pinned.push(styled(row(&format!(" ✕ {summary}"), width), RED));
         }
     }
-    pinned.extend(render_wrapped_text(
-        &format!("thread  {}", target.thread_id),
-        " ",
-        width,
-        DIM,
-    ));
-    pinned.extend(render_wrapped_text(
-        &format!("turn    {}", target.turn_id),
-        " ",
-        width,
-        DIM,
-    ));
+    let handles = format!(" thread {} · turn {}", target.thread_id, target.turn_id);
+    if display_width(&handles) <= width.saturating_sub(2) {
+        pinned.push(styled(row(&handles, width), DIM));
+    } else {
+        pinned.extend(render_wrapped_text(
+            &format!("thread {}", target.thread_id),
+            " ",
+            width,
+            DIM,
+        ));
+        pinned.extend(render_wrapped_text(
+            &format!("turn   {}", target.turn_id),
+            " ",
+            width,
+            DIM,
+        ));
+    }
     let conversation_height = height.saturating_sub(pinned.len());
     lines.extend(pinned.into_iter().take(height));
     if conversation_height == 0 {
@@ -1131,6 +1368,7 @@ fn render_transcript(
     }
 
     let available = conversation_height;
+    state.page_size = available.saturating_sub(1).max(1);
     let max_scroll = body.len().saturating_sub(available);
     if state.follow {
         state.scroll = max_scroll;
@@ -1309,7 +1547,7 @@ fn entry_style(kind: &str, status: Option<&str>) -> &'static str {
 
 fn render_wrapped_text(text: &str, prefix: &str, width: usize, style: &'static str) -> Vec<String> {
     let inner = width.saturating_sub(2);
-    let prefix = clip(prefix, inner);
+    let prefix = truncate_display_width(prefix, inner);
     let line_width = inner.saturating_sub(display_width(&prefix)).max(1);
     wrap_terminal_text(text, line_width)
         .into_iter()
@@ -1318,22 +1556,51 @@ fn render_wrapped_text(text: &str, prefix: &str, width: usize, style: &'static s
 }
 
 fn wrap_terminal_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
     let safe = safe_terminal_text(text);
     let mut lines = Vec::new();
     for paragraph in safe.split('\n') {
-        let mut line = String::new();
-        let mut used = 0;
-        for character in paragraph.chars() {
-            let character_width = char_display_width(character);
-            if used > 0 && used + character_width > width {
-                lines.push(line);
-                line = String::new();
-                used = 0;
+        let mut rest = paragraph;
+        while !rest.is_empty() {
+            let prefix = truncate_display_width(rest, width);
+            if prefix.len() == rest.len() {
+                break;
             }
-            line.push(character);
-            used += character_width;
+            if prefix.is_empty() {
+                // A wide grapheme cannot fit in a one-column viewport.
+                let first = rest.graphemes(true).next().expect("nonempty paragraph");
+                lines.push("�".to_string());
+                rest = &rest[first.len()..];
+                continue;
+            }
+            let suffix = &rest[prefix.len()..];
+            if suffix.starts_with(char::is_whitespace) {
+                lines.push(prefix.trim_end().to_string());
+                rest = suffix.trim_start();
+                continue;
+            }
+            let split = prefix
+                .char_indices()
+                .rev()
+                .find(|(index, ch)| ch.is_whitespace() && !prefix[..*index].trim().is_empty())
+                .map(|(index, _)| index);
+            match split {
+                Some(index) => {
+                    lines.push(rest[..index].trim_end().to_string());
+                    rest = rest[index..].trim_start();
+                }
+                None => {
+                    let consumed = prefix.len();
+                    lines.push(prefix);
+                    rest = &rest[consumed..];
+                }
+            }
         }
-        lines.push(line);
+        if !rest.is_empty() || paragraph.is_empty() {
+            lines.push(rest.to_string());
+        }
     }
     lines
 }
@@ -1344,6 +1611,9 @@ fn safe_terminal_text(text: &str) -> String {
             '\n' => "\n".chars().collect::<Vec<_>>(),
             '\t' => "    ".chars().collect(),
             '\x1b' => "^[".chars().collect(),
+            character if matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') => {
+                format!("\\u{{{:04x}}}", character as u32).chars().collect()
+            }
             character if character.is_control() => {
                 format!("\\x{:02x}", character as u32).chars().collect()
             }
@@ -1353,21 +1623,7 @@ fn safe_terminal_text(text: &str) -> String {
 }
 
 fn display_width(value: &str) -> usize {
-    value.chars().map(char_display_width).sum()
-}
-
-fn char_display_width(character: char) -> usize {
-    if character.is_control() {
-        0
-    } else if matches!(character as u32,
-        0x1100..=0x115f | 0x2329..=0x232a | 0x2e80..=0xa4cf | 0xac00..=0xd7a3 |
-        0xf900..=0xfaff | 0xfe10..=0xfe19 | 0xfe30..=0xfe6f | 0xff00..=0xff60 |
-        0xffe0..=0xffe6 | 0x1f300..=0x1faff | 0x20000..=0x3fffd
-    ) {
-        2
-    } else {
-        1
-    }
+    UnicodeWidthStr::width(value)
 }
 
 fn worker_rows(
@@ -1377,72 +1633,61 @@ fn worker_rows(
     width: usize,
     frame: usize,
 ) -> Vec<String> {
-    let mode = text(&worker["mode"], "worker").to_ascii_uppercase();
-    let model = worker["model"].as_str().unwrap_or("default/inherited");
-    let effort = worker["effort"].as_str().unwrap_or("default/inherited");
+    let mode = text(&worker["mode"], "worker");
+    let model = text(&worker["model"], "inherited model");
+    let effort = text(&worker["effort"], "inherited effort");
     let status = text(&worker["status"], "unknown");
-    let kind = worker["activityKind"].as_str().unwrap_or("working");
+    let kind = text(&worker["activityKind"], "working");
+    let pulse = ["◐", "◓", "◑", "◒"][frame % 4];
+    let (glyph, label) = if waiting && !is_terminal_status(Some(status)) {
+        ("!", "Needs operator")
+    } else {
+        match status {
+            "completed" => ("✓", "Completed"),
+            "failed" => ("×", "Failed"),
+            "interrupted" => ("■", "Interrupted"),
+            "inProgress" if matches!(kind, "reasoning" | "think") => (pulse, "Thinking"),
+            "inProgress" if kind == "message" => (pulse, "Responding"),
+            "inProgress" => (pulse, "Working"),
+            _ => ("?", "Unknown"),
+        }
+    };
     let age = worker["lastActivityAtMs"]
         .as_u64()
         .map(activity_age)
         .unwrap_or_else(|| "age unknown".into());
-    let tokens = worker["tokenUsage"]["threadTotalTokens"]
-        .as_u64()
-        .map(|tokens| format!(" · thread total {} tok", compact_number(tokens)))
-        .unwrap_or_default();
-    let pulse = ["◐", "◓", "◑", "◒"][frame % 4];
-    let (glyph, state_label) = if waiting && !is_terminal_status(Some(status)) {
-        ("⚠", "WAITING FOR OPERATOR".to_string())
-    } else {
-        match status {
-            "completed" => ("✓", "COMPLETED".into()),
-            "failed" => ("✕", "FAILED".into()),
-            "interrupted" => ("■", "INTERRUPTED".into()),
-            _ if matches!(kind.to_ascii_lowercase().as_str(), "reasoning" | "think") => {
-                (pulse, "THINKING".into())
-            }
-            _ if kind.eq_ignore_ascii_case("message") => (pulse, "RESPONDING".into()),
-            _ => (pulse, "WORKING".into()),
-        }
-    };
-    let marker = if selected { "›" } else { " " };
-    let line =
-        format!(" {marker} {glyph} {mode} · {model} · {effort} · {state_label} · {age}{tokens}");
-    let style = if status == "failed" {
-        format!("{BOLD}{RED}")
-    } else if waiting {
-        format!("{BOLD}{YELLOW}")
-    } else if selected {
-        format!("{BOLD}{CYAN}")
-    } else if is_terminal_status(Some(status)) {
-        DIM.to_string()
-    } else {
-        TEXT.to_string()
-    };
-    let ids = format!(
-        "{} / {}",
-        short_id(text(&worker["threadId"], "unknown")),
-        short_id(text(&worker["turnId"], "unknown"))
-    );
-    let detail = worker["prompt"]
+    let prompt = worker["prompt"]
         .as_str()
-        .map(one_line_terminal_text)
-        .map(|prompt| format!("{ids} · {prompt}"))
-        .unwrap_or(ids);
-    let mut rows = vec![
-        styled(row(&line, width), &style),
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| bounded_one_line_terminal_text(value, MAX_ACTION_TEXT_CHARS))
+        .unwrap_or_else(|| format!("{mode} · {}", text(&worker["threadId"], "unknown worker")));
+    let title = format!(" {} {}", if selected { "›" } else { " " }, prompt);
+    let style = if status == "failed" {
+        RED
+    } else if waiting {
+        YELLOW
+    } else if selected {
+        BOLD
+    } else {
+        TEXT
+    };
+    vec![
+        styled(row(&title, width), style),
         styled(
-            row(
-                &format!("     {}", clip(&detail, width.saturating_sub(8))),
+            row_lr(
+                &format!("   {glyph} {label} · {model} · {effort} · {mode}"),
+                &format!("{age} "),
                 width,
             ),
-            DIM,
+            if status == "failed" {
+                RED
+            } else if waiting {
+                YELLOW
+            } else {
+                DIM
+            },
         ),
-    ];
-    if selected && let Some(detail) = worker_context_detail(&worker["tokenUsage"]) {
-        rows.push(styled(row(&format!("     {detail}"), width), DIM));
-    }
-    rows
+    ]
 }
 
 fn worker_context_detail(usage: &Value) -> Option<String> {
@@ -1473,9 +1718,7 @@ fn worker_context_detail(usage: &Value) -> Option<String> {
             .unwrap_or_default()
             .as_millis() as u64;
         let remaining = until.saturating_sub(now) / 1_000;
-        let active = usage["cacheGuaranteeActive"]
-            .as_bool()
-            .unwrap_or(remaining > 0);
+        let active = until > now && usage["cacheGuaranteeActive"].as_bool().unwrap_or(true);
         parts.push(if !active {
             "thread cache guarantee expired".to_string()
         } else if remaining < 60 {
@@ -1484,7 +1727,7 @@ fn worker_context_detail(usage: &Value) -> Option<String> {
             format!("thread cache guarantee {}m left", remaining / 60)
         });
     }
-    (!parts.is_empty()).then(|| parts.join(" · "))
+    (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
 fn one_line_terminal_text(text: &str) -> String {
@@ -1724,18 +1967,24 @@ fn account_line(projection: &Value, width: usize) -> String {
             .map(|age| format!(" · last good {age}"))
             .unwrap_or_default();
         return format!(
-            " ACCOUNT · quota stale{age} · {}",
+            " Quota · quota stale{age} · {}",
             one_line_terminal_text(error)
         );
     }
     let limits = &projection["usage"]["rateLimits"];
-    let primary = quota_summary("5H", &limits["primary"], width >= 100);
-    let secondary = quota_summary("7D", &limits["secondary"], width >= 100);
-    let access = projection["usage"]["ordinaryUsageAllowed"]
+    let primary = quota_summary("Primary", &limits["primary"], width >= 130);
+    let secondary = quota_summary("Secondary", &limits["secondary"], width >= 130);
+    format!(
+        " Quota · {primary} · {secondary} · usage {}",
+        usage_access(projection)
+    )
+}
+
+fn usage_access(projection: &Value) -> &'static str {
+    projection["usage"]["ordinaryUsageAllowed"]
         .as_bool()
         .map(|allowed| if allowed { "open" } else { "blocked" })
-        .unwrap_or("unknown");
-    format!(" ACCOUNT · {primary} · {secondary} · usage {access}")
+        .unwrap_or("unknown")
 }
 
 fn quota_summary(fallback_label: &str, value: &Value, meter: bool) -> String {
@@ -1751,17 +2000,19 @@ fn quota_summary(fallback_label: &str, value: &Value, meter: bool) -> String {
     if meter {
         let filled = ((used / 100.0) * 8.0).round() as usize;
         format!(
-            "{label} {} {:>3.0}% {reset}",
+            "{label} {} {:>3.0}% used · resets {reset}",
             "█".repeat(filled) + &"░".repeat(8 - filled),
             used
         )
     } else {
-        format!("{label} {:>3.0}% {reset}", used)
+        format!("{label} {:>3.0}% used · resets {reset}", used)
     }
 }
 
 fn quota_label(value: &Value) -> Option<String> {
-    let minutes = value["windowDurationMins"].as_u64()?;
+    let minutes = value["windowDurationMins"]
+        .as_u64()
+        .filter(|minutes| *minutes > 0)?;
     if minutes % (24 * 60) == 0 {
         Some(format!("{}D", minutes / (24 * 60)))
     } else if minutes % 60 == 0 {
@@ -1791,19 +2042,6 @@ fn reset_in(epoch_seconds: u64) -> String {
     }
 }
 
-fn worker_capacity(height: usize, pending: usize) -> usize {
-    let pending_rows = if pending == 0 { 0 } else { pending.min(2) + 2 };
-    (height.saturating_sub(11 + pending_rows) / 2).clamp(1, 12)
-}
-
-fn section(lines: &mut Vec<String>, title: &str, width: usize) {
-    lines.push(row("", width));
-    lines.push(styled(
-        row(&format!("  {title}"), width),
-        &format!("{BOLD}{TEXT}"),
-    ));
-}
-
 fn styled(line: String, style: &str) -> String {
     format!("{style}{line}{RESET}")
 }
@@ -1814,17 +2052,6 @@ fn text<'a>(value: &'a Value, fallback: &'a str) -> &'a str {
 
 fn short_id(value: &str) -> &str {
     value.get(..8).unwrap_or(value)
-}
-
-fn clip(value: &str, max: usize) -> String {
-    let chars = value.chars().collect::<Vec<_>>();
-    if chars.len() <= max {
-        value.to_string()
-    } else if max <= 1 {
-        "…".into()
-    } else {
-        format!("{}…", chars[..max - 1].iter().collect::<String>())
-    }
 }
 
 fn terminal_size() -> (usize, usize) {
@@ -1843,12 +2070,19 @@ fn terminal_size() -> (usize, usize) {
 }
 
 fn rule(width: usize) -> String {
-    format!("  {}  ", "─".repeat(width.saturating_sub(4)))
+    if width < 4 {
+        "─".repeat(width)
+    } else {
+        format!("  {}  ", "─".repeat(width - 4))
+    }
 }
 
 fn row(content: &str, width: usize) -> String {
-    let inner = width.saturating_sub(2);
-    let mut body = truncate_display_width(content, inner);
+    if width < 2 {
+        return " ".repeat(width);
+    }
+    let inner = width - 2;
+    let mut body = elide(&safe_terminal_text(content).replace('\n', " "), inner);
     let used = display_width(&body);
     if used < inner {
         body.push_str(&" ".repeat(inner - used));
@@ -1857,35 +2091,298 @@ fn row(content: &str, width: usize) -> String {
 }
 
 fn row_lr(left: &str, right: &str, width: usize) -> String {
+    if width < 2 {
+        return " ".repeat(width);
+    }
+    let left = safe_terminal_text(left).replace('\n', " ");
+    let right = safe_terminal_text(right).replace('\n', " ");
     let inner = width.saturating_sub(2);
-    let right = truncate_display_width(right, inner);
+    let right = elide(&right, inner);
     let right_width = display_width(&right);
     if right_width >= inner {
         return row(&right, width);
     }
     let left_max = inner.saturating_sub(right_width + 1);
-    let left = truncate_display_width(left, left_max);
+    let left = elide(&left, left_max);
     let padding = inner.saturating_sub(display_width(&left) + right_width);
     format!(" {left}{}{right} ", " ".repeat(padding))
 }
 
+fn elide(value: &str, width: usize) -> String {
+    if display_width(value) <= width {
+        value.to_string()
+    } else if width == 0 {
+        String::new()
+    } else {
+        format!("{}…", truncate_display_width(value, width - 1))
+    }
+}
+
 fn truncate_display_width(value: &str, width: usize) -> String {
-    let mut truncated = String::new();
-    let mut used = 0;
-    for character in value.chars() {
-        let character_width = char_display_width(character);
-        if used + character_width > width {
+    let mut end = 0;
+    for (index, grapheme) in value.grapheme_indices(true) {
+        let next = index + grapheme.len();
+        if display_width(&value[..next]) > width {
             break;
         }
-        truncated.push(character);
-        used += character_width;
+        end = next;
     }
-    truncated
+    value[..end].to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plain(line: &str) -> String {
+        let mut parts = line.split("\x1b[");
+        let mut visible = parts.next().unwrap_or_default().to_string();
+        for part in parts {
+            if let Some((_, text)) = part.split_once('m') {
+                visible.push_str(text);
+            }
+        }
+        visible
+    }
+
+    #[test]
+    fn selected_worker_survives_crowded_layouts_and_resize() {
+        let snapshot = serde_json::json!({
+            "runtime":{"ready":true,"buildId":"build"},
+            "projection":{
+                "cwd":"/work/界面",
+                "workers":(0..18).map(|i| serde_json::json!({
+                    "threadId":format!("thread-{i}"),"turnId":format!("turn-{i}"),
+                    "prompt":format!("task-{i} café 👩‍💻"),"status":"inProgress",
+                    "model":"model","effort":"high",
+                    "tokenUsage":{"threadTotalTokens":1000,"lastRequestInputTokens":200,
+                        "lastRequestModelContextWindow":10000,"lastRequestCachedInputTokens":100}
+                })).collect::<Vec<_>>(),
+                "pendingActions":[{"params":{"reason":"needs attention"}}],
+                "notices":[{"kind":"error","summary":"observer error"}]
+            }
+        });
+        for width in [44, 80, 132] {
+            for height in [14, 16, 24, 40] {
+                let mut state = ConsoleState {
+                    selected_worker: 17,
+                    ..ConsoleState::default()
+                };
+                let lines = render_frame(
+                    Some(&snapshot),
+                    Some("disconnected"),
+                    &mut state,
+                    &TranscriptFetch::default(),
+                    0,
+                    width,
+                    height,
+                );
+                let rendered = lines.join("\n");
+                assert_eq!(lines.len(), height);
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| display_width(&plain(line)) == width),
+                    "{width}x{height}"
+                );
+                assert!(
+                    rendered.contains("› task-17"),
+                    "{width}x{height}: {rendered}"
+                );
+                assert!(rendered.contains("Working"), "{width}x{height}");
+                assert!(rendered.contains("stale"));
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_layout_preserves_graphemes_and_word_boundaries() {
+        for text in ["界面", "cafe\u{301}", "👩‍💻", "👍🏽", "🇵🇭"] {
+            for width in 0..10 {
+                assert!(display_width(&row(text, width)) <= width);
+                assert!(display_width(&row_lr(text, text, width)) <= width);
+                let clipped = truncate_display_width(text, width);
+                assert!(
+                    text.grapheme_indices(true).any(|(i, _)| i == clipped.len()) || clipped == text
+                );
+                assert!(
+                    wrap_terminal_text(text, width)
+                        .iter()
+                        .all(|line| display_width(line) <= width)
+                );
+            }
+        }
+        assert_eq!(truncate_display_width("e\u{301}x", 1), "e\u{301}");
+        assert_eq!(truncate_display_width("👩‍💻x", 2), "👩‍💻");
+        assert_eq!(
+            wrap_terminal_text("hello world again", 11),
+            ["hello world", "again"]
+        );
+        assert_eq!(
+            wrap_terminal_text("  indented\n\nnext", 20),
+            ["  indented", "", "next"]
+        );
+    }
+
+    #[test]
+    fn metadata_cannot_inject_terminal_controls_or_extra_rows() {
+        let malicious = "name\x1b]52;c;payload\x07\nline\r\u{202e}";
+        for value in [row(malicious, 100), row_lr(malicious, malicious, 100)] {
+            assert!(!value.contains(['\x1b', '\n', '\r', '\x07', '\u{202e}']));
+            assert_eq!(display_width(&value), 100);
+        }
+        let snapshot = serde_json::json!({"projection":{"workers":[{
+            "threadId":malicious,"turnId":"turn","status":malicious
+        }]}});
+        let lines = render_frame(
+            Some(&snapshot),
+            None,
+            &mut ConsoleState::default(),
+            &TranscriptFetch::default(),
+            0,
+            43,
+            12,
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains(['\x1b', '\n', '\r', '\x07', '\u{202e}']))
+        );
+    }
+
+    #[test]
+    fn decoder_handles_paging_and_ignores_paste_and_unknown_sequences() {
+        let mut decoder = InputDecoder::default();
+        for (bytes, key) in [
+            (b"\x1b[5~".as_slice(), InputKey::PageUp),
+            (b"\x1b[6~".as_slice(), InputKey::PageDown),
+            (b"\x1bOH".as_slice(), InputKey::Home),
+            (b"\x1b[F".as_slice(), InputKey::End),
+        ] {
+            assert_eq!(
+                bytes
+                    .iter()
+                    .flat_map(|b| decoder.push(*b))
+                    .collect::<Vec<_>>(),
+                [key]
+            );
+        }
+        for sequence in [
+            b"\x1b[99~".as_slice(),
+            b"\x1bOP",
+            b"\x1bq",
+            b"\x1b[200~q?aj\nG\x1b[A\x1b[201~",
+        ] {
+            assert!(
+                sequence
+                    .iter()
+                    .flat_map(|b| decoder.push(*b))
+                    .collect::<Vec<_>>()
+                    .is_empty()
+            );
+        }
+        assert_eq!(decoder.push(b'j'), [InputKey::Character('j')]);
+        for byte in b"\x1b[" {
+            assert!(decoder.push(*byte).is_empty());
+        }
+        assert_eq!(decoder.flush_escape(), None);
+    }
+
+    #[test]
+    fn active_filter_paging_help_and_tiny_resize_keep_selection_coherent() {
+        let snapshot = serde_json::json!({"projection":{"workers":[
+            {"threadId":"done","turnId":"done","status":"completed"},
+            {"threadId":"one","turnId":"one","status":"inProgress"},
+            {"threadId":"two","turnId":"two","status":"inProgress"}
+        ]}});
+        let mut state = ConsoleState {
+            page_size: 2,
+            ..ConsoleState::default()
+        };
+        state.handle_key(InputKey::PageDown, Some(&snapshot));
+        assert_eq!(state.selected_worker, 2);
+        state.handle_key(InputKey::Character('a'), Some(&snapshot));
+        assert_eq!(state.selected_worker, 1);
+        assert_eq!(
+            state.selected_worker_target.as_ref().unwrap().thread_id,
+            "two"
+        );
+        let reordered = serde_json::json!({"projection":{"workers":[
+            {"threadId":"two","turnId":"two","status":"inProgress"},
+            {"threadId":"one","turnId":"one","status":"inProgress"}
+        ]}});
+        render_frame(
+            Some(&reordered),
+            None,
+            &mut state,
+            &TranscriptFetch::default(),
+            0,
+            30,
+            10,
+        );
+        assert_eq!(state.selected_worker, 0);
+        state.handle_key(InputKey::Character('?'), Some(&reordered));
+        state.handle_key(InputKey::Character('q'), Some(&reordered));
+        assert!(!state.quit && !state.help);
+        state.handle_key(InputKey::Enter, Some(&reordered));
+        assert_eq!(state.transcript_target().unwrap().thread_id, "two");
+        state.handle_key(InputKey::PageUp, None);
+        assert!(!state.follow);
+        state.handle_key(InputKey::End, None);
+        assert!(state.follow);
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_extend_cache_deadline_or_invent_quota_windows() {
+        let usage = serde_json::json!({"cacheGuaranteedUntilMs":1,"cacheGuaranteeActive":true});
+        assert_eq!(
+            worker_context_detail(&usage).unwrap(),
+            "thread cache guarantee expired"
+        );
+        let summary = account_line(&Value::Null, 100);
+        assert!(summary.contains("Primary unavailable"));
+        assert!(summary.contains("Secondary unavailable"));
+        assert!(!summary.contains("5H") && !summary.contains("7D"));
+        assert_eq!(
+            quota_label(&serde_json::json!({"windowDurationMins":0})),
+            None
+        );
+    }
+
+    #[test]
+    fn reconnect_refreshes_open_transcript_once_after_revision_reset() {
+        let target = TranscriptTarget {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        let mut state = ConsoleState {
+            view: View::Transcript(target.clone()),
+            transcript: Some(serde_json::json!({"entries":[]})),
+            transcript_revision: 100,
+            ..ConsoleState::default()
+        };
+        let snapshot = serde_json::json!({"projection":{"workers":[{
+            "threadId":"thread","turnId":"turn","transcriptRevision":1
+        }]}});
+        let mut fetch = TranscriptFetch {
+            target: Some(target),
+            requested_revision: 1,
+            refresh_required: true,
+            ..TranscriptFetch::default()
+        };
+        assert!(fetch.should_fetch(&state, Some(&snapshot), Instant::now()));
+        fetch.finish(
+            Ok(Ok(serde_json::json!({"entries":[]}))),
+            &mut state,
+            Some(&snapshot),
+        );
+        assert_eq!(state.transcript_revision, 1);
+        assert!(!fetch.should_fetch(
+            &state,
+            Some(&snapshot),
+            Instant::now() + Duration::from_secs(60)
+        ));
+    }
 
     #[test]
     fn row_is_cropped_to_terminal_width() {
@@ -1904,10 +2401,9 @@ mod tests {
             "prompt": "Refactor the console for a human operator"
         });
         let rendered = worker_rows(true, &turn, false, 120, 0).join("\n");
-        assert!(rendered.contains("› ◐ WORK"));
+        assert!(rendered.contains("› Refactor the console"));
         assert!(rendered.contains("gpt-5.6-sol"));
         assert!(rendered.contains("high"));
-        assert!(rendered.contains("thread-1 / turn-123"));
         assert!(rendered.contains("Refactor the console"));
     }
 
@@ -1926,8 +2422,7 @@ mod tests {
             "tokenUsage": {"threadTotalTokens": 123, "lastRequestModelContextWindow": 456}
         });
         let rendered = worker_rows(false, &turn, false, 160, 0).join("\n");
-        assert!(rendered.contains("THINKING"));
-        assert!(rendered.contains("thread total 123 tok"));
+        assert!(rendered.contains("Thinking"));
         assert!(!rendered.contains("private chain of thought"));
     }
 
@@ -1942,8 +2437,8 @@ mod tests {
         });
         let rendered = worker_rows(false, &turn, false, 120, 0);
         assert_eq!(rendered.len(), 2);
-        assert!(!rendered[1].contains('\n'));
-        assert!(rendered[1].contains("first line second line"));
+        assert!(!rendered[0].contains('\n'));
+        assert!(rendered[0].contains("first line second line"));
     }
 
     #[test]
@@ -2016,9 +2511,11 @@ mod tests {
             }
         });
         let compact = account_line(&projection, 80);
-        assert!(compact.contains("ACCOUNT · 5H  50% due · 7D  25% due · usage open"));
+        assert!(compact.contains(
+            "Quota · 5H  50% used · resets due · 7D  25% used · resets due · usage open"
+        ));
         assert!(!compact.contains('█'));
-        assert!(account_line(&projection, 120).contains("████"));
+        assert!(account_line(&projection, 140).contains("████"));
     }
 
     #[test]
@@ -2049,7 +2546,7 @@ mod tests {
                 "cacheGuaranteedUntilMs":u64::MAX
             }
         });
-        let rendered = worker_rows(true, &worker, false, 120, 0).join("\n");
+        let rendered = worker_context_detail(&worker["tokenUsage"]).unwrap();
         assert!(rendered.contains("latest request input 12.0k / 200.0k tok window"));
         assert!(rendered.contains("latest request cached 9.0k tok · 75%"));
         assert!(rendered.contains("thread cache guarantee"));
@@ -2095,11 +2592,11 @@ mod tests {
             }),
             ..ConsoleState::default()
         };
-        let reordered = vec![
+        let reordered = [
             serde_json::json!({"threadId":"thread-two","turnId":"turn-two"}),
             serde_json::json!({"threadId":"thread-one","turnId":"turn-one"}),
         ];
-        sync_worker_selection(&mut state, &reordered);
+        sync_worker_selection(&mut state, &reordered.iter().collect::<Vec<_>>());
         assert_eq!(state.selected_worker, 0);
         assert_eq!(
             state.selected_worker_target,
@@ -2347,12 +2844,13 @@ mod tests {
             plain
         };
         assert!(lines.iter().all(|line| display_width(&visible(line)) == 90));
-        assert!(rendered.contains("CODEX CONNECT"));
+        assert!(rendered.contains("codex connect"));
         assert!(rendered.contains("build abc123"));
-        assert!(rendered.contains("ACCOUNT · 5H"));
+        assert!(rendered.contains("Quota · 5H"));
         assert!(rendered.contains("gpt-6-sol"));
         assert!(rendered.contains("Review the schema"));
-        assert!(lines[26].contains("READ ONLY"));
+        assert!(rendered.contains("read-only"));
+        assert!(lines[27].contains("Enter open"));
         assert!(!rendered.contains('│'));
     }
 

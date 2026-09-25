@@ -38,6 +38,31 @@ codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-projec
 
 `status` reports readiness, live build identity, navigation cwd, Codex defaults, retained persistent-command handles, and active/recent worker handles for operator rehydration. `doctor` provides local diagnostics. `console` is a read-only visibility surface for workers, transcripts, pending state, and usage; it does not steer or mutate anything. All worker/host actions remain in ChatGPT through the MCP/plugin surface.
 
+### Console navigation
+
+The console uses the terminal's foreground/background theme. Task names lead the worker
+list; the selected worker's detail area distinguishes cumulative thread tokens from
+the latest request's input, context window, and cached input. Quota percentages explicitly
+show usage consumed, with the window labels reported by App Server.
+
+| View | Keys | Effect |
+| --- | --- | --- |
+| Workers | Up/Down or j/k; Enter | Select a worker; open its transcript |
+| Workers | a | Toggle all workers / active workers |
+| Workers | Home/End or g/G; Page Up/Down | First/last worker; move by a visible page |
+| Transcript | Up/Down or j/k; Page Up/Down | Scroll and pause following |
+| Transcript | Home/g; End/G | Start of retained text; follow latest output |
+| Transcript | Escape, Left, b, or q | Return to workers |
+| Either | ?; Escape while help is open | Show/close keyboard help |
+| Either | Ctrl-C; q from workers | Exit and restore the terminal |
+
+Resizing preserves selection by thread/turn identity. Small windows use a compact view.
+Read failures retain the last successful data and visibly mark it stale; reconnecting
+refreshes an open transcript even if backend revision counters restarted. UI ticks update
+ages and animation locally. Observer notifications and transcript revisions drive backend
+reads; the console does not poll App Server for progress. Pasted text is ignored and
+pending actions remain informational: resolve them through ChatGPT.
+
 ## Host commands
 
 Use `command.exec` for short, non-interactive commands and `command.start` for
