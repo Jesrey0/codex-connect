@@ -162,7 +162,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Delegate work or a read-only review. Start fresh, resume a related cache-valid workstream, or fork durable thread context into a new workstream. If the call is lost, recover the handle from status.workers before starting replacement work.",
+                "Delegate work or a read-only review when autonomous investigation, implementation, independent review, or real parallelism materially helps. Start fresh, resume a related cache-valid workstream, or fork durable thread context into a new workstream. Keep routine operator work local. If the call is lost, recover the handle from status.workers before starting replacement work.",
                 false,
                 true,
                 true,
@@ -175,7 +175,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.wait",
                 "Wait for Codex Turn",
-                "Wait for a turn to finish or require operator action/input. Terminal output contains at most one canonical handoff message, capped at 10,240 characters: final_answer agentMessage, then exitedReviewMode, then the newest agentMessage. selectionIncomplete separately reports when the bounded scan could not establish that choice. Recover clipped text with codex.inspect detail=result and textOffset; treat that result as authoritative only when resultPage.selectionComplete is true. An individual App Server item above the transport limit remains incomplete. Returns after a bounded wait if still active; timeout does not mean failure or loss of scope ownership.",
+                "Synchronize with a delegated turn when its result or required action is needed. Do not use this tool as a polling loop: continue useful non-overlapping operator work first, and use codex.inspect for a non-blocking activity check when necessary. Terminal output contains at most one canonical handoff message, capped at 10,240 characters: final_answer agentMessage, then exitedReviewMode, then the newest agentMessage. selectionIncomplete separately reports when the bounded scan could not establish that choice. Recover clipped text with codex.inspect detail=result and textOffset; treat that result as authoritative only when resultPage.selectionComplete is true. An individual App Server item above the transport limit remains incomplete. Returns after a bounded wait if still active; timeout does not mean failure or loss of scope ownership.",
                 true,
                 false,
                 false,
@@ -378,7 +378,7 @@ fn worker_events_schema() -> Value {
     json!({
         "type":"array",
         "maxItems":8,
-        "description":"Worker notifications on HostPlane calls. workerStarted is replayed until claimed while the worker remains in bounded retained state; other notifications are one-shot. actionRequired and turnTerminal are delivered ahead of start receipts. historyLost means notification history was evicted. These events are hints, not worker authority: use status.workers to discover retained handles and codex.wait for a known turn.",
+        "description":"Worker notifications on HostPlane calls. workerStarted is replayed until claimed while the worker remains in bounded retained state; other notifications are one-shot. actionRequired and turnTerminal are delivered ahead of start receipts. historyLost means notification history was evicted. These events are hints, not worker authority: use status.workers to recover retained handles, codex.inspect for non-blocking inspection, and codex.wait only at a synchronization boundary.",
         "items":{"oneOf":[started,terminal,action,lost]}
     })
 }

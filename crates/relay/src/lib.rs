@@ -2676,28 +2676,6 @@ impl Relay {
             .collect()
     }
 
-    pub fn verify_pending_action_target(
-        &self,
-        request_id: &RpcId,
-        kind: PendingActionKind,
-        thread_id: &str,
-        turn_id: Option<&str>,
-    ) -> Result<(), RelayError> {
-        if self
-            .app_server
-            .pending_requests(Some(thread_id))
-            .iter()
-            .any(|request| pending_action_matches(request, request_id, kind, thread_id, turn_id))
-        {
-            Ok(())
-        } else {
-            Err(RelayError::Invalid(
-                "pending action no longer matches this thread and turn; call codex.wait again"
-                    .into(),
-            ))
-        }
-    }
-
     async fn push_terminal_worker_event(&self, thread_id: &str, observed: &ObservedTurn) {
         let Some(mode) = observed.mode.as_deref() else {
             return;
@@ -3275,19 +3253,6 @@ fn validate_thread_batch(thread_ids: &[String]) -> Result<(), RelayError> {
         ));
     }
     Ok(())
-}
-
-fn pending_action_matches(
-    request: &PendingServerRequest,
-    request_id: &RpcId,
-    kind: PendingActionKind,
-    thread_id: &str,
-    turn_id: Option<&str>,
-) -> bool {
-    &request.request_id == request_id
-        && request.kind == kind
-        && request.thread_id == thread_id
-        && request.turn_id.as_deref() == turn_id
 }
 
 fn validate_work_sandbox_policy(policy: &SandboxPolicy) -> Result<(), RelayError> {

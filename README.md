@@ -30,7 +30,7 @@ Deterministic host tools run with the OS account's authority. The managed backen
 
 `codex.start(mode=work)` defaults to a writable workspace sandbox with network access; `access="full"` grants unrestricted host access. Approval prompts are disabled within the selected sandbox. Reviews are read-only. Workers use the normal Codex config and AGENTS.md instruction sources.
 
-Workers own their delegated scope until completion, required action/input, interruption, or user redirect. Continue only non-overlapping work, then use `codex.wait` to join. Timeout means the worker is still active; use `codex.inspect` for activity/history. See [Operations](docs/operations.md#worker-lifecycle) for pending actions and lost-call recovery.
+Workers own their delegated scope until completion, required action/input, interruption, or user redirect. Delegation is selective: keep routine work on the operator critical path, and use workers when autonomy, independent review, or genuine parallelism materially helps. Continue useful non-overlapping work after a start, then use `codex.wait` only when the worker result is actually needed. Do not poll with repeated waits. Timeout means the worker is still active; use `codex.inspect` for a non-blocking activity/history check when one is necessary. See [Operations](docs/operations.md#worker-lifecycle) for pending actions and lost-call recovery.
 
 Do not invoke the Codex CLI through HostPlane commands when a `codex.*` semantic tool exists. Git actions are operator workflow, not application workflow.
 

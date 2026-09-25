@@ -104,8 +104,11 @@ When durable thread context is still useful but normal resume is outside that ca
 at a specific completed source turn. Forking preserves conversation history; it does not
 promise prompt-cache reuse.
 
-Retain `threadId` and `turnId`. Continue only non-overlapping operator work, then
-call `codex.wait` with those IDs. It uses a fixed server wait and returns:
+Retain `threadId` and `turnId`. Continue useful non-overlapping operator work, then
+call `codex.wait` with those IDs only at a real synchronization boundary, when the
+worker result or required action is needed. Do not use repeated waits as a polling loop;
+use `codex.inspect` for a non-blocking activity check when one is actually useful. The
+wait uses a fixed server budget and returns:
 
 - `terminal`: read the turn status, canonical handoff, and error. `turn.output` stays an
   array and contains at most one message, chosen in this order: a `final_answer`
@@ -124,8 +127,9 @@ call `codex.wait` with those IDs. It uses a fixed server wait and returns:
   thread history intact.
 - `actionRequired` or `inputRequired`: respond with `codex.act`, matching
   the pending kind, requestId, and requested answers or decisions; then wait again.
-- `timeout`: the worker is active. Continue waiting or inspect activity; timeout
-  does not establish a stall or authorize taking over its scope.
+- `timeout`: the worker is active. Continue other useful non-overlapping work or inspect
+  activity when needed; do not immediately re-enter a wait loop. Timeout does not
+  establish a stall or authorize taking over its scope.
 
 Use `codex.inspect` semantic/raw details and `afterCursor` for activity and retained journal
 notifications; use `detail: "result"` and `textOffset` to retrieve the persisted handoff.

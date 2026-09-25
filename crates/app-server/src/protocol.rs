@@ -62,7 +62,6 @@ impl Initialize {
             },
             capabilities: InitializeCapabilities {
                 experimental_api: true,
-                mcp_server_openai_form_elicitation: false,
                 request_attestation: false,
                 extensions: BTreeMap::from([(
                     "openai/form".into(),
@@ -85,8 +84,6 @@ pub struct ClientInfo {
 #[serde(rename_all = "camelCase")]
 pub struct InitializeCapabilities {
     pub experimental_api: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub mcp_server_openai_form_elicitation: bool,
     pub request_attestation: bool,
     pub extensions: BTreeMap<String, Value>,
 }

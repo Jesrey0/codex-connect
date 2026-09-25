@@ -76,7 +76,7 @@ Treat a Codex thread as a cache-bounded workstream, not a disposable invocation.
 Thread context is not runtime authority. Mutable repository, filesystem, Git, deployment, and external state must still be revalidated when current reality matters.
 
 - `codex.start` composes fresh/resumed/forked thread work or read-only review. Forking copies persisted context into a new workstream without applying the resume cache-age gate.
-- `codex.wait` synchronizes one delegated turn and returns terminal/action-required/input-required state.
+- `codex.wait` synchronizes one delegated turn at an actual operator dependency boundary and returns terminal/action-required/input-required state; it is not a progress-polling primitive.
 - `codex.inspect` projects bounded semantic activity, raw relay notifications, or the canonical handoff result in bounded text chunks.
 - `codex.query` reads Codex-owned discovery, persisted thread metadata/listings, and thread-owned background terminals.
 - `codex.act` steers or interrupts, answers pending requests, manages persisted thread archival/deletion, and terminates thread-owned background terminals.
@@ -89,12 +89,13 @@ Use the protocol pinned by `config/codex-cli-pin`. App Server methods are mandat
 ## Delegation ownership
 
 ```text
-codex.start → codex.wait ─┬─ terminal
-                         ├─ pending action/input → codex.act
-                         └─ lease expiry → codex.inspect or another bounded wait
+codex.start → useful non-overlapping operator work
+           → synchronization boundary → codex.wait ─┬─ terminal
+                                                    ├─ pending action/input → codex.act
+                                                    └─ lease expiry → continue work or codex.inspect
 ```
 
-Workers own delegated scope until terminal state, required action/input, interruption, or user redirect. Start completion survives caller loss, with unclaimed handles delivered in `workerStarted` events on host calls. `status.workers` also exposes active and recent delegated handles so a fresh operator turn can rehydrate after frontend/caller interruption without duplicating work. `codex.wait` has a fixed server budget and wakes on terminal state or required action/input; expiry leaves the worker active. See [Operations](../operations.md#worker-lifecycle) for recovery.
+Workers own delegated scope until terminal state, required action/input, interruption, or user redirect. Start completion survives caller loss, with unclaimed handles delivered in `workerStarted` events on host calls. `status.workers` also exposes active and recent delegated handles so a fresh operator turn can rehydrate after frontend/caller interruption without duplicating work. `codex.wait` has a fixed server budget and wakes on terminal state or required action/input; expiry leaves the worker active and does not justify an immediate repeated wait. See [Operations](../operations.md#worker-lifecycle) for recovery.
 
 Events drive live state. Every authoritative observation of a terminal turn passes through the same relay reconciliation path, which updates retained turn state, deduplicates terminal notification, and releases thread subscription ownership. Active delegated turns are never retention-eviction candidates; recent terminal observations are bounded separately. Reads hydrate existing turns, restore subscriptions, reconcile history loss or wait expiry, and project at most one canonical handoff message into `codex.wait`, capped at 10,240 characters. `selectionIncomplete` reports when the wait scan cannot establish the canonical choice; the item's `truncated` field reports text clipping only. This projection does not alter App Server thread history. `codex.inspect` with `detail: "result"` searches App Server items newest-first until a final answer, end of turn, or internal deadline. Its result is authoritative only when `resultPage.selectionComplete` is true. Paging adapts to aggregate transport limits, but a single item larger than the App Server transport limit leaves selection incomplete. Result lookup is independent of relay journal retention; `detail: "raw"` reads relay notifications, which may be lost. No periodic App Server read is used to observe progress.
 

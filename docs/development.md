@@ -37,7 +37,7 @@ Current references:
 - [OpenAI: Authentication](https://developers.openai.com/plugins/build/auth)
 - [MCP 2026-07-28 protocol/version guidance](https://ts.sdk.modelcontextprotocol.io/v2/protocol-versions)
 
-Expose choices that control operator intent and project upstream protocol data into that vocabulary at the MCP boundary. Do not leak fields that merely repeat input, fixed constants, ranking internals, or account metadata that cannot drive an operator action. Keep execution limits and the worker wait budget in the relay; MCP guards must allow operations to finalize. `codex.wait` accepts only thread and turn IDs. `command.read.timeoutMs` supports immediate reads and bounded waits for interactive processes.
+Expose choices that control operator intent and project upstream protocol data into that vocabulary at the MCP boundary. Do not leak fields that merely repeat input, fixed constants, ranking internals, or account metadata that cannot drive an operator action. Keep execution limits and the worker wait budget in the relay; MCP guards must allow operations to finalize. `codex.wait` accepts only thread and turn IDs and is a synchronization primitive, never a progress-polling mechanism. `command.read.timeoutMs` supports immediate reads and bounded waits for interactive processes.
 
 ### ChatGPT synchronous-result budget
 
