@@ -1,6 +1,6 @@
 # Architecture
 
-Codex Connect is a compact MCP projection over a persistent host and the official Codex App Server. ChatGPT is the primary technical operator; Codex Connect owns host authority and delegated lifecycle, while App Server owns Codex threads, turns, reviews, requests, and execution semantics.
+Codex Connect is a compact MCP projection over a persistent host and the official Codex App Server. ChatGPT is the only supported action/control interface and the primary technical operator. The local console is read-only observability, not a second operator. Codex Connect owns host authority and the adaptation boundary; App Server remains authoritative for Codex primitives and state whenever it exposes them.
 
 ## Three planes
 
@@ -18,6 +18,8 @@ Codex Connect
 
 PlatformPlane is ChatGPT-native web/files/plugins/apps/Work/browser/Scheduled Tasks. It has no implicit host access. HostPlane is deterministic and authoritative for the OS account's filesystem, processes, Git, and deployment. WorkerPlane is delegated autonomous work/review; workers do not inherit ChatGPT conversation, native tools, files, or credentials.
 
+There is intentionally no second control UI. The local console may display worker state and transcripts, but all actions remain in ChatGPT. Other local CLI commands are trusted-host maintenance/development plumbing.
+
 Host ingress owns the canonical public URL, TLS edge configuration, routing, and OAuth boundary. Codex CLI/App Server and host ingress are independently managed dependencies; their binaries, credentials, and state are not Codex Connect-owned.
 
 Tools advertise OAuth scope `codex-connect:access`. Host ingress validates tokens and strips credentials before forwarding to the loopback backend.
@@ -26,13 +28,19 @@ Tools advertise OAuth scope `codex-connect:access`. Host ingress validates token
 
 Keep implementation ownership as narrow as the plane model:
 
-- `host` owns host path resolution plus Connect-only search, image, and patch mechanics. The backend creates one validated `Host` authority and shares it with Relay and MCP dispatch.
-- `app-server` owns the pinned Codex protocol transport and official request/response contracts.
-- `relay` composes App Server operations into worker, command-session, observer, and action lifecycles. It owns execution/wait budgets and bounded live projections, not host authorization or public MCP schemas.
-- `mcp` owns the public 13-tool catalog, input parsing/dispatch, HTTP observer/runtime routes, and client-facing guard budgets.
-- `cli` is the composition and local-operations layer. Its console uses a small local backend client; deployment/service management does not own observer protocol behavior.
+- `host` owns host path validation plus only the deterministic host mechanics for which the pinned App Server has no equivalent client primitive. The backend creates one validated `Host` authority and shares it with Relay and MCP dispatch.
+- `app-server` owns the pinned Codex protocol transport, official request/response contracts, and every upstream primitive/state machine that Connect consumes.
+- `relay` adapts and composes App Server/Host operations into ChatGPT-usable lifecycles. It owns execution/wait budgets and bounded recovery projections, not upstream state or public MCP schemas.
+- `mcp` owns the public 13-tool ChatGPT catalog, input parsing/dispatch, transport policy, OpenAI/MCP descriptor projection, and client-facing guard budgets.
+- `cli` is the composition root plus trusted-host installation, service, deployment, and diagnostic plumbing. It is not a product interaction surface.
 
 Do not duplicate an authority object or mirror App Server-owned constants into the composition root. Runtime status should read invariants from the component that owns them.
+
+### Upstream-first invariant
+
+For every new capability, inspect the pinned App Server contract before designing a Connect abstraction. If App Server already exposes the primitive, route through it and preserve its IDs, lifecycle, state, errors, and notifications. Connect may normalize or combine those semantics for ChatGPT, but it must not create a second authoritative model.
+
+Today that principle is visible in thread/turn/review lifecycle, model and skill discovery, usage, streaming commands, background terminals, approvals, permissions, elicitation, filesystem reads/directory listings/metadata, image-byte reads, and fuzzy file discovery. Connect validates host paths and response bounds around those calls, then projects operator-friendly results. Connect-native host mechanics remain only where the pinned client protocol has no equivalent operator primitive, notably literal content search and deterministic patch application.
 
 ## Authority and runtime defaults
 
@@ -59,9 +67,9 @@ Thread context is not runtime authority. Mutable repository, filesystem, Git, de
 - `codex.act` steers or interrupts, answers pending requests, manages persisted thread archival/deletion, and terminates thread-owned background terminals.
 - `command.start/read/control` preserve the official streaming command lifecycle, including PTY stdin, resize, and termination.
 
-Connect journals and caches are bounded observations; App Server owns lifecycle state. The relay retains detailed cache/context telemetry for observation, while the public MCP projection exposes only operator-relevant totals, cache-hit percentage, and guaranteed-reuse state/deadline. Raw inspection remains available for deeper App Server telemetry. The read-only console follows observer events, refreshes transcripts asynchronously with bounded retry, preserves the last good view through transient read failures, and marks cached quota data with the age of its last successful refresh when updates fail. Quota refresh is independent of worker observation; the UI clock only redraws.
+Connect journals and caches are bounded observations; App Server owns lifecycle state. The relay retains only the projections needed for ChatGPT recovery, bounded inspection, current operator telemetry, and the read-only local console. Public MCP results expose operator-relevant data rather than a shadow App Server object graph. Loopback observer routes feed the console only and must remain mutation-free.
 
-Use the protocol pinned by `config/codex-cli-pin`. Prefer an App Server method when available; Connect supplies content search and deterministic patch semantics.
+Use the protocol pinned by `config/codex-cli-pin`. App Server methods are mandatory when an equivalent primitive exists; Connect supplies only missing HostPlane semantics.
 
 ## Delegation ownership
 
@@ -73,14 +81,14 @@ codex.start → codex.wait ─┬─ terminal
 
 Workers own delegated scope until terminal state, required action/input, interruption, or user redirect. Start completion survives caller loss, with unclaimed handles delivered in `workerStarted` events on host calls. `status.workers` also exposes active and recent delegated handles so a fresh operator turn can rehydrate after frontend/caller interruption without duplicating work. `codex.wait` has a fixed server budget and wakes on terminal state or required action/input; expiry leaves the worker active. See [Operations](../operations.md#worker-lifecycle) for recovery.
 
-Events drive live state. Every authoritative observation of a terminal turn passes through the same relay reconciliation path, which updates the observer projection, deduplicates terminal notification, and releases thread subscription ownership. Active delegated turns are never retention-eviction candidates; recent terminal observations are bounded separately. Reads hydrate existing turns, restore subscriptions, reconcile history loss or wait expiry, and project at most one canonical handoff message into `codex.wait`, capped at 10,240 characters. `selectionIncomplete` reports when the wait scan cannot establish the canonical choice; the item's `truncated` field reports text clipping only. This projection does not alter App Server thread history. `codex.inspect` with `detail: "result"` searches App Server items newest-first until a final answer, end of turn, or internal deadline. Its result is authoritative only when `resultPage.selectionComplete` is true. Paging adapts to aggregate transport limits, but a single item larger than the App Server transport limit leaves selection incomplete. Result lookup is independent of relay journal retention; `detail: "raw"` reads relay notifications, which may be lost. No periodic App Server read is used to observe progress.
+Events drive live state. Every authoritative observation of a terminal turn passes through the same relay reconciliation path, which updates retained turn state, deduplicates terminal notification, and releases thread subscription ownership. Active delegated turns are never retention-eviction candidates; recent terminal observations are bounded separately. Reads hydrate existing turns, restore subscriptions, reconcile history loss or wait expiry, and project at most one canonical handoff message into `codex.wait`, capped at 10,240 characters. `selectionIncomplete` reports when the wait scan cannot establish the canonical choice; the item's `truncated` field reports text clipping only. This projection does not alter App Server thread history. `codex.inspect` with `detail: "result"` searches App Server items newest-first until a final answer, end of turn, or internal deadline. Its result is authoritative only when `resultPage.selectionComplete` is true. Paging adapts to aggregate transport limits, but a single item larger than the App Server transport limit leaves selection incomplete. Result lookup is independent of relay journal retention; `detail: "raw"` reads relay notifications, which may be lost. No periodic App Server read is used to observe progress.
 
 The relay owns execution and wait budgets. MCP guards allow for finalization and response delivery. Transport failures and wait expiry do not establish worker failure.
 
 ## Public surface
 
-See the [public tool list](../../README.md#public-mcp-surface) and live schemas for the operator interface.
+The supported human interface is ChatGPT using the public MCP/plugin catalog. See the [public tool list](../../README.md#public-mcp-surface); live schemas are authoritative for tool inputs, outputs, annotations, OAuth metadata, and limits.
 
-## Version-state boundaries
+## State boundaries
 
-Verify source, Git, deployed artifacts, live build identity, connector discovery, and CI separately. Backend deployment does not commit/push, refresh the connector, or restart ingress.
+Verify source, Git, deployed artifacts, live build identity, ChatGPT plugin discovery, and CI separately. Backend deployment does not commit/push, rescan the ChatGPT plugin, or restart ingress.

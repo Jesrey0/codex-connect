@@ -10,3 +10,7 @@ Notable project-level changes remain under `Unreleased` until Codex Connect has 
 - OpenAI Secure MCP Tunnel is no longer part of the current supported architecture; ngrok plus host ingress is the single remote path.
 - Transport-specific tunnel configuration is no longer project-owned; client response deadlines remain independent from Codex Connect operation budgets.
 - The ChatGPT-facing MCP surface now projects operator intent rather than upstream transport detail, with compact discovery, normalized pending actions, persistent-command recovery through `status`, bounded terminal output, and one terminal-turn reconciliation path.
+- ChatGPT is the only supported action/control interface. The local console/observer surface remains intentionally read-only for worker visibility; all mutations stay in ChatGPT.
+- Codex App Server primacy is explicit: Connect reuses upstream primitives and state whenever available, adding Connect-native HostPlane mechanics only for genuine protocol gaps.
+- ChatGPT-facing synchronous work is budgeted against the empirically observed ~55-second result window, with longer work moved behind retained worker or command handles.
+- Public tool descriptors track the current OpenAI Plugin/MCP contract, including compact schemas, behavioral annotations, and per-tool OAuth `securitySchemes`.

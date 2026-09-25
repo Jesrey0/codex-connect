@@ -474,12 +474,10 @@ fn inject_openai_security_schemes(value: &mut Value) -> bool {
     true
 }
 
-fn tool_list_result(protocol_version: Option<ProtocolVersion>) -> ListToolsResult {
-    let mut result = ListToolsResult::with_all_items(tool_catalog());
-    if protocol_version.is_some_and(|version| version >= ProtocolVersion::V_2026_07_28) {
-        result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Private);
-    }
-    result
+fn tool_list_result() -> ListToolsResult {
+    ListToolsResult::with_all_items(tool_catalog())
+        .with_ttl_ms(0)
+        .with_cache_scope(CacheScope::Private)
 }
 
 pub async fn serve_router(listener: TcpListener, router: Router) -> anyhow::Result<()> {
@@ -621,9 +619,9 @@ impl ServerHandler for McpHandler {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(tool_list_result(context.protocol_version()))
+        Ok(tool_list_result())
     }
 
     async fn call_tool(
@@ -1872,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_tool_projection_mirrors_security_schemes_at_descriptor_root() {
+    fn openai_tool_projection_declares_security_schemes_only_at_descriptor_root() {
         let mut response = json!({
             "jsonrpc":"2.0",
             "id":1,
@@ -1884,19 +1882,15 @@ mod tests {
                 tool["securitySchemes"],
                 json!([{"type":"oauth2","scopes":[OAUTH_SCOPE]}])
             );
-            assert_eq!(tool["securitySchemes"], tool["_meta"]["securitySchemes"]);
+            assert!(tool["_meta"].get("securitySchemes").is_none());
         }
     }
 
     #[test]
-    fn tool_list_cache_hints_follow_protocol_generation() {
-        let legacy = tool_list_result(Some(ProtocolVersion::V_2025_11_25));
-        assert_eq!(legacy.ttl_ms, None);
-        assert_eq!(legacy.cache_scope, None);
-
-        let modern = tool_list_result(Some(ProtocolVersion::V_2026_07_28));
-        assert_eq!(modern.ttl_ms, Some(0));
-        assert_eq!(modern.cache_scope, Some(CacheScope::Private));
+    fn tool_list_uses_modern_cache_hints() {
+        let result = tool_list_result();
+        assert_eq!(result.ttl_ms, Some(0));
+        assert_eq!(result.cache_scope, Some(CacheScope::Private));
     }
 
     #[test]

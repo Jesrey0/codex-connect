@@ -302,11 +302,6 @@ fn tool_invocation_meta(name: &str) -> MetaObject {
         "openai/toolInvocation/invoked".into(),
         Value::String(invoked.into()),
     );
-    // Advertise the OAuth scope enforced by host ingress.
-    meta.0.insert(
-        "securitySchemes".into(),
-        json!([{"type":"oauth2","scopes":[OAUTH_SCOPE]}]),
-    );
     meta
 }
 
@@ -715,29 +710,53 @@ fn command_read_output_schema() -> Value {
     )
 }
 fn command_control_schema() -> Value {
-    object_schema(
+    let process_id = || json!({"type":"string","minLength":1,"description":"Process handle returned by command.start."});
+    let write = object_schema(
         json!({
-            "action":{"type":"string","enum":["write","resize","terminate"],"description":"Control action. write accepts input/closeStdin; resize requires rows and cols; terminate requests process termination."},
-            "processId":{"type":"string","minLength":1,"description":"Process handle returned by command.start."},
-            "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES,"description":"For action=write, exact UTF-8 bytes to write. Omit/null when only closing stdin."},
-            "closeStdin":{"type":"boolean","default":false,"description":"For action=write, close stdin after any supplied input is written."},
-            "rows":{"type":"integer","minimum":1,"maximum":65535,"description":"Required for action=resize. PTY rows."},
-            "cols":{"type":"integer","minimum":1,"maximum":65535,"description":"Required for action=resize. PTY columns."}
+            "action":{"const":"write","description":"Write bytes to the process stdin and optionally close stdin."},
+            "processId":process_id(),
+            "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES,"description":"Exact UTF-8 bytes to write. Omit/null when only closing stdin."},
+            "closeStdin":{"type":"boolean","default":false,"description":"Close stdin after any supplied input is written."}
         }),
         &["action", "processId"],
-    )
+    );
+    let resize = object_schema(
+        json!({
+            "action":{"const":"resize","description":"Resize the PTY for a running command."},
+            "processId":process_id(),
+            "rows":{"type":"integer","minimum":1,"maximum":65535,"description":"PTY rows."},
+            "cols":{"type":"integer","minimum":1,"maximum":65535,"description":"PTY columns."}
+        }),
+        &["action", "processId", "rows", "cols"],
+    );
+    let terminate = object_schema(
+        json!({
+            "action":{"const":"terminate","description":"Request process termination."},
+            "processId":process_id()
+        }),
+        &["action", "processId"],
+    );
+    json!({"type":"object","oneOf":[write,resize,terminate]})
 }
 fn command_control_output_schema() -> Value {
-    object_schema(
-        json!({
-            "processId":{"type":"string"},
-            "written":{"type":"boolean","description":"Present for action=write."},
-            "stdinClosed":{"type":"boolean","description":"Present for action=write."},
-            "resized":{"type":"boolean","description":"Present for action=resize."},
-            "terminationRequested":{"type":"boolean","description":"Present for action=terminate."}
-        }),
-        &["processId"],
-    )
+    json!({"type":"object","oneOf":[
+        object_schema(
+            json!({
+                "processId":{"type":"string"},
+                "written":{"type":"boolean"},
+                "stdinClosed":{"type":"boolean"}
+            }),
+            &["processId", "written", "stdinClosed"],
+        ),
+        object_schema(
+            json!({"processId":{"type":"string"},"resized":{"type":"boolean"}}),
+            &["processId", "resized"],
+        ),
+        object_schema(
+            json!({"processId":{"type":"string"},"terminationRequested":{"type":"boolean"}}),
+            &["processId", "terminationRequested"],
+        )
+    ]})
 }
 fn review_target_schema() -> Value {
     json!({"description":"Official Codex review target.","oneOf":[
@@ -1015,26 +1034,98 @@ fn thread_ids_schema() -> Value {
 }
 
 fn codex_act_schema() -> Value {
-    object_schema(
+    let steer = object_schema(
         json!({
-            "action":{"type":"string","enum":["steer","interrupt","respondApproval","respondPermissions","respondUserInput","respondElicitation","setArchived","delete","terminateBackgroundTerminal"],"description":"Codex-state action. Only fields relevant to the selected action should be supplied."},
-            "threadId":{"type":"string","description":"Required for steer, interrupt, and terminateBackgroundTerminal."},
-            "expectedTurnId":{"type":"string","description":"Required for action=steer."},
-            "instruction":{"type":"string","minLength":1,"description":"Required for action=steer."},
-            "turnId":{"type":"string","description":"Required for action=interrupt."},
-            "requestId":rpc_id_schema(),
-            "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"],"description":"Required for action=respondApproval."},
-            "permissions":permissions_schema(),
-            "scope":{"type":"string","enum":["turn","session"],"description":"Optional for action=respondPermissions."},
-            "answers":{"type":"object","minProperties":1,"additionalProperties":{"type":"array","items":{"type":"string"}},"description":"Required for action=respondUserInput."},
-            "disposition":{"type":"string","enum":["accept","decline","cancel"],"description":"Required for action=respondElicitation."},
-            "content":{"description":"Accepted elicitation payload for action=respondElicitation. Omit for decline/cancel.","type":["object","array","string","number","boolean","null"]},
-            "threadIds":thread_ids_schema(),
-            "archived":{"type":"boolean","description":"Required for action=setArchived."},
-            "processId":{"type":"string","description":"Required for action=terminateBackgroundTerminal."}
+            "action":{"const":"steer"},
+            "threadId":{"type":"string"},
+            "expectedTurnId":{"type":"string"},
+            "instruction":{"type":"string","minLength":1}
         }),
-        &["action"],
-    )
+        &["action", "threadId", "expectedTurnId", "instruction"],
+    );
+    let interrupt = object_schema(
+        json!({
+            "action":{"const":"interrupt"},
+            "threadId":{"type":"string"},
+            "turnId":{"type":"string"}
+        }),
+        &["action", "threadId", "turnId"],
+    );
+    let respond_approval = object_schema(
+        json!({
+            "action":{"const":"respondApproval"},
+            "requestId":rpc_id_schema(),
+            "decision":{"type":"string","enum":["approve","approveForSession","decline","cancel"]}
+        }),
+        &["action", "requestId", "decision"],
+    );
+    let respond_permissions = object_schema(
+        json!({
+            "action":{"const":"respondPermissions"},
+            "requestId":rpc_id_schema(),
+            "permissions":permissions_schema(),
+            "scope":{"type":"string","enum":["turn","session"]}
+        }),
+        &["action", "requestId", "permissions"],
+    );
+    let respond_user_input = object_schema(
+        json!({
+            "action":{"const":"respondUserInput"},
+            "requestId":rpc_id_schema(),
+            "answers":{"type":"object","minProperties":1,"additionalProperties":{"type":"array","items":{"type":"string"}}}
+        }),
+        &["action", "requestId", "answers"],
+    );
+    let elicitation_content = json!({"type":["object","array","string","number","boolean","null"]});
+    let respond_elicitation_accept = object_schema(
+        json!({
+            "action":{"const":"respondElicitation"},
+            "requestId":rpc_id_schema(),
+            "disposition":{"const":"accept"},
+            "content":elicitation_content
+        }),
+        &["action", "requestId", "disposition", "content"],
+    );
+    let respond_elicitation_decline = object_schema(
+        json!({
+            "action":{"const":"respondElicitation"},
+            "requestId":rpc_id_schema(),
+            "disposition":{"enum":["decline","cancel"]}
+        }),
+        &["action", "requestId", "disposition"],
+    );
+    let set_archived = object_schema(
+        json!({
+            "action":{"const":"setArchived"},
+            "threadIds":thread_ids_schema(),
+            "archived":{"type":"boolean"}
+        }),
+        &["action", "threadIds", "archived"],
+    );
+    let delete = object_schema(
+        json!({"action":{"const":"delete"},"threadIds":thread_ids_schema()}),
+        &["action", "threadIds"],
+    );
+    let terminate_background_terminal = object_schema(
+        json!({
+            "action":{"const":"terminateBackgroundTerminal"},
+            "threadId":{"type":"string"},
+            "processId":{"type":"string"}
+        }),
+        &["action", "threadId", "processId"],
+    );
+    json!({"type":"object","oneOf":[
+        steer,
+        interrupt,
+        respond_approval,
+        respond_permissions,
+        respond_user_input,
+        respond_elicitation_accept,
+        respond_elicitation_decline,
+        set_archived,
+        delete,
+        terminate_background_terminal
+    ]})
 }
 
 fn codex_act_output_schema() -> Value {
@@ -1047,20 +1138,51 @@ fn codex_act_output_schema() -> Value {
         }),
         &["threadId"],
     );
-    object_schema(
-        json!({
-            "action":{"type":"string","enum":["steer","interrupt","respondApproval","respondPermissions","respondUserInput","respondElicitation","setArchived","delete","terminateBackgroundTerminal"]},
-            "turnId":{"type":"string"},
-            "interrupted":{"type":"boolean"},
-            "requestId":rpc_id_schema(),
-            "accepted":{"type":"boolean"},
-            "results":{"type":"array","items":result_row},
-            "threadId":{"type":"string"},
-            "processId":{"type":"string"},
-            "terminated":{"type":"boolean"}
-        }),
-        &["action"],
-    )
+    let request_response = |action: &'static str| {
+        object_schema(
+            json!({
+                "action":{"const":action},
+                "requestId":rpc_id_schema(),
+                "accepted":{"type":"boolean"}
+            }),
+            &["action", "requestId", "accepted"],
+        )
+    };
+    json!({"type":"object","oneOf":[
+        object_schema(
+            json!({"action":{"const":"steer"},"turnId":{"type":"string"}}),
+            &["action", "turnId"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"interrupt"},
+                "turnId":{"type":"string"},
+                "interrupted":{"type":"boolean"}
+            }),
+            &["action", "turnId", "interrupted"],
+        ),
+        request_response("respondApproval"),
+        request_response("respondPermissions"),
+        request_response("respondUserInput"),
+        request_response("respondElicitation"),
+        object_schema(
+            json!({"action":{"const":"setArchived"},"results":{"type":"array","items":result_row.clone()}}),
+            &["action", "results"],
+        ),
+        object_schema(
+            json!({"action":{"const":"delete"},"results":{"type":"array","items":result_row}}),
+            &["action", "results"],
+        ),
+        object_schema(
+            json!({
+                "action":{"const":"terminateBackgroundTerminal"},
+                "threadId":{"type":"string"},
+                "processId":{"type":"string"},
+                "terminated":{"type":"boolean"}
+            }),
+            &["action", "threadId", "processId", "terminated"],
+        )
+    ]})
 }
 
 fn nullable(schema: Value) -> Value {
@@ -1601,7 +1723,9 @@ mod tests {
                 for combinator in ["oneOf", "anyOf", "allOf"] {
                     let mode_schema = combinator == "oneOf"
                         && ((tool["name"] == "codex.start" && schema_name == "inputSchema")
-                            || tool["name"] == "codex.inspect");
+                            || tool["name"] == "codex.inspect"
+                            || tool["name"] == "command.control"
+                            || tool["name"] == "codex.act");
                     if mode_schema {
                         assert!(root.get(combinator).is_some());
                     } else {
@@ -1623,10 +1747,7 @@ mod tests {
                 assert!(!message.is_empty());
                 assert!(message.chars().count() <= 64);
             }
-            assert_eq!(
-                meta["securitySchemes"],
-                json!([{"type":"oauth2","scopes":[OAUTH_SCOPE]}])
-            );
+            assert!(meta.get("securitySchemes").is_none());
             assert!(
                 serde_json::to_vec(tool).unwrap().len() < 20_000,
                 "tool schema too large: {}",
@@ -1649,11 +1770,10 @@ mod tests {
         assert_eq!(annotations["openWorldHint"], false);
         assert_eq!(annotations["idempotentHint"], false);
         let schema = &tool["inputSchema"];
-        let actions = schema["properties"]["action"]["enum"]
-            .as_array()
-            .unwrap()
+        let variants = schema["oneOf"].as_array().unwrap();
+        let actions = variants
             .iter()
-            .map(|action| action.as_str().unwrap())
+            .map(|variant| variant["properties"]["action"]["const"].as_str().unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(
             actions,
@@ -1668,6 +1788,83 @@ mod tests {
                 "delete",
                 "terminateBackgroundTerminal",
             ])
+        );
+        let required = |action: &str| {
+            variants
+                .iter()
+                .find(|variant| variant["properties"]["action"]["const"] == action)
+                .unwrap()["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|field| field.as_str().unwrap())
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            required("steer"),
+            BTreeSet::from(["action", "threadId", "expectedTurnId", "instruction"])
+        );
+        assert_eq!(
+            required("interrupt"),
+            BTreeSet::from(["action", "threadId", "turnId"])
+        );
+        assert_eq!(
+            required("respondPermissions"),
+            BTreeSet::from(["action", "requestId", "permissions"])
+        );
+        assert_eq!(
+            required("setArchived"),
+            BTreeSet::from(["action", "threadIds", "archived"])
+        );
+        assert_eq!(required("delete"), BTreeSet::from(["action", "threadIds"]));
+        assert_eq!(
+            required("terminateBackgroundTerminal"),
+            BTreeSet::from(["action", "threadId", "processId"])
+        );
+        let elicitation_variants = variants
+            .iter()
+            .filter(|variant| variant["properties"]["action"]["const"] == "respondElicitation")
+            .collect::<Vec<_>>();
+        assert_eq!(elicitation_variants.len(), 2);
+        assert!(elicitation_variants.iter().any(|variant| {
+            variant["properties"]["disposition"]["const"] == "accept"
+                && variant["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("content"))
+        }));
+        assert!(elicitation_variants.iter().any(|variant| {
+            variant["properties"]["disposition"]["enum"] == json!(["decline", "cancel"])
+                && variant["properties"].get("content").is_none()
+        }));
+    }
+
+    #[test]
+    fn command_control_schema_requires_variant_specific_fields() {
+        let schema = command_control_schema();
+        let variants = schema["oneOf"].as_array().unwrap();
+        let variant = |action: &str| {
+            variants
+                .iter()
+                .find(|variant| variant["properties"]["action"]["const"] == action)
+                .unwrap()
+        };
+        let required = |action: &str| {
+            variant(action)["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|field| field.as_str().unwrap())
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(required("write"), BTreeSet::from(["action", "processId"]));
+        assert_eq!(
+            required("resize"),
+            BTreeSet::from(["action", "processId", "rows", "cols"])
+        );
+        assert_eq!(
+            required("terminate"),
+            BTreeSet::from(["action", "processId"])
         );
     }
 }

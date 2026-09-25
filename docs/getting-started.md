@@ -15,9 +15,9 @@ host bridge. Its port must remain on loopback; authentication belongs to host in
 - The exact official Codex CLI release in `config/codex-cli-pin`, authenticated.
 - The [host-ingress deployment](https://github.com/Jesrey0/host-ingress), providing
   a stable ngrok HTTPS endpoint, Caddy, and ChatGPT-compatible OAuth.
-- ChatGPT Developer mode/custom MCP access with the required read/write tools.
-  Availability and UI labels vary by account and workspace; check current settings
-  and [OpenAI's developer-mode guide](https://developers.openai.com/api/docs/guides/developer-mode).
+- ChatGPT Developer mode with access to personal Plugins/MCP connections.
+  OpenAI's current setup path is documented in the
+  [Plugins quickstart](https://developers.openai.com/plugins/quickstart).
 
 Codex CLI and host ingress are independently managed. Codex Connect owns its backend service, deployment records/cache, and installed artifacts.
 
@@ -64,7 +64,7 @@ service PATH captured by setup. Deployment state and cache use the standard XDG
 state/cache locations.
 
 Expected private endpoint: `http://127.0.0.1:8767/mcp`. Never enter this localhost
-address as the remote ChatGPT connector URL.
+address as the ChatGPT plugin MCP URL.
 
 ## 3. Configure and verify host ingress
 
@@ -83,20 +83,25 @@ Private status/health endpoints and undeclared routes must remain inaccessible.
 
 ## 4. Connect ChatGPT
 
-1. Enable Developer mode/custom app creation in your ChatGPT account or workspace.
-2. Create or update **Codex Connect** using the public HTTPS MCP URL above.
-3. Select **OAuth** authentication and **CIMD** when offered. Leave static client
-   ID/secret fields empty.
+1. In ChatGPT, open **Settings → Security and login** and enable **Developer mode**.
+2. Open **ChatGPT Plugins**, add a new MCP server, and enter the public HTTPS MCP URL above.
+3. Configure OAuth. Prefer **CIMD** when offered by the builder and supported by host ingress;
+   do not invent or paste a static client secret for ChatGPT.
 4. Complete the browser operator login and consent. The login uses the existing
-   host-ingress credential; do not put it in the MCP URL or ChatGPT client fields.
-5. Scan/discover tools and enable the app. Expect exactly 13 tools.
+   host-ingress credential; never put credentials in the MCP URL or tool arguments.
+5. Scan/discover the server and install/enable the resulting Codex Connect plugin. Expect exactly 13 tools.
 
-Backend deployment and connector refresh are separate. Refresh/rediscover after
-tool metadata changes; a running service does not prove the connector snapshot is current.
+OpenAI's product labels and supported invocation surfaces can change independently of
+Codex Connect. The architectural requirement here is stable: **all actions and mutations
+flow through ChatGPT**. The local `codex-connect console` is the deliberate exception for
+read-only worker visibility; it must never become a second control surface.
+
+Backend deployment and plugin scan/refresh are separate. Rescan after tool metadata
+changes; a running service does not prove ChatGPT's cached tool snapshot is current.
 
 ## 5. Verify from ChatGPT
 
-Use the connected app to call `status` and `inspect`; check live build identity and navigation cwd. Verify command, worker, and pending-action flows with disposable work as described in [Operations](operations.md). Repeat after an idle period and a controlled backend restart.
+Use ChatGPT with the connected plugin to call `status` and `inspect`; check live build identity and navigation cwd. Verify command, worker, and pending-action flows with disposable work as described in [Operations](operations.md). Repeat after an idle period and a controlled backend restart.
 
 ## Updates, restart, and removal
 
@@ -110,18 +115,20 @@ codex-connect deploy status <operation-id>
 ```
 
 Activate only after preparation and verification. Final status must report the exact
-prepared artifact live. Deployment does not imply Git commit/push or connector refresh.
+prepared artifact live. Deployment does not imply Git commit/push or a ChatGPT plugin rescan.
 
 After reboot, check `codex-connect doctor` and host-ingress health separately. Repair
 the failed service rather than rerunning setup. OAuth state survives ingress restarts;
 MCP clients send independent `2026-07-28` requests after the backend restarts.
 
 `codex-connect uninstall` removes only its managed backend installation and state.
-Remove its public route and ChatGPT connector separately when retiring the service.
+Remove its public route and ChatGPT plugin connection separately when retiring the service.
 
 ## References
 
 - [Codex releases](https://github.com/openai/codex/releases)
+- [OpenAI Plugins quickstart](https://developers.openai.com/plugins/quickstart)
+- [OpenAI MCP server guidance](https://developers.openai.com/plugins/build/mcp-server)
 - [OpenAI authentication](https://developers.openai.com/plugins/build/auth)
 - [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
 - [Host ingress](https://github.com/Jesrey0/host-ingress)

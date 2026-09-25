@@ -146,7 +146,7 @@ class OperatorProtocolTests(unittest.TestCase):
         expected_security = [{"type": "oauth2", "scopes": ["codex-connect:access"]}]
         for tool in self.client.catalog:
             self.assertEqual(tool["securitySchemes"], expected_security)
-            self.assertEqual(tool["securitySchemes"], tool["_meta"]["securitySchemes"])
+            self.assertNotIn("securitySchemes", tool.get("_meta", {}))
         status = self.client.call("status")
         worker_events = status.pop("workerEvents", [])
         for event in worker_events:
@@ -207,7 +207,7 @@ class OperatorProtocolTests(unittest.TestCase):
         expected_security = [{"type": "oauth2", "scopes": ["codex-connect:access"]}]
         for tool in tools:
             self.assertEqual(tool["securitySchemes"], expected_security)
-            self.assertEqual(tool["securitySchemes"], tool["_meta"]["securitySchemes"])
+            self.assertNotIn("securitySchemes", tool.get("_meta", {}))
 
     def test_dns_rebinding_validation_precedes_oversized_body_limit(self):
         server = urllib.parse.urlsplit(self.url)
@@ -448,7 +448,8 @@ class OperatorProtocolTests(unittest.TestCase):
         started = self.client.call("command.start", {
             "command": ["fixture-stream"],
         })
-        self.assertEqual(set(started), {"processId"})
+        self.assertIn("processId", started)
+        self.assertTrue(set(started) <= {"processId", "workerEvents"})
         recovered = next(
             command for command in self.client.call("status")["commands"]
             if command["processId"] == started["processId"]

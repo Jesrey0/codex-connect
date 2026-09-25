@@ -15,16 +15,17 @@ The public MCP endpoint accepts only `2026-07-28` requests with per-request meta
 does not use an `initialize` handshake or protocol-level sessions. The `tools/list` response
 stays JSON so the OpenAI `securitySchemes` projection can add its root-level descriptor field.
 
-The pinned RMCP SDK waits for the first handler message before opening a `2026-07-28`
-response stream. A quiet tool call therefore receives neither SSE headers nor comments
-until its result is ready. SSE comments are not ChatGPT conversation progress. The transport
-does not support `Last-Event-ID` resumability. Keep synchronous tools inside the caller's
-measured result window and use retained worker or command handles for long work. Origin
-validation remains enabled for the ChatGPT origins.
+The pinned RMCP SDK waits for the first handler message before opening a response stream.
+A quiet tool call therefore receives neither SSE headers nor comments until its result is
+ready. SSE comments are not ChatGPT conversation progress and cannot extend the measured
+caller result window. The transport does not support `Last-Event-ID` resumability. Keep
+useful synchronous work near 50 seconds or below and use retained worker or command handles
+for longer work. Origin validation remains enabled for the ChatGPT origins.
 
 ## Backend lifecycle
 
-Initial setup is documented in [Getting Started](getting-started.md). Routine commands are:
+Initial setup is documented in [Getting Started](getting-started.md). The following are
+trusted-host maintenance commands, not a second product interface:
 
 ```bash
 codex-connect status
@@ -35,7 +36,7 @@ codex-connect console
 codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-project
 ```
 
-`status` reports readiness, live build identity, navigation cwd, Codex defaults, retained persistent-command handles, and active/recent worker handles for operator rehydration. `doctor` provides local diagnostics. `console` follows worker activity, quota, pending actions, and transcripts without changing worker state.
+`status` reports readiness, live build identity, navigation cwd, Codex defaults, retained persistent-command handles, and active/recent worker handles for operator rehydration. `doctor` provides local diagnostics. `console` is a read-only visibility surface for workers, transcripts, pending state, and usage; it does not steer or mutate anything. All worker/host actions remain in ChatGPT through the MCP/plugin surface.
 
 ## Host commands
 
@@ -46,7 +47,8 @@ for pipes, redirects, or expansion. Set `tty=true` only when a terminal is neede
 After `command.start`, retain `processId`; the first `command.read` starts at cursor `0`, then
 passes each returned cursor to the next read. If the start response is lost, `status.commands`
 lists retained `processId`, state, and TTY mode for recovery. `timeoutMs=0` reads immediately; otherwise the read waits for output
-or exit, up to 50 seconds per call. Timeout does not terminate the process. Continue until `drained=true` for
+or exit, up to 50 seconds per call. That ceiling is intentionally below the measured ChatGPT
+outer result window. Timeout does not terminate the process. Continue until `drained=true` for
 final output; `historyLost=true` means older output was evicted. Termination can be
 forceful: confirm exit with `command.read`. Process handles belong to the backend's
 App Server connection and do not survive its restart.
@@ -136,7 +138,7 @@ Verify ingress independently:
 CHECK_PUBLIC=1 ./scripts/check
 ```
 
-Host ingress owns `host-ngrok`, `host-ingress` (Caddy), and `host-oauth` services, their startup ordering, public URL, credentials, and reconnect behavior. Codex Connect readiness describes the local backend; it does not assert public reachability or a valid ChatGPT connection. Backend restart/deployment/uninstall do not manage ingress. Rediscover/refresh the ChatGPT app separately when its tool catalog changes.
+Host ingress owns `host-ngrok`, `host-ingress` (Caddy), and `host-oauth` services, their startup ordering, public URL, credentials, and reconnect behavior. Codex Connect readiness describes the local backend; it does not assert public reachability or a valid ChatGPT connection. Backend restart/deployment/uninstall do not manage ingress. Rescan/refresh the ChatGPT plugin separately when its tool catalog changes.
 
 ## Restart recovery
 
@@ -162,11 +164,11 @@ codex-connect deploy activate <operation-id>
 codex-connect deploy status <operation-id>
 ```
 
-`prepare` queues a detached release build and records a durable operation. Wait for `prepared`; `activate` queues the backend restart; the final `status` verifies the exact prepared artifact is live. The deployment build cache at `~/.cache/codex-connect/deploy/build` is a compiler cache, not runtime authority. Deployment does not restart ingress or refresh the connector.
+`prepare` queues a detached release build and records a durable operation. Wait for `prepared`; `activate` queues the backend restart; the final `status` verifies the exact prepared artifact is live. The deployment build cache at `~/.cache/codex-connect/deploy/build` is a compiler cache, not runtime authority. Deployment does not restart ingress or rescan the ChatGPT plugin.
 
 Deployment records and managed unit files use the same durable atomic-write primitive. Deployment build, activation, and per-operation transitions use one file-lock mechanism with separate lock keys; these locks serialize local state changes but do not create a second runtime authority. Activation preflights the managed operator link before touching the backend, stages its replacement, and commits the service, operator link, and deployment record under the activation lock; a failed commit restores the previous link and service state, reporting any partial rollback explicitly.
 
-Verify source, Git, prepared artifact, live build identity, connector discovery, and CI separately. Deployment does not commit or push.
+Verify source, Git, prepared artifact, live build identity, ChatGPT plugin discovery, and CI separately. Deployment does not commit or push.
 
 ## Runtime defaults and uninstall
 

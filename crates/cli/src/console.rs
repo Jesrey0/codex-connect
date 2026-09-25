@@ -9,7 +9,6 @@ use tokio::time::{Instant, MissedTickBehavior, interval};
 
 const UI_TICK_MS: u64 = 750;
 const RECONNECT_MS: u64 = 500;
-const TRANSCRIPT_FRESH_MS: u64 = 15_000;
 const TRANSCRIPT_RETRY_MAX_MS: u64 = 15_000;
 const ESCAPE_SEQUENCE_MS: u64 = 50;
 const MAX_ACTION_TEXT_CHARS: usize = 2 * 1024;
@@ -17,8 +16,9 @@ const MAX_ACTION_ROW_CHARS: usize = 512;
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
+// Leave ordinary content in the terminal's foreground so light and dark themes work.
+const TEXT: &str = "\x1b[39m";
 const CYAN: &str = "\x1b[36m";
-const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 
@@ -509,12 +509,7 @@ impl TranscriptFetch {
             .and_then(|snapshot| worker_for_target(snapshot, target))
             .and_then(|worker| worker["transcriptRevision"].as_u64())
             .unwrap_or_default();
-        self.failures > 0
-            || state.transcript.is_none()
-            || revision > state.transcript_revision
-            || self.last_success.is_none_or(|at| {
-                now.duration_since(at) >= Duration::from_millis(TRANSCRIPT_FRESH_MS)
-            })
+        self.failures > 0 || state.transcript.is_none() || revision > state.transcript_revision
     }
 
     fn schedule(&mut self, backend: BackendClient, state: &ConsoleState, snapshot: Option<&Value>) {
@@ -665,8 +660,11 @@ fn draw(
     let lines = render_frame(snapshot, last_error, state, fetch, frame, width, height);
     let mut stdout = io::stdout();
     write!(stdout, "\x1b[H")?;
-    for line in lines {
-        writeln!(stdout, "{line}")?;
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            writeln!(stdout)?;
+        }
+        write!(stdout, "{line}")?;
     }
     write!(stdout, "\x1b[J")?;
     stdout.flush()?;
@@ -696,23 +694,23 @@ fn render_frame(
         (None, None) => None,
     };
 
-    lines.push(styled(border('╭', '─', '╮', width), CYAN));
+    lines.push(styled(row("", width), TEXT));
     lines.push(styled(
         row_lr(
-            " CODEX CONNECT // CONSOLE",
+            "  ◈  CODEX CONNECT",
             &format!(
-                "{pulse} {} ",
+                "{pulse} {}  ",
                 if snapshot.is_some() && last_error.is_none() {
-                    "LIVE EVENTS"
+                    "LIVE"
                 } else {
                     "RECONNECTING"
                 }
             ),
             width,
         ),
-        &format!("{BOLD}{CYAN}"),
+        &format!("{BOLD}{TEXT}"),
     ));
-    lines.push(styled(border('├', '─', '┤', width), CYAN));
+    lines.push(styled(rule(width), DIM));
 
     let body_height = height.saturating_sub(6 + if read_error.is_some() { 2 } else { 0 });
     let body_start = lines.len();
@@ -741,9 +739,12 @@ fn render_frame(
         }
     }
     lines.truncate(body_start.saturating_add(body_height));
+    while lines.len() < body_start + body_height {
+        lines.push(row("", width));
+    }
 
     if let Some(error) = read_error {
-        lines.push(styled(border('├', '─', '┤', width), RED));
+        lines.push(styled(rule(width), RED));
         lines.push(styled(
             row(
                 &format!(" ⚠ READ ERROR  {}", safe_terminal_text(&error)),
@@ -753,22 +754,24 @@ fn render_frame(
         ));
     }
 
-    lines.push(styled(border('├', '─', '┤', width), CYAN));
+    lines.push(styled(rule(width), DIM));
     lines.push(styled(
         row_lr(
             match state.view {
-                View::Dashboard => " ◉ OBSERVE ONLY · ↑/↓ select · Enter open",
+                View::Dashboard => "  READ ONLY  ·  ↑/↓ select  ·  Enter open",
                 View::Transcript(_) if state.follow => {
-                    " ◉ FOLLOWING LIVE · ↑/↓ scroll · g start · Esc back"
+                    "  FOLLOWING  ·  ↑/↓ scroll  ·  g start  ·  Esc back"
                 }
-                View::Transcript(_) => " ◉ PAUSED · G live · g start · ↑/↓ scroll · Esc back",
+                View::Transcript(_) => {
+                    "  PAUSED  ·  G live  ·  g start  ·  ↑/↓ scroll  ·  Esc back"
+                }
             },
-            "Ctrl-C exits ",
+            "Ctrl-C exit  ",
             width,
         ),
         DIM,
     ));
-    lines.push(styled(border('╰', '─', '╯', width), CYAN));
+    lines.push(styled(row("", width), TEXT));
 
     lines.truncate(height);
     lines
@@ -869,7 +872,7 @@ fn render_snapshot(
     let health = if ready { "● ONLINE" } else { "○ OFFLINE" };
     let build = text(&runtime["buildId"], "unknown");
     let release = text(&runtime["codex"]["release"], "unknown");
-    let health_style = if ready { GREEN } else { RED };
+    let health_style = if ready { TEXT } else { RED };
 
     lines.push(styled(
         row_lr(
@@ -887,7 +890,7 @@ fn render_snapshot(
         ),
         DIM,
     ));
-    lines.push(styled(row(&account_line(projection, width), width), DIM));
+    lines.push(styled(row(&account_line(projection, width), width), TEXT));
 
     let pending = projection["pendingActions"]
         .as_array()
@@ -1028,7 +1031,7 @@ fn render_transcript(
             &format!("{model} · {effort} "),
             width,
         ),
-        &format!("{BOLD}{CYAN}"),
+        &format!("{BOLD}{TEXT}"),
     )];
     pinned.push(styled(
         row(
@@ -1094,8 +1097,8 @@ fn render_transcript(
         Some(transcript) => {
             let prompt = context.and_then(|value| value["prompt"].as_str());
             if let Some(prompt) = prompt {
-                body.push(styled(row(" TASK", width), &format!("{BOLD}{CYAN}")));
-                body.extend(render_wrapped_text(prompt, "   ", width, CYAN));
+                body.push(styled(row(" TASK", width), &format!("{BOLD}{TEXT}")));
+                body.extend(render_wrapped_text(prompt, "   ", width, TEXT));
             }
             let pending = transcript["pendingActions"]
                 .as_array()
@@ -1119,7 +1122,7 @@ fn render_transcript(
             }
             body.push(styled(
                 row(" CONVERSATION", width),
-                &format!("{BOLD}{CYAN}"),
+                &format!("{BOLD}{TEXT}"),
             ));
             body.extend(render_transcript_entries(transcript, width));
             body.extend(render_live_activity(transcript, width, frame));
@@ -1262,7 +1265,7 @@ fn render_live_activity(transcript: &Value, width: usize, frame: usize) -> Vec<S
         let Some(summary) = activity["summary"].as_str().filter(|text| !text.is_empty()) else {
             return vec![styled(
                 row(&format!(" {pulse} RESPONDING · {age}{usage}"), width),
-                GREEN,
+                TEXT,
             )];
         };
         if latest_agent_text(transcript).is_some_and(|text| text == summary) {
@@ -1273,9 +1276,9 @@ fn render_live_activity(transcript: &Value, width: usize, frame: usize) -> Vec<S
                 &format!(" {pulse} AGENT · responding · {age}{usage}"),
                 width,
             ),
-            GREEN,
+            TEXT,
         )];
-        lines.extend(render_wrapped_text(summary, "   ", width, GREEN));
+        lines.extend(render_wrapped_text(summary, "   ", width, TEXT));
         return lines;
     }
     if kind.eq_ignore_ascii_case("error") {
@@ -1298,7 +1301,7 @@ fn entry_style(kind: &str, status: Option<&str>) -> &'static str {
     } else if kind.eq_ignore_ascii_case("user") {
         CYAN
     } else if kind.eq_ignore_ascii_case("agent") || kind.eq_ignore_ascii_case("assistant") {
-        GREEN
+        TEXT
     } else {
         DIM
     }
@@ -1414,7 +1417,7 @@ fn worker_rows(
     } else if is_terminal_status(Some(status)) {
         DIM.to_string()
     } else {
-        GREEN.to_string()
+        TEXT.to_string()
     };
     let ids = format!(
         "{} / {}",
@@ -1791,10 +1794,10 @@ fn worker_capacity(height: usize, pending: usize) -> usize {
 }
 
 fn section(lines: &mut Vec<String>, title: &str, width: usize) {
-    lines.push(styled(border('├', '─', '┤', width), CYAN));
+    lines.push(row("", width));
     lines.push(styled(
-        row(&format!(" {title}"), width),
-        &format!("{BOLD}{CYAN}"),
+        row(&format!("  {title}"), width),
+        &format!("{BOLD}{TEXT}"),
     ));
 }
 
@@ -1836,11 +1839,8 @@ fn terminal_size() -> (usize, usize) {
     }
 }
 
-fn border(left: char, fill: char, right: char, width: usize) -> String {
-    format!(
-        "{left}{}{right}",
-        fill.to_string().repeat(width.saturating_sub(2))
-    )
+fn rule(width: usize) -> String {
+    format!("  {}  ", "─".repeat(width.saturating_sub(4)))
 }
 
 fn row(content: &str, width: usize) -> String {
@@ -1850,7 +1850,7 @@ fn row(content: &str, width: usize) -> String {
     if used < inner {
         body.push_str(&" ".repeat(inner - used));
     }
-    format!("│{body}│")
+    format!(" {body} ")
 }
 
 fn row_lr(left: &str, right: &str, width: usize) -> String {
@@ -1863,7 +1863,7 @@ fn row_lr(left: &str, right: &str, width: usize) -> String {
     let left_max = inner.saturating_sub(right_width + 1);
     let left = truncate_display_width(left, left_max);
     let padding = inner.saturating_sub(display_width(&left) + right_width);
-    format!("│{left}{}{right}│", " ".repeat(padding))
+    format!(" {left}{}{right} ", " ".repeat(padding))
 }
 
 fn truncate_display_width(value: &str, width: usize) -> String {
@@ -2178,7 +2178,6 @@ mod tests {
         let mut fetch = TranscriptFetch {
             target: Some(target),
             requested_revision: 3,
-            last_success: Some(Instant::now()),
             ..TranscriptFetch::default()
         };
         let snapshot = serde_json::json!({"projection":{"workers":[{
@@ -2218,7 +2217,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_refreshes_after_freshness_window_without_new_revision() {
+    fn transcript_fetches_only_when_revision_advances() {
         let target = TranscriptTarget {
             thread_id: "thread".into(),
             turn_id: "turn".into(),
@@ -2232,22 +2231,16 @@ mod tests {
         let now = Instant::now();
         let fetch = TranscriptFetch {
             target: Some(target),
-            last_success: Some(now),
             ..TranscriptFetch::default()
         };
         let snapshot = serde_json::json!({"projection":{"workers":[{
             "threadId":"thread","turnId":"turn","transcriptRevision":2
         }]}});
-        assert!(!fetch.should_fetch(
-            &state,
-            Some(&snapshot),
-            now + Duration::from_millis(TRANSCRIPT_FRESH_MS - 1)
-        ));
-        assert!(fetch.should_fetch(
-            &state,
-            Some(&snapshot),
-            now + Duration::from_millis(TRANSCRIPT_FRESH_MS)
-        ));
+        assert!(!fetch.should_fetch(&state, Some(&snapshot), now + Duration::from_secs(60)));
+        let changed = serde_json::json!({"projection":{"workers":[{
+            "threadId":"thread","turnId":"turn","transcriptRevision":3
+        }]}});
+        assert!(fetch.should_fetch(&state, Some(&changed), now));
     }
 
     #[test]
@@ -2311,6 +2304,53 @@ mod tests {
                     .all(|line| display_width(line) <= width && !line.contains('│'))
             );
         }
+    }
+
+    #[test]
+    fn dashboard_keeps_observer_data_visible_with_footer_at_bottom() {
+        let snapshot = serde_json::json!({
+            "runtime":{"ready":true,"buildId":"abc123","codex":{"release":"0.155.1"}},
+            "projection":{
+                "cwd":"/work/repo",
+                "usage":{"ordinaryUsageAllowed":true,"rateLimits":{
+                    "primary":{"usedPercent":50,"resetsAt":0,"windowDurationMins":300},
+                    "secondary":{"usedPercent":25,"resetsAt":0,"windowDurationMins":10080}
+                }},
+                "workers":[{"threadId":"thread-123456789","turnId":"turn-123456789",
+                    "status":"inProgress","mode":"work","model":"gpt-6-sol",
+                    "effort":"high","prompt":"Review the schema"}],
+                "pendingActions":[],"notices":[]
+            }
+        });
+        let lines = render_frame(
+            Some(&snapshot),
+            None,
+            &mut ConsoleState::default(),
+            &TranscriptFetch::default(),
+            0,
+            90,
+            28,
+        );
+        let rendered = lines.join("\n");
+        assert_eq!(lines.len(), 28);
+        let visible = |line: &str| {
+            let mut parts = line.split("\x1b[");
+            let mut plain = parts.next().unwrap_or_default().to_string();
+            for part in parts {
+                if let Some((_, text)) = part.split_once('m') {
+                    plain.push_str(text);
+                }
+            }
+            plain
+        };
+        assert!(lines.iter().all(|line| display_width(&visible(line)) == 90));
+        assert!(rendered.contains("CODEX CONNECT"));
+        assert!(rendered.contains("build abc123"));
+        assert!(rendered.contains("ACCOUNT · 5H"));
+        assert!(rendered.contains("gpt-6-sol"));
+        assert!(rendered.contains("Review the schema"));
+        assert!(lines[26].contains("READ ONLY"));
+        assert!(!rendered.contains('│'));
     }
 
     #[test]
