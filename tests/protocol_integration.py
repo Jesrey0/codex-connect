@@ -831,10 +831,10 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIn(observed["activityKind"], {"turn", "think", "message", "tool", "file", "search", "item", "waiting"})
         self.assertIn("activitySummary", observed)
         self.assertEqual(set(observed["tokenUsage"]), {
-            "totalTokens",
-            "modelContextWindow",
-            "lastInputTokens",
-            "lastCachedInputTokens",
+            "threadTotalTokens",
+            "lastRequestModelContextWindow",
+            "lastRequestInputTokens",
+            "lastRequestCachedInputTokens",
             "cacheHitPercent",
             "lastModelUsageAtMs",
             "cacheGuaranteedUntilMs",

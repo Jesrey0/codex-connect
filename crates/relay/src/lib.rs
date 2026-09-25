@@ -222,6 +222,8 @@ struct LiveTurns {
     // while its turn/start response catches up with an early completion event.
     turns: HashMap<(String, String), ObservedTurn>,
     order: VecDeque<(String, String)>,
+    // App Server usage updates are cumulative thread snapshots, including on resume replay.
+    thread_token_usage_totals: HashMap<String, u64>,
     // Only the newest delegated terminal observations remain in the console view.
     recent: VecDeque<(String, String, ObservedTurn)>,
 }
@@ -240,10 +242,10 @@ struct ObservedTurn {
     transcript_revision: u64,
     message_item_id: Option<String>,
     message_excerpt: String,
-    token_usage_total: Option<u64>,
-    model_context_window: Option<u64>,
-    last_input_tokens: Option<u64>,
-    last_cached_input_tokens: Option<u64>,
+    thread_total_tokens: Option<u64>,
+    last_request_model_context_window: Option<u64>,
+    last_request_input_tokens: Option<u64>,
+    last_request_cached_input_tokens: Option<u64>,
     last_model_usage_at_ms: Option<u64>,
 }
 
@@ -354,10 +356,10 @@ impl LiveTurns {
                 transcript_revision: 0,
                 message_item_id: None,
                 message_excerpt: String::new(),
-                token_usage_total: None,
-                model_context_window: None,
-                last_input_tokens: None,
-                last_cached_input_tokens: None,
+                thread_total_tokens: None,
+                last_request_model_context_window: None,
+                last_request_input_tokens: None,
+                last_request_cached_input_tokens: None,
                 last_model_usage_at_ms: None,
             },
         );
@@ -436,6 +438,48 @@ impl LiveTurns {
         let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
             return;
         };
+
+        if method == "thread/tokenUsage/updated" {
+            let usage = &params["tokenUsage"];
+            let Some(thread_total_tokens) = usage["total"]["totalTokens"].as_u64() else {
+                return;
+            };
+            let turn_id = params.get("turnId").and_then(Value::as_str);
+            let observed = turn_id.and_then(|turn_id| {
+                self.turns
+                    .get_mut(&(thread_id.to_string(), turn_id.to_string()))
+                    .or_else(|| {
+                        self.recent
+                            .iter_mut()
+                            .find(|(recent_thread, recent_turn, _)| {
+                                recent_thread == thread_id && recent_turn == turn_id
+                            })
+                            .map(|(_, _, observed)| observed)
+                    })
+            });
+            let previous_total = self
+                .thread_token_usage_totals
+                .insert(thread_id.to_string(), thread_total_tokens);
+            let usage_advanced = previous_total
+                .map(|previous| thread_total_tokens > previous)
+                // A nonzero first snapshot on an observed live turn establishes usage from
+                // the implicit zero baseline. An unassociated resume replay only seeds it.
+                .unwrap_or(observed.is_some() && thread_total_tokens > 0);
+
+            if let Some(observed) = observed {
+                observed.thread_total_tokens = Some(thread_total_tokens);
+                if usage_advanced {
+                    observed.last_request_model_context_window =
+                        usage["modelContextWindow"].as_u64();
+                    let last = &usage["last"];
+                    observed.last_request_input_tokens = last["inputTokens"].as_u64();
+                    observed.last_request_cached_input_tokens = last["cachedInputTokens"].as_u64();
+                    observed.last_model_usage_at_ms = Some(now_epoch_ms());
+                }
+            }
+            return;
+        }
+
         let turn_id = params.get("turnId").and_then(Value::as_str).or_else(|| {
             params
                 .get("turn")
@@ -468,17 +512,6 @@ impl LiveTurns {
                 ))
         {
             observed.transcript_revision = observed.transcript_revision.saturating_add(1);
-        }
-
-        if method == "thread/tokenUsage/updated" {
-            let usage = &params["tokenUsage"];
-            observed.token_usage_total = usage["total"]["totalTokens"].as_u64();
-            observed.model_context_window = usage["modelContextWindow"].as_u64();
-            let last = &usage["last"];
-            observed.last_input_tokens = last["inputTokens"].as_u64();
-            observed.last_cached_input_tokens = last["cachedInputTokens"].as_u64();
-            observed.last_model_usage_at_ms = Some(now_epoch_ms());
-            return;
         }
 
         if method == "item/agentMessage/delta" {
@@ -692,8 +725,8 @@ fn operator_worker_handle_value(thread_id: &str, observed: &ObservedTurn) -> Val
 
 fn token_usage_value(observed: &ObservedTurn) -> Value {
     let cache_hit_percent = match (
-        observed.last_input_tokens,
-        observed.last_cached_input_tokens,
+        observed.last_request_input_tokens,
+        observed.last_request_cached_input_tokens,
     ) {
         (Some(input), Some(cached)) if input > 0 => {
             Some(((u128::from(cached) * 100 / u128::from(input)).min(100)) as u64)
@@ -705,10 +738,10 @@ fn token_usage_value(observed: &ObservedTurn) -> Value {
         .map(|timestamp| timestamp.saturating_add(THREAD_REUSE_POLICY_MS));
     let cache_guarantee_active = cache_guaranteed_until_ms.map(|until| now_epoch_ms() < until);
     json!({
-        "totalTokens": observed.token_usage_total,
-        "modelContextWindow": observed.model_context_window,
-        "lastInputTokens": observed.last_input_tokens,
-        "lastCachedInputTokens": observed.last_cached_input_tokens,
+        "threadTotalTokens": observed.thread_total_tokens,
+        "lastRequestModelContextWindow": observed.last_request_model_context_window,
+        "lastRequestInputTokens": observed.last_request_input_tokens,
+        "lastRequestCachedInputTokens": observed.last_request_cached_input_tokens,
         "cacheHitPercent": cache_hit_percent,
         "lastModelUsageAtMs": observed.last_model_usage_at_ms,
         "cacheGuaranteedUntilMs": cache_guaranteed_until_ms,
@@ -3735,13 +3768,112 @@ mod tests {
             }),
         );
         let usage = &live.observer_workers()[0]["tokenUsage"];
-        assert_eq!(usage["totalTokens"], 32270);
-        assert_eq!(usage["lastInputTokens"], 16314);
-        assert_eq!(usage["lastCachedInputTokens"], 15104);
+        assert_eq!(usage["threadTotalTokens"], 32270);
+        assert!(usage.get("totalTokens").is_none());
+        assert_eq!(usage["lastRequestInputTokens"], 16314);
+        assert_eq!(usage["lastRequestCachedInputTokens"], 15104);
         assert_eq!(usage["cacheHitPercent"], 92);
         assert!(usage["lastModelUsageAtMs"].as_u64().is_some());
         assert!(usage["cacheGuaranteedUntilMs"].as_u64().is_some());
         assert_eq!(usage["cacheGuaranteeActive"], true);
+    }
+
+    #[test]
+    fn unchanged_thread_usage_snapshots_do_not_refresh_or_reattribute_last_request() {
+        let mut live = LiveTurns::default();
+        live.insert("thread", test_turn("first-turn", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "first-turn",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: None,
+                effort: None,
+                prompt: None,
+            },
+        );
+        let usage_event = |turn_id: &str, total: u64, input: u64| {
+            json!({
+                "threadId":"thread",
+                "turnId":turn_id,
+                "tokenUsage":{
+                    "modelContextWindow":200000,
+                    "last":{
+                        "cachedInputTokens":input / 2,
+                        "inputTokens":input,
+                        "outputTokens":10,
+                        "reasoningOutputTokens":0,
+                        "totalTokens":input + 10
+                    },
+                    "total":{"totalTokens":total}
+                }
+            })
+        };
+
+        live.observe_event(
+            "thread/tokenUsage/updated",
+            &usage_event("first-turn", 100, 80),
+        );
+        let first = live
+            .observer_workers()
+            .into_iter()
+            .find(|worker| worker["turnId"] == "first-turn")
+            .unwrap()["tokenUsage"]
+            .clone();
+        let first_at = first["lastModelUsageAtMs"].as_u64().unwrap();
+        assert_eq!(first["threadTotalTokens"], 100);
+        assert_eq!(first["lastRequestInputTokens"], 80);
+
+        // A rate-limit-only update may repeat the previous last-request breakdown.
+        live.observe_event(
+            "thread/tokenUsage/updated",
+            &usage_event("first-turn", 100, 999),
+        );
+        let workers = live.observer_workers();
+        let unchanged = &workers
+            .iter()
+            .find(|worker| worker["turnId"] == "first-turn")
+            .unwrap()["tokenUsage"];
+        assert_eq!(unchanged["threadTotalTokens"], 100);
+        assert_eq!(unchanged["lastRequestInputTokens"], 80);
+        assert_eq!(unchanged["lastModelUsageAtMs"], first_at);
+        assert_eq!(
+            unchanged["cacheGuaranteedUntilMs"],
+            first["cacheGuaranteedUntilMs"]
+        );
+
+        // A resume replay can arrive before its turn is present; it still seeds the
+        // thread baseline so a later unchanged notification cannot be misattributed.
+        live.observe_event(
+            "thread/tokenUsage/updated",
+            &usage_event("unobserved-replay-turn", 150, 120),
+        );
+        live.insert("thread", test_turn("second-turn", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "second-turn",
+            WorkerAnnotation {
+                mode: "work".into(),
+                model: None,
+                effort: None,
+                prompt: None,
+            },
+        );
+        live.observe_event(
+            "thread/tokenUsage/updated",
+            &usage_event("second-turn", 150, 120),
+        );
+        let second = live
+            .observer_workers()
+            .into_iter()
+            .find(|worker| worker["turnId"] == "second-turn")
+            .unwrap()["tokenUsage"]
+            .clone();
+        assert_eq!(second["threadTotalTokens"], 150);
+        assert!(second["lastRequestInputTokens"].is_null());
+        assert!(second["lastRequestCachedInputTokens"].is_null());
+        assert!(second["lastModelUsageAtMs"].is_null());
+        assert!(second["cacheGuaranteedUntilMs"].is_null());
     }
 
     #[test]

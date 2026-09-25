@@ -1390,8 +1390,8 @@ fn project_current_activity(activity: Option<&mut Value>) {
     token_usage.retain(|key, _| {
         matches!(
             key.as_str(),
-            "totalTokens"
-                | "modelContextWindow"
+            "threadTotalTokens"
+                | "lastRequestModelContextWindow"
                 | "cacheHitPercent"
                 | "cacheGuaranteedUntilMs"
                 | "cacheGuaranteeActive"
@@ -1891,6 +1891,27 @@ mod tests {
         let result = tool_list_result();
         assert_eq!(result.ttl_ms, Some(0));
         assert_eq!(result.cache_scope, Some(CacheScope::Private));
+    }
+
+    #[test]
+    fn current_activity_projection_exposes_cumulative_thread_total_without_alias() {
+        let mut activity = json!({
+            "tokenUsage": {
+                "threadTotalTokens": 1234,
+                "totalTokens": 1234,
+                "lastRequestModelContextWindow": 200000,
+                "modelContextWindow": 200000,
+                "cacheHitPercent": 75
+            }
+        });
+        project_current_activity(Some(&mut activity));
+        assert_eq!(activity["tokenUsage"]["threadTotalTokens"], 1234);
+        assert_eq!(
+            activity["tokenUsage"]["lastRequestModelContextWindow"],
+            200000
+        );
+        assert!(activity["tokenUsage"].get("totalTokens").is_none());
+        assert!(activity["tokenUsage"].get("modelContextWindow").is_none());
     }
 
     #[test]

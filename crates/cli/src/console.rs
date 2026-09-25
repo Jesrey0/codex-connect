@@ -1245,9 +1245,9 @@ fn render_live_activity(transcript: &Value, width: usize, frame: usize) -> Vec<S
         .map(activity_age)
         .unwrap_or_else(|| "now".to_string());
     let pulse = ["◐", "◓", "◑", "◒"][frame % 4];
-    let usage = activity["tokenUsage"]["totalTokens"]
+    let usage = activity["tokenUsage"]["threadTotalTokens"]
         .as_u64()
-        .map(|tokens| format!(" · {} tok", compact_number(tokens)))
+        .map(|tokens| format!(" · thread total {} tok", compact_number(tokens)))
         .unwrap_or_default();
     if matches!(kind.to_ascii_lowercase().as_str(), "reasoning" | "think") {
         return vec![styled(
@@ -1386,9 +1386,9 @@ fn worker_rows(
         .as_u64()
         .map(activity_age)
         .unwrap_or_else(|| "age unknown".into());
-    let tokens = worker["tokenUsage"]["totalTokens"]
+    let tokens = worker["tokenUsage"]["threadTotalTokens"]
         .as_u64()
-        .map(|tokens| format!(" · {} tok", compact_number(tokens)))
+        .map(|tokens| format!(" · thread total {} tok", compact_number(tokens)))
         .unwrap_or_default();
     let pulse = ["◐", "◓", "◑", "◒"][frame % 4];
     let (glyph, state_label) = if waiting && !is_terminal_status(Some(status)) {
@@ -1448,21 +1448,24 @@ fn worker_rows(
 fn worker_context_detail(usage: &Value) -> Option<String> {
     let mut parts = Vec::new();
     if let (Some(input), Some(window)) = (
-        usage["lastInputTokens"].as_u64(),
-        usage["modelContextWindow"].as_u64(),
+        usage["lastRequestInputTokens"].as_u64(),
+        usage["lastRequestModelContextWindow"].as_u64(),
     ) {
         parts.push(format!(
-            "context {} / {} tok",
+            "latest request input {} / {} tok window",
             compact_number(input),
             compact_number(window)
         ));
     }
-    if let Some(cached) = usage["lastCachedInputTokens"].as_u64() {
+    if let Some(cached) = usage["lastRequestCachedInputTokens"].as_u64() {
         let percent = usage["cacheHitPercent"]
             .as_u64()
             .map(|percent| format!(" · {percent}%"))
             .unwrap_or_default();
-        parts.push(format!("cached {} tok{percent}", compact_number(cached)));
+        parts.push(format!(
+            "latest request cached {} tok{percent}",
+            compact_number(cached)
+        ));
     }
     if let Some(until) = usage["cacheGuaranteedUntilMs"].as_u64() {
         let now = SystemTime::now()
@@ -1474,11 +1477,11 @@ fn worker_context_detail(usage: &Value) -> Option<String> {
             .as_bool()
             .unwrap_or(remaining > 0);
         parts.push(if !active {
-            "cache guarantee expired".to_string()
+            "thread cache guarantee expired".to_string()
         } else if remaining < 60 {
-            "cache guarantee <1m left".to_string()
+            "thread cache guarantee <1m left".to_string()
         } else {
-            format!("cache guarantee {}m left", remaining / 60)
+            format!("thread cache guarantee {}m left", remaining / 60)
         });
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
@@ -1920,11 +1923,11 @@ mod tests {
             "lastActivityAtMs": 0,
             "activityKind": "think",
             "activitySummary": "private chain of thought",
-            "tokenUsage": {"totalTokens": 123, "modelContextWindow": 456}
+            "tokenUsage": {"threadTotalTokens": 123, "lastRequestModelContextWindow": 456}
         });
         let rendered = worker_rows(false, &turn, false, 160, 0).join("\n");
         assert!(rendered.contains("THINKING"));
-        assert!(rendered.contains("123 tok"));
+        assert!(rendered.contains("thread total 123 tok"));
         assert!(!rendered.contains("private chain of thought"));
     }
 
@@ -2041,15 +2044,15 @@ mod tests {
         let worker = serde_json::json!({
             "threadId":"thread","turnId":"turn","status":"inProgress",
             "tokenUsage":{
-                "lastInputTokens":12000,"modelContextWindow":200000,
-                "lastCachedInputTokens":9000,"cacheHitPercent":75,
+                "lastRequestInputTokens":12000,"lastRequestModelContextWindow":200000,
+                "lastRequestCachedInputTokens":9000,"cacheHitPercent":75,
                 "cacheGuaranteedUntilMs":u64::MAX
             }
         });
         let rendered = worker_rows(true, &worker, false, 120, 0).join("\n");
-        assert!(rendered.contains("context 12.0k / 200.0k tok"));
-        assert!(rendered.contains("cached 9.0k tok · 75%"));
-        assert!(rendered.contains("cache guarantee"));
+        assert!(rendered.contains("latest request input 12.0k / 200.0k tok window"));
+        assert!(rendered.contains("latest request cached 9.0k tok · 75%"));
+        assert!(rendered.contains("thread cache guarantee"));
     }
 
     #[test]
@@ -2134,7 +2137,7 @@ mod tests {
                     "activitySummary":"hello",
                     "lastActivityAtMs":10,
                     "transcriptRevision":4,
-                    "tokenUsage":{"totalTokens":12,"modelContextWindow":100}
+                    "tokenUsage":{"threadTotalTokens":12,"lastRequestModelContextWindow":100}
                 }],
                 "pendingActions": [{
                     "threadId":"thread",
@@ -2434,7 +2437,7 @@ mod tests {
                 "kind": "reasoning",
                 "summary": "private chain of thought",
                 "lastActivityAtMs": 0,
-                "tokenUsage": {"totalTokens": 12, "modelContextWindow": 34}
+                "tokenUsage": {"threadTotalTokens": 12, "lastRequestModelContextWindow": 34}
             }
         });
         let rendered = render_live_activity(&transcript, 100, 0).join("\n");

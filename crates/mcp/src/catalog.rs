@@ -538,14 +538,14 @@ fn current_activity_schema() -> Value {
             "summary":{"type":["string","null"]},
             "lastActivityAtMs":{"type":"integer","minimum":0},
             "tokenUsage":object_schema(json!({
-                "totalTokens":{"type":["integer","null"],"minimum":0},
-                "modelContextWindow":{"type":["integer","null"],"minimum":0},
+                "threadTotalTokens":{"type":["integer","null"],"minimum":0,"description":"Cumulative raw token total for this Codex thread/session; a snapshot, not per-turn usage."},
+                "lastRequestModelContextWindow":{"type":["integer","null"],"minimum":0,"description":"Model context window reported with the latest request usage snapshot."},
                 "cacheHitPercent":{"type":["integer","null"],"minimum":0,"maximum":100,"description":"Latest-request cached-input share, computed server-side."},
                 "cacheGuaranteedUntilMs":{"type":["integer","null"],"minimum":0,"description":"End of OpenAI's minimum 30-minute prompt-cache reuse guarantee measured from the latest observed model usage. Cache entries may survive longer."},
-                "cacheGuaranteeActive":{"type":["boolean","null"],"description":"Whether this observed turn is still inside the minimum guaranteed cache-reuse window."}
+                "cacheGuaranteeActive":{"type":["boolean","null"],"description":"Whether this thread is still inside the minimum guaranteed cache-reuse window."}
             }), &[
-                "totalTokens",
-                "modelContextWindow",
+                "threadTotalTokens",
+                "lastRequestModelContextWindow",
                 "cacheHitPercent",
                 "cacheGuaranteedUntilMs",
                 "cacheGuaranteeActive"
@@ -1552,6 +1552,19 @@ mod tests {
         );
         assert_eq!(input["required"], json!(["threadId", "turnId"]));
         assert_eq!(input["additionalProperties"], false);
+    }
+
+    #[test]
+    fn current_activity_schema_names_thread_total_and_latest_request_window() {
+        let schema = current_activity_schema();
+        let usage = &schema["properties"]["tokenUsage"]["properties"];
+        assert_eq!(
+            usage["threadTotalTokens"]["description"],
+            "Cumulative raw token total for this Codex thread/session; a snapshot, not per-turn usage."
+        );
+        assert!(usage.get("totalTokens").is_none());
+        assert!(usage.get("modelContextWindow").is_none());
+        assert!(usage.get("lastRequestModelContextWindow").is_some());
     }
 
     #[test]
