@@ -16,13 +16,14 @@ const ESCAPE_SEQUENCE_MS: u64 = 50;
 const MAX_ACTION_TEXT_CHARS: usize = 2 * 1024;
 const MAX_ACTION_ROW_CHARS: usize = 512;
 const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-// Leave ordinary content in the terminal's foreground so light and dark themes work.
-const TEXT: &str = "\x1b[39m";
-const CYAN: &str = "\x1b[36m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
+// Neutral 256-color palette: bright text stays grey-white, hierarchy comes from
+// luminance rather than saturated decoration. Warning/error hues are intentionally muted.
+const BOLD: &str = "\x1b[1m\x1b[38;5;255m";
+const TEXT: &str = "\x1b[38;5;252m";
+const DIM: &str = "\x1b[38;5;245m";
+const CYAN: &str = "\x1b[38;5;250m";
+const YELLOW: &str = "\x1b[38;5;180m";
+const RED: &str = "\x1b[38;5;203m";
 
 pub async fn run() -> Result<()> {
     if !io::stdout().is_terminal() {
@@ -794,8 +795,8 @@ fn render_frame(
     let mut lines = vec![
         styled(
             row_lr(
-                " >_ codex connect",
-                &format!("read-only · {connection} "),
+                "  codex connect",
+                &format!("observer · {connection} · read-only "),
                 width,
             ),
             BOLD,
@@ -885,19 +886,23 @@ fn render_frame(
 
 fn render_help(lines: &mut Vec<String>, width: usize) {
     for label in [
-        " Keyboard shortcuts",
+        " shortcuts",
         "",
-        " Workers    ↑/↓ or j/k select · Enter open",
-        "            a active/all · Home/End or g/G first/last",
-        "            PgUp/PgDn move one page",
-        " Transcript ↑/↓ or j/k scroll · PgUp/PgDn page",
-        "            Home/g start · End/G follow latest",
-        "            Esc/←/b/q back to workers",
-        " General    ? help · q exit from workers · Ctrl-C exit",
+        " workers     ↑/↓ or j/k select · Enter open",
+        "             a active/all · Home/End or g/G first/last",
+        "             PgUp/PgDn move one page",
+        " transcript  ↑/↓ or j/k scroll · PgUp/PgDn page",
+        "             Home/g start · End/G follow latest",
+        "             Esc/←/b/q back to workers",
+        " general     ? help · q exit from workers · Ctrl-C exit",
         "",
-        " Read-only. Resolve actions through ChatGPT.",
+        " typography  terminal controls the typeface · Cascadia Mono / JetBrains Mono work well",
+        " read-only   resolve actions through ChatGPT",
     ] {
-        lines.push(styled(row(label, width), TEXT));
+        lines.push(styled(
+            row(label, width),
+            if label == " shortcuts" { BOLD } else { TEXT },
+        ));
     }
 }
 
@@ -1019,8 +1024,8 @@ fn render_snapshot(
     lines.push(styled(
         row_lr(
             &format!(
-                " {} · {}",
-                if ready { "● Online" } else { "○ Offline" },
+                " {}  {}",
+                if ready { "●" } else { "○" },
                 text(&projection["cwd"], "unknown workspace")
             ),
             &format!("build {} ", text(&runtime["buildId"], "unknown")),
@@ -1101,7 +1106,7 @@ fn render_snapshot(
     }
     lines.push(styled(
         row_lr(
-            &format!(" Workers · {active} active · {} recent", total - active),
+            &format!(" workers  {active} active · {} recent", total - active),
             &format!(
                 "{} ",
                 if state.active_only {
@@ -1259,7 +1264,7 @@ fn render_transcript(
         .unwrap_or("default/inherited");
     let mut pinned = vec![styled(
         row_lr(
-            &format!(" WORKER · {} · {status}", mode.to_ascii_uppercase()),
+            &format!(" {mode} · {status}"),
             &format!("{model} · {effort} "),
             width,
         ),
@@ -1334,7 +1339,7 @@ fn render_transcript(
         Some(transcript) => {
             let prompt = context.and_then(|value| value["prompt"].as_str());
             if let Some(prompt) = prompt {
-                body.push(styled(row(" TASK", width), &format!("{BOLD}{TEXT}")));
+                body.push(styled(row(" task", width), BOLD));
                 body.extend(render_wrapped_text(prompt, "   ", width, TEXT));
             }
             let pending = transcript["pendingActions"]
@@ -1357,10 +1362,7 @@ fn render_transcript(
                     YELLOW,
                 ));
             }
-            body.push(styled(
-                row(" CONVERSATION", width),
-                &format!("{BOLD}{TEXT}"),
-            ));
+            body.push(styled(row(" conversation", width), BOLD));
             body.extend(render_transcript_entries(transcript, width));
             body.extend(render_live_activity(transcript, width, frame));
         }
@@ -1436,7 +1438,7 @@ fn render_transcript_entries(transcript: &Value, width: usize) -> Vec<String> {
     let Some(entries) = transcript["entries"].as_array() else {
         return lines;
     };
-    for entry in entries {
+    for entry in transcript_entries_for_display(entries) {
         let kind = entry["kind"].as_str().unwrap_or("entry");
         if !matches!(kind, "user" | "agent") {
             continue;
@@ -1449,12 +1451,12 @@ fn render_transcript_entries(transcript: &Value, width: usize) -> Vec<String> {
         }
         let label = if kind.eq_ignore_ascii_case("agent") {
             match entry["title"].as_str() {
-                Some(title) if title.contains("FINAL") => "AGENT · FINAL",
-                Some(title) if title.contains("REVIEW") => "AGENT · REVIEW",
-                _ => "AGENT",
+                Some(title) if title.contains("FINAL") => "agent · final",
+                Some(title) if title.contains("REVIEW") => "agent · review",
+                _ => "agent",
             }
         } else {
-            "OPERATOR"
+            "operator"
         };
         lines.push(styled(
             row(&format!(" {label}"), width),
@@ -1468,6 +1470,44 @@ fn render_transcript_entries(transcript: &Value, width: usize) -> Vec<String> {
         ));
     }
     lines
+}
+
+fn transcript_entries_for_display(entries: &[Value]) -> Vec<&Value> {
+    let mut visible = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(previous) = visible.last().copied() else {
+            visible.push(entry);
+            continue;
+        };
+        let same_agent_text = previous["kind"].as_str() == Some("agent")
+            && entry["kind"].as_str() == Some("agent")
+            && previous["text"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty() && entry["text"].as_str() == Some(text));
+        if !same_agent_text {
+            visible.push(entry);
+            continue;
+        }
+
+        let previous_rank = transcript_handoff_rank(previous);
+        let current_rank = transcript_handoff_rank(entry);
+        if previous_rank.max(current_rank) < 2 {
+            // Repeated ordinary agent messages are real transcript history. Only collapse
+            // App Server handoff aliases such as exitedReviewMode + agentMessage.
+            visible.push(entry);
+        } else if current_rank > previous_rank {
+            *visible.last_mut().expect("previous transcript entry") = entry;
+        }
+    }
+    visible
+}
+
+fn transcript_handoff_rank(entry: &Value) -> u8 {
+    match entry["title"].as_str() {
+        Some(title) if title.contains("FINAL") => 3,
+        Some(title) if title.contains("REVIEW") => 2,
+        _ => 1,
+    }
 }
 
 fn render_live_activity(transcript: &Value, width: usize, frame: usize) -> Vec<String> {
@@ -1634,22 +1674,22 @@ fn worker_rows(
     frame: usize,
 ) -> Vec<String> {
     let mode = text(&worker["mode"], "worker");
-    let model = text(&worker["model"], "inherited model");
-    let effort = text(&worker["effort"], "inherited effort");
+    let model = text(&worker["model"], "default");
+    let effort = text(&worker["effort"], "default");
     let status = text(&worker["status"], "unknown");
     let kind = text(&worker["activityKind"], "working");
     let pulse = ["◐", "◓", "◑", "◒"][frame % 4];
     let (glyph, label) = if waiting && !is_terminal_status(Some(status)) {
-        ("!", "Needs operator")
+        ("!", "needs operator")
     } else {
         match status {
-            "completed" => ("✓", "Completed"),
-            "failed" => ("×", "Failed"),
-            "interrupted" => ("■", "Interrupted"),
-            "inProgress" if matches!(kind, "reasoning" | "think") => (pulse, "Thinking"),
-            "inProgress" if kind == "message" => (pulse, "Responding"),
-            "inProgress" => (pulse, "Working"),
-            _ => ("?", "Unknown"),
+            "completed" => ("✓", "complete"),
+            "failed" => ("×", "failed"),
+            "interrupted" => ("■", "interrupted"),
+            "inProgress" if matches!(kind, "reasoning" | "think") => (pulse, "thinking"),
+            "inProgress" if kind == "message" => (pulse, "responding"),
+            "inProgress" => (pulse, "working"),
+            _ => ("?", "unknown"),
         }
     };
     let age = worker["lastActivityAtMs"]
@@ -1661,7 +1701,7 @@ fn worker_rows(
         .filter(|value| !value.trim().is_empty())
         .map(|value| bounded_one_line_terminal_text(value, MAX_ACTION_TEXT_CHARS))
         .unwrap_or_else(|| format!("{mode} · {}", text(&worker["threadId"], "unknown worker")));
-    let title = format!(" {} {}", if selected { "›" } else { " " }, prompt);
+    let title = format!(" {} {}", if selected { "▸" } else { " " }, prompt);
     let style = if status == "failed" {
         RED
     } else if waiting {
@@ -1675,7 +1715,7 @@ fn worker_rows(
         styled(row(&title, width), style),
         styled(
             row_lr(
-                &format!("   {glyph} {label} · {model} · {effort} · {mode}"),
+                &format!("   {glyph} {label:<14} {model} · {effort} · {mode}"),
                 &format!("{age} "),
                 width,
             ),
@@ -2186,10 +2226,10 @@ mod tests {
                     "{width}x{height}"
                 );
                 assert!(
-                    rendered.contains("› task-17"),
+                    rendered.contains("▸ task-17"),
                     "{width}x{height}: {rendered}"
                 );
-                assert!(rendered.contains("Working"), "{width}x{height}");
+                assert!(rendered.contains("working"), "{width}x{height}");
                 assert!(rendered.contains("stale"));
             }
         }
@@ -2401,7 +2441,7 @@ mod tests {
             "prompt": "Refactor the console for a human operator"
         });
         let rendered = worker_rows(true, &turn, false, 120, 0).join("\n");
-        assert!(rendered.contains("› Refactor the console"));
+        assert!(rendered.contains("▸ Refactor the console"));
         assert!(rendered.contains("gpt-5.6-sol"));
         assert!(rendered.contains("high"));
         assert!(rendered.contains("Refactor the console"));
@@ -2422,7 +2462,7 @@ mod tests {
             "tokenUsage": {"threadTotalTokens": 123, "lastRequestModelContextWindow": 456}
         });
         let rendered = worker_rows(false, &turn, false, 160, 0).join("\n");
-        assert!(rendered.contains("Thinking"));
+        assert!(rendered.contains("thinking"));
         assert!(!rendered.contains("private chain of thought"));
     }
 
@@ -2911,6 +2951,36 @@ mod tests {
         assert!(!rendered.contains("raw tool output"));
         assert!(!rendered.contains("\u{1b}[31m"));
         assert_eq!(wrap_terminal_text("abcdefgh", 3), ["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn transcript_collapses_duplicate_review_handoff_aliases() {
+        let transcript = serde_json::json!({
+            "entries": [
+                {"kind": "agent", "title": "AGENT · REVIEW", "text": "same review response"},
+                {"kind": "agent", "title": "AGENT", "text": "same review response"}
+            ]
+        });
+        let rendered = render_transcript_entries(&transcript, 80).join("\n");
+        assert_eq!(rendered.matches("same review response").count(), 1);
+        assert!(rendered.contains("agent · review"));
+    }
+
+    #[test]
+    fn transcript_prefers_final_handoff_and_preserves_ordinary_repeats() {
+        let transcript = serde_json::json!({
+            "entries": [
+                {"kind": "agent", "title": "AGENT", "text": "ordinary repeat"},
+                {"kind": "agent", "title": "AGENT", "text": "ordinary repeat"},
+                {"kind": "agent", "title": "AGENT", "text": "terminal response"},
+                {"kind": "agent", "title": "AGENT · REVIEW", "text": "terminal response"},
+                {"kind": "agent", "title": "AGENT · FINAL", "text": "terminal response"}
+            ]
+        });
+        let rendered = render_transcript_entries(&transcript, 80).join("\n");
+        assert_eq!(rendered.matches("ordinary repeat").count(), 2);
+        assert_eq!(rendered.matches("terminal response").count(), 1);
+        assert!(rendered.contains("agent · final"));
     }
 
     #[test]
