@@ -2,6 +2,21 @@
 
 Codex Connect is a compact MCP projection over a persistent host and the official Codex App Server. ChatGPT is the only supported action/control interface and the primary technical operator. The local console is read-only observability, not a second operator. Codex Connect owns host authority and the adaptation boundary; App Server remains authoritative for Codex primitives and state whenever it exposes them.
 
+## Architectural invariants
+
+Treat these as the canonical review checklist. Detailed sections below explain the mechanisms; they do not weaken these rules.
+
+1. **ChatGPT is the task owner and the only supported product action/control interface.** Trusted-host maintenance plumbing may diagnose, install, or deploy the backend, but it must not become a second operator surface. The console remains read-only, and worker/host mutation intent stays in ChatGPT.
+2. **Authority stays in its plane.** PlatformPlane owns ChatGPT-native capabilities, HostPlane owns deterministic host/filesystem/process/Git/deployment reality, and WorkerPlane owns only delegated Codex lifecycle and cognition. No plane gains another plane's authority implicitly.
+3. **Upstream primitives stay upstream.** Inspect the pinned App Server contract first. When it exposes a primitive, preserve its IDs, lifecycle, state, errors, and notifications instead of creating a competing Connect state machine or source of truth.
+4. **Every durable fact has one owner.** Components may adapt, validate, bound, or project another component's state, but they must not duplicate authority objects or mirror authoritative constants into a second owner.
+5. **Workers own bounded delegated scope, not the overall task.** ChatGPT remains responsible for decomposition, integration, consequential host actions, and final verification. Parallel work must be non-overlapping; do not duplicate an active worker's investigation merely to create concurrency.
+6. **Conversation or thread context is not runtime truth.** Revalidate mutable filesystem, Git, deployment, external, and live service state at the owning layer. Source changed, committed, pushed, prepared, deployed, live, plugin-discovered, and CI-green are distinct states and must not be inferred from one another.
+7. **Reuse context deliberately.** Treat threads as cache-bounded workstreams: reuse a compatible thread when its context is useful, start fresh when settings change or independence matters, and do not spend compute recreating context already owned by an active compatible workstream.
+8. **Long work is retained and event-driven.** Caller timeout, transport failure, or frontend detachment does not establish worker failure. Recover from retained handles and authoritative reads; do not poll App Server for progress. During long ChatGPT operations, human-visible progress is the liveness signal—SSE keepalives are not conversation progress.
+9. **The network/security boundary stays outside the backend.** Codex Connect remains loopback-only; host ingress owns the public HTTPS route and OAuth enforcement. Codex CLI/App Server, Codex Connect, and host ingress retain independent lifecycles and state ownership.
+10. **Pre-release changes are clean breaks.** There is no compatibility constituency yet: when semantics change, rename them coherently across code, schemas, tests, and docs. Do not add aliases, fallback readers, migration shims, dual paths, or product versioning without a present requirement.
+
 ## Three planes
 
 ```text
@@ -36,7 +51,7 @@ Keep implementation ownership as narrow as the plane model:
 
 Do not duplicate an authority object or mirror App Server-owned constants into the composition root. Runtime status should read invariants from the component that owns them.
 
-### Upstream-first invariant
+### Upstream-first ownership
 
 For every new capability, inspect the pinned App Server contract before designing a Connect abstraction. If App Server already exposes the primitive, route through it and preserve its IDs, lifecycle, state, errors, and notifications. Connect may normalize or combine those semantics for ChatGPT, but it must not create a second authoritative model.
 
