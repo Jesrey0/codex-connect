@@ -166,7 +166,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIsInstance(status["commands"], list)
         self.assertIsInstance(status["workers"], list)
         self.assertEqual(status["defaultCwd"], str(self.workspace))
-        self.assertEqual(status["codexRelease"], "0.155.1")
+        self.assertEqual(status["codexRelease"], CONTRACT["codexPin"])
         with urllib.request.urlopen(self.url + "/runtime") as response:
             runtime = json.load(response)
         self.assertTrue(runtime["ready"])
