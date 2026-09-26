@@ -42,8 +42,6 @@ class OperatorProtocolTests(unittest.TestCase):
         cls.project = cls.workspace / "project"
         cls.project.mkdir()
         cls.coverage_path = cls.workspace / "fake-app-server-coverage.jsonl"
-        cls.config_path = cls.workspace / "fake-app-server-config.json"
-        cls.config_path.write_text("{}")
         (cls.project / "local.txt").write_text("project-local\n")
         (cls.project / "pixel.png").write_bytes(base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
@@ -59,7 +57,6 @@ class OperatorProtocolTests(unittest.TestCase):
         ], stdout=cls.log, stderr=cls.log, env={
             **os.environ,
             "CODEX_CONNECT_FAKE_COVERAGE_FILE": str(cls.coverage_path),
-            "CODEX_CONNECT_FAKE_CONFIG_FILE": str(cls.config_path),
         })
         try:
             for _ in range(200):
@@ -91,7 +88,17 @@ class OperatorProtocolTests(unittest.TestCase):
         cls.outside.cleanup()
 
     def start(self, scenario, **arguments):
+        arguments.setdefault("model", "fixture-model-1")
+        if "threadId" not in arguments and "forkFromThreadId" not in arguments:
+            arguments.setdefault("cwd", str(self.workspace))
         return self.client.call("codex.start", {"mode": "work", "task": scenario, **arguments})
+
+    def codex_start(self, arguments, **options):
+        arguments = dict(arguments)
+        arguments.setdefault("model", "fixture-model-1")
+        if "threadId" not in arguments and "forkFromThreadId" not in arguments:
+            arguments.setdefault("cwd", str(self.workspace))
+        return self.client.call("codex.start", arguments, **options)
 
     def wait(self, work, **arguments):
         return self.client.call("codex.wait", {
@@ -133,15 +140,15 @@ class OperatorProtocolTests(unittest.TestCase):
             time.sleep(0.025)
         self.fail(f"{method} did not reach {count} calls")
 
-    def wait_for_worker_event(self, predicate, timeout=2.0):
+    def wait_for_worker(self, predicate, timeout=2.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
             status = self.client.call("status")
-            for event in status.get("workerEvents", []):
-                if predicate(event):
-                    return event
+            for worker in status["workers"]:
+                if predicate(worker):
+                    return worker
             time.sleep(0.025)
-        self.fail("worker event was not delivered on the host plane")
+        self.fail("worker was not registered in status")
 
     def test_catalog_status_runtime_and_origin_boundary(self):
         self.assertEqual(len(self.client.catalog), 13)
@@ -151,22 +158,15 @@ class OperatorProtocolTests(unittest.TestCase):
             self.assertEqual(tool["securitySchemes"], expected_security)
             self.assertNotIn("securitySchemes", tool.get("_meta", {}))
         status = self.client.call("status")
-        worker_events = status.pop("workerEvents", [])
-        for event in worker_events:
-            self.assertIn(
-                event["kind"],
-                {"workerStarted", "turnTerminal", "actionRequired", "historyLost"},
-            )
         self.assertTrue(status["ready"])
-        self.assertEqual(set(status), {"ready", "cwd", "buildId", "commands", "workers", "codex"})
+        self.assertEqual(
+            set(status),
+            {"ready", "defaultCwd", "buildId", "codexRelease", "commands", "workers"},
+        )
         self.assertIsInstance(status["commands"], list)
         self.assertIsInstance(status["workers"], list)
-        self.assertEqual(status["cwd"], str(self.workspace))
-        self.assertEqual(set(status["codex"]), {"release", "config", "configError"})
-        self.assertEqual(status["codex"]["config"], {
-            "model": None, "reasoningEffort": None, "serviceTier": None,
-        })
-        self.assertIsNone(status["codex"]["configError"])
+        self.assertEqual(status["defaultCwd"], str(self.workspace))
+        self.assertEqual(status["codexRelease"], "0.155.1")
         with urllib.request.urlopen(self.url + "/runtime") as response:
             runtime = json.load(response)
         self.assertTrue(runtime["ready"])
@@ -191,9 +191,9 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIsInstance(observer["cursor"], int)
         projection = observer["projection"]
         self.assertEqual(set(projection), {
-            "cwd", "usage", "usageError", "usageUpdatedAtMs", "workers", "pendingActions", "notices",
+            "defaultCwd", "usage", "usageError", "usageUpdatedAtMs", "workers", "pendingActions", "notices",
         })
-        self.assertEqual(projection["cwd"], str(self.workspace))
+        self.assertEqual(projection["defaultCwd"], str(self.workspace))
         self.assertIsNone(projection["usageError"])
         if projection["usage"] is None:
             with urllib.request.urlopen(
@@ -204,27 +204,6 @@ class OperatorProtocolTests(unittest.TestCase):
             projection = observer["projection"]
         self.assertIn("rateLimits", projection["usage"])
         self.assertIsInstance(projection["usageUpdatedAtMs"], int)
-
-    def test_status_reads_running_app_server_configuration_each_time(self):
-        try:
-            self.config_path.write_text(json.dumps({
-                "model": "fixture-model-2",
-                "model_reasoning_effort": "high",
-                "service_tier": "default",
-            }))
-            configured = self.client.call("status")["codex"]
-            self.assertEqual(configured["config"], {
-                "model": "fixture-model-2",
-                "reasoningEffort": "high",
-                "serviceTier": "default",
-            })
-            self.assertIsNone(configured["configError"])
-        finally:
-            self.config_path.write_text("{}")
-        upstream = self.client.call("status")["codex"]
-        self.assertEqual(upstream["config"], {
-            "model": None, "reasoningEffort": None, "serviceTier": None,
-        })
 
     def test_trailing_slash_tools_list_preserves_root_security_schemes(self):
         tools = self.client.request("tools/list", path="/mcp/")["tools"]
@@ -263,56 +242,31 @@ class OperatorProtocolTests(unittest.TestCase):
                 finally:
                     connection.close()
 
-    def test_cancelled_codex_start_is_recovered_as_worker_started_event(self):
-        # Drain unrelated replayable start receipts from earlier scenarios so this test binds
-        # to the handle created by the deliberately abandoned caller below.
-        self.client.call("status")
+    def test_cancelled_codex_start_is_recovered_from_nondestructive_status(self):
         caller = McpClient(self.url)
         caller.request_timeout = 0.1
         with self.assertRaises((TimeoutError, socket.timeout)):
             caller.call("codex.start", {
-                "mode":"work",
-                "task":"delayed_start_response",
+                "mode": "work", "task": "delayed_start_response",
+                "cwd": str(self.project), "model": "fixture-model-1",
             })
-
-        event = self.wait_for_worker_event(
-            lambda event: event.get("kind") == "workerStarted" and event.get("mode") == "work",
-            timeout=2.0,
+        recovered = self.wait_for_worker(
+            lambda worker: worker.get("prompt") == "delayed_start_response", timeout=2.0,
         )
-        self.assertTrue(event["threadId"])
-        self.assertTrue(event["turnId"])
-        recovered_status = self.client.call("status")
-        replay = recovered_status.get("workerEvents", [])
-        self.assertTrue(any(
-            candidate.get("kind") == "workerStarted"
-            and candidate.get("threadId") == event["threadId"]
-            and candidate.get("turnId") == event["turnId"]
-            for candidate in replay
-        ))
-        recovered = next(
-            worker for worker in recovered_status["workers"]
-            if worker["threadId"] == event["threadId"] and worker["turnId"] == event["turnId"]
-        )
+        self.assertEqual(recovered["cwd"], str(self.project))
         self.assertEqual(recovered["mode"], "work")
-        self.assertIn(recovered["status"], {"inProgress", "completed"})
-        self.assertEqual(recovered["prompt"], "delayed_start_response")
+        for _ in range(2):
+            same = next(worker for worker in self.client.call("status")["workers"]
+                        if worker["turnId"] == recovered["turnId"])
+            self.assertEqual(same, recovered)
         result = self.client.call("codex.wait", {
-            "threadId":event["threadId"],
-            "turnId":event["turnId"],
+            "threadId": recovered["threadId"], "turnId": recovered["turnId"],
         })
         self.assertEqual(result["state"], "terminal")
-        joined_status = self.client.call("status")
-        self.assertFalse(any(
-            candidate.get("kind") == "workerStarted"
-            and candidate.get("threadId") == event["threadId"]
-            and candidate.get("turnId") == event["turnId"]
-            for candidate in joined_status.get("workerEvents", [])
-        ))
-        terminal = next(
-            worker for worker in joined_status["workers"]
-            if worker["threadId"] == event["threadId"] and worker["turnId"] == event["turnId"]
-        )
+        terminal = next(worker for worker in self.client.call("status")["workers"]
+                        if worker["turnId"] == recovered["turnId"])
         self.assertEqual(terminal["status"], "completed")
+        self.assertEqual(terminal["cwd"], str(self.project))
 
     def test_observer_wait_is_event_driven_and_projects_live_worker_state(self):
         with urllib.request.urlopen(self.url + "/observe") as response:
@@ -488,7 +442,8 @@ class OperatorProtocolTests(unittest.TestCase):
             "command": ["fixture-stream"],
         })
         self.assertIn("processId", started)
-        self.assertTrue(set(started) <= {"processId", "workerEvents"})
+        self.assertEqual(set(started), {"processId", "cwd"})
+        self.assertEqual(started["cwd"], str(self.workspace))
         recovered = next(
             command for command in self.client.call("status")["commands"]
             if command["processId"] == started["processId"]
@@ -995,75 +950,29 @@ class OperatorProtocolTests(unittest.TestCase):
         )
         self.assertEqual(len(self.method_params("thread/unsubscribe")), unsubscribes_before + 1)
 
-    def test_host_plane_delivers_terminal_and_action_worker_events_once(self):
-        self.client.call("status")  # discard events from earlier tests
-        unsubscribes_before = len(self.method_params("thread/unsubscribe"))
-        complete_work = self.start("complete")
-        terminal = self.wait_for_worker_event(
-            lambda event: event.get("kind") == "turnTerminal"
-            and event.get("turnId") == complete_work["turnId"]
-        )
-        self.assertEqual(terminal["mode"], "work")
-        self.assertEqual(terminal["status"], "completed")
-        self.assertFalse(any(
-            event.get("kind") == "turnTerminal"
-            and event.get("turnId") == complete_work["turnId"]
-            for event in self.client.call("status").get("workerEvents", [])
-        ))
-        unsubscribes = self.wait_for_method_count(
-            "thread/unsubscribe", unsubscribes_before + 1,
-        )
-        self.assertEqual(
-            unsubscribes[unsubscribes_before],
-            {"threadId": complete_work["threadId"]},
-        )
-        self.assertEqual(self.wait(complete_work)["state"], "terminal")
-        time.sleep(0.05)
-        self.assertEqual(len(self.method_params("thread/unsubscribe")), unsubscribes_before + 1)
+    def test_status_workers_and_pending_actions_are_nondestructive(self):
+        work = self.start("complete", cwd=str(self.project))
+        terminal = self.wait_for_worker(lambda worker: worker["turnId"] == work["turnId"]
+                                        and worker["status"] == "completed")
+        self.assertEqual(terminal["cwd"], str(self.project))
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        self.assertEqual(next(worker for worker in self.client.call("status")["workers"]
+                              if worker["turnId"] == work["turnId"])["cwd"], str(self.project))
 
-        self.client.call("status")
-        approval_work = self.start("approval")
-        action_event = self.wait_for_worker_event(
-            lambda event: event.get("kind") == "actionRequired"
-            and event.get("turnId") == approval_work["turnId"]
+        approval = self.start("approval")
+        pending = self.wait(approval)["pendingActions"][0]
+        self.assertEqual(pending["type"], "approval")
+        approval_worker = next(
+            worker
+            for worker in self.client.call("status")["workers"]
+            if worker["turnId"] == approval["turnId"]
         )
-        self.assertEqual(action_event["actionKind"], "approval")
-        self.assertTrue(action_event["blocking"])
-        self.assertFalse(any(
-            event.get("requestId") == action_event["requestId"]
-            for event in self.client.call("status").get("workerEvents", [])
-        ))
-        pending = self.wait(approval_work)["pendingActions"][0]
-        self.assertEqual(pending["requestId"], action_event["requestId"])
+        self.assertEqual(approval_worker["cwd"], str(self.workspace))
         self.client.call("codex.act", {
-            "action": "respondApproval",
-            "requestId": pending["requestId"],
+            "action": "respondApproval", "requestId": pending["requestId"],
             "decision": "approve",
         })
-        self.assertEqual(self.wait(approval_work)["state"], "terminal")
-
-    def test_explicit_wait_acknowledges_passive_worker_events(self):
-        self.client.call("status")
-        complete_work = self.start("complete")
-        self.assertEqual(self.wait(complete_work)["state"], "terminal")
-        time.sleep(0.05)
-        self.assertFalse(any(
-            event.get("turnId") == complete_work["turnId"]
-            for event in self.client.call("status").get("workerEvents", [])
-        ))
-
-        approval_work = self.start("approval")
-        pending = self.wait(approval_work)["pendingActions"][0]
-        self.assertFalse(any(
-            event.get("requestId") == pending["requestId"]
-            for event in self.client.call("status").get("workerEvents", [])
-        ))
-        self.client.call("codex.act", {
-            "action": "respondApproval",
-            "requestId": pending["requestId"],
-            "decision": "approve",
-        })
-        self.assertEqual(self.wait(approval_work)["state"], "terminal")
+        self.assertEqual(self.wait(approval)["state"], "terminal")
 
     def test_authoritative_terminal_reconciliation_releases_thread_subscription(self):
         unsubscribes_before = len(self.method_params("thread/unsubscribe"))
@@ -1096,7 +1005,7 @@ class OperatorProtocolTests(unittest.TestCase):
 
     def test_start_failure_after_thread_load_releases_subscription(self):
         unsubscribes_before = len(self.method_params("thread/unsubscribe"))
-        self.client.call("codex.start", {
+        self.codex_start({
             "mode": "work",
             "task": "start_error",
             "access": "full",
@@ -1164,7 +1073,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.method_params("thread/unsubscribe")), unsubscribes_before + 1)
 
     def test_observer_hides_unannotated_review_auxiliary_turn(self):
-        review = self.client.call("codex.start", {
+        review = self.codex_start({
             "mode": "review",
             "target": {"type": "uncommittedChanges"},
             "model": "gpt-6-astra",
@@ -1427,10 +1336,6 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(notification_result["state"], "terminal")
         self.assertEqual(notification_result["wakeReason"], "terminal")
         self.assertTrue(self.inspect_turn(notification)["historyLost"])
-        self.assertTrue(any(
-            event.get("kind") == "historyLost"
-            for event in self.client.call("status").get("workerEvents", [])
-        ))
 
         request = self.start("oversized_question")
         request_result = self.wait(request)
@@ -1513,7 +1418,7 @@ class OperatorProtocolTests(unittest.TestCase):
         source_result = self.wait(source)
         self.assertEqual(source_result["state"],"terminal")
         self.assertEqual(source_result["wakeReason"],"terminal")
-        review = self.client.call("codex.start",{
+        review = self.codex_start({
             "mode":"review", "threadId": source["threadId"], "target":{"type":"uncommittedChanges"},
         })
         self.assertNotIn("createdThread", review)
@@ -1736,13 +1641,18 @@ class OperatorProtocolTests(unittest.TestCase):
         resumes_before_expired = len(self.method_params("thread/resume"))
         self.client.call(
             "codex.start",
-            {"mode": "work", "task": "complete", "threadId": expired["threadId"]},
+            {
+                "mode": "work",
+                "task": "complete",
+                "threadId": expired["threadId"],
+                "model": expired["model"],
+            },
             error=True,
         )
         self.assertEqual(len(self.method_params("thread/resume")), resumes_before_expired)
 
         forks_before = len(self.method_params("thread/fork"))
-        forked = self.client.call("codex.start", {
+        forked = self.codex_start({
             "mode": "work",
             "task": "complete",
             "forkFromThreadId": expired["threadId"],
@@ -1761,7 +1671,7 @@ class OperatorProtocolTests(unittest.TestCase):
 
         before_threads = len(self.method_params("thread/start"))
         before_reviews = len(self.method_params("review/start"))
-        review = self.client.call("codex.start", {
+        review = self.codex_start({
             "mode": "review",
             "model": "gpt-6-astra",
             "target": {"type": "uncommittedChanges"},
@@ -1775,17 +1685,14 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(set(review_start), {"threadId", "target", "delivery"})
 
         before_threads = len(self.method_params("thread/start"))
-        model_less = self.client.call("codex.start", {
-            "mode": "review",
+        self.client.call("codex.start", {
+            "mode": "review", "cwd": str(self.workspace),
             "target": {"type": "uncommittedChanges"},
-        })
-        self.assertEqual(self.wait(model_less)["state"], "terminal")
-        model_less_start = self.method_params("thread/start")[before_threads]
-        self.assertNotIn("model", model_less_start)
-        self.assertEqual(model_less_start["sandbox"], "read-only")
+        }, error=True, validate_input=False)
+        self.assertEqual(len(self.method_params("thread/start")), before_threads)
 
         resumes_before_rejection = len(self.method_params("thread/resume"))
-        self.client.call("codex.start", {
+        self.codex_start({
             "mode": "review",
             "threadId": source["threadId"],
             "model": "gpt-6-astra",
@@ -1793,10 +1700,91 @@ class OperatorProtocolTests(unittest.TestCase):
         }, error=True, validate_input=False)
         self.assertEqual(len(self.method_params("thread/resume")), resumes_before_rejection)
 
+    def test_start_requires_explicit_cwd_and_model_without_mutating_existing_threads(self):
+        before_threads = len(self.method_params("thread/start"))
+        for arguments in [
+            {"mode": "work", "task": "complete", "model": "fixture-model-1"},
+            {"mode": "work", "task": "complete", "cwd": str(self.project)},
+            {"mode": "review", "target": {"type": "uncommittedChanges"}, "model": "fixture-model-1"},
+            {"mode": "review", "target": {"type": "uncommittedChanges"}, "cwd": str(self.project)},
+        ]:
+            self.client.call("codex.start", arguments, error=True, validate_input=False)
+        self.assertEqual(len(self.method_params("thread/start")), before_threads)
+
+        source = self.start("complete", cwd=str(self.project))
+        self.assertEqual(self.wait(source)["state"], "terminal")
+        self.assertEqual(source["cwd"], str(self.project))
+        before_resume = len(self.method_params("thread/resume"))
+        before_fork = len(self.method_params("thread/fork"))
+        for arguments in [
+            {"mode": "work", "task": "complete", "threadId": source["threadId"]},
+            {"mode": "work", "task": "complete", "forkFromThreadId": source["threadId"]},
+            {"mode": "review", "threadId": source["threadId"], "target": {"type": "uncommittedChanges"}},
+        ]:
+            self.client.call("codex.start", arguments, error=True, validate_input=False)
+        for arguments in [
+            {"mode": "work", "task": "complete", "threadId": source["threadId"],
+             "model": "fixture-model-2"},
+            {"mode": "work", "task": "complete", "forkFromThreadId": source["threadId"],
+             "model": "fixture-model-2"},
+            {"mode": "review", "threadId": source["threadId"],
+             "target": {"type": "uncommittedChanges"}, "model": "fixture-model-2"},
+        ]:
+            self.client.call("codex.start", arguments, error=True, validate_input=False)
+        self.assertEqual(len(self.method_params("thread/resume")), before_resume)
+        self.assertEqual(len(self.method_params("thread/fork")), before_fork)
+        resumed = self.start("complete", threadId=source["threadId"])
+        self.assertEqual(self.wait(resumed)["state"], "terminal")
+        self.assertEqual(resumed["cwd"], str(self.project))
+        self.assertEqual(resumed["model"], source["model"])
+        forked = self.codex_start({"mode": "work", "task": "complete",
+                                   "forkFromThreadId": source["threadId"]})
+        self.assertEqual(self.wait(forked)["state"], "terminal")
+        self.assertEqual(forked["cwd"], str(self.project))
+        self.assertEqual(forked["model"], source["model"])
+
+    def test_concurrent_projects_and_cwd_fair_retention(self):
+        first = self.start("idle", cwd=str(self.workspace))
+        second = self.start("idle", cwd=str(self.project))
+        status = self.client.call("status")
+        self.assertEqual(status["defaultCwd"], str(self.workspace))
+        active = {worker["turnId"]: worker for worker in status["workers"]}
+        self.assertEqual(active[first["turnId"]]["cwd"], str(self.workspace))
+        self.assertEqual(active[second["turnId"]]["cwd"], str(self.project))
+        for work in (first, second):
+            self.client.call("codex.act", {
+                "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
+            })
+            self.assertEqual(self.wait(work)["state"], "terminal")
+
+        sentinel = self.start("complete", cwd=str(self.project))
+        self.assertEqual(self.wait(sentinel)["state"], "terminal")
+        for _ in range(34):
+            work = self.start("complete", cwd=str(self.workspace))
+            self.assertEqual(self.wait(work)["state"], "terminal")
+        retained = self.client.call("status")["workers"]
+        self.assertTrue(any(worker["turnId"] == sentinel["turnId"]
+                            and worker["cwd"] == str(self.project) for worker in retained))
+        self.assertLessEqual(sum(worker["status"] != "inProgress" for worker in retained), 32)
+
+        command = self.client.call("command.start", {
+            "command": ["fixture-exit"], "cwd": str(self.project),
+        })
+        self.client.call("command.read", {"processId": command["processId"], "timeoutMs": 1000})
+        for _ in range(34):
+            started = self.client.call("command.start", {
+                "command": ["fixture-exit"], "cwd": str(self.workspace),
+            })
+            self.client.call("command.read", {"processId": started["processId"], "timeoutMs": 1000})
+        commands = self.client.call("status")["commands"]
+        self.assertTrue(any(row["processId"] == command["processId"]
+                            and row["cwd"] == str(self.project) for row in commands))
+        self.assertLessEqual(len(commands), 32)
+
     def test_wait_tracks_review_turn_before_thread_history_catches_up(self):
         source = self.start("complete")
         self.assertEqual(self.wait(source)["state"], "terminal")
-        review = self.client.call("codex.start", {
+        review = self.codex_start({
             "mode": "review", "threadId": source["threadId"],
             "target": {"type": "custom", "instructions": "delayed_visibility"},
         })
@@ -1832,12 +1820,12 @@ class OperatorProtocolTests(unittest.TestCase):
         })
         self.assertEqual(self.wait(resumed)["state"], "terminal")
 
-        review = self.client.call("codex.start", {
+        review = self.codex_start({
             "mode": "review", "threadId": source["threadId"], "target": {"type": "uncommittedChanges"},
         })
         self.assertEqual(self.wait(review)["state"], "terminal")
 
-        forked = self.client.call("codex.start", {
+        forked = self.codex_start({
             "mode": "work", "task": "complete", "forkFromThreadId": source["threadId"],
         })
         self.assertEqual(self.wait(forked)["state"], "terminal")
@@ -1918,7 +1906,7 @@ class OperatorProtocolTests(unittest.TestCase):
     def test_z_disconnect_exits_backend_for_service_recovery(self):
         self.start("question")
         persistent = self.client.call("command.start", {"command": ["fixture-quiet"]})
-        self.assertEqual(set(persistent) - {"workerEvents"}, {"processId"})
+        self.assertEqual(set(persistent), {"processId", "cwd"})
         try:
             self.client.call("command.exec",{"command":["disconnect"]},error=True)
         except (urllib.error.URLError, ConnectionError):

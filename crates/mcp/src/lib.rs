@@ -1,7 +1,7 @@
 //! ChatGPT-native MCP surface over Codex App Server and the operator host.
 
 mod catalog;
-use catalog::{OAUTH_SCOPE, host_plane_reports_worker_events, tool_catalog};
+use catalog::{OAUTH_SCOPE, tool_catalog};
 
 use axum::body::{Body, HttpBody, to_bytes};
 use axum::extract::{Path, State};
@@ -70,15 +70,6 @@ pub struct RuntimeIdentity {
     pub codex_binary: String,
     pub codex_home: String,
     pub codex_home_source: String,
-}
-
-fn attach_worker_events(value: &mut Value, events: Vec<Value>) {
-    if events.is_empty() {
-        return;
-    }
-    if let Value::Object(object) = value {
-        object.insert("workerEvents".into(), Value::Array(events));
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
@@ -482,51 +473,20 @@ struct McpHandler {
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexConfigStatus {
-    pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub service_tier: Option<String>,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct McpCodexStatus {
-    pub release: String,
-    pub config: Option<CodexConfigStatus>,
-    pub config_error: Option<String>,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct McpStatus {
     pub ready: bool,
     pub build_id: String,
-    pub cwd: String,
-    pub codex: McpCodexStatus,
+    pub default_cwd: String,
+    pub codex_release: String,
 }
 
 impl McpStatus {
-    async fn read(relay: &Relay, runtime: &RuntimeIdentity) -> Self {
-        let (config, config_error) = match relay.codex_config().await {
-            Ok(config) => (
-                Some(CodexConfigStatus {
-                    model: config.model,
-                    reasoning_effort: config.model_reasoning_effort,
-                    service_tier: config.service_tier,
-                }),
-                None,
-            ),
-            Err(error) => (None, Some(error.to_string())),
-        };
+    fn read(relay: &Relay, runtime: &RuntimeIdentity) -> Self {
         Self {
             ready: relay.worker_available(),
             build_id: runtime.build_id.clone(),
-            cwd: relay.default_cwd(),
-            codex: McpCodexStatus {
-                release: codex_connect_relay::CODEX_RELEASE.trim().to_string(),
-                config,
-                config_error,
-            },
+            default_cwd: relay.default_cwd(),
+            codex_release: codex_connect_relay::CODEX_RELEASE.trim().to_string(),
         }
     }
 }
@@ -628,7 +588,7 @@ impl ServerHandler for McpHandler {
             };
         }
         if name == "apply_patch" {
-            return apply_patch_response(&self.relay, &self.host, arguments).await;
+            return apply_patch_response(&self.host, arguments).await;
         }
         let operation_cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelOnDrop(operation_cancelled.clone());
@@ -656,9 +616,6 @@ impl ServerHandler for McpHandler {
             }
             Ok(Ok(mut value)) => {
                 project_tool_output(name, &mut value);
-                if host_plane_reports_worker_events(name) {
-                    attach_worker_events(&mut value, self.relay.take_worker_events().await);
-                }
                 let summary = summary_for(name, &value);
                 let mut result = CallToolResult::success(vec![ContentBlock::text(summary)]);
                 result.structured_content = Some(value);
@@ -914,7 +871,7 @@ async fn dispatch(
     match name {
         "status" => {
             ensure_empty(arguments)?;
-            let mut value = serde_json::to_value(McpStatus::read(relay, runtime).await)?;
+            let mut value = serde_json::to_value(McpStatus::read(relay, runtime))?;
             value["commands"] = Value::Array(relay.command_handles().await);
             value["workers"] = Value::Array(relay.worker_handles().await);
             Ok(value)
@@ -1357,7 +1314,7 @@ fn project_tool_output(name: &str, value: &mut Value) {
                 object.remove("stderrBytes");
             }
         }
-        "command.start" => retain_object_keys(value, &["processId"]),
+        "command.start" => retain_object_keys(value, &["processId", "cwd"]),
         "codex.start" => {
             if let Some(object) = value.as_object_mut() {
                 object.remove("createdThread");
@@ -1657,7 +1614,7 @@ fn project_usage(result: &mut Value) {
 }
 
 fn summary_for(name: &str, value: &Value) -> String {
-    let mut summary = match name {
+    match name {
         "command.exec" => {
             let exit_code = value.get("exitCode").and_then(Value::as_i64).unwrap_or(-1);
             let duration_ms = value.get("durationMs").and_then(Value::as_u64).unwrap_or(0);
@@ -1731,51 +1688,10 @@ fn summary_for(name: &str, value: &Value) -> String {
         "codex.inspect" => "Codex activity inspected.".into(),
         "inspect" => "Inspection completed.".into(),
         _ => "Operation completed.".into(),
-    };
-    let worker_events = value
-        .get("workerEvents")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    if !worker_events.is_empty() {
-        summary.push_str(" Worker events:");
-        for event in worker_events {
-            let kind = event
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            match kind {
-                "workerStarted" | "turnTerminal" => {
-                    summary.push_str(&format!(
-                        " {kind} {}/{}{};",
-                        event.get("threadId").and_then(Value::as_str).unwrap_or("?"),
-                        event.get("turnId").and_then(Value::as_str).unwrap_or("?"),
-                        event
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .map(|status| format!(":{status}"))
-                            .unwrap_or_default(),
-                    ));
-                }
-                "actionRequired" => summary.push_str(&format!(
-                    " actionRequired {}/{} request={};",
-                    event.get("threadId").and_then(Value::as_str).unwrap_or("?"),
-                    event.get("turnId").and_then(Value::as_str).unwrap_or("?"),
-                    event
-                        .get("requestId")
-                        .map(Value::to_string)
-                        .unwrap_or_else(|| "?".into()),
-                )),
-                "historyLost" => summary.push_str(" historyLost;"),
-                _ => summary.push_str(&format!(" {kind};")),
-            }
-        }
     }
-    summary
 }
 
 async fn apply_patch_response(
-    relay: &Relay,
     host: &Host,
     arguments: JsonObject,
 ) -> Result<rmcp::model::CallToolResponse, McpError> {
@@ -1811,8 +1727,7 @@ async fn apply_patch_response(
     .await;
     match result {
         Ok(applied) => {
-            let mut value = json!({"applied":applied});
-            attach_worker_events(&mut value, relay.take_worker_events().await);
+            let value = json!({"applied":applied});
             let mut response = CallToolResult::success(vec![ContentBlock::text("Patch applied.")]);
             response.structured_content = Some(value);
             Ok(response.into())
@@ -1843,9 +1758,8 @@ async fn image_response(
     .await;
     match result {
         Ok(image) => {
-            let mut metadata =
+            let metadata =
                 json!({"path":image.path,"mimeType":image.mime_type,"detail":image.detail});
-            attach_worker_events(&mut metadata, relay.take_worker_events().await);
             let mut image_meta = MetaObject::new();
             image_meta
                 .0

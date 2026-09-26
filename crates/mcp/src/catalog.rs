@@ -25,7 +25,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "status",
                 "Read Operator Status",
-                "Read backend readiness, live build identity, navigation cwd, App Server configuration for that cwd, and retained command/worker handles for recovery. Null config values leave selection to App Server when a workstream starts; another cwd may resolve differently.",
+                "Read backend-global readiness, build identity, default cwd, pinned Codex release, and retained command/worker handles for recovery after caller interruption. Reading status does not consume recovery state.",
                 true,
                 false,
                 false,
@@ -261,14 +261,7 @@ fn tool(metadata: ToolMetadata, input: Value, output: Option<Value>) -> Tool {
     )
     .with_meta(tool_invocation_meta(metadata.name));
     match output {
-        Some(schema) => {
-            let schema = if host_plane_reports_worker_events(metadata.name) {
-                with_worker_events(schema)
-            } else {
-                schema
-            };
-            tool.with_raw_output_schema(json_schema(schema))
-        }
+        Some(schema) => tool.with_raw_output_schema(json_schema(schema)),
         None => tool,
     }
 }
@@ -305,83 +298,6 @@ fn tool_invocation_meta(name: &str) -> MetaObject {
     meta
 }
 
-pub(super) fn host_plane_reports_worker_events(name: &str) -> bool {
-    matches!(
-        name,
-        "status"
-            | "inspect"
-            | "apply_patch"
-            | "command.exec"
-            | "command.start"
-            | "command.read"
-            | "command.control"
-            | "view_image"
-    )
-}
-
-fn with_worker_events(mut schema: Value) -> Value {
-    fn add(schema: &mut Value) {
-        if schema.get("type").and_then(Value::as_str) == Some("object")
-            && let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut)
-        {
-            properties.insert("workerEvents".into(), worker_events_schema());
-        }
-        if let Some(one_of) = schema.get_mut("oneOf").and_then(Value::as_array_mut) {
-            for branch in one_of {
-                add(branch);
-            }
-        }
-    }
-    add(&mut schema);
-    schema
-}
-
-fn worker_events_schema() -> Value {
-    let started = object_schema(
-        json!({
-            "kind":{"const":"workerStarted"},
-            "threadId":{"type":"string"},
-            "turnId":{"type":"string"},
-            "mode":{"enum":["work","review"]}
-        }),
-        &["kind", "threadId", "turnId", "mode"],
-    );
-    let terminal = object_schema(
-        json!({
-            "kind":{"const":"turnTerminal"},
-            "threadId":{"type":"string"},
-            "turnId":{"type":"string"},
-            "mode":{"enum":["work","review"]},
-            "status":{"enum":["completed","failed","interrupted"]}
-        }),
-        &["kind", "threadId", "turnId", "mode", "status"],
-    );
-    let action = object_schema(
-        json!({
-            "kind":{"const":"actionRequired"},
-            "threadId":{"type":"string"},
-            "turnId":{"type":["string","null"]},
-            "actionKind":{"enum":["approval","permissions","elicitation","userInput"]},
-            "requestId":rpc_id_schema(),
-            "blocking":{"type":"boolean"}
-        }),
-        &[
-            "kind",
-            "threadId",
-            "turnId",
-            "actionKind",
-            "requestId",
-            "blocking",
-        ],
-    );
-    let lost = object_schema(json!({"kind":{"const":"historyLost"}}), &["kind"]);
-    json!({
-        "type":"array",
-        "maxItems":8,
-        "description":"Worker notifications on HostPlane calls. workerStarted is replayed until claimed while the worker remains in bounded retained state; other notifications are one-shot. actionRequired and turnTerminal are delivered ahead of start receipts. historyLost means notification history was evicted. These events are hints, not worker authority: use status.workers to recover retained handles, codex.inspect for non-blocking inspection, and codex.wait only at a synchronization boundary.",
-        "items":{"oneOf":[started,terminal,action,lost]}
-    })
-}
 fn json_schema(value: Value) -> Arc<JsonObject> {
     match value {
         Value::Object(v) => Arc::new(v),
@@ -476,16 +392,19 @@ fn status_schema() -> Value {
     object_schema(
         json!({
             "ready":{"type":"boolean"},
-            "cwd":{"type":"string"},
+            "defaultCwd":{"type":"string"},
             "buildId":{"type":"string"},
+            "codexRelease":{"type":"string","description":"Pinned Codex CLI/App Server release used by this backend."},
             "commands":{"type":"array","description":"Retained persistent-command handles. Use these to recover a command.start response lost by the caller.","items":object_schema(json!({
                 "processId":{"type":"string"},
+                "cwd":{"type":"string"},
                 "state":{"enum":["running","exited","failed"]},
                 "tty":{"type":"boolean"}
-            }), &["processId","state","tty"])},
+            }), &["processId","cwd","state","tty"])},
             "workers":{"type":"array","description":"Active workers followed by newest retained terminal workers. Use these handles to rehydrate after a caller/frontend interruption before starting replacement work.","items":object_schema(json!({
                 "threadId":{"type":"string"},
                 "turnId":{"type":"string"},
+                "cwd":{"type":"string"},
                 "status":{"enum":["inProgress","completed","failed","interrupted"]},
                 "mode":{"enum":["work","review"]},
                 "prompt":{"type":["string","null"]},
@@ -493,18 +412,16 @@ fn status_schema() -> Value {
                 "lastActivityAtMs":{"type":"integer","minimum":0},
                 "activityKind":{"type":"string"},
                 "activitySummary":{"type":["string","null"]}
-            }), &["threadId","turnId","status","mode","prompt","terminalAtMs","lastActivityAtMs","activityKind","activitySummary"])},
-            "codex":object_schema(json!({
-                "release":{"type":"string"},
-                "config":nullable(object_schema(json!({
-                    "model":{"type":["string","null"]},
-                    "reasoningEffort":{"type":["string","null"]},
-                    "serviceTier":{"type":["string","null"]},
-                }), &["model","reasoningEffort","serviceTier"])),
-                "configError":{"type":["string","null"],"description":"An App Server config/read failure; config is null and status remains usable for recovery."}
-            }), &["release","config","configError"])
+            }), &["threadId","turnId","cwd","status","mode","prompt","terminalAtMs","lastActivityAtMs","activityKind","activitySummary"])},
         }),
-        &["ready", "cwd", "buildId", "commands", "workers", "codex"],
+        &[
+            "ready",
+            "defaultCwd",
+            "buildId",
+            "codexRelease",
+            "commands",
+            "workers",
+        ],
     )
 }
 fn work_started_schema() -> Value {
@@ -512,11 +429,12 @@ fn work_started_schema() -> Value {
         json!({
             "threadId":{"type":"string"},
             "turnId":{"type":"string"},
+            "cwd":{"type":"string"},
             "cursor":{"type":"integer","minimum":0},
             "model":{"type":["string","null"],"description":"Effective thread model reported by App Server."},
             "effort":{"type":["string","null"],"description":"Effective thread reasoning effort when available."}
         }),
-        &["threadId", "turnId", "cursor", "model", "effort"],
+        &["threadId", "turnId", "cwd", "cursor", "model", "effort"],
     )
 }
 fn work_wait_output_schema() -> Value {
@@ -663,7 +581,10 @@ fn command_start_schema() -> Value {
     )
 }
 fn command_started_schema() -> Value {
-    object_schema(json!({"processId":{"type":"string"}}), &["processId"])
+    object_schema(
+        json!({"processId":{"type":"string"},"cwd":{"type":"string"}}),
+        &["processId", "cwd"],
+    )
 }
 fn command_read_schema() -> Value {
     object_schema(
@@ -767,30 +688,38 @@ fn review_target_schema() -> Value {
     ]})
 }
 fn codex_start_schema() -> Value {
-    let work = object_schema(
+    let mut work = object_schema(
         json!({
             "mode":{"const":"work","description":"Start or resume a work turn."},
             "task":{"type":"string","minLength":1,"description":"Self-contained objective or next delta for the workstream."},
-            "cwd":{"type":"string","description":"Host working directory for a new workstream. Omit to use the backend navigation cwd. Existing threads retain their cwd."},
-            "threadId":{"type":"string","description":"Existing work thread to resume. Resume retains its cwd, model, reasoning effort, and access and is subject to the server cache-age policy."},
+            "cwd":{"type":"string","minLength":1,"description":"Required for fresh work. Resume and fork inherit the canonical cwd and reject this field."},
+            "threadId":{"type":"string","description":"Existing work thread to resume. Resume retains its cwd, reasoning effort, and access and is subject to the server cache-age policy."},
             "forkFromThreadId":{"type":"string","description":"Source thread whose durable context should be copied into a new workstream instead of resuming it."},
             "lastTurnId":{"type":"string","description":"With forkFromThreadId, optional source turn to fork through, inclusive."},
-            "model":{"type":"string","description":"Model ID for a new workstream; discover IDs with codex.query. Existing threads retain their model."},
+            "model":{"type":"string","minLength":1,"description":"Required on every start. For resume or fork, must equal the canonical thread model; discover IDs with codex.query."},
             "effort":{"type":"string","description":"Reasoning effort for a new workstream; discover supported values with codex.query."},
             "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Access for a new workstream. workspace permits workspace writes and network access; full grants unrestricted host access."}
         }),
-        &["mode", "task"],
+        &["mode", "task", "model"],
     );
-    let review = object_schema(
+    work["allOf"] = json!([
+        {"if":{"not":{"anyOf":[{"required":["threadId"]},{"required":["forkFromThreadId"]}]}},"then":{"required":["cwd"]}},
+        {"if":{"anyOf":[{"required":["threadId"]},{"required":["forkFromThreadId"]}]},"then":{"not":{"required":["cwd"]}}}
+    ]);
+    let mut review = object_schema(
         json!({
             "mode":{"const":"review","description":"Run a review."},
-            "cwd":{"type":"string","description":"Host working directory for a review. Omit to use the backend navigation cwd. Existing threads retain their cwd."},
+            "cwd":{"type":"string","minLength":1,"description":"Required for a fresh review. Resume inherits the canonical cwd and rejects this field."},
             "threadId":{"type":"string","description":"Existing review thread to resume. Resume retains its cwd and model and is subject to the server cache-age policy."},
             "target":review_target_schema(),
-            "model":{"type":"string","description":"Model ID for a review; discover IDs with codex.query. Existing threads retain their model."}
+            "model":{"type":"string","minLength":1,"description":"Required on every review start. Resume must match the canonical thread model."}
         }),
-        &["mode", "target"],
+        &["mode", "target", "model"],
     );
+    review["allOf"] = json!([
+        {"if":{"not":{"required":["threadId"]}},"then":{"required":["cwd"]}},
+        {"if":{"required":["threadId"]},"then":{"not":{"required":["cwd"]}}}
+    ]);
     json!({"type":"object","oneOf":[work,review]})
 }
 fn codex_wait_schema() -> Value {
@@ -1319,23 +1248,24 @@ mod tests {
         let schema = status_schema();
         let properties = &schema["properties"];
         assert_eq!(properties["ready"]["type"], "boolean");
-        assert_eq!(properties["cwd"]["type"], "string");
+        assert_eq!(properties["defaultCwd"]["type"], "string");
         assert_eq!(properties["buildId"]["type"], "string");
+        assert_eq!(properties["codexRelease"]["type"], "string");
         assert_eq!(properties["commands"]["type"], "array");
         assert_eq!(properties["workers"]["type"], "array");
+        assert_eq!(
+            properties["workers"]["items"]["properties"]["cwd"]["type"],
+            "string"
+        );
+        assert_eq!(
+            properties["commands"]["items"]["properties"]["cwd"]["type"],
+            "string"
+        );
         assert_eq!(
             properties["workers"]["items"]["properties"]["status"]["enum"],
             json!(["inProgress", "completed", "failed", "interrupted"])
         );
-        assert_eq!(properties["codex"]["type"], "object");
-        assert_eq!(
-            properties["codex"]["properties"]["config"]["anyOf"][1]["type"],
-            "null"
-        );
-        assert_eq!(
-            properties["codex"]["properties"]["configError"]["type"],
-            json!(["string", "null"])
-        );
+        assert!(properties.get("codex").is_none());
         assert!(properties.get("operatorContract").is_none());
         assert!(properties.get("binarySha256").is_none());
         assert!(properties.get("appServer").is_none());
@@ -1382,7 +1312,8 @@ mod tests {
                 "threadId",
             ])
         );
-        assert_eq!(work["required"], json!(["mode", "task"]));
+        assert_eq!(work["required"], json!(["mode", "task", "model"]));
+        assert_eq!(work["allOf"][0]["then"]["required"], json!(["cwd"]));
         assert_eq!(work["additionalProperties"], false);
         assert_eq!(work_properties["access"]["default"], "workspace");
         assert_eq!(
@@ -1410,53 +1341,11 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["cwd", "mode", "model", "target", "threadId"])
         );
-        assert_eq!(review["required"], json!(["mode", "target"]));
+        assert_eq!(review["required"], json!(["mode", "target", "model"]));
+        assert_eq!(review["allOf"][0]["then"]["required"], json!(["cwd"]));
         assert_eq!(review["additionalProperties"], false);
         assert!(review_properties.get("access").is_none());
         assert!(review_properties.get("effort").is_none());
-    }
-
-    #[test]
-    fn host_plane_outputs_can_deliver_compact_worker_events() {
-        let tools = tool_catalog();
-        for name in [
-            "status",
-            "inspect",
-            "apply_patch",
-            "view_image",
-            "command.exec",
-            "command.start",
-            "command.read",
-            "command.control",
-        ] {
-            let tool = tools
-                .iter()
-                .find(|tool| tool.name.as_ref() == name)
-                .unwrap();
-            let output = tool.output_schema.as_ref().unwrap();
-            let encoded = serde_json::to_string(output).unwrap();
-            assert!(encoded.contains("workerEvents"), "{name}");
-            assert!(encoded.contains("turnTerminal"), "{name}");
-            assert!(encoded.contains("actionRequired"), "{name}");
-        }
-        for name in [
-            "codex.start",
-            "codex.wait",
-            "codex.inspect",
-            "codex.query",
-            "codex.act",
-        ] {
-            let tool = tools
-                .iter()
-                .find(|tool| tool.name.as_ref() == name)
-                .unwrap();
-            assert!(
-                !serde_json::to_string(tool.output_schema.as_ref().unwrap())
-                    .unwrap()
-                    .contains("workerEvents"),
-                "{name}"
-            );
-        }
     }
 
     #[test]

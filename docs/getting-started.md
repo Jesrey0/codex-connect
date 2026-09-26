@@ -59,7 +59,7 @@ backend resolves `codex` from its captured service PATH; App Server verifies the
 pinned release during startup.
 
 Codex Connect has no product configuration file. The managed backend binds
-`127.0.0.1:8767`, uses `~` as its navigation cwd, and resolves `codex` from the
+`127.0.0.1:8767`, uses `~` as its default cwd, and resolves `codex` from the
 service PATH captured by setup. Deployment state and cache use the standard XDG
 state/cache locations.
 
@@ -101,7 +101,7 @@ changes; a running service does not prove ChatGPT's cached tool snapshot is curr
 
 ## 5. Verify from ChatGPT
 
-Use ChatGPT with the connected plugin to call `status` and `inspect`; check live build identity and navigation cwd. Verify command, worker, and pending-action flows with disposable work as described in [Operations](operations.md). Repeat after an idle period and a controlled backend restart.
+Use ChatGPT with the connected plugin to call `status` and `inspect`; check live build identity and default cwd. Verify command, worker, and pending-action flows with disposable work as described in [Operations](operations.md). Repeat after an idle period and a controlled backend restart.
 
 ## Updates, restart, and removal
 

@@ -131,30 +131,6 @@ fn thread_management_matches_the_pinned_wire_shape() {
 }
 
 #[test]
-fn config_read_uses_the_upstream_effective_config() {
-    assert_eq!(
-        serde_json::to_value(ConfigRead {
-            cwd: "/workspace".into(),
-            include_layers: false,
-        })
-        .unwrap(),
-        json!({"cwd":"/workspace","includeLayers":false})
-    );
-    let response: ConfigReadResponse = serde_json::from_value(json!({
-        "config": {
-            "model": null,
-            "model_reasoning_effort": null,
-            "service_tier": null
-        },
-        "origins": {}
-    }))
-    .unwrap();
-    assert!(response.config.model.is_none());
-    assert!(response.config.model_reasoning_effort.is_none());
-    assert!(response.config.service_tier.is_none());
-}
-
-#[test]
 fn exact_internal_contracts_include_initialization_and_selected_actions() {
     let artifact = artifact();
     assert_eq!(artifact["codexPin"], CODEX_PIN.trim());
@@ -186,7 +162,6 @@ fn exact_internal_contracts_include_initialization_and_selected_actions() {
         FsReadDirectory::METHOD,
         FsGetMetadata::METHOD,
         ModelList::METHOD,
-        ConfigRead::METHOD,
         SkillsList::METHOD,
         RateLimitsRead::METHOD,
     ]

@@ -527,26 +527,6 @@ pub struct ModelListResponse {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConfigRead {
-    pub cwd: String,
-    pub include_layers: bool,
-}
-request!(ConfigRead, "config/read", ConfigReadResponse);
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct ConfigReadResponse {
-    pub config: CodexConfig,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct CodexConfig {
-    pub model: Option<String>,
-    pub model_reasoning_effort: Option<String>,
-    pub service_tier: Option<String>,
-}
-
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillsList {

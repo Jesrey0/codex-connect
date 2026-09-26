@@ -5,7 +5,6 @@ mod activity;
 mod command_sessions;
 mod event_journal;
 mod thread_subscriptions;
-mod worker_notifications;
 
 pub use actions::{
     ApprovalDecision, ElicitationAction, PermissionGrant, PermissionScope,
@@ -15,8 +14,8 @@ use activity::{activity, compact_text};
 use base64::Engine;
 pub use codex_connect_app_server::APP_SERVER_LAUNCH_OVERRIDES;
 pub use codex_connect_app_server::protocol::{
-    ApprovalPolicy, CommandExec, CommandExecTerminalSize, ConfigRead, ModelList, ReviewTarget,
-    RpcId, SandboxMode, SandboxPolicy,
+    ApprovalPolicy, CommandExec, CommandExecTerminalSize, ModelList, ReviewTarget, RpcId,
+    SandboxMode, SandboxPolicy,
 };
 use codex_connect_app_server::protocol::{
     CommandExecOutputDeltaNotification, CommandExecResize, CommandExecTerminate, CommandExecWrite,
@@ -62,7 +61,7 @@ const MAX_LIVE_MESSAGE_CHARS: usize = 8 * 1024;
 const MAX_OBSERVER_PROMPT_CHARS: usize = 8 * 1024;
 const MAX_OBSERVER_SUMMARY_PROMPT_CHARS: usize = 512;
 const MAX_UNANNOTATED_TERMINALS: usize = 256;
-const MAX_RECENT_WORKERS: usize = 8;
+const MAX_RECENT_WORKERS: usize = 32;
 const MAX_WAIT_SCAN_ITEMS: usize = 512;
 // Keep the normal codex.wait handoff small enough for an operator context window.
 const MAX_WAIT_HANDOFF_CHARS: usize = 10 * 1024;
@@ -207,7 +206,6 @@ pub struct Relay {
     app_server: Arc<AppServerClient>,
     host: Host,
     journal: event_journal::EventJournal,
-    worker_notifications: worker_notifications::WorkerNotifications,
     live_turns: Arc<Mutex<LiveTurns>>,
     thread_subscriptions: Arc<Mutex<ThreadSubscriptions>>,
     observer_usage: Arc<Mutex<ObserverUsageState>>,
@@ -231,6 +229,7 @@ struct LiveTurns {
 #[derive(Clone)]
 struct ObservedTurn {
     turn: codex_connect_app_server::protocol::Turn,
+    cwd: Option<String>,
     mode: Option<String>,
     model: Option<String>,
     effort: Option<String>,
@@ -261,6 +260,7 @@ struct ObserverUsageState {
 #[derive(Clone)]
 struct WorkerAnnotation {
     mode: String,
+    cwd: String,
     model: Option<String>,
     effort: Option<String>,
     prompt: Option<String>,
@@ -271,6 +271,17 @@ struct PreparedThread {
     cwd: String,
     model: Option<String>,
     effort: Option<String>,
+}
+
+fn validate_thread_model(requested: &str, canonical: Option<&str>) -> Result<(), RelayError> {
+    if canonical == Some(requested) {
+        Ok(())
+    } else {
+        Err(RelayError::Invalid(format!(
+            "model {requested:?} does not match the canonical thread model {:?}",
+            canonical
+        )))
+    }
 }
 
 struct TerminalOutput {
@@ -345,6 +356,7 @@ impl LiveTurns {
             key,
             ObservedTurn {
                 turn,
+                cwd: None,
                 mode: None,
                 model: None,
                 effort: None,
@@ -426,6 +438,7 @@ impl LiveTurns {
             });
         if let Some(observed) = observed {
             observed.mode = Some(annotation.mode);
+            observed.cwd = Some(annotation.cwd);
             observed.model = annotation.model;
             observed.effort = annotation.effort;
             observed.prompt = annotation
@@ -599,7 +612,19 @@ impl LiveTurns {
         self.recent
             .push_back((thread_id.to_string(), turn_id.to_string(), observed));
         while self.recent.len() > MAX_RECENT_WORKERS {
-            self.recent.pop_front();
+            let mut counts = HashMap::<&str, usize>::new();
+            for (_, _, turn) in &self.recent {
+                *counts.entry(turn.cwd.as_deref().unwrap_or("")).or_default() += 1;
+            }
+            let largest = counts.values().copied().max().unwrap_or(0);
+            let index = self
+                .recent
+                .iter()
+                .position(|(_, _, turn)| {
+                    counts.get(turn.cwd.as_deref().unwrap_or("")).copied() == Some(largest)
+                })
+                .unwrap();
+            self.recent.remove(index);
         }
     }
 
@@ -679,6 +704,7 @@ fn observer_worker_value(thread_id: &str, observed: &ObservedTurn) -> Value {
         "turnId": observed.turn.id,
         "status": observed.turn.status,
         "mode": observed.mode,
+        "cwd": observed.cwd,
         "model": observed.model,
         "effort": observed.effort,
         "prompt": observed.prompt,
@@ -697,6 +723,7 @@ fn observer_worker_summary_value(thread_id: &str, observed: &ObservedTurn) -> Va
         "turnId": observed.turn.id,
         "status": observed.turn.status,
         "mode": observed.mode,
+        "cwd": observed.cwd,
         "model": observed.model,
         "effort": observed.effort,
         "prompt": observed.prompt.as_deref().map(|value| observer_clip(value, MAX_OBSERVER_SUMMARY_PROMPT_CHARS)),
@@ -715,6 +742,7 @@ fn operator_worker_handle_value(thread_id: &str, observed: &ObservedTurn) -> Val
         "turnId": observed.turn.id,
         "status": observed.turn.status,
         "mode": observed.mode,
+        "cwd": observed.cwd,
         "prompt": observed.prompt.as_deref().map(|value| observer_clip(value, MAX_OBSERVER_SUMMARY_PROMPT_CHARS)),
         "terminalAtMs": observed.terminal_at_ms,
         "lastActivityAtMs": observed.last_activity_at_ms,
@@ -783,7 +811,6 @@ impl Relay {
             app_server,
             host,
             journal: event_journal::EventJournal::default(),
-            worker_notifications: worker_notifications::WorkerNotifications::default(),
             live_turns: Arc::new(Mutex::new(LiveTurns::default())),
             thread_subscriptions: Arc::new(Mutex::new(ThreadSubscriptions::default())),
             observer_usage: Arc::new(Mutex::new(ObserverUsageState::default())),
@@ -815,7 +842,6 @@ impl Relay {
             .insert(thread_id, turn_metadata(turn))
         {
             self.journal.mark_gap().await;
-            self.worker_notifications.mark_history_lost().await;
         }
     }
 
@@ -852,24 +878,7 @@ impl Relay {
     ) {
         self.finish_thread_start(thread_id, Some(&turn.id)).await;
         self.remember_live_turn(thread_id, turn).await;
-        let mode = annotation.mode.clone();
         self.annotate_live_turn(thread_id, &turn.id, annotation)
-            .await;
-        self.push_started_worker_event(thread_id, &turn.id, &mode)
-            .await;
-    }
-
-    async fn push_started_worker_event(&self, thread_id: &str, turn_id: &str, mode: &str) {
-        self.worker_notifications
-            .push_once(
-                format!("started:{thread_id}:{turn_id}"),
-                json!({
-                    "kind":"workerStarted",
-                    "threadId":thread_id,
-                    "turnId":turn_id,
-                    "mode":mode,
-                }),
-            )
             .await;
     }
 
@@ -924,14 +933,11 @@ impl Relay {
         if !turn.status.is_terminal() {
             return;
         }
-        let (observed, changed) = self
+        let (_, changed) = self
             .live_turns
             .lock()
             .await
             .reconcile_terminal(thread_id, turn);
-        if let Some(observed) = observed {
-            self.push_terminal_worker_event(thread_id, &observed).await;
-        }
         self.release_terminal_subscription(thread_id, &turn.id)
             .await;
         if changed {
@@ -1286,7 +1292,7 @@ impl Relay {
             self.next_command_id.fetch_add(1, Ordering::Relaxed)
         );
         self.command_sessions
-            .insert(process_id.clone(), tty)
+            .insert(process_id.clone(), cwd.clone(), tty)
             .await
             .map_err(RelayError::Invalid)?;
         let command_events = self.app_server.subscribe();
@@ -1308,7 +1314,7 @@ impl Relay {
                 disable_output_cap: true,
                 tty,
                 size,
-                cwd: Some(cwd),
+                cwd: Some(cwd.clone()),
                 env,
                 sandbox_policy: None,
             })
@@ -1322,6 +1328,7 @@ impl Relay {
         cleanup.armed = false;
         Ok(json!({
             "processId":process_id,
+            "cwd":cwd,
             "state":"running",
             "tty":tty,
             "cursor":0,
@@ -1472,6 +1479,11 @@ impl Relay {
         if task.trim().is_empty() {
             return Err(RelayError::Invalid("task must not be empty".into()));
         }
+        if model.as_deref().is_none_or(|model| model.trim().is_empty()) {
+            return Err(RelayError::Invalid(
+                "codex.start requires an explicit model".into(),
+            ));
+        }
         if thread_id.is_some() && fork_from_thread_id.is_some() {
             return Err(RelayError::Invalid(
                 "threadId and forkFromThreadId are mutually exclusive".into(),
@@ -1482,18 +1494,21 @@ impl Relay {
                 "lastTurnId requires forkFromThreadId".into(),
             ));
         }
-        if thread_id.is_some()
-            && (cwd.is_some() || model.is_some() || effort.is_some() || sandbox_policy.is_some())
-        {
+        if thread_id.is_some() && (cwd.is_some() || effort.is_some() || sandbox_policy.is_some()) {
             return Err(RelayError::Invalid(
-                "resumed work inherits cwd, model, effort, and access; start a fresh thread to change workstream settings".into(),
+                "resumed work inherits cwd, effort, and access; start a fresh thread to change workstream settings".into(),
             ));
         }
         if fork_from_thread_id.is_some()
-            && (cwd.is_some() || model.is_some() || effort.is_some() || sandbox_policy.is_some())
+            && (cwd.is_some() || effort.is_some() || sandbox_policy.is_some())
         {
             return Err(RelayError::Invalid(
-                "forked work inherits cwd, model, effort, and access from its source thread".into(),
+                "forked work inherits cwd, effort, and access from its source thread".into(),
+            ));
+        }
+        if thread_id.is_none() && fork_from_thread_id.is_none() && cwd.is_none() {
+            return Err(RelayError::Invalid(
+                "fresh codex.start requires an explicit cwd".into(),
             ));
         }
         if let Some(policy) = sandbox_policy.as_ref() {
@@ -1544,8 +1559,12 @@ impl Relay {
         let thread_sandbox = sandbox_policy.as_ref().map(sandbox_mode);
         let prepared = match fork_from_thread_id {
             Some(source_thread_id) => {
-                self.prepare_forked_thread(source_thread_id, last_turn_id)
-                    .await?
+                self.prepare_forked_thread(
+                    source_thread_id,
+                    last_turn_id,
+                    model.as_deref().unwrap(),
+                )
+                .await?
             }
             None => {
                 self.prepare_thread(
@@ -1558,10 +1577,11 @@ impl Relay {
                 .await?
             }
         };
-        let effective_model = model.or(prepared.model.clone());
+        let effective_model = prepared.model.clone();
         let effective_effort = effort.or(prepared.effort.clone());
         let annotation = WorkerAnnotation {
             mode: "work".into(),
+            cwd: prepared.cwd.clone(),
             model: effective_model.clone(),
             effort: effective_effort.clone(),
             prompt: Some(observer_prompt),
@@ -1572,7 +1592,7 @@ impl Relay {
             .start_request(TurnStart {
                 thread_id: prepared.id.clone(),
                 input: vec![TextInput::Text { text: task }],
-                cwd: prepared.cwd,
+                cwd: prepared.cwd.clone(),
                 approval_policy: None,
                 sandbox_policy: turn_sandbox,
                 model: effective_model.clone(),
@@ -1602,6 +1622,7 @@ impl Relay {
             "turnId":turn_id,
             "createdThread":created,
             "cursor":cursor,
+            "cwd":prepared.cwd,
             "model":effective_model,
             "effort":effective_effort,
         }))
@@ -1611,8 +1632,10 @@ impl Relay {
         &self,
         source_thread_id: String,
         last_turn_id: Option<String>,
+        expected_model: &str,
     ) -> Result<PreparedThread, RelayError> {
-        self.read_thread_metadata(source_thread_id.clone()).await?;
+        let source = self.read_thread_metadata(source_thread_id.clone()).await?;
+        validate_thread_model(expected_model, source.model.as_deref())?;
         let response = self
             .app_server
             .start_request(ThreadFork {
@@ -1623,6 +1646,7 @@ impl Relay {
             .await?
             .wait()
             .await?;
+        validate_thread_model(expected_model, response.thread.model.as_deref())?;
         let thread_id = response.thread.id.clone();
         self.begin_thread_start(&thread_id).await;
         self.mark_thread_subscribed(&thread_id).await;
@@ -1669,6 +1693,12 @@ impl Relay {
                     return Err(error);
                 }
             };
+            if let Some(expected_model) = new_thread_model.as_deref()
+                && let Err(error) = validate_thread_model(expected_model, metadata.model.as_deref())
+            {
+                self.finish_thread_start(&id, None).await;
+                return Err(error);
+            }
             if let Err(error) = self.ensure_thread_reuse_policy(&metadata).await {
                 self.finish_thread_start(&id, None).await;
                 return Err(error);
@@ -1688,6 +1718,13 @@ impl Relay {
             };
             match response {
                 Ok(response) => {
+                    if let Some(expected_model) = new_thread_model.as_deref()
+                        && let Err(error) =
+                            validate_thread_model(expected_model, response.thread.model.as_deref())
+                    {
+                        self.finish_thread_start(&id, None).await;
+                        return Err(error);
+                    }
                     self.mark_thread_subscribed(&id).await;
                     response
                 }
@@ -1703,7 +1740,9 @@ impl Relay {
                     model: new_thread_model,
                     sandbox: new_thread_sandbox,
                     approval_policy: new_thread_approval,
-                    cwd: Some(cwd.unwrap_or_else(|| self.default_cwd())),
+                    cwd: Some(cwd.ok_or_else(|| {
+                        RelayError::Invalid("fresh codex.start requires an explicit cwd".into())
+                    })?),
                     service_name: Some("codex-connect".into()),
                     ..ThreadStart::default()
                 })
@@ -2249,7 +2288,6 @@ impl Relay {
                     "turn":turn_snapshot(&selected, selection_incomplete), "currentActivity":activity,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 });
-                self.acknowledge_wait_result(&result).await;
                 if selected.status.is_terminal() && stored_terminal {
                     self.forget_live_turn(&thread_id, &turn_id).await;
                 }
@@ -2280,7 +2318,6 @@ impl Relay {
                     "turn":turn_snapshot(&selected, None), "currentActivity":activity,
                     "pendingActions":pending.iter().map(|r| r.as_ref()).collect::<Vec<_>>(),
                 });
-                self.acknowledge_wait_result(&result).await;
                 return Ok(result);
             }
 
@@ -2491,55 +2528,7 @@ impl Relay {
                 })
             }
         };
-        self.acknowledge_worker_started(&thread_id, &turn_id).await;
-        if selected.status.is_terminal() {
-            self.worker_notifications
-                .acknowledge_once(format!("turn:{thread_id}:{turn_id}"))
-                .await;
-        }
         Ok(result)
-    }
-
-    async fn acknowledge_wait_result(&self, result: &Value) {
-        let thread_id = result.get("threadId").and_then(Value::as_str);
-        let terminal_turn = result
-            .get("turn")
-            .and_then(Value::as_object)
-            .filter(|turn| {
-                matches!(
-                    turn.get("status").and_then(Value::as_str),
-                    Some("completed" | "failed" | "interrupted")
-                )
-            })
-            .and_then(|turn| turn.get("id").and_then(Value::as_str));
-        if let (Some(thread_id), Some(turn_id)) = (thread_id, terminal_turn) {
-            self.worker_notifications
-                .acknowledge_once(format!("turn:{thread_id}:{turn_id}"))
-                .await;
-        }
-        if let (Some(thread_id), Some(turn_id)) =
-            (thread_id, result.get("turnId").and_then(Value::as_str))
-        {
-            self.worker_notifications
-                .acknowledge_once(format!("started:{thread_id}:{turn_id}"))
-                .await;
-        }
-
-        let actions = result
-            .get("pendingActions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|action| action.get("requestId"))
-            .map(|request_id| format!("action:{request_id}"))
-            .collect::<Vec<_>>();
-        self.worker_notifications.acknowledge_actions(actions).await;
-    }
-
-    async fn acknowledge_worker_started(&self, thread_id: &str, turn_id: &str) {
-        self.worker_notifications
-            .acknowledge_once(format!("started:{thread_id}:{turn_id}"))
-            .await;
     }
 
     pub async fn work_steer(
@@ -2560,8 +2549,6 @@ impl Relay {
                 input: vec![TextInput::Text { text: instruction }],
             })
             .await?;
-        self.acknowledge_worker_started(&thread_id, &expected_turn_id)
-            .await;
         Ok(json!({"turnId":response.turn_id}))
     }
 
@@ -2577,7 +2564,6 @@ impl Relay {
                 turn_id: turn_id.clone(),
             })
             .await?;
-        self.acknowledge_worker_started(&thread_id, &turn_id).await;
         Ok(json!({"turnId":turn_id,"interrupted":true}))
     }
 
@@ -2588,9 +2574,19 @@ impl Relay {
         target: ReviewTarget,
         model: Option<String>,
     ) -> Result<Value, RelayError> {
-        if thread_id.is_some() && (model.is_some() || cwd.is_some()) {
+        if model.as_deref().is_none_or(|model| model.trim().is_empty()) {
             return Err(RelayError::Invalid(
-                "resumed reviews inherit cwd and model; start a fresh review thread to change workstream settings".into(),
+                "codex.start requires an explicit model".into(),
+            ));
+        }
+        if thread_id.is_some() && cwd.is_some() {
+            return Err(RelayError::Invalid(
+                "resumed reviews inherit cwd; start a fresh review thread to change it".into(),
+            ));
+        }
+        if thread_id.is_none() && cwd.is_none() {
+            return Err(RelayError::Invalid(
+                "fresh review requires an explicit cwd".into(),
             ));
         }
         let relay = self.clone();
@@ -2623,10 +2619,11 @@ impl Relay {
                 None,
             )
             .await?;
-        let effective_model = model.or(prepared.model.clone());
+        let effective_model = prepared.model.clone();
         let effective_effort = prepared.effort.clone();
         let annotation = WorkerAnnotation {
             mode: "review".into(),
+            cwd: prepared.cwd.clone(),
             model: effective_model.clone(),
             effort: effective_effort.clone(),
             prompt: Some(observer_prompt),
@@ -2663,6 +2660,7 @@ impl Relay {
             "turnId":turn_id,
             "createdThread":created,
             "cursor":cursor,
+            "cwd":prepared.cwd,
             "model":effective_model,
             "effort":effective_effort,
         }))
@@ -2674,65 +2672,6 @@ impl Relay {
             .iter()
             .map(|r| serde_json::to_value(r.as_ref()).unwrap())
             .collect()
-    }
-
-    async fn push_terminal_worker_event(&self, thread_id: &str, observed: &ObservedTurn) {
-        let Some(mode) = observed.mode.as_deref() else {
-            return;
-        };
-        if !observed.turn.status.is_terminal() {
-            return;
-        }
-        let turn_id = observed.turn.id.clone();
-        self.worker_notifications
-            .push_once(
-                format!("turn:{thread_id}:{turn_id}"),
-                json!({
-                    "kind":"turnTerminal",
-                    "threadId":thread_id,
-                    "turnId":turn_id,
-                    "mode":mode,
-                    "status":observed.turn.status,
-                }),
-            )
-            .await;
-    }
-
-    pub async fn take_worker_events(&self) -> Vec<Value> {
-        let pending = self.app_server.pending_requests(None);
-        let delegated = self.live_turns.lock().await;
-        let actions = pending
-            .into_iter()
-            .filter(|request| {
-                delegated.order.iter().any(|(thread_id, turn_id)| {
-                    thread_id == &request.thread_id
-                        && request.turn_id.as_deref().is_none_or(|id| id == turn_id)
-                        && delegated
-                            .turns
-                            .get(&(thread_id.clone(), turn_id.clone()))
-                            .is_some_and(|observed| observed.mode.is_some())
-                })
-            })
-            .map(|request| {
-                let request_id = serde_json::to_value(&request.request_id).unwrap();
-                let action_kind = serde_json::to_value(request.kind).unwrap();
-                (
-                    format!("action:{request_id}"),
-                    json!({
-                        "kind":"actionRequired",
-                        "threadId":request.thread_id,
-                        "turnId":request.turn_id,
-                        "actionKind":action_kind,
-                        "requestId":request_id,
-                        "blocking":request.is_blocking,
-                    }),
-                )
-            })
-            .collect::<Vec<_>>();
-        self.worker_notifications.sync_actions(actions).await;
-        let events = self.worker_notifications.take().await;
-        drop(delegated);
-        events
     }
 
     pub async fn model_list(&self) -> Result<Value, RelayError> {
@@ -2759,19 +2698,6 @@ impl Relay {
             }
             cursor = Some(next_cursor);
         }
-    }
-
-    pub async fn codex_config(
-        &self,
-    ) -> Result<codex_connect_app_server::protocol::CodexConfig, RelayError> {
-        Ok(self
-            .app_server
-            .request(ConfigRead {
-                cwd: self.default_cwd(),
-                include_layers: false,
-            })
-            .await?
-            .config)
     }
 
     pub async fn skills_list(
@@ -3059,7 +2985,7 @@ impl Relay {
         let pending_actions = self.pending_actions(None).await;
         let notices = self.journal.observer_notices(8).await;
         json!({
-            "cwd": self.default_cwd(),
+            "defaultCwd": self.default_cwd(),
             "usage": usage,
             "usageError": usage_error,
             "usageUpdatedAtMs": usage_updated_at_ms,
@@ -3158,7 +3084,6 @@ impl Relay {
     fn start_event_loop(&self) {
         let journal = self.journal.clone();
         let live_turns = self.live_turns.clone();
-        let worker_notifications = self.worker_notifications.clone();
         let relay = self.clone();
         let mut events = self.app_server.subscribe();
         tokio::spawn(async move {
@@ -3168,7 +3093,6 @@ impl Relay {
                         if let Some(method) = event.get("method").and_then(Value::as_str) {
                             if method == "codexConnect/appServerHistoryGap" {
                                 journal.mark_gap().await;
-                                worker_notifications.mark_history_lost().await;
                                 continue;
                             }
                             if method == "command/exec/outputDelta" {
@@ -3196,7 +3120,6 @@ impl Relay {
                             }
                             if history_lost {
                                 journal.mark_gap().await;
-                                worker_notifications.mark_history_lost().await;
                             }
                             live_turns
                                 .lock()
@@ -3223,7 +3146,6 @@ impl Relay {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         journal.mark_gap().await;
-                        worker_notifications.mark_history_lost().await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -3698,6 +3620,7 @@ mod tests {
             "turn",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: None,
                 effort: None,
                 prompt: Some("x".repeat(MAX_OBSERVER_PROMPT_CHARS + 10)),
@@ -3721,6 +3644,7 @@ mod tests {
             "turn",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: Some("gpt-6-luna".into()),
                 effort: Some("low".into()),
                 prompt: Some("inspect cache telemetry".into()),
@@ -3765,6 +3689,7 @@ mod tests {
             "first-turn",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: None,
                 effort: None,
                 prompt: None,
@@ -3832,6 +3757,7 @@ mod tests {
             "second-turn",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: None,
                 effort: None,
                 prompt: None,
@@ -3863,6 +3789,7 @@ mod tests {
             "turn",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: Some("gpt-5.6-sol".into()),
                 effort: Some("high".into()),
                 prompt: Some("x".repeat(MAX_OBSERVER_PROMPT_CHARS)),
@@ -3884,6 +3811,7 @@ mod tests {
             "turn",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: None,
                 effort: None,
                 prompt: Some("task".into()),
@@ -3932,6 +3860,7 @@ mod tests {
             "turn",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: None,
                 effort: None,
                 prompt: Some("task".into()),
@@ -3981,6 +3910,7 @@ mod tests {
             "turn",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: None,
                 effort: None,
                 prompt: None,
@@ -4012,12 +3942,13 @@ mod tests {
             "turn-0",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: None,
                 effort: None,
                 prompt: Some("turn-0".into()),
             },
         );
-        for index in 1..10 {
+        for index in 1..MAX_RECENT_WORKERS + 2 {
             let turn_id = format!("turn-{index}");
             live.insert("thread", test_turn(&turn_id, TurnStatus::Completed));
             live.annotate(
@@ -4025,6 +3956,7 @@ mod tests {
                 &turn_id,
                 WorkerAnnotation {
                     mode: "work".into(),
+                    cwd: "/project".into(),
                     model: None,
                     effort: None,
                     prompt: Some(turn_id.clone()),
@@ -4035,15 +3967,21 @@ mod tests {
         live.reconcile_terminal("thread", &test_turn("turn-0", TurnStatus::Completed));
 
         let workers = live.observer_workers();
-        assert_eq!(workers.len(), 8);
+        assert_eq!(workers.len(), MAX_RECENT_WORKERS);
         assert_eq!(workers[0]["turnId"], "turn-0");
-        assert_eq!(workers[1]["turnId"], "turn-9");
+        assert_eq!(
+            workers[1]["turnId"],
+            format!("turn-{}", MAX_RECENT_WORKERS + 1)
+        );
         assert!(!workers.iter().any(|worker| worker["turnId"] == "turn-1"));
 
         let handles = live.operator_worker_handles();
-        assert_eq!(handles.len(), 8);
+        assert_eq!(handles.len(), MAX_RECENT_WORKERS);
         assert_eq!(handles[0]["turnId"], "turn-0");
-        assert_eq!(handles[1]["turnId"], "turn-9");
+        assert_eq!(
+            handles[1]["turnId"],
+            format!("turn-{}", MAX_RECENT_WORKERS + 1)
+        );
         assert!(handles[0].get("tokenUsage").is_none());
         assert!(handles[0].get("transcriptRevision").is_none());
     }
@@ -4060,6 +3998,7 @@ mod tests {
             "turn",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: None,
                 effort: None,
                 prompt: Some("task".into()),
@@ -4067,6 +4006,51 @@ mod tests {
         );
         live.record_recent("thread", "turn");
         assert!(live.recent.back().unwrap().2.turn.items.is_empty());
+    }
+
+    #[test]
+    fn terminal_worker_retention_preserves_less_represented_cwds() {
+        let mut live = LiveTurns::default();
+        for index in 0..MAX_RECENT_WORKERS {
+            let id = format!("a-{index}");
+            live.insert("thread", test_turn(&id, TurnStatus::Completed));
+            live.annotate(
+                "thread",
+                &id,
+                WorkerAnnotation {
+                    mode: "work".into(),
+                    cwd: "/a".into(),
+                    model: None,
+                    effort: None,
+                    prompt: None,
+                },
+            );
+            live.record_recent("thread", &id);
+        }
+        for (id, cwd) in [("b", "/b"), ("a-new", "/a")] {
+            live.insert("thread", test_turn(id, TurnStatus::Completed));
+            live.annotate(
+                "thread",
+                id,
+                WorkerAnnotation {
+                    mode: "work".into(),
+                    cwd: cwd.into(),
+                    model: None,
+                    effort: None,
+                    prompt: None,
+                },
+            );
+            live.record_recent("thread", id);
+        }
+        let handles = live.operator_worker_handles();
+        assert_eq!(handles.len(), MAX_RECENT_WORKERS);
+        assert!(
+            handles
+                .iter()
+                .any(|handle| handle["turnId"] == "b" && handle["cwd"] == "/b")
+        );
+        assert!(!handles.iter().any(|handle| handle["turnId"] == "a-0"));
+        assert!(!handles.iter().any(|handle| handle["turnId"] == "a-1"));
     }
 
     #[test]
@@ -4078,6 +4062,7 @@ mod tests {
             "active",
             WorkerAnnotation {
                 mode: "work".into(),
+                cwd: "/project".into(),
                 model: None,
                 effort: None,
                 prompt: Some("long task".into()),
@@ -4091,6 +4076,7 @@ mod tests {
                 &id,
                 WorkerAnnotation {
                     mode: "work".into(),
+                    cwd: "/project".into(),
                     model: None,
                     effort: None,
                     prompt: None,

@@ -26,6 +26,6 @@ Do not use an OS account whose sudo or filesystem privileges exceed what you int
 
 - Keep the backend bound to loopback. The public route is the authenticated host-ingress path.
 - Run `codex-connect doctor` after installation or upgrades.
-- Verify the exact live build and navigation cwd with `status`; verify public routing, OAuth, and the ChatGPT connection independently.
+- Verify the exact live build and default cwd with `status`; verify public routing, OAuth, and the ChatGPT connection independently.
 - Treat HostPlane, WorkerPlane, and PlatformPlane permissions as non-transitive.
 - Use `codex-connect uninstall` for Codex Connect state; retire the public route and OAuth grants through host ingress.

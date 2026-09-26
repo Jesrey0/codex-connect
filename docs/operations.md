@@ -36,11 +36,11 @@ codex-connect console
 codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-project
 ```
 
-`codex-connect status` reports service and runtime identity; `doctor` provides local diagnostics. The MCP `status` tool also reports configuration read from the running App Server for the navigation cwd and retained command/worker handles for operator recovery. Null configuration values leave selection to App Server when a workstream starts; `configError` makes a failed read explicit without hiding recovery handles. `console` is a read-only visibility surface for workers, transcripts, pending state, and usage; it does not steer or mutate anything. All worker/host actions remain in ChatGPT through the MCP/plugin surface.
+`codex-connect status` reports service and runtime identity; `doctor` provides local diagnostics. The MCP `status` tool is the compact recovery anchor: readiness, live build identity, default cwd, pinned Codex release, and retained command/worker handles. It does not read or mirror App Server configuration; effective workstream model/effort comes from `codex.start` and persisted thread metadata. `console` is a read-only visibility surface for workers, transcripts, pending state, and usage; it does not steer or mutate anything. All worker/host actions remain in ChatGPT through the MCP/plugin surface.
 
 ### Console navigation
 
-The console uses the terminal's foreground/background theme. Task names lead the worker
+The console shows backend `defaultCwd` separately from each worker cwd. It uses the terminal's foreground/background theme. Task names lead the worker
 list; the selected worker's detail area distinguishes cumulative thread tokens from
 the latest request's input, context window, and cached input. Quota percentages explicitly
 show usage consumed, with the window labels reported by App Server.
@@ -71,7 +71,7 @@ for pipes, redirects, or expansion. Set `tty=true` only when a terminal is neede
 
 After `command.start`, retain `processId`; the first `command.read` starts at cursor `0`, then
 passes each returned cursor to the next read. If the start response is lost, `status.commands`
-lists retained `processId`, state, and TTY mode for recovery. `timeoutMs=0` reads immediately; otherwise the read waits for output
+lists retained `processId`, effective cwd, state, and TTY mode for recovery. `timeoutMs=0` reads immediately; otherwise the read waits for output
 or exit, up to 43 seconds per call. That ceiling leaves headroom below the measured ChatGPT
 outer result window. Timeout does not terminate the process. Continue until `drained=true` for
 final output; `historyLost=true` means older output was evicted. Termination can be
@@ -80,12 +80,10 @@ App Server connection and do not survive its restart.
 
 ## Worker lifecycle
 
-Treat a Codex thread as a cache-bounded workstream. A new work thread receives a
-self-contained task and may select cwd, model, reasoning effort, and access. Those settings
-become workstream state. A resumed work turn supplies only `threadId` plus the next
-objective/delta; Connect explicitly resends the canonical thread model and effort while
-keeping cwd/access fixed. Review follows the same shape: cwd/model are creation-time choices,
-while a resumed review supplies only its thread and target.
+Treat a Codex thread as a cache-bounded workstream. Every `codex.start` call supplies a
+model. Fresh work and review also supply an explicit cwd. Resume and fork inherit the
+canonical cwd and reject a cwd argument; the supplied model must equal the canonical
+thread model. Workstream effort and access are inherited on resume and fork.
 
 Connect conservatively accepts resume only inside OpenAI's minimum 30-minute prompt-cache
 guarantee, even though the cache may survive longer. Live model-usage telemetry drives that
@@ -147,15 +145,13 @@ If the ChatGPT caller/frontend is interrupted while the backend remains healthy,
 active workers first and newest retained terminal workers after them. Reattach with the
 reported `threadId`/`turnId` and reconcile through `codex.wait` or `codex.inspect`.
 
-A lost `codex.start` response does not cancel creation. Do not retry immediately.
-HostPlane responses can carry a `workerStarted` recovery receipt with the missing
-thread/turn IDs. Receipts are reconciled from the relay's bounded retained-worker
-state and replay until `codex.wait`, `codex.inspect`, or another known-turn control
-operation claims them. `status.workers` is the deterministic recovery projection once
-the worker is registered, so consult it before considering a retry. `workerEvents` can also report completion or
-required action; those notifications take delivery priority over start receipts.
-`historyLost` means older notification or recovery state was evicted. After a
-backend restart, use retained thread/turn IDs to reconcile through `codex.wait`.
+A lost `codex.start` response does not cancel creation. The backend registers a worker
+independently of response delivery. Read `status.workers` for active and recent handles,
+matching the task and cwd before starting replacement work. Repeated status reads do not
+consume handles; use `codex.wait` or `codex.inspect` with the recovered IDs. Terminal
+workers and commands are retained with bounded, cwd-fair eviction. Active workers are
+never evicted from the recovery projection. A backend restart invalidates live handles;
+use persisted thread metadata through `codex.query` when reconciling older work.
 
 ## Ingress lifecycle
 
@@ -201,9 +197,9 @@ Verify source, Git, prepared artifact, live build identity, ChatGPT plugin disco
 
 ## Runtime defaults and uninstall
 
-The managed backend intentionally has no Codex Connect configuration file. Its loopback endpoint is `127.0.0.1:8767`, its navigation cwd comes from the service HOME, and `codex` is resolved from the service PATH and verified against the pinned release at App Server startup. Project-specific paths belong in tool-call `cwd` values rather than persistent backend state.
+The managed backend intentionally has no Codex Connect configuration file. Its loopback endpoint is `127.0.0.1:8767`, its default cwd comes from the service HOME, and `codex` is resolved from the service PATH and verified against the pinned release at App Server startup. Project-specific paths belong in tool-call `cwd` values rather than persistent backend state.
 
-`status.codex.config` reads the running App Server's `config/read` response for the navigation cwd. It does not parse `config.toml` or guess a model when the upstream value is null. `codex.start` reports the model and effort assigned to the actual workstream. Worker instruction sources remain the Codex config and AGENTS.md chain.
+`status` intentionally does not expose Codex selection configuration. `codex.start` reports the model and effort assigned to the actual workstream, and `codex.query` reads Codex-owned model/thread state when needed. Worker instruction sources remain the Codex config and AGENTS.md chain.
 
 ```bash
 codex-connect uninstall

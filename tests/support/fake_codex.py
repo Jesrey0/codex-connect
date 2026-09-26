@@ -82,7 +82,6 @@ command_sessions = {}
 initialized = False
 handshake = False
 coverage_file = os.environ.get("CODEX_CONNECT_FAKE_COVERAGE_FILE")
-config_file = os.environ.get("CODEX_CONNECT_FAKE_CONFIG_FILE")
 
 
 def allocate_thread_id():
@@ -218,10 +217,7 @@ for line in sys.stdin:
         respond(message, result)
         continue
     assert initialized
-    if method == "config/read":
-        assert params["includeLayers"] is False
-        result["config"] = json.loads(pathlib.Path(config_file).read_text())
-    elif method == "thread/start":
+    if method == "thread/start":
         thread_id = allocate_thread_id()
         thread = result["thread"]
         now = int(time.time())
@@ -546,7 +542,15 @@ for line in sys.stdin:
             ]
             notify("turn/completed", {"threadId": thread_id, "turn": turn})
         elif scenario == "handoff_long_history_gap":
-            send({"method":"item/completed","params":{"threadId":thread_id,"turnId":turn_id,"data":"x"*(9*1024*1024)}})
+            for index in range(520):
+                send({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "delta": f"history-{index}",
+                    },
+                })
             turn["status"] = "completed"
             turn["items"] = [{
                 "type": "agentMessage",

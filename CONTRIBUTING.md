@@ -20,7 +20,7 @@ App Server primacy is an invariant, not a preference: if the pinned App Server e
 
 ## Operating rules
 
-- Keep the managed backend's home-directory cwd as navigation, never authorization.
+- Keep the managed backend's home-directory default cwd as a path default, never authorization.
 - Engineer synchronous ChatGPT-facing calls against the empirically observed ~55 second outer result window. Keep local tool guards at or below 48 seconds; move longer work behind retained worker/command handles. App Server, host, worker-join, command, and client-response budgets still follow their own semantics.
 - Git actions are operator workflow, not application workflow.
 

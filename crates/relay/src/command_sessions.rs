@@ -79,6 +79,7 @@ struct CommandSessionState {
 }
 
 struct CommandSession {
+    cwd: String,
     tty: bool,
     stdin_open: bool,
     cursor: u64,
@@ -126,6 +127,7 @@ impl CommandSessions {
                 };
                 Some(json!({
                     "processId":process_id,
+                    "cwd":session.cwd,
                     "state":status,
                     "tty":session.tty,
                 }))
@@ -138,14 +140,23 @@ impl CommandSessions {
             .send_modify(|value| *value = value.wrapping_add(1));
     }
 
-    pub async fn insert(&self, process_id: String, tty: bool) -> Result<(), String> {
+    pub async fn insert(&self, process_id: String, cwd: String, tty: bool) -> Result<(), String> {
         let mut state = self.state.lock().await;
         while state.sessions.len() >= MAX_SESSIONS {
+            let mut counts = HashMap::<&str, usize>::new();
+            for session in state
+                .sessions
+                .values()
+                .filter(|session| session.terminal.is_some())
+            {
+                *counts.entry(&session.cwd).or_default() += 1;
+            }
+            let largest = counts.values().copied().max().unwrap_or(0);
             let Some(index) = state.order.iter().position(|id| {
-                state
-                    .sessions
-                    .get(id)
-                    .is_some_and(|session| session.terminal.is_some())
+                state.sessions.get(id).is_some_and(|session| {
+                    session.terminal.is_some()
+                        && counts.get(session.cwd.as_str()).copied() == Some(largest)
+                })
             }) else {
                 return Err(format!(
                     "at most {MAX_SESSIONS} persistent command sessions may be active"
@@ -159,6 +170,7 @@ impl CommandSessions {
         state.sessions.insert(
             process_id,
             CommandSession {
+                cwd,
                 tty,
                 stdin_open: true,
                 cursor: 0,
@@ -347,7 +359,10 @@ mod tests {
     #[tokio::test]
     async fn terminal_reads_report_retained_output_drain_state() {
         let sessions = CommandSessions::default();
-        sessions.insert("process".into(), false).await.unwrap();
+        sessions
+            .insert("process".into(), "/project".into(), false)
+            .await
+            .unwrap();
         sessions
             .push_output(
                 "process",
@@ -396,7 +411,10 @@ mod tests {
     #[tokio::test]
     async fn split_utf8_is_buffered_across_output_notifications() {
         let sessions = CommandSessions::default();
-        sessions.insert("process".into(), false).await.unwrap();
+        sessions
+            .insert("process".into(), "/project".into(), false)
+            .await
+            .unwrap();
         sessions
             .push_output("process", CommandExecOutputStream::Stdout, vec![0xe2, 0x82])
             .await;
@@ -416,7 +434,10 @@ mod tests {
     #[tokio::test]
     async fn terminal_flushes_incomplete_utf8_without_hiding_bytes() {
         let sessions = CommandSessions::default();
-        sessions.insert("process".into(), false).await.unwrap();
+        sessions
+            .insert("process".into(), "/project".into(), false)
+            .await
+            .unwrap();
         sessions
             .push_output("process", CommandExecOutputStream::Stderr, vec![0xe2])
             .await;
@@ -438,9 +459,18 @@ mod tests {
     #[tokio::test]
     async fn handle_snapshot_is_compact_and_includes_terminal_sessions() {
         let sessions = CommandSessions::default();
-        sessions.insert("running".into(), true).await.unwrap();
-        sessions.insert("exited".into(), false).await.unwrap();
-        sessions.insert("failed".into(), false).await.unwrap();
+        sessions
+            .insert("running".into(), "/project".into(), true)
+            .await
+            .unwrap();
+        sessions
+            .insert("exited".into(), "/project".into(), false)
+            .await
+            .unwrap();
+        sessions
+            .insert("failed".into(), "/project".into(), false)
+            .await
+            .unwrap();
         sessions
             .complete(
                 "exited",
@@ -456,10 +486,64 @@ mod tests {
         assert_eq!(
             sessions.handles().await,
             vec![
-                json!({"processId":"running","state":"running","tty":true}),
-                json!({"processId":"exited","state":"exited","tty":false}),
-                json!({"processId":"failed","state":"failed","tty":false}),
+                json!({"processId":"running","cwd":"/project","state":"running","tty":true}),
+                json!({"processId":"exited","cwd":"/project","state":"exited","tty":false}),
+                json!({"processId":"failed","cwd":"/project","state":"failed","tty":false}),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_command_eviction_preserves_less_represented_cwds_and_active_handles() {
+        let sessions = CommandSessions::default();
+        sessions
+            .insert("active".into(), "/a".into(), false)
+            .await
+            .unwrap();
+        for index in 0..MAX_SESSIONS - 1 {
+            let id = format!("a-{index}");
+            sessions
+                .insert(id.clone(), "/a".into(), false)
+                .await
+                .unwrap();
+            sessions
+                .complete(
+                    &id,
+                    CommandExecResponse {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    },
+                )
+                .await;
+        }
+        sessions
+            .insert("b".into(), "/b".into(), false)
+            .await
+            .unwrap();
+        sessions
+            .complete(
+                "b",
+                CommandExecResponse {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .await;
+        sessions
+            .insert("a-new".into(), "/a".into(), false)
+            .await
+            .unwrap();
+        let handles = sessions.handles().await;
+        assert_eq!(handles.len(), MAX_SESSIONS);
+        assert!(handles.iter().any(|handle| handle["processId"] == "active"));
+        assert!(
+            handles
+                .iter()
+                .any(|handle| handle["processId"] == "b" && handle["cwd"] == "/b")
+        );
+        assert!(!handles.iter().any(|handle| handle["processId"] == "a-0"));
+        assert!(!handles.iter().any(|handle| handle["processId"] == "a-1"));
     }
 }

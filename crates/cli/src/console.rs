@@ -1026,7 +1026,11 @@ fn render_snapshot(
             &format!(
                 " {}  {}",
                 if ready { "●" } else { "○" },
-                text(&projection["cwd"], "unknown workspace")
+                format!(
+                    "default cwd: {}",
+                    text(&projection["defaultCwd"], "unknown")
+                )
+                .as_str()
             ),
             &format!("build {} ", text(&runtime["buildId"], "unknown")),
             width,
@@ -1715,7 +1719,10 @@ fn worker_rows(
         styled(row(&title, width), style),
         styled(
             row_lr(
-                &format!("   {glyph} {label:<14} {model} · {effort} · {mode}"),
+                &format!(
+                    "   {glyph} {label:<14} {model} · {effort} · {mode} · {}",
+                    text(&worker["cwd"], "unknown cwd")
+                ),
                 &format!("{age} "),
                 width,
             ),
@@ -2190,7 +2197,7 @@ mod tests {
         let snapshot = serde_json::json!({
             "runtime":{"ready":true,"buildId":"build"},
             "projection":{
-                "cwd":"/work/界面",
+                "defaultCwd":"/work/界面",
                 "workers":(0..18).map(|i| serde_json::json!({
                     "threadId":format!("thread-{i}"),"turnId":format!("turn-{i}"),
                     "prompt":format!("task-{i} café 👩‍💻"),"status":"inProgress",
@@ -2851,7 +2858,7 @@ mod tests {
         let snapshot = serde_json::json!({
             "runtime":{"ready":true,"buildId":"abc123","codex":{"release":"0.155.1"}},
             "projection":{
-                "cwd":"/work/repo",
+                "defaultCwd":"/work/repo",
                 "usage":{"ordinaryUsageAllowed":true,"rateLimits":{
                     "primary":{"usedPercent":50,"resetsAt":0,"windowDurationMins":300},
                     "secondary":{"usedPercent":25,"resetsAt":0,"windowDurationMins":10080}
