@@ -1,6 +1,6 @@
 # Codex Connect
 
-Codex Connect is a pre-release, single-user, self-hosted bridge from ChatGPT to a persistent Linux host and the official Codex CLI/App Server. ChatGPT can inspect host files, run deterministic commands, edit files, and delegate autonomous work or review to Codex.
+Codex Connect is a pre-release, single-user, self-hosted bridge from ChatGPT to a persistent Linux host and the official Codex CLI/App Server. The single-user boundary is a trust boundary, not a single-conversation limit: one backend may serve multiple independent ChatGPT operators for the same trusted user concurrently. ChatGPT can inspect host files, run deterministic commands, edit files, and delegate autonomous work or review to Codex.
 
 **ChatGPT is the only supported action/control interface.** Human-visible local tooling is allowed for read-only observability. The `codex-connect console` exists to watch workers, transcripts, quota, and pending state without mutating anything; setup/service/deployment/diagnostic CLI commands remain trusted-host maintenance plumbing. No local UI may steer workers, answer approvals, mutate thread state, or otherwise bypass ChatGPT for actions.
 
@@ -19,6 +19,8 @@ ChatGPT is the primary technical operator and orchestrator. Keep these planes di
 HostPlane is authoritative for host work. WorkerPlane is authoritative for delegated Codex lifecycle and cognition. PlatformPlane does not acquire host authority, and host or worker tools do not acquire connected-account authority. Workers do not inherit ChatGPT conversation, files, native tools, plugins, or scheduled tasks; delegated tasks must carry their own context and acceptance criteria.
 
 The remote path is ChatGPT → ngrok HTTPS → host ingress with OAuth → loopback Codex Connect. Codex CLI/App Server and host ingress are independently managed. Connect owns its backend service, deployment state/cache, and installed artifacts.
+
+The backend is shared and does not infer operator, conversation, session, or project ownership. HostPlane defaults to the service user's home directory; each fresh WorkerPlane workstream selects its own cwd explicitly. Retained command and worker state is backend-global, non-destructive recovery state distinguished by factual cwd and authoritative IDs.
 
 The implementation is upstream-first: when the pinned Codex App Server exposes a primitive, App Server owns that feature and Connect adapts it. Connect must not invent a second thread, turn, review, command, model, usage, approval, permission, elicitation, or background-terminal state machine. Connect-native mechanics are reserved for host capabilities that do not have an equivalent App Server client primitive.
 

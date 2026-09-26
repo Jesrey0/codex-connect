@@ -147,7 +147,9 @@ reported `threadId`/`turnId` and reconcile through `codex.wait` or `codex.inspec
 
 A lost `codex.start` response does not cancel creation. The backend registers a worker
 independently of response delivery. Read `status.workers` for active and recent handles,
-matching the task and cwd before starting replacement work. Repeated status reads do not
+matching cwd, task/prompt context, and authoritative IDs before starting replacement work.
+This recovery index is shared across independent ChatGPT operators and is not scoped to the
+conversation that created a worker. Repeated status reads do not
 consume handles; use `codex.wait` or `codex.inspect` with the recovered IDs. Terminal
 workers and commands are retained with bounded, cwd-fair eviction. Active workers are
 never evicted from the recovery projection. A backend restart invalidates live handles;

@@ -96,6 +96,11 @@ Codex Connect. The architectural requirement here is stable: **all actions and m
 flow through ChatGPT**. The local `codex-connect console` is the deliberate exception for
 read-only worker visibility; it must never become a second control surface.
 
+The backend may be connected from multiple ChatGPT operators for the same trusted user.
+They share one backend-global recovery view and the same underlying OS-account authority;
+Codex Connect does not create per-conversation or per-account ownership boundaries. Do not
+use this architecture as a multi-tenant isolation mechanism.
+
 Backend deployment and plugin scan/refresh are separate. Rescan after tool metadata
 changes; a running service does not prove ChatGPT's cached tool snapshot is current.
 

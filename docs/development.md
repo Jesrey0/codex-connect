@@ -72,9 +72,9 @@ Run the repository gate with the pinned CLI installed and Python `jsonschema` av
 ```bash
 ./scripts/generate-app-server-tool-schemas.py --check
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-cargo check --locked
+git diff --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --locked -p codex-connect
 python3 tests/protocol_integration.py
 ```
