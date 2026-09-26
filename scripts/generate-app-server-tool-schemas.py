@@ -18,6 +18,7 @@ METHODS = {
     "command/exec/resize": ("v2/CommandExecResizeParams", "v2/CommandExecResizeResponse"),
     "command/exec/terminate": ("v2/CommandExecTerminateParams", "v2/CommandExecTerminateResponse"),
     "command/exec/write": ("v2/CommandExecWriteParams", "v2/CommandExecWriteResponse"),
+    "config/read": ("v2/ConfigReadParams", "v2/ConfigReadResponse"),
     "fuzzyFileSearch": ("FuzzyFileSearchParams", "FuzzyFileSearchResponse"),
     "fs/getMetadata": ("v2/FsGetMetadataParams", "v2/FsGetMetadataResponse"),
     "fs/readDirectory": ("v2/FsReadDirectoryParams", "v2/FsReadDirectoryResponse"),

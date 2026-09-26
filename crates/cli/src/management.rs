@@ -560,13 +560,6 @@ pub async fn status() -> Result<()> {
                 "Codex: {} ({})",
                 runtime.codex.release, runtime.codex.binary
             );
-            let defaults = &runtime.codex.global_config;
-            println!(
-                "Worker defaults: model={}  reasoning={}  serviceTier={}",
-                defaults.model.as_deref().unwrap_or("upstream"),
-                defaults.reasoning_effort.as_deref().unwrap_or("upstream"),
-                defaults.service_tier.as_deref().unwrap_or("upstream")
-            );
         }
         Err(error) => {
             println!("Navigation cwd: unavailable");

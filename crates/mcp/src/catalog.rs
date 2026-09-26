@@ -25,7 +25,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "status",
                 "Read Operator Status",
-                "Read backend readiness, live build identity, host cwd, Codex defaults, and retained command/worker handles for recovery or operator rehydration. Use codex-connect doctor on the host for detailed diagnostics.",
+                "Read backend readiness, live build identity, navigation cwd, App Server configuration for that cwd, and retained command/worker handles for recovery. Null config values leave selection to App Server when a workstream starts; another cwd may resolve differently.",
                 true,
                 false,
                 false,
@@ -496,13 +496,13 @@ fn status_schema() -> Value {
             }), &["threadId","turnId","status","mode","prompt","terminalAtMs","lastActivityAtMs","activityKind","activitySummary"])},
             "codex":object_schema(json!({
                 "release":{"type":"string"},
-                "defaults":object_schema(json!({
+                "config":nullable(object_schema(json!({
                     "model":{"type":["string","null"]},
                     "reasoningEffort":{"type":["string","null"]},
                     "serviceTier":{"type":["string","null"]},
-                    "source":{"enum":["userConfig","upstream"],"description":"userConfig: at least one default is set in Codex config. upstream: Codex resolves all defaults. Null values are unset."}
-                }), &["model","reasoningEffort","serviceTier","source"])
-            }), &["release","defaults"])
+                }), &["model","reasoningEffort","serviceTier"])),
+                "configError":{"type":["string","null"],"description":"An App Server config/read failure; config is null and status remains usable for recovery."}
+            }), &["release","config","configError"])
         }),
         &["ready", "cwd", "buildId", "commands", "workers", "codex"],
     )
@@ -1329,8 +1329,12 @@ mod tests {
         );
         assert_eq!(properties["codex"]["type"], "object");
         assert_eq!(
-            properties["codex"]["properties"]["defaults"]["properties"]["source"]["enum"],
-            json!(["userConfig", "upstream"])
+            properties["codex"]["properties"]["config"]["anyOf"][1]["type"],
+            "null"
+        );
+        assert_eq!(
+            properties["codex"]["properties"]["configError"]["type"],
+            json!(["string", "null"])
         );
         assert!(properties.get("operatorContract").is_none());
         assert!(properties.get("binarySha256").is_none());

@@ -15,8 +15,8 @@ use activity::{activity, compact_text};
 use base64::Engine;
 pub use codex_connect_app_server::APP_SERVER_LAUNCH_OVERRIDES;
 pub use codex_connect_app_server::protocol::{
-    ApprovalPolicy, CommandExec, CommandExecTerminalSize, ModelList, ReviewTarget, RpcId,
-    SandboxMode, SandboxPolicy,
+    ApprovalPolicy, CommandExec, CommandExecTerminalSize, ConfigRead, ModelList, ReviewTarget,
+    RpcId, SandboxMode, SandboxPolicy,
 };
 use codex_connect_app_server::protocol::{
     CommandExecOutputDeltaNotification, CommandExecResize, CommandExecTerminate, CommandExecWrite,
@@ -47,7 +47,7 @@ use thread_subscriptions::ThreadSubscriptions;
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::{Duration, Instant};
 
-const WORK_WAIT_MS: u64 = 40_000;
+const WORK_WAIT_MS: u64 = 33_000;
 const WAIT_FINALIZATION_RESERVE_MS: u64 = 10_000;
 pub const WORK_WAIT_OPERATION_MS: u64 = WORK_WAIT_MS + WAIT_FINALIZATION_RESERVE_MS;
 const WAIT_FINAL_RECONCILE_MS: u64 = 500;
@@ -79,11 +79,11 @@ const CODEX_QUERY_PAGE_MAX: u32 = 50;
 const MAX_THREAD_PREVIEW_CHARS: usize = 512;
 const MAX_BACKGROUND_COMMAND_CHARS: usize = 1024;
 pub const COMMAND_EXEC_RESPONSE_ALLOWANCE_MS: u64 = 10_000;
-pub const DEFAULT_COMMAND_MS: u64 = 40_000;
+pub const DEFAULT_COMMAND_MS: u64 = 33_000;
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMAND_MS: u64 = 45_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
-pub const MAX_COMMAND_READ_MS: u64 = 50_000;
+pub const MAX_COMMAND_READ_MS: u64 = 43_000;
 pub const DEFAULT_COMMAND_READ_MS: u64 = 40_000;
 pub const MAX_COMMAND_WRITE_BYTES: usize = 64 * 1024;
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
@@ -2759,6 +2759,19 @@ impl Relay {
             }
             cursor = Some(next_cursor);
         }
+    }
+
+    pub async fn codex_config(
+        &self,
+    ) -> Result<codex_connect_app_server::protocol::CodexConfig, RelayError> {
+        Ok(self
+            .app_server
+            .request(ConfigRead {
+                cwd: self.default_cwd(),
+                include_layers: false,
+            })
+            .await?
+            .config)
     }
 
     pub async fn skills_list(

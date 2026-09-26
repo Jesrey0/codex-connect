@@ -55,7 +55,7 @@ Do not duplicate an authority object or mirror App Server-owned constants into t
 
 For every new capability, inspect the pinned App Server contract before designing a Connect abstraction. If App Server already exposes the primitive, route through it and preserve its IDs, lifecycle, state, errors, and notifications. Connect may normalize or combine those semantics for ChatGPT, but it must not create a second authoritative model.
 
-Today that principle is visible in thread/turn/review lifecycle, model and skill discovery, usage, streaming commands, background terminals, approvals, permissions, elicitation, filesystem reads/directory listings/metadata, image-byte reads, and fuzzy file discovery. Connect validates host paths and response bounds around those calls, then projects operator-friendly results. Connect-native host mechanics remain only where the pinned client protocol has no equivalent operator primitive, notably literal content search and deterministic patch application.
+Today that principle is visible in thread/turn/review lifecycle, effective configuration reads, model and skill discovery, usage, streaming commands, background terminals, approvals, permissions, elicitation, filesystem reads/directory listings/metadata, image-byte reads, and fuzzy file discovery. Connect validates host paths and response bounds around those calls, then projects operator-friendly results. Connect-native host mechanics remain only where the pinned client protocol has no equivalent operator primitive, notably literal content search and deterministic patch application.
 
 ## Authority and runtime defaults
 

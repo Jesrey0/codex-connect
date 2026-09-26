@@ -42,6 +42,8 @@ class OperatorProtocolTests(unittest.TestCase):
         cls.project = cls.workspace / "project"
         cls.project.mkdir()
         cls.coverage_path = cls.workspace / "fake-app-server-coverage.jsonl"
+        cls.config_path = cls.workspace / "fake-app-server-config.json"
+        cls.config_path.write_text("{}")
         (cls.project / "local.txt").write_text("project-local\n")
         (cls.project / "pixel.png").write_bytes(base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
@@ -57,6 +59,7 @@ class OperatorProtocolTests(unittest.TestCase):
         ], stdout=cls.log, stderr=cls.log, env={
             **os.environ,
             "CODEX_CONNECT_FAKE_COVERAGE_FILE": str(cls.coverage_path),
+            "CODEX_CONNECT_FAKE_CONFIG_FILE": str(cls.config_path),
         })
         try:
             for _ in range(200):
@@ -159,11 +162,11 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIsInstance(status["commands"], list)
         self.assertIsInstance(status["workers"], list)
         self.assertEqual(status["cwd"], str(self.workspace))
-        self.assertEqual(set(status["codex"]), {"release", "defaults"})
-        self.assertEqual(set(status["codex"]["defaults"]), {
-            "model", "reasoningEffort", "serviceTier", "source",
+        self.assertEqual(set(status["codex"]), {"release", "config", "configError"})
+        self.assertEqual(status["codex"]["config"], {
+            "model": None, "reasoningEffort": None, "serviceTier": None,
         })
-        self.assertIn(status["codex"]["defaults"]["source"], {"userConfig", "upstream"})
+        self.assertIsNone(status["codex"]["configError"])
         with urllib.request.urlopen(self.url + "/runtime") as response:
             runtime = json.load(response)
         self.assertTrue(runtime["ready"])
@@ -201,6 +204,27 @@ class OperatorProtocolTests(unittest.TestCase):
             projection = observer["projection"]
         self.assertIn("rateLimits", projection["usage"])
         self.assertIsInstance(projection["usageUpdatedAtMs"], int)
+
+    def test_status_reads_running_app_server_configuration_each_time(self):
+        try:
+            self.config_path.write_text(json.dumps({
+                "model": "fixture-model-2",
+                "model_reasoning_effort": "high",
+                "service_tier": "default",
+            }))
+            configured = self.client.call("status")["codex"]
+            self.assertEqual(configured["config"], {
+                "model": "fixture-model-2",
+                "reasoningEffort": "high",
+                "serviceTier": "default",
+            })
+            self.assertIsNone(configured["configError"])
+        finally:
+            self.config_path.write_text("{}")
+        upstream = self.client.call("status")["codex"]
+        self.assertEqual(upstream["config"], {
+            "model": None, "reasoningEffort": None, "serviceTier": None,
+        })
 
     def test_trailing_slash_tools_list_preserves_root_security_schemes(self):
         tools = self.client.request("tools/list", path="/mcp/")["tools"]
@@ -320,6 +344,21 @@ class OperatorProtocolTests(unittest.TestCase):
             "action":"interrupt", "threadId":work["threadId"], "turnId":work["turnId"]
         })
         self.assertEqual(self.wait(work)["state"], "terminal")
+    def test_large_content_search_returns_partial_matches(self):
+        path = self.workspace / ("many-matches-" + "p" * 100 + ".txt")
+        path.write_text(("needle" + "x" * 994 + "\n") * 1_000)
+        try:
+            row = self.client.call("inspect", {"operations": [
+                {"type": "searchContent", "query": "needle", "path": path.name, "maxResults": 1_000},
+            ]})["results"][0]
+            matches = row["result"]["matches"]
+            self.assertTrue(row["result"]["truncated"])
+            self.assertGreater(len(matches), 0)
+            self.assertLess(len(matches), 1_000)
+            self.assertEqual(matches[0]["line"], 1)
+        finally:
+            path.unlink()
+
     def test_inspection_uses_default_cwd_and_accepts_absolute_host_paths(self):
         result = self.client.call("inspect", {"operations": [
             {"type": "readText", "path": "sample.txt", "startLine": 2, "endLine": 2},
@@ -427,7 +466,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertFalse(result["stderrMayBeTruncated"])
         self.assertGreaterEqual(result["durationMs"], 0)
         command_params = self.method_params("command/exec")[-1]
-        self.assertEqual(command_params["timeoutMs"], 40000)
+        self.assertEqual(command_params["timeoutMs"], 33000)
         self.assertEqual(command_params["outputBytesCap"], 65536)
         self.assertNotIn("sandboxPolicy", command_params)
         self.assertEqual(self.client.call("command.exec", {
@@ -594,7 +633,7 @@ class OperatorProtocolTests(unittest.TestCase):
     def test_modern_command_read_uses_bounded_tool_result(self):
         self.assertEqual(
             self.client.tools["command.read"]["inputSchema"]["properties"]["timeoutMs"]["maximum"],
-            50_000,
+            43_000,
         )
         quiet = self.client.call("command.start", {"command": ["fixture-quiet"]})
         request_id = next(self.client.ids)
@@ -1206,8 +1245,8 @@ class OperatorProtocolTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertEqual(result["state"], "active")
         self.assertEqual(result["wakeReason"], "timeout")
-        self.assertGreaterEqual(elapsed, 39.5)
-        self.assertLess(elapsed, 41.5)
+        self.assertGreaterEqual(elapsed, 32.5)
+        self.assertLess(elapsed, 34.5)
         self.client.call("codex.act", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })
@@ -1223,8 +1262,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["wakeReason"], "timeout")
         self.assertEqual(result["turn"]["id"], work["turnId"])
         self.assertEqual(len(self.method_params("thread/read")), reads_before)
-        self.assertGreaterEqual(elapsed, 39.5)
-        self.assertLess(elapsed, 41.5)
+        self.assertGreaterEqual(elapsed, 32.5)
+        self.assertLess(elapsed, 34.5)
         self.client.call("codex.act", {
             "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
         })

@@ -82,6 +82,7 @@ command_sessions = {}
 initialized = False
 handshake = False
 coverage_file = os.environ.get("CODEX_CONNECT_FAKE_COVERAGE_FILE")
+config_file = os.environ.get("CODEX_CONNECT_FAKE_CONFIG_FILE")
 
 
 def allocate_thread_id():
@@ -217,7 +218,10 @@ for line in sys.stdin:
         respond(message, result)
         continue
     assert initialized
-    if method == "thread/start":
+    if method == "config/read":
+        assert params["includeLayers"] is False
+        result["config"] = json.loads(pathlib.Path(config_file).read_text())
+    elif method == "thread/start":
         thread_id = allocate_thread_id()
         thread = result["thread"]
         now = int(time.time())

@@ -19,7 +19,7 @@ The pinned RMCP SDK waits for the first handler message before opening a respons
 A quiet tool call therefore receives neither SSE headers nor comments until its result is
 ready. SSE comments are not ChatGPT conversation progress and cannot extend the measured
 caller result window. The transport does not support `Last-Event-ID` resumability. Keep
-useful synchronous work near 50 seconds or below and use retained worker or command handles
+local tool guards at or below 48 seconds and use retained worker or command handles
 for longer work. Origin validation remains enabled for the ChatGPT origins.
 
 ## Backend lifecycle
@@ -36,7 +36,7 @@ codex-connect console
 codex-connect probe --codex-bin "$(command -v codex)" --cwd ~/src/example-project
 ```
 
-`status` reports readiness, live build identity, navigation cwd, Codex defaults, retained persistent-command handles, and active/recent worker handles for operator rehydration. `doctor` provides local diagnostics. `console` is a read-only visibility surface for workers, transcripts, pending state, and usage; it does not steer or mutate anything. All worker/host actions remain in ChatGPT through the MCP/plugin surface.
+`codex-connect status` reports service and runtime identity; `doctor` provides local diagnostics. The MCP `status` tool also reports configuration read from the running App Server for the navigation cwd and retained command/worker handles for operator recovery. Null configuration values leave selection to App Server when a workstream starts; `configError` makes a failed read explicit without hiding recovery handles. `console` is a read-only visibility surface for workers, transcripts, pending state, and usage; it does not steer or mutate anything. All worker/host actions remain in ChatGPT through the MCP/plugin surface.
 
 ### Console navigation
 
@@ -72,7 +72,7 @@ for pipes, redirects, or expansion. Set `tty=true` only when a terminal is neede
 After `command.start`, retain `processId`; the first `command.read` starts at cursor `0`, then
 passes each returned cursor to the next read. If the start response is lost, `status.commands`
 lists retained `processId`, state, and TTY mode for recovery. `timeoutMs=0` reads immediately; otherwise the read waits for output
-or exit, up to 50 seconds per call. That ceiling is intentionally below the measured ChatGPT
+or exit, up to 43 seconds per call. That ceiling leaves headroom below the measured ChatGPT
 outer result window. Timeout does not terminate the process. Continue until `drained=true` for
 final output; `historyLost=true` means older output was evicted. Termination can be
 forceful: confirm exit with `command.read`. Process handles belong to the backend's
@@ -203,7 +203,7 @@ Verify source, Git, prepared artifact, live build identity, ChatGPT plugin disco
 
 The managed backend intentionally has no Codex Connect configuration file. Its loopback endpoint is `127.0.0.1:8767`, its navigation cwd comes from the service HOME, and `codex` is resolved from the service PATH and verified against the pinned release at App Server startup. Project-specific paths belong in tool-call `cwd` values rather than persistent backend state.
 
-Worker defaults may be reported by `status` from the normal Codex global config; worker instruction sources remain the Codex config and AGENTS.md chain.
+`status.codex.config` reads the running App Server's `config/read` response for the navigation cwd. It does not parse `config.toml` or guess a model when the upstream value is null. `codex.start` reports the model and effort assigned to the actual workstream. Worker instruction sources remain the Codex config and AGENTS.md chain.
 
 ```bash
 codex-connect uninstall

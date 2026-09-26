@@ -36,7 +36,7 @@ use tokio::net::TcpListener;
 use tower_service::Service;
 
 const QUICK_TOOL_GUARD_MS: u64 = 45_000;
-const CODEX_START_GUARD_MS: u64 = 50_000;
+const CODEX_START_GUARD_MS: u64 = 48_000;
 const COMMAND_EXEC_GUARD_MS: u64 = codex_connect_relay::DEFAULT_COMMAND_MS
     + codex_connect_relay::COMMAND_EXEC_RESPONSE_ALLOWANCE_MS
     + 5_000;
@@ -70,7 +70,6 @@ pub struct RuntimeIdentity {
     pub codex_binary: String,
     pub codex_home: String,
     pub codex_home_source: String,
-    pub codex_global_config: CodexGlobalConfigSummary,
 }
 
 fn attach_worker_events(value: &mut Value, events: Vec<Value>) {
@@ -84,26 +83,11 @@ fn attach_worker_events(value: &mut Value, events: Vec<Value>) {
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexGlobalConfigSummary {
-    pub path: String,
-    pub exists: bool,
-    pub parsed: bool,
-    pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub service_tier: Option<String>,
-    pub approval_policy: Option<String>,
-    pub sandbox_mode: Option<String>,
-    pub workspace_write_network_access: Option<bool>,
-}
-
-#[derive(Clone, Debug, Deserialize, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RuntimeCodexStatus {
     pub binary: String,
     pub release: String,
     pub home: String,
     pub home_source: String,
-    pub global_config: CodexGlobalConfigSummary,
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
@@ -498,18 +482,18 @@ struct McpHandler {
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexDefaults {
+pub struct CodexConfigStatus {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
-    pub source: String,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpCodexStatus {
     pub release: String,
-    pub defaults: CodexDefaults,
+    pub config: Option<CodexConfigStatus>,
+    pub config_error: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -522,27 +506,26 @@ pub struct McpStatus {
 }
 
 impl McpStatus {
-    fn read(relay: &Relay, runtime: &RuntimeIdentity) -> Self {
-        let config = &runtime.codex_global_config;
+    async fn read(relay: &Relay, runtime: &RuntimeIdentity) -> Self {
+        let (config, config_error) = match relay.codex_config().await {
+            Ok(config) => (
+                Some(CodexConfigStatus {
+                    model: config.model,
+                    reasoning_effort: config.model_reasoning_effort,
+                    service_tier: config.service_tier,
+                }),
+                None,
+            ),
+            Err(error) => (None, Some(error.to_string())),
+        };
         Self {
             ready: relay.worker_available(),
             build_id: runtime.build_id.clone(),
             cwd: relay.default_cwd(),
             codex: McpCodexStatus {
                 release: codex_connect_relay::CODEX_RELEASE.trim().to_string(),
-                defaults: CodexDefaults {
-                    model: config.model.clone(),
-                    reasoning_effort: config.reasoning_effort.clone(),
-                    service_tier: config.service_tier.clone(),
-                    source: if config.model.is_some()
-                        || config.reasoning_effort.is_some()
-                        || config.service_tier.is_some()
-                    {
-                        "userConfig".into()
-                    } else {
-                        "upstream".into()
-                    },
-                },
+                config,
+                config_error,
             },
         }
     }
@@ -579,7 +562,6 @@ impl RuntimeStatus {
                 release: codex_connect_relay::CODEX_RELEASE.trim().to_string(),
                 home: runtime.codex_home.clone(),
                 home_source: runtime.codex_home_source.clone(),
-                global_config: runtime.codex_global_config.clone(),
             },
             app_server: RuntimeAppServerStatus {
                 transport: "stdio".into(),
@@ -932,7 +914,7 @@ async fn dispatch(
     match name {
         "status" => {
             ensure_empty(arguments)?;
-            let mut value = serde_json::to_value(McpStatus::read(relay, runtime))?;
+            let mut value = serde_json::to_value(McpStatus::read(relay, runtime).await)?;
             value["commands"] = Value::Array(relay.command_handles().await);
             value["workers"] = Value::Array(relay.worker_handles().await);
             Ok(value)
@@ -1320,14 +1302,39 @@ async fn inspect(
         };
         let size = serde_json::to_vec(&row)?.len();
         if output_bytes.saturating_add(size) > MAX_INSPECT_OUTPUT_BYTES {
-            results
-                .push(json!({"index":index,"type":kind,"error":"inspect output limit exceeded"}));
+            let remaining = MAX_INSPECT_OUTPUT_BYTES.saturating_sub(output_bytes);
+            if let Some(bounded) = fit_search_result(row, remaining)? {
+                output_bytes += serde_json::to_vec(&bounded)?.len();
+                results.push(bounded);
+            } else {
+                results.push(json!({"index":index,"type":kind,"error":"inspect output limit exceeded; narrow the requested range or result count"}));
+            }
         } else {
             output_bytes += size;
             results.push(row);
         }
     }
     Ok(json!({"results":results}))
+}
+
+fn fit_search_result(mut row: Value, remaining: usize) -> anyhow::Result<Option<Value>> {
+    if row["type"] != "searchContent" || !row["result"]["matches"].is_array() {
+        return Ok(None);
+    }
+    let matches = std::mem::take(row["result"]["matches"].as_array_mut().unwrap());
+    row["result"]["truncated"] = Value::Bool(true);
+    let (mut low, mut high) = (0, matches.len());
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        row["result"]["matches"] = Value::Array(matches[..mid].to_vec());
+        if serde_json::to_vec(&row)?.len() <= remaining {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    row["result"]["matches"] = Value::Array(matches.into_iter().take(low).collect());
+    Ok((serde_json::to_vec(&row)?.len() <= remaining).then_some(row))
 }
 
 fn parse<T: DeserializeOwned>(arguments: JsonObject) -> anyhow::Result<T> {
@@ -1942,5 +1949,31 @@ mod tests {
         assert_eq!(tool_guard_ms("command.exec", &empty), COMMAND_EXEC_GUARD_MS);
         assert_eq!(tool_guard_ms("codex.start", &empty), CODEX_START_GUARD_MS);
         assert_eq!(tool_guard_ms("status", &empty), QUICK_TOOL_GUARD_MS);
+        for guard in [
+            CODEX_WAIT_GUARD_MS,
+            COMMAND_EXEC_GUARD_MS,
+            COMMAND_READ_GUARD_MS,
+            CODEX_START_GUARD_MS,
+        ] {
+            assert!(guard <= 48_000);
+        }
+    }
+
+    #[test]
+    fn oversized_content_search_preserves_a_bounded_prefix() {
+        let matches = (0..1_000)
+            .map(|line| json!({"path":format!("{}.txt", "p".repeat(100)),"line":line + 1,"text":"x".repeat(1_000)}))
+            .collect::<Vec<_>>();
+        let row = json!({"index":0,"type":"searchContent","result":{"matches":matches,"truncated":false}});
+        assert!(serde_json::to_vec(&row).unwrap().len() > MAX_INSPECT_OUTPUT_BYTES);
+        let bounded = fit_search_result(row, MAX_INSPECT_OUTPUT_BYTES)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bounded["result"]["truncated"], true);
+        let matches = bounded["result"]["matches"].as_array().unwrap();
+        assert!(!matches.is_empty());
+        assert!(matches.len() < 1_000);
+        assert_eq!(matches[0]["line"], 1);
+        assert!(serde_json::to_vec(&bounded).unwrap().len() <= MAX_INSPECT_OUTPUT_BYTES);
     }
 }
