@@ -1063,21 +1063,6 @@ fn render_snapshot(
     } else {
         lines.push(styled(row(&account_line(projection, width), width), TEXT));
     }
-    if let Some(notice) = projection["notices"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|notice| notice["kind"].as_str() == Some("error"))
-    {
-        lines.push(styled(
-            row(
-                &format!(" Error · {}", text(&notice["summary"], "observer error")),
-                width,
-            ),
-            RED,
-        ));
-    }
     let pending = projection["pendingActions"]
         .as_array()
         .map(Vec::as_slice)
@@ -1302,15 +1287,7 @@ fn render_transcript(
                 pinned.push(compact_action_row(action, width));
             }
         }
-        if let Some(notice) = snapshot["projection"]["notices"]
-            .as_array()
-            .and_then(|notices| {
-                notices
-                    .iter()
-                    .rev()
-                    .find(|notice| notice["kind"].as_str() == Some("error"))
-            })
-        {
+        if let Some(notice) = target_error_notice(snapshot, target) {
             let summary =
                 one_line_terminal_text(notice["summary"].as_str().unwrap_or("observer error"));
             pinned.push(styled(row(&format!(" ✕ {summary}"), width), RED));
@@ -1382,6 +1359,20 @@ fn render_transcript(
         state.scroll = state.scroll.min(max_scroll);
     }
     lines.extend(body.into_iter().skip(state.scroll).take(available));
+}
+
+fn target_error_notice<'a>(snapshot: &'a Value, target: &TranscriptTarget) -> Option<&'a Value> {
+    snapshot["projection"]["notices"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|notice| {
+            notice["kind"].as_str() == Some("error")
+                && notice["threadId"].as_str() == Some(target.thread_id.as_str())
+                && notice["turnId"]
+                    .as_str()
+                    .is_none_or(|turn_id| turn_id == target.turn_id)
+        })
 }
 
 fn pending_for_target<'a>(snapshot: &'a Value, target: &TranscriptTarget) -> Vec<&'a Value> {
@@ -2807,7 +2798,7 @@ mod tests {
         let snapshot = serde_json::json!({"projection":{
             "workers":[{"threadId":target.thread_id,"turnId":target.turn_id,"status":"failed"}],
             "pendingActions":[{"threadId":target.thread_id,"turnId":target.turn_id,"kind":"userInput","method":"item/tool/requestUserInput","params":{"questions":[{"question":"Which format?"}]}}],
-            "notices":[{"kind":"error","summary":"terminal worker error"}]
+            "notices":[{"kind":"error","summary":"terminal worker error","threadId":target.thread_id,"turnId":target.turn_id}]
         }});
         let mut state = state;
         let rendered = render_frame(
@@ -2828,6 +2819,69 @@ mod tests {
         assert!(rendered.contains("turn-full-recovery-handle"));
         assert!(rendered.contains("message 39"));
         assert!(!rendered.contains("message 0"));
+    }
+
+    #[test]
+    fn dashboard_does_not_promote_historical_worker_errors_to_global_state() {
+        let snapshot = serde_json::json!({
+            "runtime":{"ready":true,"buildId":"build"},
+            "projection":{
+                "defaultCwd":"/work/repo",
+                "usage":{"ordinaryUsageAllowed":true,"rateLimits":{
+                    "primary":{"usedPercent":2,"resetsAt":0,"windowDurationMins":300},
+                    "secondary":{"usedPercent":16,"resetsAt":0,"windowDurationMins":10080}
+                }},
+                "workers":[{"threadId":"failed-thread","turnId":"failed-turn","status":"failed",
+                    "mode":"work","model":"gpt-6-astra","effort":"high","prompt":"Historical failed work"}],
+                "pendingActions":[],
+                "notices":[{"kind":"error","summary":"You’ve hit your usage limit.",
+                    "threadId":"failed-thread","turnId":"failed-turn"}]
+            }
+        });
+        let rendered = render_frame(
+            Some(&snapshot),
+            None,
+            &mut ConsoleState::default(),
+            &TranscriptFetch::default(),
+            0,
+            120,
+            28,
+        )
+        .join("\n");
+        assert!(rendered.contains("usage open"));
+        assert!(!rendered.contains("You’ve hit your usage limit."));
+    }
+
+    #[test]
+    fn transcript_only_pins_errors_for_its_worker() {
+        let target = TranscriptTarget {
+            thread_id: "thread-a".into(),
+            turn_id: "turn-a".into(),
+        };
+        let snapshot = serde_json::json!({"projection":{
+            "workers":[{"threadId":"thread-a","turnId":"turn-a","status":"failed"}],
+            "pendingActions":[],
+            "notices":[
+                {"kind":"error","summary":"other worker error","threadId":"thread-b","turnId":"turn-b"},
+                {"kind":"error","summary":"this worker error","threadId":"thread-a","turnId":"turn-a"}
+            ]
+        }});
+        let mut state = ConsoleState {
+            view: View::Transcript(target),
+            ..ConsoleState::default()
+        };
+        let rendered = render_frame(
+            Some(&snapshot),
+            None,
+            &mut state,
+            &TranscriptFetch::default(),
+            0,
+            100,
+            24,
+        )
+        .join("\n");
+        assert!(rendered.contains("this worker error"));
+        assert!(!rendered.contains("other worker error"));
     }
 
     #[test]
