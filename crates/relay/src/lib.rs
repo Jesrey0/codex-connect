@@ -1260,8 +1260,10 @@ impl Relay {
             stderr: response.stderr,
             stdout_bytes,
             stderr_bytes,
-            stdout_may_be_truncated: stdout_bytes == output_bytes_cap,
-            stderr_may_be_truncated: stderr_bytes == output_bytes_cap,
+            // The cap applies to captured bytes before upstream text decoding, which can
+            // expand an incomplete or invalid multibyte sequence beyond that byte count.
+            stdout_may_be_truncated: stdout_bytes >= output_bytes_cap,
+            stderr_may_be_truncated: stderr_bytes >= output_bytes_cap,
             duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         })
     }

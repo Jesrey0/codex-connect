@@ -693,6 +693,15 @@ for line in sys.stdin:
                 else "fixture command\n"
             )
             result.update(exitCode=0, stdout=stdout, stderr="")
+            if params["command"][0] == "fixture-output-cap":
+                cap = params["outputBytesCap"]
+                kind = params["command"][1]
+                output = {
+                    "expanded": "a" * (cap - 1) + chr(0xFFFD),
+                    "exact": "a" * cap,
+                    "below": chr(0x20AC),
+                }[kind]
+                result.update(stdout=output, stderr=output)
         else:
             process_id = params["processId"]
             assert params["streamStdin"] is True

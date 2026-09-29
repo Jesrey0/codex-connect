@@ -437,6 +437,17 @@ class OperatorProtocolTests(unittest.TestCase):
         ]:
             self.client.call("command.exec",arguments,error=True,validate_input=False)
 
+    def test_command_output_cap_accounts_for_decoded_byte_expansion(self):
+        for kind, expected in [("expanded", True), ("exact", True), ("below", False)]:
+            with self.subTest(kind=kind):
+                result = self.client.call("command.exec", {
+                    "command": ["fixture-output-cap", kind],
+                })
+                self.assertEqual(result["stdoutMayBeTruncated"], expected)
+                self.assertEqual(result["stderrMayBeTruncated"], expected)
+                if kind == "expanded":
+                    self.assertGreater(len(result["stdout"].encode()), 65536)
+
     def test_persistent_nonpty_streaming_and_host_context(self):
         started = self.client.call("command.start", {
             "command": ["fixture-stream"],

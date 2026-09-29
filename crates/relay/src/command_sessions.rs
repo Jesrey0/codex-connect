@@ -41,6 +41,9 @@ fn flush_utf8_pending(session: &mut CommandSession) {
             CommandExecOutputStream::Stderr => std::mem::take(&mut session.stderr_utf8_pending),
         };
         if !bytes.is_empty() {
+            // Each flushed stream must have its own cursor so a page boundary
+            // between stdout and stderr cannot skip the second chunk.
+            session.cursor = session.cursor.wrapping_add(1);
             retain_chunk(session, stream, bytes);
         }
     }
@@ -454,6 +457,52 @@ mod tests {
         let result = sessions.read_after("process", 0).await.unwrap();
         assert_eq!(result.value["stderr"], "�");
         assert_eq!(result.value["drained"], true);
+    }
+
+    #[tokio::test]
+    async fn terminal_utf8_flush_preserves_both_streams_across_pages() {
+        for failed in [false, true] {
+            let sessions = CommandSessions::default();
+            sessions
+                .insert("process".into(), "/project".into(), false)
+                .await
+                .unwrap();
+            for stream in [
+                CommandExecOutputStream::Stdout,
+                CommandExecOutputStream::Stderr,
+            ] {
+                sessions
+                    .push_output("process", stream, vec![b'a'; MAX_CHUNK_BYTES - 2])
+                    .await;
+                sessions
+                    .push_output("process", stream, vec![0xf0, 0x9f, 0x92])
+                    .await;
+            }
+            if failed {
+                sessions.fail("process", "connection closed".into()).await;
+            } else {
+                sessions
+                    .complete(
+                        "process",
+                        CommandExecResponse {
+                            exit_code: 0,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        },
+                    )
+                    .await;
+            }
+            let first = sessions.read_after("process", 0).await.unwrap();
+            assert_eq!(first.value["hasMoreOutput"], true);
+            assert_eq!(first.value["drained"], false);
+            let cursor = first.value["cursor"].as_u64().unwrap();
+            let second = sessions.read_after("process", cursor).await.unwrap();
+            assert_eq!(second.value["stderr"], "\u{fffd}");
+            assert_eq!(second.value["stdout"], "");
+            assert_eq!(second.value["historyLost"], false);
+            assert_eq!(second.value["drained"], true);
+            assert!(second.value["cursor"].as_u64().unwrap() > cursor);
+        }
     }
 
     #[tokio::test]
