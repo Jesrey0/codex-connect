@@ -199,20 +199,22 @@ outbound HTTPS and needs no additional ngrok route. Installed services and the
 ChatGPT plugin have not been updated by source validation.
 
 Events state is `${XDG_STATE_HOME:-$HOME/.local/state}/codex-connect/events`, with
-private atomic storage and exclusive process ownership. Default lifetime is one
-hour; requested finite lifetimes are bounded to one minute through 24 hours.
-Omitted or null lifetimes still receive finite expiry. Capacity is 128 retained
-subscriptions and one terminal outbox slot per subscription. Retired records stay
-for 24 hours after their granted expiry, then are pruned. Overflow is a visible
+private atomic storage and exclusive process ownership. An omitted `ttlMs` gets
+the one-hour default; finite requests are bounded to one minute through 24 hours.
+Explicit `ttlMs: null` requests no expiry and returns `refreshBefore: null`.
+Capacity is 128 retained subscriptions and one terminal outbox slot per
+subscription. Retired records stay for 24 hours after their granted expiry, or
+after retirement when no expiry was granted. Overflow is a visible
 MCP error and diagnostic counter. Webhook concurrency is one, each attempt has a
 ten-second overall timeout, and transient failures receive at most eight attempts
 with exponential backoff. Redirects, ordinary non-transient client errors, 410 and
 413 exhaust delivery immediately. A 2xx acknowledges receipt only.
 
-Verification caching lasts five minutes from successful verification; repeated
-refreshes do not extend that cache indefinitely. Secret changes trigger a new
-challenge and five-minute dual signing. A second key change during that window is
-rejected to keep rotation bounded. Cancellation, finite expiry and recognized
+Verification caching lasts five minutes from successful verification for the
+authenticated principal and callback URL; repeated refreshes do not extend that
+cache indefinitely. Secret changes reuse endpoint verification and use five
+minutes of dual signing. A second key change during that window is rejected to
+keep rotation bounded. Cancellation, finite expiry and recognized
 revocation retire pending work and remove signing keys. Ingress outage pauses
 without allowing delivery; recovery requires the same stored grant to remain
 valid. A new grant never auto-reactivates an old subscription.

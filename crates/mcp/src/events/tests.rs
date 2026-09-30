@@ -160,9 +160,12 @@ async fn fixture() -> (Fixture, Events) {
     )
 }
 
+fn request_value(url: &str) -> Value {
+    json!({"name":EVENT_NAME,"arguments":{"threadId":"thread-1","turnId":"turn-1"},
+        "delivery":{"mode":"webhook","url":url,"secret":format!("whsec_{}",base64::engine::general_purpose::STANDARD.encode([1;32]))}})
+}
 fn request(url: &str) -> SubscriptionRequest {
-    serde_json::from_value(json!({"name":EVENT_NAME,"arguments":{"threadId":"thread-1","turnId":"turn-1"},
-        "delivery":{"mode":"webhook","url":url,"secret":format!("whsec_{}",base64::engine::general_purpose::STANDARD.encode([1;32]))}})).unwrap()
+    serde_json::from_value(request_value(url)).unwrap()
 }
 fn terminal(thread: &str, turn: &str) -> TerminalTurn {
     TerminalTurn {
@@ -259,13 +262,19 @@ async fn canonical_identity_idempotency_and_verification_cache() {
     let (fixture, events) = fixture().await;
     let url = "https://receiver.example/a";
     let first = subscribe(&events, url).await;
+    assert!(first.get("resultType").is_none());
+    assert!(first["refreshBefore"].as_str().is_some());
+    let initial_expiry =
+        events.0.store.lock().unwrap().subscriptions[first["id"].as_str().unwrap()].expires_ms;
+    assert!(initial_expiry.is_some_and(|expires| expires > now_ms()));
     let mut refresh = request(url);
-    refresh.ttl_ms = Some(1);
+    refresh.ttl_ms = TtlMs::Finite(1);
     let result = events
         .subscribe(refresh, authorization(), |_| async { Ok(()) })
         .await
         .unwrap();
     assert_eq!(first["id"], result["id"]);
+    assert!(result.get("resultType").is_none());
     assert!(
         chrono::DateTime::parse_from_rfc3339(result["refreshBefore"].as_str().unwrap())
             .unwrap()
@@ -284,6 +293,62 @@ async fn canonical_identity_idempotency_and_verification_cache() {
             .unwrap()["id"]
     );
     assert!(first["cursor"].is_null());
+    assert_eq!(fixture.callback.records.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn null_ttl_is_non_expiring_across_refresh_and_restart() {
+    let (fixture, events) = fixture().await;
+    let url = "https://receiver.example/non-expiring";
+    let mut value = request_value(url);
+    value["ttlMs"] = Value::Null;
+    let parsed: SubscriptionRequest = serde_json::from_value(value).unwrap();
+    let created = events
+        .subscribe(parsed, authorization(), |_| async { Ok(()) })
+        .await
+        .unwrap();
+    assert_eq!(created["refreshBefore"], Value::Null);
+    assert!(created.get("resultType").is_none());
+    let id = created["id"].as_str().unwrap().to_owned();
+    assert!(
+        events.0.store.lock().unwrap().subscriptions[&id]
+            .expires_ms
+            .is_none()
+    );
+
+    let mut refresh = request_value(url);
+    refresh["ttlMs"] = Value::Null;
+    let refresh: SubscriptionRequest = serde_json::from_value(refresh).unwrap();
+    let refreshed = events
+        .subscribe(refresh, authorization(), |_| async { Ok(()) })
+        .await
+        .unwrap();
+    assert_eq!(refreshed["id"], created["id"]);
+    assert_eq!(refreshed["refreshBefore"], Value::Null);
+    assert_eq!(events.0.store.lock().unwrap().subscriptions.len(), 1);
+    assert_eq!(fixture.callback.records.lock().unwrap().len(), 1);
+
+    events.tick().await.unwrap();
+    assert_eq!(events.diagnostics()["states"]["active"], 1);
+    let directory = fixture.directory.path().join("events");
+    drop(events);
+    let recovered = Events::with_network(
+        directory,
+        fixture.ingress.clone(),
+        webhook::Webhook {
+            fixture: Some(fixture.callback.clone()),
+        },
+    )
+    .unwrap();
+    assert_eq!(recovered.diagnostics()["states"]["paused"], 1);
+    due(&recovered);
+    recovered.tick().await.unwrap();
+    assert_eq!(recovered.diagnostics()["states"]["active"], 1);
+    assert!(
+        recovered.0.store.lock().unwrap().subscriptions[&id]
+            .expires_ms
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -373,7 +438,7 @@ async fn revocation_outage_and_expiry_block_network_and_do_not_auto_rebind() {
     events
         .update(|store| {
             for sub in store.subscriptions.values_mut() {
-                sub.expires_ms = 0;
+                sub.expires_ms = Some(0);
             }
             Ok(())
         })
@@ -516,7 +581,7 @@ async fn refresh_rotates_secrets_and_rechecks_expired_verification() {
         .subscribe(refresh, authorization(), |_| async { Ok(()) })
         .await
         .unwrap();
-    assert_eq!(fixture.callback.records.lock().unwrap().len(), 2);
+    assert_eq!(fixture.callback.records.lock().unwrap().len(), 1);
     events.observe(terminal("thread-1", "turn-1")).unwrap();
     events.tick().await.unwrap();
     let records = fixture.callback.application_records();
@@ -545,7 +610,7 @@ async fn refresh_rotates_secrets_and_rechecks_expired_verification() {
         .subscribe(refresh, authorization(), |_| async { Ok(()) })
         .await
         .unwrap();
-    assert_eq!(fixture.callback.records.lock().unwrap().len(), 4);
+    assert_eq!(fixture.callback.records.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -830,6 +895,8 @@ async fn http_boundary_requires_verified_context_and_projects_only_core_event() 
     )
     .await;
     assert_eq!(catalog.0, 200);
+    assert!(catalog.1["result"].get("resultType").is_none());
+    assert_eq!(catalog.1["result"].as_object().unwrap().len(), 1);
     assert_eq!(catalog.1["result"]["events"].as_array().unwrap().len(), 1);
     assert_eq!(catalog.1["result"]["events"][0]["name"], EVENT_NAME);
     let worker = relay
@@ -860,6 +927,11 @@ async fn http_boundary_requires_verified_context_and_projects_only_core_event() 
     .await;
     assert_eq!(result.0, 200);
     assert!(result.1.get("error").is_none(), "{:?}", result.1);
+    assert_eq!(result.1["result"].as_object().unwrap().len(), 4);
+    assert!(result.1["result"]["refreshBefore"].as_str().is_some());
+    assert_eq!(result.1["result"]["cursor"], Value::Null);
+    assert_eq!(result.1["result"]["truncated"], false);
+    assert!(result.1["result"].get("resultType").is_none());
     assert!(
         result.1["result"]["id"]
             .as_str()
@@ -906,7 +978,7 @@ async fn http_boundary_requires_verified_context_and_projects_only_core_event() 
         Some("verified-request"),
     )
     .await;
-    assert_eq!(stopped.1["result"], json!({"resultType":"complete"}));
+    assert_eq!(stopped.1["result"], json!({}));
     fixture.authority.outage.store(true, Ordering::Relaxed);
     assert_eq!(
         call(

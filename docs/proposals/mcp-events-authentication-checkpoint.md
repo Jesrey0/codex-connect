@@ -120,15 +120,15 @@ denial retires pending work permanently; authority outage pauses it visibly.
 | Property | Implemented bound or policy |
 | --- | --- |
 | Subscriptions/outbox | 128 retained subscriptions, one logical terminal delivery slot each; capacity rejection and durable overflow counter |
-| Lifetime | Default one hour; finite requests bounded to one minute through 24 hours; omitted/null receives finite expiry |
-| Retention | Retired records pruned 24 hours after their granted expiry; delivered slots deduplicate subsequent observations while retained |
+| Lifetime | Omitted `ttlMs` defaults to one hour; finite requests are bounded to one minute through 24 hours; `ttlMs: null` grants no expiry and returns `refreshBefore: null` |
+| Retention | Retired records pruned 24 hours after granted expiry, or after retirement when no expiry was granted; delivered slots deduplicate subsequent observations while retained |
 | Body | One event per request; maximum 256 KiB; compact factual payload |
 | Concurrency | One admitted outbound attempt; callback I/O runs outside relay notification handling |
 | Network time | Ten-second overall callback attempt/challenge; five-second connect timeout; private ingress calls three seconds |
 | Retry | At most eight consumed attempts; exponential 2/4/8/16/32/64/128-second delays between attempts; fresh signing timestamp/signature, stable bytes/ID |
 | Nonretryable | Redirect responses and ordinary non-transient 4xx, including 410/413; 408/429 remain bounded transient retries |
 | Verification | Fresh random, single-use challenge, signed control body, 2xx plus constant-time echo comparison; five-minute cache from successful verification |
-| Rotation | Replacement secret reverified; dual signing for five minutes; only one old key, further change during window rejected |
+| Rotation | Verification cache is keyed by authenticated principal and callback URL; replacement secrets reuse cached verification and use dual signing for five minutes; only one old key, further change during window rejected |
 | Storage | Effective XDG state root `codex-connect/events/store.json`, mode 0600 inside 0700 directory; atomic replacement/fsync and exclusive process lock |
 | Authorization | Before activation, verification, restart observation and every delivery attempt; denial stops, outage pauses, no allow cache |
 

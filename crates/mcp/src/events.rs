@@ -56,8 +56,25 @@ struct SubscriptionRequest {
     name: String,
     arguments: Filters,
     delivery: Destination,
-    ttl_ms: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_ttl")]
+    ttl_ms: TtlMs,
     cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum TtlMs {
+    #[default]
+    Default,
+    Finite(u64),
+    NonExpiring,
+}
+
+fn deserialize_ttl<'de, D>(deserializer: D) -> Result<TtlMs, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)
+        .map(|ttl| ttl.map_or(TtlMs::NonExpiring, TtlMs::Finite))
 }
 
 #[derive(Deserialize)]
@@ -89,7 +106,8 @@ struct Subscription {
     secret: String,
     old_secret: Option<String>,
     rotation_until_ms: u64,
-    expires_ms: u64,
+    expires_ms: Option<u64>,
+    retired_ms: Option<u64>,
     verified_until_ms: u64,
     auth_next_ms: u64,
     state: String,
@@ -172,6 +190,7 @@ fn live_state(state: &str) -> bool {
     matches!(state, "active" | "paused" | "verifying")
 }
 fn retire(sub: &mut Subscription, state: &str) {
+    sub.retired_ms.get_or_insert_with(now_ms);
     sub.state = state.to_owned();
     sub.secret.clear();
     sub.old_secret = None;
@@ -181,6 +200,11 @@ fn retire(sub: &mut Subscription, state: &str) {
     {
         delivery.state = state.to_owned();
     }
+}
+fn retention_deadline(sub: &Subscription) -> Option<u64> {
+    sub.expires_ms
+        .or(sub.retired_ms)
+        .map(|timestamp| timestamp.saturating_add(RETENTION_MS))
 }
 fn validate(name: &str, filters: &Filters, delivery: &Destination) -> Result<(), McpError> {
     if name != EVENT_NAME || delivery.mode != "webhook" {
@@ -244,7 +268,7 @@ impl Events {
             if sub.state == "verifying" {
                 retire(sub, "verificationFailed");
             } else if live_state(&sub.state) {
-                if sub.expires_ms <= now {
+                if sub.expires_ms.is_some_and(|expires| expires <= now) {
                     retire(sub, "expired");
                 } else {
                     sub.state = "paused".into();
@@ -306,14 +330,14 @@ impl Events {
     }
 
     pub fn catalog() -> Value {
-        json!({"resultType":"complete","events":[{"name":EVENT_NAME,
+        json!({"events":[{"name":EVENT_NAME,
             "description":"An authoritative Codex turn reached completed, interrupted, or failed status. Use codex.inspect for its result.",
             "delivery":["webhook"],
             "inputSchema":{"type":"object","properties":{"threadId":{"type":"string"},"turnId":{"type":"string"}},
                 "required":["threadId","turnId"],"additionalProperties":false},
-            "payloadSchema":{"type":"object","properties":{"threadId":{"type":"string"},"turnId":{"type":"string"},
+                "payloadSchema":{"type":"object","properties":{"threadId":{"type":"string"},"turnId":{"type":"string"},
                 "status":{"type":"string","enum":["completed","interrupted","failed"]}},
-                "required":["threadId","turnId","status"],"additionalProperties":false}}],"nextCursor":null})
+                "required":["threadId","turnId","status"],"additionalProperties":false}}]})
     }
 
     pub async fn dispatch(
@@ -377,7 +401,7 @@ impl Events {
             Ok(())
         })
         .map_err(|_| internal())?;
-        Ok(json!({"resultType":"complete"}))
+        Ok(json!({}))
     }
 
     async fn subscribe<F, Fut>(
@@ -413,16 +437,19 @@ impl Events {
             return Err(auth_error());
         }
         let now = now_ms();
-        let ttl = request
-            .ttl_ms
-            .unwrap_or(DEFAULT_TTL_MS)
-            .clamp(MIN_TTL_MS, MAX_TTL_MS);
+        let ttl_ms = match request.ttl_ms {
+            TtlMs::Default => Some(DEFAULT_TTL_MS),
+            TtlMs::Finite(ttl) => Some(ttl.clamp(MIN_TTL_MS, MAX_TTL_MS)),
+            TtlMs::NonExpiring => None,
+        };
+        let expires_ms = ttl_ms.map(|ttl| now.saturating_add(ttl));
         let id = identity(&auth, &request.arguments, &request.delivery.url);
         let filters = request.arguments;
         let capacity = self
             .update(|store| {
                 store.subscriptions.retain(|_, sub| {
-                    live_state(&sub.state) || sub.expires_ms.saturating_add(RETENTION_MS) > now
+                    live_state(&sub.state)
+                        || retention_deadline(sub).is_some_and(|until| until > now)
                 });
                 if !store.subscriptions.contains_key(&id)
                     && store.subscriptions.len() >= MAX_SUBSCRIPTIONS
@@ -443,7 +470,8 @@ impl Events {
         let (verified, sub) = self
             .update(|store| {
                 store.subscriptions.retain(|_, sub| {
-                    live_state(&sub.state) || sub.expires_ms.saturating_add(RETENTION_MS) > now
+                    live_state(&sub.state)
+                        || retention_deadline(sub).is_some_and(|until| until > now)
                 });
                 if !store.subscriptions.contains_key(&id)
                     && store.subscriptions.len() >= MAX_SUBSCRIPTIONS
@@ -462,7 +490,6 @@ impl Events {
                     .filter(|s| {
                         s.authorization.principal == auth.principal
                             && s.url == request.delivery.url
-                            && s.secret == secret
                             && s.verified_until_ms > now
                             && live_state(&s.state)
                     })
@@ -489,7 +516,8 @@ impl Events {
                         .filter(|s| s.secret == request.delivery.secret.clone().unwrap_or_default())
                         .map(|s| s.rotation_until_ms)
                         .unwrap_or(now + ROTATION_MS),
-                    expires_ms: now + ttl,
+                    expires_ms,
+                    retired_ms: None,
                     verified_until_ms: verified_until,
                     auth_next_ms: 0,
                     state: "verifying".into(),
@@ -516,11 +544,11 @@ impl Events {
             if !self.0.ingress.valid(&sub.authorization).await.map_err(|_| auth_error())? { return Err(auth_error()); }
             self.update(|store| {
                 let sub = store.subscriptions.get_mut(&id).context("subscription disappeared")?;
-                if sub.expires_ms <= now_ms() { retire(sub, "expired"); bail!("subscription expired during verification"); }
+                if sub.expires_ms.is_some_and(|expires| expires <= now_ms()) { retire(sub, "expired"); bail!("subscription expired during verification"); }
                 sub.state = "active".into();
                 if !verified { sub.verified_until_ms = now_ms() + VERIFY_CACHE_MS; }
                 sub.auth_next_ms = now_ms() + AUTH_INTERVAL_MS;
-                Ok(json!({"resultType":"complete","id":id,"refreshBefore":iso(sub.expires_ms)?,"cursor":null,"truncated":false}))
+                Ok(json!({"id":id,"refreshBefore":sub.expires_ms.map(iso).transpose()? ,"cursor":null,"truncated":false}))
             }).map_err(|_| internal())
         }.await;
         if result.is_err() {
@@ -585,7 +613,7 @@ impl Events {
         self.update(|store| {
             let now = now_ms();
             for sub in store.subscriptions.values_mut() {
-                if sub.expires_ms <= now && live_state(&sub.state) { retire(sub, "expired"); }
+                if sub.expires_ms.is_some_and(|expires| expires <= now) && live_state(&sub.state) { retire(sub, "expired"); }
                 if live_state(&sub.state) && sub.filters.thread_id == fact.thread_id && sub.filters.turn_id == fact.turn_id && sub.delivery.is_none() {
                     let bytes = serde_json::to_string(&json!({"eventId":event_id,"name":EVENT_NAME,"timestamp":iso(fact.timestamp_ms)?,
                         "data":{"threadId":fact.thread_id,"turnId":fact.turn_id,"status":fact.status},"cursor":null}))?;
@@ -644,10 +672,10 @@ impl Events {
         let now = now_ms();
         let candidates = self.update(|store| {
             store.subscriptions.retain(|_, sub| {
-                live_state(&sub.state) || sub.expires_ms.saturating_add(RETENTION_MS) > now
+                live_state(&sub.state) || retention_deadline(sub).is_some_and(|until| until > now)
             });
             for sub in store.subscriptions.values_mut() {
-                if live_state(&sub.state) && sub.expires_ms <= now {
+                if live_state(&sub.state) && sub.expires_ms.is_some_and(|expires| expires <= now) {
                     retire(sub, "expired");
                 }
                 if sub.rotation_until_ms <= now {
@@ -745,7 +773,7 @@ impl Events {
                 Ok(())
             })?;
         }
-        if sub.expires_ms <= now_ms() {
+        if sub.expires_ms.is_some_and(|expires| expires <= now_ms()) {
             self.update(|store| {
                 retire(store.subscriptions.get_mut(&sub.id).unwrap(), "expired");
                 Ok(())
@@ -759,7 +787,7 @@ impl Events {
             if !live_state(&sub.state) {
                 return Ok((sub.clone(), false));
             }
-            if sub.expires_ms <= now_ms() {
+            if sub.expires_ms.is_some_and(|expires| expires <= now_ms()) {
                 retire(sub, "expired");
                 return Ok((sub.clone(), false));
             }
