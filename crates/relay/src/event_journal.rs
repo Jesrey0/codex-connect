@@ -31,6 +31,7 @@ struct JournalState {
 pub struct EventJournal {
     state: Arc<Mutex<JournalState>>,
     changed: watch::Sender<u64>,
+    gaps: watch::Sender<u64>,
 }
 
 impl Default for EventJournal {
@@ -38,6 +39,7 @@ impl Default for EventJournal {
         Self {
             state: Arc::new(Mutex::new(JournalState::default())),
             changed: watch::channel(0).0,
+            gaps: watch::channel(0).0,
         }
     }
 }
@@ -57,6 +59,10 @@ pub struct SemanticBatch {
 }
 
 impl EventJournal {
+    pub fn history_gaps(&self) -> watch::Receiver<u64> {
+        self.gaps.subscribe()
+    }
+
     pub fn changes(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
     }
@@ -94,6 +100,7 @@ impl EventJournal {
         let mut state = self.state.lock().await;
         state.cursor += 1;
         state.dropped_through = state.cursor;
+        self.gaps.send_replace(state.cursor);
         self.changed.send_replace(state.cursor);
     }
 

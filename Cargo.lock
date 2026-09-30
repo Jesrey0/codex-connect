@@ -307,6 +307,7 @@ dependencies = [
  "codex-connect-host",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

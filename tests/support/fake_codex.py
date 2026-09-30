@@ -77,6 +77,7 @@ slow_turn_list_at = {}
 empty_turn_list_once = set()
 empty_items_list_once = set()
 turn_list_counts = {}
+event_scenarios = {}
 pending = {}
 command_sessions = {}
 initialized = False
@@ -148,6 +149,19 @@ def complete(thread_id, turn_id, status="completed", emit_notification=True):
         threads[thread_id]["updatedAt"] = completed_at
         if emit_notification:
             notify("turn/completed", {"threadId": thread_id, "turn": turn})
+
+
+def complete_released_event(thread_id, turn_id, scenario):
+    release = pathlib.Path(threads[thread_id]["cwd"]) / "events-release"
+    deadline = time.monotonic() + 15
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.01)
+    complete(thread_id, turn_id, emit_notification=scenario == "events_natural")
+    if scenario == "events_gap":
+        # Exercise the real transport's oversized-notification history-gap path.
+        send({"method": "item/completed", "params": {"data": "x" * (9 * 1024 * 1024)}})
 
 
 def action(thread_id, turn_id, scenario):
@@ -322,9 +336,18 @@ for line in sys.stdin:
             thread["turns"] = []
         result["thread"] = thread
         if method == "thread/resume":
+            if event_scenarios.get(params["threadId"]) == "events_attach_cancel":
+                (pathlib.Path(thread["cwd"]) / "events-resume-entered").touch()
+                time.sleep(0.2)
+                event_scenarios[params["threadId"]] = "events_attach"
+            if event_scenarios.get(params["threadId"]) == "events_attach":
+                # Completion precedes attachment; metadata-only resume cannot replay it.
+                complete(params["threadId"], stored["turns"][-1]["id"], emit_notification=False)
             thread["cwd"] = params.get("cwd", thread["cwd"])
             subscriptions.add(params["threadId"])
             result["cwd"] = thread["cwd"]
+            if params.get("excludeTurns"):
+                thread["turns"] = []
     elif method == "thread/unsubscribe":
         thread_id = params["threadId"]
         if thread_id in unsubscribe_failures:
@@ -366,7 +389,13 @@ for line in sys.stdin:
             })
             continue
     elif method == "thread/turns/list":
+        scenario = event_scenarios.get(params["threadId"])
+        if scenario == "events_natural":
+            assert not (pathlib.Path(threads[params["threadId"]]["cwd"]) / "events-release").exists(), "notification-only completion must not read turn state"
         turns = copy.deepcopy(threads[params["threadId"]]["turns"])
+        if scenario == "events_stale_read":
+            event_scenarios.pop(params["threadId"])
+            complete(params["threadId"], turns[-1]["id"])
         if params.get("itemsView") == "notLoaded":
             for turn in turns:
                 turn["items"] = []
@@ -438,6 +467,8 @@ for line in sys.stdin:
             thread["reasoningEffort"] = params["effort"]
         thread["updatedAt"] = int(time.time())
         scenario = params["input"][0]["text"]
+        if scenario.startswith("events_"):
+            event_scenarios[thread_id] = scenario
         if scenario == "start_error":
             send({"id": message["id"], "error": {"code": -32001, "message": "fixture turn/start failure"}})
             continue
@@ -473,7 +504,11 @@ for line in sys.stdin:
             continue
         respond(message, result)
         notify("turn/started", {"threadId": thread_id, "turn": turn})
-        if scenario == "no_event":
+        if scenario in ("events_natural", "events_gap"):
+            threading.Thread(target=complete_released_event, args=(thread_id, turn_id, scenario), daemon=True).start()
+        elif scenario in ("events_attach", "events_attach_cancel", "events_stale_read"):
+            pass
+        elif scenario == "no_event":
             complete(thread_id, turn_id, emit_notification=False)
         elif scenario == "progress":
             send({"method":"item/agentMessage/delta","params":{"threadId":thread_id,"turnId":turn_id,"delta":"Working"}})

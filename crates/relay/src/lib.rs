@@ -4,6 +4,8 @@ mod actions;
 mod activity;
 mod command_sessions;
 mod event_journal;
+#[cfg(test)]
+mod terminal_tests;
 mod thread_subscriptions;
 
 pub use actions::{
@@ -224,6 +226,33 @@ pub struct Relay {
     command_generation: Arc<str>,
     next_command_id: Arc<AtomicU64>,
     terminal_observer: Arc<std::sync::OnceLock<TerminalObserver>>,
+}
+
+// A bounded observation attempt may be cancelled while resume is in flight.
+// Always release its temporary start claim so terminal cleanup can proceed.
+struct ObservationStart {
+    relay: Relay,
+    thread_id: String,
+    armed: bool,
+}
+
+impl ObservationStart {
+    async fn finish(&mut self, turn_id: Option<&str>) {
+        self.relay
+            .finish_thread_start(&self.thread_id, turn_id)
+            .await;
+        self.armed = false;
+    }
+}
+
+impl Drop for ObservationStart {
+    fn drop(&mut self) {
+        if self.armed {
+            let relay = self.relay.clone();
+            let thread = self.thread_id.clone();
+            tokio::spawn(async move { relay.finish_thread_start(&thread, None).await });
+        }
+    }
 }
 
 #[derive(Default)]
@@ -855,6 +884,22 @@ impl Relay {
         if thread.id != thread_id {
             return Err(RelayError::Invalid("threadId must be canonical".into()));
         }
+        // Attach before reading: metadata-only resume does not replay a completion
+        // that preceded attachment. The subsequent read closes that interval.
+        self.ensure_wait_subscription(thread_id, turn_id, Instant::now() + Duration::from_secs(10))
+            .await?;
+        self.reconcile_watched_turn(thread_id, turn_id).await
+    }
+
+    pub fn history_gaps(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.journal.history_gaps()
+    }
+
+    async fn reconcile_watched_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<(), RelayError> {
         let stored = self.find_stored_turn_metadata(thread_id, turn_id).await?;
         let live = self.live_turn(thread_id, turn_id).await;
         let turn = match (stored, live) {
@@ -865,18 +910,21 @@ impl Relay {
             }
             (Some(stored), _) => Some(stored),
             (None, live) => live,
-        }
-        .ok_or_else(|| RelayError::Invalid("turnId does not belong to threadId".into()))?;
-        if turn.status.is_terminal() {
-            self.reconcile_terminal_turn(thread_id, &turn).await;
-        } else {
-            self.ensure_wait_subscription(
-                thread_id,
-                turn_id,
-                Instant::now() + Duration::from_secs(15),
-            )
-            .await?;
-            self.remember_live_turn(thread_id, &turn).await;
+        };
+        let Some(turn) = turn else {
+            // Only authoritative absence releases this registration. A read error
+            // must not detach an existing worker that still needs observation.
+            self.release_terminal_subscription(thread_id, turn_id).await;
+            return Err(RelayError::Invalid(
+                "turnId does not belong to threadId".into(),
+            ));
+        };
+        // insert preserves a terminal notification racing with this snapshot.
+        self.remember_live_turn(thread_id, &turn).await;
+        if let Some(latest) = self.live_turn(thread_id, turn_id).await
+            && latest.status.is_terminal()
+        {
+            self.reconcile_terminal_turn(thread_id, &latest).await;
         }
         Ok(())
     }
@@ -1040,18 +1088,23 @@ impl Relay {
                     .into(),
             ));
         }
+        let mut start = ObservationStart {
+            relay: self.clone(),
+            thread_id: thread_id.to_owned(),
+            armed: true,
+        };
         if self
             .thread_subscriptions
             .lock()
             .await
             .is_subscribed(thread_id)
         {
-            self.finish_thread_start(thread_id, Some(turn_id)).await;
+            start.finish(Some(turn_id)).await;
             return Ok(());
         }
         let remaining = operation_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            self.finish_thread_start(thread_id, None).await;
+            start.finish(None).await;
             return Err(RelayError::BudgetExceeded(
                 "codex.wait reached its operation deadline before thread subscription recovery"
                     .into(),
@@ -1072,11 +1125,11 @@ impl Relay {
         match resumed {
             Ok(_) => {
                 self.mark_thread_subscribed(thread_id).await;
-                self.finish_thread_start(thread_id, Some(turn_id)).await;
+                start.finish(Some(turn_id)).await;
                 Ok(())
             }
             Err(error) => {
-                self.finish_thread_start(thread_id, None).await;
+                start.finish(None).await;
                 Err(error.into())
             }
         }

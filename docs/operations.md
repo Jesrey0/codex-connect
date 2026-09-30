@@ -227,6 +227,27 @@ visibly and terminates the delivery service. Read-only `/observe` exposes counts
 and states, including paused, revoked, expired, cancelled, verification failure,
 delivered, exhausted, overflow and storage failure, without callbacks or keys.
 
+`/observe.events.lifecycle` adds process-local counters and the latest 128
+sanitized lifecycle records. The same records are emitted as `mcp_events` JSON
+lines in the service log. A request ID joins `subscriptionReceived` to
+`subscriptionRejected` or `subscriptionAccepted`; acceptance links to the
+subscription ID used by `subscriptionActivated`, `eventQueued`, `deliveryAttempt`,
+`deliveryOutcome`, and `callbackAcknowledged`. Records include canonical worker
+IDs, logical event IDs, attempt numbers, categorized failures and HTTP statuses,
+never callback URLs, signing keys, authorization contexts or raw error messages.
+Counters reset on restart; service-log retention is host-owned. A received request
+may still fail validation; acceptance does not prove ChatGPT received the response,
+and callback acknowledgement does not prove a chat resumed.
+
+Observation attaches upstream before reconciling turn state, preserving terminal
+notifications that race with a read. Transport history gaps and broadcast lag
+schedule reconciliation for live subscriptions without a terminal outbox entry.
+Recovery uses the existing serial delivery loop: at most one subscription per
+tick, a ten-second observation deadline, and a thirty-second retry delay after
+failure. Authorization is rechecked before recovery and delivery. Healthy
+subscriptions do not poll turn state. `historyGap` and `observationRecovery`
+diagnostics expose this recovery work.
+
 See the [contract, validation and exact acceptance steps](proposals/mcp-events-authentication-checkpoint.md).
 Deployment of ingress and backend, plugin rescan, account discovery, post-turn
 follow-up and closed-browser acceptance still require separate authorization.

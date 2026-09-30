@@ -181,6 +181,100 @@ async fn subscribe(events: &Events, url: &str) -> Value {
         .await
         .unwrap()
 }
+
+async fn await_acknowledgement(events: &Events) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if events.diagnostics()["lifecycle"]["evidence"]["counters"]["callbackAcknowledged"]
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal callback was not acknowledged");
+}
+
+#[tokio::test]
+async fn transport_history_gap_recovers_monitored_turn_without_operator_reads() {
+    let (fixture, events) = fixture().await;
+    let host = codex_connect_host::Host::open(fixture.directory.path()).unwrap();
+    let relay = Relay::start(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/support/fake_codex.py"),
+        host,
+    )
+    .await
+    .unwrap();
+    let sink = events.clone();
+    relay
+        .set_terminal_observer(Arc::new(move |fact| sink.observe(fact)))
+        .unwrap();
+    let delivery_events = events.clone();
+    let delivery_relay = relay.clone();
+    let deliveries = tokio::spawn(async move { delivery_events.run(delivery_relay).await });
+    let worker = relay
+        .work_start(
+            "events_gap".into(),
+            Some(fixture.directory.path().display().to_string()),
+            None,
+            None,
+            None,
+            Some("fixture-model-1".into()),
+            None,
+            Some(codex_connect_relay::SandboxPolicy::DangerFullAccess),
+        )
+        .await
+        .unwrap();
+    let mut subscription = request_value("https://receiver.example/gap");
+    subscription["arguments"] = json!({"threadId":worker["threadId"],"turnId":worker["turnId"]});
+    events
+        .dispatch("events/subscribe", subscription, authorization(), &relay)
+        .await
+        .unwrap();
+    fs::write(fixture.directory.path().join("events-release"), b"").unwrap();
+    await_acknowledgement(&events).await;
+    let diagnostics = events.diagnostics();
+    assert_eq!(
+        diagnostics["lifecycle"]["evidence"]["counters"]["observationRecovery"],
+        1
+    );
+    assert_eq!(fixture.callback.application_records().len(), 1);
+    let record = fixture.callback.application_records().remove(0);
+    let event: Value = serde_json::from_slice(&record.4).unwrap();
+    assert_eq!(
+        event["data"],
+        json!({"threadId":worker["threadId"],"turnId":worker["turnId"],"status":"completed"})
+    );
+    deliveries.abort();
+}
+
+#[tokio::test]
+async fn completion_during_validation_is_queued_but_delivery_requires_verification() {
+    for verified in [true, false] {
+        let (fixture, events) = fixture().await;
+        fixture.callback.echo.store(verified, Ordering::Relaxed);
+        let result = events
+            .subscribe(
+                request("https://receiver.example/race"),
+                authorization(),
+                |_| async {
+                    events.observe(terminal("thread-1", "turn-1")).unwrap();
+                    assert_eq!(events.diagnostics()["states"]["delivery:pending"], 1);
+                    assert!(fixture.callback.application_records().is_empty());
+                    Ok(())
+                },
+            )
+            .await;
+        assert_eq!(result.is_ok(), verified);
+        events.tick().await.unwrap();
+        assert_eq!(
+            fixture.callback.application_records().len(),
+            usize::from(verified)
+        );
+    }
+}
 fn due(events: &Events) {
     events
         .update(|store| {
@@ -193,6 +287,23 @@ fn due(events: &Events) {
             Ok(())
         })
         .unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_receipts_are_bounded_and_cancellation_is_visible() {
+    let (_fixture, events) = fixture().await;
+    for _ in 0..140 {
+        drop(events.subscription_received());
+    }
+    let diagnostics = events.diagnostics();
+    let evidence = &diagnostics["lifecycle"]["evidence"];
+    assert_eq!(evidence["counters"]["subscriptionReceived"], 140);
+    assert_eq!(evidence["counters"]["subscriptionRejected"], 140);
+    assert_eq!(evidence["recent"].as_array().unwrap().len(), 128);
+    assert_eq!(
+        evidence["recent"].as_array().unwrap().last().unwrap()["reason"],
+        "cancelledOrUndispatched"
+    );
 }
 fn cancel_request(url: &str) -> UnsubscribeRequest {
     serde_json::from_value(json!({"name":EVENT_NAME,
@@ -788,6 +899,46 @@ async fn durable_write_failure_stops_admission_visibly() {
     assert_eq!(events.diagnostics()["storageFailed"], true);
 }
 
+async fn call(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    params: Value,
+    context: Option<&str>,
+) -> (u16, Value) {
+    let mut params = params;
+    params.as_object_mut().unwrap().insert(
+        "_meta".into(),
+        json!({
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientInfo":{"name":"events-test","version":"1"},
+        "io.modelcontextprotocol/clientCapabilities":{}}),
+    );
+    let mut request = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", method)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}));
+    if let Some(context) = context {
+        request = request.header(CONTEXT_HEADER, context);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    let body = if let Ok(body) = serde_json::from_str(&text) {
+        body
+    } else {
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE result");
+        serde_json::from_str(data).unwrap()
+    };
+    (status, body)
+}
+
 #[tokio::test]
 async fn http_boundary_requires_verified_context_and_projects_only_core_event() {
     let (fixture, events) = fixture().await;
@@ -817,53 +968,17 @@ async fn http_boundary_requires_verified_context_and_projects_only_core_event() 
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
+    let delivery_events = events.clone();
+    let delivery_relay = relay.clone();
+    let deliveries = tokio::spawn(async move { delivery_events.run(delivery_relay).await });
     let client = reqwest::Client::new();
-    async fn call(
-        client: &reqwest::Client,
-        url: &str,
-        method: &str,
-        params: Value,
-        context: Option<&str>,
-    ) -> (u16, Value) {
-        let mut params = params;
-        params.as_object_mut().unwrap().insert(
-            "_meta".into(),
-            json!({
-            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
-            "io.modelcontextprotocol/clientInfo":{"name":"events-test","version":"1"},
-            "io.modelcontextprotocol/clientCapabilities":{}}),
-        );
-        let mut request = client
-            .post(url)
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .header("MCP-Protocol-Version", "2026-07-28")
-            .header("Mcp-Method", method)
-            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}));
-        if let Some(context) = context {
-            request = request.header(CONTEXT_HEADER, context);
-        }
-        let response = request.send().await.unwrap();
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap();
-        let body = if let Ok(body) = serde_json::from_str(&text) {
-            body
-        } else {
-            let data = text
-                .lines()
-                .find_map(|line| line.strip_prefix("data: "))
-                .expect("SSE result");
-            serde_json::from_str(data).unwrap()
-        };
-        (status, body)
-    }
     for context in [
         None,
         Some("forged"),
         Some("verified-request, verified-request"),
     ] {
         assert_eq!(
-            call(&client, &endpoint, "events/list", json!({}), context)
+            call(&client, &endpoint, "events/subscribe", json!({}), context)
                 .await
                 .0,
             401
@@ -901,7 +1016,7 @@ async fn http_boundary_requires_verified_context_and_projects_only_core_event() 
     assert_eq!(catalog.1["result"]["events"][0]["name"], EVENT_NAME);
     let worker = relay
         .work_start(
-            "idle".into(),
+            "events_natural".into(),
             Some(fixture.directory.path().display().to_string()),
             None,
             None,
@@ -953,20 +1068,14 @@ async fn http_boundary_requires_verified_context_and_projects_only_core_event() 
         .get("error")
         .is_some()
     );
-    relay
-        .work_interrupt(thread.to_owned(), turn.to_owned())
-        .await
-        .unwrap();
-    // Event notification and authoritative read converge at the same durable projection.
-    relay.watch_terminal(thread, turn).await.unwrap();
-    events.tick().await.unwrap();
-    relay.watch_terminal(thread, turn).await.unwrap();
-    due(&events);
-    events.tick().await.unwrap();
+    // After subscription succeeds, only the worker notification and delivery loop
+    // may produce the callback. The fake rejects post-release turn-state reads.
+    fs::write(fixture.directory.path().join("events-release"), b"").unwrap();
+    await_acknowledgement(&events).await;
     let records = fixture.callback.application_records();
     assert_eq!(records.len(), 1);
     let event: Value = serde_json::from_slice(&records[0].4).unwrap();
-    assert_eq!(event["data"]["status"], "interrupted");
+    assert_eq!(event["data"]["status"], "completed");
     assert_eq!(event["data"]["threadId"], thread);
     assert_eq!(event["data"]["turnId"], turn);
     let stopped = call(
@@ -992,6 +1101,30 @@ async fn http_boundary_requires_verified_context_and_projects_only_core_event() 
         .0,
         401
     );
+    let diagnostics = events.diagnostics();
+    let counters = &diagnostics["lifecycle"]["evidence"]["counters"];
+    assert_eq!(counters["subscriptionReceived"], 5);
+    assert_eq!(counters["subscriptionRejected"], 4);
+    assert_eq!(counters["subscriptionAccepted"], 1);
+    assert_eq!(counters["subscriptionActivated"], 1);
+    assert_eq!(counters["eventQueued"], 1);
+    assert_eq!(counters["deliveryAttempt"], 1);
+    assert_eq!(counters["deliveryOutcome"], 1);
+    assert_eq!(counters["callbackAcknowledged"], 1);
+    assert!(counters.get("observationRecovery").is_none());
+    let evidence = diagnostics.to_string();
+    for sensitive in [
+        "https://",
+        "whsec_",
+        "verified-request",
+        "fixture-encrypted-grant-context",
+    ] {
+        assert!(
+            !evidence.contains(sensitive),
+            "diagnostics leaked {sensitive}"
+        );
+    }
+    deliveries.abort();
     server.abort();
 }
 

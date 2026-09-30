@@ -83,6 +83,13 @@ keys and grant state there. Do not use live ChatGPT subscriptions as source test
 The atomic storage and OS lock primitives formerly in the CLI are shared through
 `codex-connect-host::storage`; keep one owner when adding consumers.
 
+Also run `cargo test --locked -p codex-connect-relay terminal_watch` for attachment
+ordering, cancellation cleanup and monotonic terminal preservation. Events
+integration tests release natural completion only after subscription, reject
+follow-up turn reads on that path, and exercise recovery from a real oversized
+transport notification without operator reads. These tests use the fixture peer;
+they do not establish live ChatGPT callback acceptance or wake behavior.
+
 ## Validation
 
 Run the repository gate with the pinned CLI installed and Python `jsonschema` available:

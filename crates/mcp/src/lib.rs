@@ -287,6 +287,11 @@ async fn project_openai_tool_descriptors(
             .unwrap_or("");
         let is_tool_list = method == "tools/list";
         let is_discovery = method == "server/discover";
+        let subscription_receipt =
+            (method == "events/subscribe").then(|| boundary.events.subscription_received());
+        if let Some(receipt) = &subscription_receipt {
+            parts.extensions.insert(receipt.clone());
+        }
         if method.starts_with("events/")
             || (is_discovery && parts.headers.contains_key(events::CONTEXT_HEADER))
         {
@@ -305,6 +310,9 @@ async fn project_openai_tool_descriptors(
                 None
             };
             let Some(authorization) = authorization else {
+                if let Some(receipt) = &subscription_receipt {
+                    receipt.rejected("authorization", Some(-32001));
+                }
                 return (StatusCode::UNAUTHORIZED, Json(json!({"jsonrpc":"2.0","id":input.as_ref().and_then(|v| v.get("id")),
                     "error":{"code":-32001,"message":"Events authorization denied or unavailable"}}))).into_response();
             };
@@ -633,6 +641,11 @@ impl ServerHandler for McpHandler {
                     None,
                 )
             })?;
+        let receipt = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Arc<events::SubscriptionReceipt>>())
+            .cloned();
         let result = tokio::time::timeout(
             Duration::from_secs(45),
             self.events.dispatch(
@@ -643,8 +656,11 @@ impl ServerHandler for McpHandler {
             ),
         )
         .await
-        .map_err(|_| McpError::internal_error("Events operation timed out", None))??;
-        Ok(rmcp::model::CustomResult(result))
+        .unwrap_or_else(|_| Err(McpError::internal_error("Events operation timed out", None)));
+        if let Some(receipt) = receipt {
+            receipt.finish(&result);
+        }
+        result.map(rmcp::model::CustomResult)
     }
 
     async fn list_tools(

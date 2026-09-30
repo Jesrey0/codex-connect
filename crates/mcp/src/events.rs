@@ -1,5 +1,7 @@
 //! Single-user terminal subscriptions and a bounded durable webhook outbox.
+mod diagnostics;
 mod ingress;
+pub(crate) use diagnostics::SubscriptionReceipt;
 #[cfg(test)]
 mod tests;
 mod webhook;
@@ -131,6 +133,8 @@ struct Inner {
     admission: tokio::sync::Mutex<()>,
     ingress: Ingress,
     webhook: webhook::Webhook,
+    diagnostics: Mutex<diagnostics::Diagnostics>,
+    next_receipt: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -286,6 +290,8 @@ impl Events {
             admission: tokio::sync::Mutex::new(()),
             ingress,
             webhook,
+            diagnostics: Mutex::new(diagnostics::Diagnostics::default()),
+            next_receipt: std::sync::atomic::AtomicU64::new(1),
         }));
         events.update(|_| Ok(()))?;
         Ok(events)
@@ -560,6 +566,9 @@ impl Events {
             })
             .map_err(|_| internal())?;
         }
+        if result.is_ok() {
+            self.record_subscription("subscriptionActivated", &sub, None, None);
+        }
         result
     }
 
@@ -610,18 +619,24 @@ impl Events {
             return Err("nonterminal projection".into());
         }
         let event_id = digest("evt_", &json!([EVENT_NAME, fact.thread_id, fact.turn_id]));
-        self.update(|store| {
+        let queued = self.update(|store| {
             let now = now_ms();
+            let mut queued = Vec::new();
             for sub in store.subscriptions.values_mut() {
                 if sub.expires_ms.is_some_and(|expires| expires <= now) && live_state(&sub.state) { retire(sub, "expired"); }
                 if live_state(&sub.state) && sub.filters.thread_id == fact.thread_id && sub.filters.turn_id == fact.turn_id && sub.delivery.is_none() {
                     let bytes = serde_json::to_string(&json!({"eventId":event_id,"name":EVENT_NAME,"timestamp":iso(fact.timestamp_ms)?,
                         "data":{"threadId":fact.thread_id,"turnId":fact.turn_id,"status":fact.status},"cursor":null}))?;
                     sub.delivery = Some(Delivery { event_id: event_id.clone(), bytes, attempts: 0, next_attempt_ms: now, state: "pending".into() });
+                    queued.push(sub.clone());
                 }
             }
-            Ok(())
-        }).map_err(|_| "terminal delivery storage failed".into())
+            Ok(queued)
+        }).map_err(|_| "terminal delivery storage failed".to_owned())?;
+        for sub in queued {
+            self.record_subscription("eventQueued", &sub, None, None);
+        }
+        Ok(())
     }
 
     pub fn diagnostics(&self) -> Value {
@@ -637,13 +652,34 @@ impl Events {
                     .or_default() += 1;
             }
         }
-        json!({"storageFailed":self.0.failed.load(Ordering::Acquire),"states":states,"capacity":MAX_SUBSCRIPTIONS,"overflows":store.overflows})
+        json!({"storageFailed":self.0.failed.load(Ordering::Acquire),"states":states,"capacity":MAX_SUBSCRIPTIONS,"overflows":store.overflows,
+            "lifecycle": {"scope":"process", "evidence": &*self.0.diagnostics.lock().expect("Events diagnostics poisoned")}})
     }
 
     pub async fn run(&self, relay: Relay) -> Result<()> {
+        let mut gaps = relay.history_gaps();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
+            tokio::select! {
+                changed = gaps.changed() => {
+                    changed.context("terminal observation closed")?;
+                    let scheduled = self.update(|store| {
+                        let mut scheduled = 0;
+                        for sub in store.subscriptions.values_mut() {
+                            if live_state(&sub.state) && sub.delivery.is_none() {
+                                sub.needs_observation = true;
+                                sub.auth_next_ms = 0;
+                                scheduled += 1;
+                            }
+                        }
+                        Ok(scheduled)
+                    })?;
+                    self.record("historyGap", json!({"scheduled":scheduled}));
+                    continue;
+                }
+                _ = tick.tick() => {}
+            }
             let relay = &relay;
             self.process_next(|filters| async move {
                 tokio::time::timeout(
@@ -730,6 +766,16 @@ impl Events {
         }
         if sub.needs_observation {
             let recovered = recover(sub.filters.clone()).await;
+            self.record_subscription(
+                "observationRecovery",
+                &sub,
+                Some(if recovered.is_ok() {
+                    "reconciled"
+                } else {
+                    "retryPending"
+                }),
+                None,
+            );
             if recovered.is_err() {
                 self.update(|store| {
                     let current = store.subscriptions.get_mut(&sub.id).unwrap();
@@ -814,6 +860,7 @@ impl Events {
             return Ok(());
         }
         if let Some(mut delivery) = attempt {
+            self.record_subscription("deliveryAttempt", &sub, None, None);
             let timestamp = now_ms() / 1000;
             let mut signatures = webhook::signature(
                 &sub.secret,
@@ -844,7 +891,15 @@ impl Events {
                 ),
             )
             .await;
-            let status = receipt.ok().and_then(Result::ok).map(|r| r.status);
+            let (status, outcome) = match receipt {
+                Ok(Ok(receipt)) => (Some(receipt.status), "httpResponse"),
+                Ok(Err(_)) => (None, "connectionOrPolicyError"),
+                Err(_) => (None, "timeout"),
+            };
+            self.record_subscription("deliveryOutcome", &sub, Some(outcome), status);
+            if status.is_some_and(|s| (200..300).contains(&s)) {
+                self.record_subscription("callbackAcknowledged", &sub, None, status);
+            }
             if status.is_some_and(|s| (200..300).contains(&s)) {
                 delivery.state = "delivered".into();
             } else if status.is_some_and(|s| {
