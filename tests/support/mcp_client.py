@@ -60,6 +60,8 @@ class McpClient:
         }
         if value["method"] == "tools/call":
             headers["Mcp-Name"] = params["name"]
+        elif value["method"] == "resources/read":
+            headers["Mcp-Name"] = params["uri"]
         request = urllib.request.Request(self.url + path, json.dumps(value).encode(), headers)
         return urllib.request.urlopen(request, timeout=self.request_timeout)
 

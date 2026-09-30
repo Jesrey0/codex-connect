@@ -2,6 +2,7 @@
 
 mod catalog;
 pub mod events;
+mod workers;
 use catalog::{OAUTH_SCOPE, tool_catalog};
 
 use axum::body::{Body, HttpBody, to_bytes};
@@ -608,13 +609,18 @@ impl ServerHandler for McpHandler {
     }
 
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(ProtocolVersion::V_2026_07_28)
-            .with_server_info(Implementation::new(
-                "codex-connect",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_instructions(SERVER_INSTRUCTIONS)
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_protocol_version(ProtocolVersion::V_2026_07_28)
+        .with_server_info(Implementation::new(
+            "codex-connect",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(SERVER_INSTRUCTIONS)
     }
 
     async fn on_custom_request(
@@ -669,6 +675,25 @@ impl ServerHandler for McpHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         Ok(tool_list_result())
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, McpError> {
+        Ok(workers::list())
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        if request.uri != workers::uri() {
+            return Err(McpError::invalid_params("Unknown UI resource", None));
+        }
+        Ok(workers::read().into())
     }
 
     async fn call_tool(
@@ -985,6 +1010,30 @@ async fn dispatch(
     operation_cancelled: Arc<AtomicBool>,
 ) -> anyhow::Result<Value> {
     match name {
+        "workers.open" | "workers.snapshot" => {
+            ensure_empty(arguments)?;
+            let observed = relay.observer_snapshot().await;
+            let projection = &observed["projection"];
+            let mut workers = projection["workers"].clone();
+            for worker in workers.as_array_mut().expect("observer workers array") {
+                project_current_activity(Some(worker));
+            }
+            let pending = projection["pendingActions"]
+                .as_array()
+                .expect("observer pending array")
+                .iter()
+                .map(project_pending_action)
+                .collect::<Vec<_>>();
+            let mut snapshot = serde_json::to_value(McpStatus::read(relay, runtime))?;
+            snapshot["capturedAtMs"] = json!(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis() as u64
+            );
+            snapshot["workers"] = workers;
+            snapshot["pendingActions"] = json!(pending);
+            Ok(snapshot)
+        }
         "status" => {
             ensure_empty(arguments)?;
             let mut value = serde_json::to_value(McpStatus::read(relay, runtime))?;

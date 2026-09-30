@@ -66,7 +66,7 @@ Keep implementation ownership as narrow as the plane model:
 - `host` owns shared atomic private-file storage and OS lock primitives, host path validation plus only the deterministic host mechanics for which the pinned App Server has no equivalent client primitive. The backend creates one validated `Host` authority and shares it with Relay and MCP dispatch.
 - `app-server` owns the pinned Codex protocol transport, official request/response contracts, and every upstream primitive/state machine that Connect consumes.
 - `relay` adapts and composes App Server/Host operations into ChatGPT-usable lifecycles. It owns execution/wait budgets and bounded recovery projections, not upstream state or public MCP schemas.
-- `mcp` owns the terminal Events subscription/outbox service, the public 13-tool ChatGPT catalog, input parsing/dispatch, transport policy, OpenAI/MCP descriptor projection, and client-facing guard budgets.
+- `mcp` owns the terminal Events subscription/outbox service, the public ChatGPT catalog (14 model-visible tools plus the app-only worker snapshot helper), input parsing/dispatch, transport policy, OpenAI/MCP descriptor projection, client-facing guard budgets, and the embedded Workers UI resource.
 - `cli` is the composition root plus trusted-host installation, service, deployment, and diagnostic plumbing. It is not a product interaction surface.
 
 Do not duplicate an authority object or mirror App Server-owned constants into the composition root. Runtime status should read invariants from the component that owns them.
@@ -126,6 +126,16 @@ Events drive live state. Every authoritative observation of a terminal turn pass
 The relay owns execution and wait budgets. MCP guards allow for finalization and response delivery. Transport failures and wait expiry do not establish worker failure.
 
 ## Public surface
+
+The **Workers** conversation panel is a read-only MCP App in ChatGPT, opened by
+`workers.open` or its thread entrypoint. It renders current/recent retained workers
+by cwd, runtime readiness/build, activity, and informational pending requests.
+The initial opener snapshot and explicit Refresh use the existing relay observer
+projection; canonical selected results use `codex.inspect` and its authority/text
+pagination contract. Context attachment and inspection requests travel through
+the pinned MCP Apps host bridge. Worker mutation remains a ChatGPT model action.
+No new service, ingress, authentication, hosted frontend, or periodic browser
+polling is introduced. See [panel development](../development.md#conversation-worker-panel).
 
 The supported human interface is ChatGPT using the public MCP/plugin catalog. See the [public tool list](../../README.md#public-mcp-surface); live schemas are authoritative for tool inputs, outputs, annotations, OAuth metadata, and limits.
 

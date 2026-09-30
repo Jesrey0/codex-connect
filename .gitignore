@@ -6,4 +6,5 @@
 .env
 .env.*
 /target/
+**/node_modules/
 /AGENTS.md
