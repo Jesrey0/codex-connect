@@ -40,14 +40,33 @@ Host ingress owns the canonical public URL, TLS edge configuration, routing, and
 
 Tools advertise OAuth scope `codex-connect:access`. Host ingress validates tokens and strips credentials before forwarding to the loopback backend.
 
+MCP Events use ingress-authenticated metadata for delivery routing and revocation,
+not worker or ChatGPT conversation ownership. A short-lived opaque context is
+resolved by ingress; subscriptions retain a separately authenticated opaque grant
+context and check its current grant through the private loopback authority. The
+fixed operator and existing OAuth provider remain the only identity model.
+
+Only `codex.turn.terminal` is implemented, with exact canonical `threadId` and
+`turnId` filters. Both notifications and authoritative reads pass through relay
+terminal reconciliation. A compact observer records a stable logical event and
+matching outbox entries durably before callback I/O. The MCP Events service owns
+bounded subscription/delivery state, webhook verification and delivery; it is not
+a second App Server worker lifecycle. Restart rechecks grants before restoring
+observation through the relay's existing thread-subscription owner. Multiple
+callbacks can independently observe the same turn. Missed offline transitions
+cannot be recovered through a replay cursor; explicit authoritative terminal
+reads may project an existing terminal fact without creating a new logical ID.
+See the [implementation checkpoint](../proposals/mcp-events-authentication-checkpoint.md).
+
+
 ## Component ownership
 
 Keep implementation ownership as narrow as the plane model:
 
-- `host` owns host path validation plus only the deterministic host mechanics for which the pinned App Server has no equivalent client primitive. The backend creates one validated `Host` authority and shares it with Relay and MCP dispatch.
+- `host` owns shared atomic private-file storage and OS lock primitives, host path validation plus only the deterministic host mechanics for which the pinned App Server has no equivalent client primitive. The backend creates one validated `Host` authority and shares it with Relay and MCP dispatch.
 - `app-server` owns the pinned Codex protocol transport, official request/response contracts, and every upstream primitive/state machine that Connect consumes.
 - `relay` adapts and composes App Server/Host operations into ChatGPT-usable lifecycles. It owns execution/wait budgets and bounded recovery projections, not upstream state or public MCP schemas.
-- `mcp` owns the public 13-tool ChatGPT catalog, input parsing/dispatch, transport policy, OpenAI/MCP descriptor projection, and client-facing guard budgets.
+- `mcp` owns the terminal Events subscription/outbox service, the public 13-tool ChatGPT catalog, input parsing/dispatch, transport policy, OpenAI/MCP descriptor projection, and client-facing guard budgets.
 - `cli` is the composition root plus trusted-host installation, service, deployment, and diagnostic plumbing. It is not a product interaction surface.
 
 Do not duplicate an authority object or mirror App Server-owned constants into the composition root. Runtime status should read invariants from the component that owns them.
@@ -67,6 +86,8 @@ One backend serves independent ChatGPT operators concurrently. Connect has no op
 HostPlane uses the OS account's authority, and the dedicated App Server is launched with the process-local `sandbox_mode="danger-full-access"` override. The manual `serve` command retains explicit runtime flags for diagnostics; those overrides are not managed configuration.
 
 For `codex.start(mode=work)`, omitted `access` means the canonical writable workspace sandbox with network access; `access="full"` means `danger-full-access`. Connect sends `approvalPolicy="never"` for work turns. That prevents mechanical approval stalls but does not enlarge the sandbox. Reviews are read-only.
+
+Fresh workspace work may supply `writableRoots` as additional absolute write directories while keeping `cwd` as its primary working directory. Omitted roots and an empty list preserve the default scope. Full access, review, resume, and fork reject this field. App Server owns path enforcement and policy persistence; see [the pinned persistence limitation](../development.md#writable-root-persistence).
 
 Connect does not send `thread/start.developerInstructions`. Worker cognition is ordered by upstream `~/.codex/config.toml` `developer_instructions`, `~/.codex/AGENTS.md`, repository/directory `AGENTS.md`, and the delegated task. Connect owns authority, lifecycle, and operator orchestration; it does not add a competing instruction source.
 

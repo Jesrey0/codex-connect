@@ -12,3 +12,7 @@ Policy and history:
 - [Security](../SECURITY.md)
 - [Contributing](../CONTRIBUTING.md)
 - [Changelog](../CHANGELOG.md)
+
+Feature proposals:
+
+- [MCP Events operator follow-up](proposals/mcp-events-operator-follow-up.md) — proposed asynchronous worker notifications that trigger instructed follow-up in a subscribed ChatGPT chat; account validation pending.

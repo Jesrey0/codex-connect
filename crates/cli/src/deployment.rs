@@ -2,9 +2,7 @@ use crate::artifact::ArtifactIdentity;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,9 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const OPERATION_ID_LENGTH: usize = 24;
 const ACTIVATION_HANDOFF_DELAY: &str = "3s";
 
-pub(crate) struct DeploymentLock {
-    file: File,
-}
+pub(crate) type DeploymentLock = crate::storage::ExclusiveLock;
 
 pub(crate) fn verify_prepared_artifact(record: &DeploymentRecord) -> Result<()> {
     let (sha256, executable) = prepared_artifact(record)?;
@@ -31,15 +27,6 @@ fn verify_artifact_at(sha256: &str, executable: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-#[cfg(unix)]
-impl Drop for DeploymentLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
 }
 
 pub(crate) fn acquire_build_lock() -> Result<DeploymentLock> {
@@ -92,16 +79,7 @@ fn acquire_lock(path: PathBuf, label: &str) -> Result<DeploymentLock> {
         .write(true)
         .open(&path)
         .with_context(|| format!("unable to open {label} lock {}", path.display()))?;
-    crate::storage::set_file_mode(&file, 0o600)?;
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("unable to lock {label}"));
-        }
-    }
-    Ok(DeploymentLock { file })
+    crate::storage::lock_exclusive(file, false).with_context(|| format!("unable to lock {label}"))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

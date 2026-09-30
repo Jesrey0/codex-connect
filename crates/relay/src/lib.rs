@@ -201,6 +201,17 @@ fn checked_next_cursor(
     Ok(next)
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalTurn {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub status: String,
+    pub timestamp_ms: u64,
+}
+
+type TerminalObserver = Arc<dyn Fn(TerminalTurn) -> Result<(), String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Relay {
     app_server: Arc<AppServerClient>,
@@ -212,6 +223,7 @@ pub struct Relay {
     command_sessions: command_sessions::CommandSessions,
     command_generation: Arc<str>,
     next_command_id: Arc<AtomicU64>,
+    terminal_observer: Arc<std::sync::OnceLock<TerminalObserver>>,
 }
 
 #[derive(Default)]
@@ -825,9 +837,48 @@ impl Relay {
             )
             .into(),
             next_command_id: Arc::new(AtomicU64::new(1)),
+            terminal_observer: Arc::new(std::sync::OnceLock::new()),
         };
         relay.start_event_loop();
         Ok(relay)
+    }
+
+    pub fn set_terminal_observer(&self, observer: TerminalObserver) -> Result<(), RelayError> {
+        self.terminal_observer
+            .set(observer)
+            .map_err(|_| RelayError::Invalid("terminal observer already installed".into()))
+    }
+
+    // Validate canonical upstream IDs and retain observation through the existing owner.
+    pub async fn watch_terminal(&self, thread_id: &str, turn_id: &str) -> Result<(), RelayError> {
+        let thread = self.read_thread_metadata(thread_id.to_owned()).await?;
+        if thread.id != thread_id {
+            return Err(RelayError::Invalid("threadId must be canonical".into()));
+        }
+        let stored = self.find_stored_turn_metadata(thread_id, turn_id).await?;
+        let live = self.live_turn(thread_id, turn_id).await;
+        let turn = match (stored, live) {
+            (Some(stored), Some(live))
+                if !stored.status.is_terminal() && live.status.is_terminal() =>
+            {
+                Some(live)
+            }
+            (Some(stored), _) => Some(stored),
+            (None, live) => live,
+        }
+        .ok_or_else(|| RelayError::Invalid("turnId does not belong to threadId".into()))?;
+        if turn.status.is_terminal() {
+            self.reconcile_terminal_turn(thread_id, &turn).await;
+        } else {
+            self.ensure_wait_subscription(
+                thread_id,
+                turn_id,
+                Instant::now() + Duration::from_secs(15),
+            )
+            .await?;
+            self.remember_live_turn(thread_id, &turn).await;
+        }
+        Ok(())
     }
 
     async fn remember_live_turn(
@@ -932,6 +983,30 @@ impl Relay {
     ) {
         if !turn.status.is_terminal() {
             return;
+        }
+        if let Some(observer) = self.terminal_observer.get() {
+            let fact = TerminalTurn {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn.id.clone(),
+                status: serde_json::to_value(turn.status)
+                    .expect("turn status serializes")
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                timestamp_ms: turn
+                    .completed_at
+                    .and_then(|time| u64::try_from(time).ok())
+                    .map(|seconds| seconds.saturating_mul(1000))
+                    .unwrap_or_else(now_epoch_ms),
+            };
+            if observer(fact).is_err() {
+                self.journal
+                    .push(
+                        "codexConnect/eventsStorageFailure",
+                        &json!({"error":"terminal delivery storage failed"}),
+                    )
+                    .await;
+            }
         }
         let (_, changed) = self
             .live_turns
@@ -1498,14 +1573,14 @@ impl Relay {
         }
         if thread_id.is_some() && (cwd.is_some() || effort.is_some() || sandbox_policy.is_some()) {
             return Err(RelayError::Invalid(
-                "resumed work inherits cwd, effort, and access; start a fresh thread to change workstream settings".into(),
+                "resumed work rejects cwd, effort, access, and writableRoots overrides; start a fresh thread to change workstream settings".into(),
             ));
         }
         if fork_from_thread_id.is_some()
             && (cwd.is_some() || effort.is_some() || sandbox_policy.is_some())
         {
             return Err(RelayError::Invalid(
-                "forked work inherits cwd, effort, and access from its source thread".into(),
+                "forked work rejects cwd, effort, access, and writableRoots overrides; settings come from its source thread".into(),
             ));
         }
         if thread_id.is_none() && fork_from_thread_id.is_none() && cwd.is_none() {

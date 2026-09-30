@@ -1,6 +1,7 @@
 //! ChatGPT-native MCP surface over Codex App Server and the operator host.
 
 mod catalog;
+pub mod events;
 use catalog::{OAUTH_SCOPE, tool_catalog};
 
 use axum::body::{Body, HttpBody, to_bytes};
@@ -148,11 +149,17 @@ enum CommandControlArgs {
     },
 }
 
-pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
+pub fn router(
+    relay: Relay,
+    host: Host,
+    runtime: RuntimeIdentity,
+    events: events::Events,
+) -> Router {
     let handler = McpHandler {
         relay,
         host,
         runtime,
+        events: events.clone(),
     };
     let runtime_status = handler.clone();
     let observer = handler.clone();
@@ -182,7 +189,10 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
     Router::new()
         .nest_service("/mcp", service)
         .layer(middleware::from_fn_with_state(
-            json_tool_list_service,
+            McpBoundary {
+                json_tool_list_service,
+                events,
+            },
             project_openai_tool_descriptors,
         ))
         .route("/healthz", axum::routing::get(|| async { StatusCode::OK }))
@@ -203,6 +213,7 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
                         "runtime": handler.runtime_status_value(),
                         "cursor": observed["cursor"],
                         "projection": observed["projection"],
+                        "events": handler.events.diagnostics(),
                     }))
                 }
             }),
@@ -243,10 +254,16 @@ pub fn router(relay: Relay, host: Host, runtime: RuntimeIdentity) -> Router {
         )
 }
 
+#[derive(Clone)]
+struct McpBoundary {
+    json_tool_list_service: JsonToolListService,
+    events: events::Events,
+}
+
 type JsonToolListService = StreamableHttpService<McpHandler, LocalSessionManager>;
 
 async fn project_openai_tool_descriptors(
-    State(json_tool_list_service): State<JsonToolListService>,
+    State(boundary): State<McpBoundary>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -256,24 +273,47 @@ async fn project_openai_tool_descriptors(
         return mcp_header_error_response(status, message);
     }
 
+    let mut advertise_events = false;
     let response = if is_mcp_post {
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
         let bytes = match to_bytes(body, MAX_MCP_REQUEST_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
         };
-        let is_tool_list = serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .is_some_and(|method| method == "tools/list");
+        let input = serde_json::from_slice::<Value>(&bytes).ok();
+        let method = input
+            .as_ref()
+            .and_then(|v| v["method"].as_str())
+            .unwrap_or("");
+        let is_tool_list = method == "tools/list";
+        let is_discovery = method == "server/discover";
+        if method.starts_with("events/")
+            || (is_discovery && parts.headers.contains_key(events::CONTEXT_HEADER))
+        {
+            let contexts: Vec<_> = parts
+                .headers
+                .get_all(events::CONTEXT_HEADER)
+                .iter()
+                .collect();
+            let authorization = if contexts.len() == 1 {
+                if let Ok(context) = contexts[0].to_str() {
+                    boundary.events.authenticate(context).await.ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some(authorization) = authorization else {
+                return (StatusCode::UNAUTHORIZED, Json(json!({"jsonrpc":"2.0","id":input.as_ref().and_then(|v| v.get("id")),
+                    "error":{"code":-32001,"message":"Events authorization denied or unavailable"}}))).into_response();
+            };
+            parts.extensions.insert(authorization);
+            advertise_events = is_discovery;
+        }
         let request = Request::from_parts(parts, Body::from(bytes));
-        if is_tool_list {
-            let mut service = json_tool_list_service;
+        if is_tool_list || is_discovery {
+            let mut service = boundary.json_tool_list_service;
             service
                 .call(request)
                 .await
@@ -314,7 +354,17 @@ async fn project_openai_tool_descriptors(
         Ok(value) => value,
         Err(_) => return Response::from_parts(parts, Body::from(bytes)),
     };
-    if !inject_openai_security_schemes(&mut value) {
+    let mut projected_metadata = inject_openai_security_schemes(&mut value);
+    if advertise_events
+        && let Some(capabilities) = value
+            .get_mut("result")
+            .and_then(|result| result.get_mut("capabilities"))
+            .and_then(Value::as_object_mut)
+    {
+        capabilities.insert("events".into(), json!({}));
+        projected_metadata = true;
+    }
+    if !projected_metadata {
         return Response::from_parts(parts, Body::from(bytes));
     }
     let projected = match serde_json::to_vec(&value) {
@@ -469,6 +519,7 @@ struct McpHandler {
     relay: Relay,
     host: Host,
     runtime: RuntimeIdentity,
+    events: events::Events,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -556,6 +607,44 @@ impl ServerHandler for McpHandler {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: rmcp::model::CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CustomResult, McpError> {
+        if !request.method.starts_with("events/") {
+            return Err(McpError::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                "Method not found",
+                None,
+            ));
+        }
+        let authorization = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<events::Authorization>())
+            .cloned()
+            .ok_or_else(|| {
+                McpError::new(
+                    rmcp::model::ErrorCode(-32001),
+                    "Events authorization required",
+                    None,
+                )
+            })?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(45),
+            self.events.dispatch(
+                &request.method,
+                request.params.unwrap_or_else(|| json!({})),
+                authorization,
+                &self.relay,
+            ),
+        )
+        .await
+        .map_err(|_| McpError::internal_error("Events operation timed out", None))??;
+        Ok(rmcp::model::CustomResult(result))
     }
 
     async fn list_tools(
@@ -716,6 +805,7 @@ enum CodexStartArgs {
         model: Option<String>,
         effort: Option<String>,
         access: Option<WorkAccess>,
+        writable_roots: Option<Vec<String>>,
     },
     Review {
         cwd: Option<String>,
@@ -733,16 +823,26 @@ enum WorkAccess {
     Full,
 }
 
-fn work_sandbox_policy(access: WorkAccess) -> SandboxPolicy {
-    match access {
+fn work_sandbox_policy(
+    access: WorkAccess,
+    writable_roots: Option<Vec<String>>,
+) -> anyhow::Result<SandboxPolicy> {
+    Ok(match access {
         WorkAccess::Workspace => SandboxPolicy::WorkspaceWrite {
-            writable_roots: Vec::new(),
+            writable_roots: writable_roots.unwrap_or_default(),
             network_access: true,
             exclude_slash_tmp: false,
             exclude_tmpdir_env_var: false,
         },
-        WorkAccess::Full => SandboxPolicy::DangerFullAccess,
-    }
+        WorkAccess::Full => {
+            if writable_roots.is_some() {
+                anyhow::bail!(
+                    "writableRoots is only supported for fresh work with workspace access"
+                );
+            }
+            SandboxPolicy::DangerFullAccess
+        }
+    })
 }
 
 #[derive(Deserialize)]
@@ -938,11 +1038,18 @@ async fn dispatch(
                 model,
                 effort,
                 access,
+                writable_roots,
             } => {
-                let sandbox_policy = if thread_id.is_none() && fork_from_thread_id.is_none() {
-                    Some(work_sandbox_policy(access.unwrap_or_default()))
+                let sandbox_policy = if (thread_id.is_none() && fork_from_thread_id.is_none())
+                    || access.is_some()
+                    || writable_roots.is_some()
+                {
+                    Some(work_sandbox_policy(
+                        access.unwrap_or_default(),
+                        writable_roots,
+                    )?)
                 } else {
-                    access.map(work_sandbox_policy)
+                    None
                 };
                 relay
                     .work_start(

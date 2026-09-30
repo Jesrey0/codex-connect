@@ -18,6 +18,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import jsonschema
+
 from support.mcp_client import McpClient, PROTOCOL_VERSION
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -57,6 +59,7 @@ class OperatorProtocolTests(unittest.TestCase):
         ], stdout=cls.log, stderr=cls.log, env={
             **os.environ,
             "CODEX_CONNECT_FAKE_COVERAGE_FILE": str(cls.coverage_path),
+            "XDG_STATE_HOME": str(cls.workspace / "state"),
         })
         try:
             for _ in range(200):
@@ -1710,6 +1713,79 @@ class OperatorProtocolTests(unittest.TestCase):
             "target": {"type": "uncommittedChanges"},
         }, error=True, validate_input=False)
         self.assertEqual(len(self.method_params("thread/resume")), resumes_before_rejection)
+
+    def test_workspace_writable_roots_forwarding_and_lifecycle_wire_defaults(self):
+        roots = [str(self.workspace / "selected-one"), str(self.outside_path / "selected-two")]
+        for access in [None, "workspace"]:
+            with self.subTest(access=access):
+                arguments = {"cwd": str(self.project), "writableRoots": roots}
+                if access is not None:
+                    arguments["access"] = access
+                work = self.start("complete", **arguments)
+                self.assertEqual(self.wait(work)["state"], "terminal")
+                policy = self.method_params("turn/start")[-1]["sandboxPolicy"]
+                self.assertEqual(policy, {
+                    "type": "workspaceWrite", "writableRoots": roots,
+                    "networkAccess": True, "excludeSlashTmp": False, "excludeTmpdirEnvVar": False,
+                })
+                self.assertEqual(work["cwd"], str(self.project))
+                self.assertEqual(self.method_params("thread/start")[-1]["cwd"], str(self.project))
+                self.assertEqual(self.method_params("turn/start")[-1]["cwd"], str(self.project))
+
+                # Wire evidence only: upstream persistence is not exercised by this peer.
+                resumed = self.start("complete", threadId=work["threadId"])
+                self.assertEqual(self.wait(resumed)["state"], "terminal")
+                self.assertNotIn("sandboxPolicy", self.method_params("turn/start")[-1])
+                self.assertNotIn("sandbox", self.method_params("thread/resume")[-1])
+                forked = self.start("complete", forkFromThreadId=work["threadId"], lastTurnId=work["turnId"])
+                self.assertEqual(self.wait(forked)["state"], "terminal")
+                self.assertNotIn("sandboxPolicy", self.method_params("turn/start")[-1])
+                self.assertNotIn("sandbox", self.method_params("thread/fork")[-1])
+                self.assertEqual(resumed["cwd"], str(self.project))
+                self.assertEqual(forked["cwd"], str(self.project))
+
+        for arguments in [{}, {"writableRoots": []}, {"access": "workspace", "writableRoots": []}]:
+            with self.subTest(arguments=arguments):
+                work = self.start("complete", **arguments)
+                self.assertEqual(self.wait(work)["state"], "terminal")
+                policy = self.method_params("turn/start")[-1]["sandboxPolicy"]
+                self.assertEqual(policy["writableRoots"], [])
+                self.assertTrue(policy["networkAccess"])
+
+    def test_writable_roots_invalid_inputs_fail_before_upstream_mutation(self):
+        source = self.start("complete")
+        self.assertEqual(self.wait(source)["state"], "terminal")
+        before = {method: len(self.method_params(method)) for method in [
+            "thread/start", "thread/resume", "thread/fork", "turn/start", "review/start",
+        ]}
+        base = {"mode": "work", "task": "complete", "cwd": str(self.project), "model": source["model"]}
+        for root in ["relative/path", "../sibling", "", "~/project"]:
+            result = self.client.call("codex.start", {**base, "writableRoots": [str(self.project), root]},
+                                      error=True, validate_input=False)
+            self.assertIn("writableRoots must contain absolute paths", result["content"][0]["text"])
+
+        schema = jsonschema.Draft202012Validator(self.client.tools["codex.start"]["inputSchema"])
+        for roots in [[], [str(self.outside_path)]]:
+            for arguments in [
+                {**base, "access": "full", "writableRoots": roots},
+                {"mode": "review", "cwd": str(self.project), "model": source["model"],
+                 "target": {"type": "uncommittedChanges"}, "writableRoots": roots},
+                {"mode": "review", "threadId": source["threadId"], "model": source["model"],
+                 "target": {"type": "uncommittedChanges"}, "writableRoots": roots},
+                {"mode": "work", "task": "complete", "model": source["model"],
+                 "threadId": source["threadId"], "writableRoots": roots},
+                {"mode": "work", "task": "complete", "model": source["model"],
+                 "forkFromThreadId": source["threadId"], "writableRoots": roots},
+            ]:
+                with self.subTest(arguments=arguments):
+                    self.assertFalse(schema.is_valid(arguments))
+                    result = self.client.call("codex.start", arguments, error=True, validate_input=False)
+                    self.assertIn("writableRoots", result["content"][0]["text"])
+        for roots in ["/project", [123]]:
+            result = self.client.call("codex.start", {**base, "writableRoots": roots}, error=True, validate_input=False)
+            self.assertTrue(result["isError"])
+        for method, count in before.items():
+            self.assertEqual(len(self.method_params(method)), count)
 
     def test_start_requires_explicit_cwd_and_model_without_mutating_existing_threads(self):
         before_threads = len(self.method_params("thread/start"))

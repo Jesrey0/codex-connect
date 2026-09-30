@@ -5,7 +5,7 @@ mod deployment;
 mod management;
 mod paths;
 mod service;
-mod storage;
+use codex_connect_host::storage;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -229,11 +229,17 @@ async fn serve_mcp(config: ServeConfig) -> Result<()> {
         codex_home_source,
     };
     let mut changes = relay.changes();
-    let router = mcp_router(relay.clone(), host, runtime);
+    let events =
+        codex_connect_mcp::events::Events::open(paths::state_root()?.join("codex-connect/events"))?;
+    let projection = events.clone();
+    relay.set_terminal_observer(std::sync::Arc::new(move |fact| projection.observe(fact)))?;
+    let router = mcp_router(relay.clone(), host, runtime, events.clone());
+    let deliveries = events.run(relay.clone());
     println!("Codex Connect MCP listening at http://{listen}/mcp");
     println!("default cwd: {}", default_cwd.display());
     tokio::select! {
         result = serve_router(listener, router) => result,
+        result = deliveries => result,
         _ = async {
             while relay.worker_available() {
                 if changes.changed().await.is_err() { break; }

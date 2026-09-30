@@ -65,6 +65,24 @@ Preserve the [worker lifecycle and recovery contract](operations.md#worker-lifec
 
 Each tool descriptor advertises OAuth scope `codex-connect:access`. Host ingress owns token validation, discovery challenges, and authorization metadata.
 
+### Writable-root persistence
+
+Connect forwards fresh workspace `writableRoots` unchanged through `turn/start.sandboxPolicy`, with network access enabled, and sends no sandbox override for resumed or forked work. Fixture lifecycle tests verify that Connect leaves the inherited policy alone; they do not prove upstream persistence or OS enforcement.
+
+The [App Server documentation](https://learn.chatgpt.com/docs/app-server) describes turn settings as defaults for later turns. Pinned 0.159.0 source, however, installs a raw sandbox override as an unnamed permission snapshot (`core/src/session/session.rs` and `protocol/src/permission_profile_snapshot.rs`). Cold resume and fork restore only the active permission-profile ID (`app-server/src/request_processors/persisted_resume_settings.rs` and `thread_processor.rs`), not the persisted concrete policy. Loaded-thread defaults are distinct from cold restoration. Additional roots therefore cannot be guaranteed across cold reload or fork from this interface alone. This is an integration blocker for durable root retention, not evidence that wire forwarding failed. No Connect-owned policy store or raw rollout parser is introduced here.
+
+## MCP Events feature validation
+
+Before the full gate, run `cargo test --locked -p codex-connect-mcp events`.
+The fixture tests cover the actual RMCP HTTP custom dispatch/discovery boundary,
+relay notification/read reconciliation, private authorization failures, callback
+verification/signatures, filters, refresh/rotation/cancellation, queue limits,
+retry exhaustion and restart recovery. The private ingress contract is owned and
+tested separately by host-ingress with `./scripts/check source`; it keeps OAuth,
+keys and grant state there. Do not use live ChatGPT subscriptions as source tests.
+The atomic storage and OS lock primitives formerly in the CLI are shared through
+`codex-connect-host::storage`; keep one owner when adding consumers.
+
 ## Validation
 
 Run the repository gate with the pinned CLI installed and Python `jsonschema` available:

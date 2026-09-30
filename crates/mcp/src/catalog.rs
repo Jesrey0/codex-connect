@@ -698,13 +698,15 @@ fn codex_start_schema() -> Value {
             "lastTurnId":{"type":"string","description":"With forkFromThreadId, optional source turn to fork through, inclusive."},
             "model":{"type":"string","minLength":1,"description":"Required on every start. For resume or fork, must equal the canonical thread model; discover IDs with codex.query."},
             "effort":{"type":"string","description":"Reasoning effort for a new workstream; discover supported values with codex.query."},
-            "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Access for a new workstream. workspace permits workspace writes and network access; full grants unrestricted host access."}
+            "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Access for a new workstream. workspace permits workspace writes and network access; full grants unrestricted host access."},
+            "writableRoots":{"type":"array","items":{"type":"string","minLength":1},"description":"Additional absolute directories writable by fresh workspace work (including default access). cwd remains the primary working directory. Omitted or [] adds no roots. Rejected with full access, review, resume, or fork. Persistence across reload/fork depends on App Server."}
         }),
         &["mode", "task", "model"],
     );
     work["allOf"] = json!([
         {"if":{"not":{"anyOf":[{"required":["threadId"]},{"required":["forkFromThreadId"]}]}},"then":{"required":["cwd"]}},
-        {"if":{"anyOf":[{"required":["threadId"]},{"required":["forkFromThreadId"]}]},"then":{"not":{"required":["cwd"]}}}
+        {"if":{"anyOf":[{"required":["threadId"]},{"required":["forkFromThreadId"]}]},"then":{"not":{"anyOf":[{"required":["cwd"]},{"required":["writableRoots"]}]}}},
+        {"if":{"properties":{"access":{"const":"full"}},"required":["access"]},"then":{"not":{"required":["writableRoots"]}}}
     ]);
     let mut review = object_schema(
         json!({
@@ -1310,12 +1312,15 @@ mod tests {
                 "model",
                 "task",
                 "threadId",
+                "writableRoots",
             ])
         );
         assert_eq!(work["required"], json!(["mode", "task", "model"]));
         assert_eq!(work["allOf"][0]["then"]["required"], json!(["cwd"]));
         assert_eq!(work["additionalProperties"], false);
         assert_eq!(work_properties["access"]["default"], "workspace");
+        assert_eq!(work_properties["writableRoots"]["type"], "array");
+        assert_eq!(work_properties["writableRoots"]["items"]["type"], "string");
         assert_eq!(
             work_properties["access"]["enum"],
             json!(["workspace", "full"])

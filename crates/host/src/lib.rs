@@ -1,5 +1,7 @@
 //! Host path resolution plus Connect-only search, image, and patch operations.
 
+pub mod storage;
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use image::GenericImageView;

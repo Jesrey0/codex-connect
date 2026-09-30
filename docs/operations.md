@@ -85,6 +85,28 @@ model. Fresh work and review also supply an explicit cwd. Resume and fork inheri
 canonical cwd and reject a cwd argument; the supplied model must equal the canonical
 thread model. Workstream effort and access are inherited on resume and fork.
 
+Fresh work with `access: "workspace"` (or omitted access) accepts `writableRoots`,
+an array of absolute directory paths passed directly to App Server's workspace-write
+sandbox. `cwd` remains the primary working directory; roots grant additional write
+permissions using upstream semantics. Omission and `[]` both add no roots. Network
+access and upstream temporary-directory defaults remain enabled. For example:
+
+```json
+{
+  "mode": "work",
+  "cwd": "/home/operator/projects/backend",
+  "model": "<discovered-model-id>",
+  "task": "Update the backend and its shared fixtures; write build output to the selected scratch directory.",
+  "writableRoots": ["/home/operator/projects/shared-fixtures", "/home/operator/build-scratch"]
+}
+```
+
+`writableRoots` is rejected with full access, review, resume, or fork, including an
+explicit empty list. Start a fresh workstream to select different roots. Connect
+does not override sandbox settings on resume or fork; upstream owns persistence.
+See the [pinned persistence limitation](development.md#writable-root-persistence)
+before relying on additional roots after a thread reload or fork.
+
 Connect conservatively accepts resume only inside OpenAI's minimum 30-minute prompt-cache
 guarantee, even though the cache may survive longer. Live model-usage telemetry drives that
 cutoff when available; after restart/history loss, latest completed-turn time is the fallback.
@@ -166,6 +188,47 @@ CHECK_PUBLIC=1 ./scripts/check
 ```
 
 Host ingress owns `host-ngrok`, `host-ingress` (Caddy), and `host-oauth` services, their startup ordering, public URL, credentials, and reconnect behavior. Codex Connect readiness describes the local backend; it does not assert public reachability or a valid ChatGPT connection. Backend restart/deployment/uninstall do not manage ingress. Rescan/refresh the ChatGPT plugin separately when its tool catalog changes.
+
+### MCP Events readiness
+
+The source implements authenticated discovery, `events/list`, `events/subscribe`
+and `events/unsubscribe` for `codex.turn.terminal`. Require both canonical Codex
+`threadId` and `turnId`; ChatGPT supplies the callback and associates it with its
+chat. Incoming methods use the existing OAuth-protected MCP route. Delivery is
+outbound HTTPS and needs no additional ngrok route. Installed services and the
+ChatGPT plugin have not been updated by source validation.
+
+Events state is `${XDG_STATE_HOME:-$HOME/.local/state}/codex-connect/events`, with
+private atomic storage and exclusive process ownership. Default lifetime is one
+hour; requested finite lifetimes are bounded to one minute through 24 hours.
+Omitted or null lifetimes still receive finite expiry. Capacity is 128 retained
+subscriptions and one terminal outbox slot per subscription. Retired records stay
+for 24 hours after their granted expiry, then are pruned. Overflow is a visible
+MCP error and diagnostic counter. Webhook concurrency is one, each attempt has a
+ten-second overall timeout, and transient failures receive at most eight attempts
+with exponential backoff. Redirects, ordinary non-transient client errors, 410 and
+413 exhaust delivery immediately. A 2xx acknowledges receipt only.
+
+Verification caching lasts five minutes from successful verification; repeated
+refreshes do not extend that cache indefinitely. Secret changes trigger a new
+challenge and five-minute dual signing. A second key change during that window is
+rejected to keep rotation bounded. Cancellation, finite expiry and recognized
+revocation retire pending work and remove signing keys. Ingress outage pauses
+without allowing delivery; recovery requires the same stored grant to remain
+valid. A new grant never auto-reactivates an old subscription.
+
+After restart, unfinished verification is retired, live subscriptions start
+paused, and current authorization is checked before observation or delivery.
+Pending bytes, IDs and consumed attempts survive; delivered/exhausted/cancelled/
+expired/revoked work is never recovered as pending. Storage failure stops delivery
+visibly and terminates the delivery service. Read-only `/observe` exposes counts
+and states, including paused, revoked, expired, cancelled, verification failure,
+delivered, exhausted, overflow and storage failure, without callbacks or keys.
+
+See the [contract, validation and exact acceptance steps](proposals/mcp-events-authentication-checkpoint.md).
+Deployment of ingress and backend, plugin rescan, account discovery, post-turn
+follow-up and closed-browser acceptance still require separate authorization.
+A callback 2xx does not establish any of those ChatGPT behaviors.
 
 ## Restart recovery
 
