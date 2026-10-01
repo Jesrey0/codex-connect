@@ -1,49 +1,60 @@
 ---
 name: 0xoperator
-description: Own connected host and coding work across Codex Connect and OpenCode Connect. Select a substrate for a coherent workstream and apply its provider mechanics. Use for operator work, delegation, recovery, and verification through these connections.
+description: Own connected host and coding work across Codex and OpenCode. Choose the runtime substrate, apply its adapter, recover canonical state, and verify the user’s outcome.
 ---
 
 # 0x0perator
 
-ChatGPT owns the user's goal, strategy, integration, deployment, and final acceptance.
-Choose the available substrate that fits the workstream, then read its provider
-skill and live tool schemas. Those schemas own call arguments and lifecycle contracts.
+The primary operator owns the user’s objective, strategy, integration, deployment,
+and final acceptance. Choose a substrate for each coherent workstream, then read
+its adapter and live tool schemas. Schema contracts own arguments and lifecycle.
 
-## Select an owner
+| Substrate | Adapter | Native strengths |
+| --- | --- | --- |
+| Codex | [0xoperator-codex](../0xoperator-codex/SKILL.md) | App Server work/review turns, retained commands, scoped access and terminal subscriptions |
+| OpenCode | [0xoperator-opencode](../0xoperator-opencode/SKILL.md) | Persisted sessions/inbox, explicit agents/skills/files, native worktrees, session diffs, terminal screens and runtime events |
 
-One active substrate owns each coherent workstream: host operations, worker
-lifecycle, recovery, and event handling stay with that provider. Codex Connect
-uses threads and turns; OpenCode Connect uses persisted sessions and messages.
-Keep their explicit namespaces and canonical identities.
+Use **substrate** for Codex/OpenCode, **connector** for Codex Connect/OpenCode
+Connect, and **provider** for upstream model providers such as OpenAI. HostPlane
+owns direct files/processes/VCS/worktrees; WorkerPlane owns delegated execution;
+PlatformPlane owns the calling product’s subscriptions and continuation.
 
-A cross-provider workstream needs a clear purpose and ownership boundary, such
-as implementation in one substrate and independent review in the other. Establish
-the current canonical state before transitioning. Slowness or a lost response
-does not establish failure or authorize replacement work in another provider.
+## Choose and own the workstream
 
-## Use the owning plane
+Keep host operations, worker lifecycle, recovery and events with one substrate.
+Choose its native strengths for the task; do not force API or behavioral parity.
+Use direct HostPlane primitives for deterministic work. Delegate bounded
+investigation, implementation or independent review when it materially helps,
+and keep useful non-overlapping operator work while workers run.
 
-PlatformPlane owns ChatGPT capabilities and subscriptions. HostPlane owns files,
-processes, Git, deployment, and live services. WorkerPlane belongs to the selected
-runtime. Use deterministic host/runtime primitives for direct operations; delegate
-when autonomous investigation, implementation, or independent review materially helps.
+A cross-substrate boundary needs a purpose and clear ownership, such as
+implementation followed by independent review. Inspect canonical state before
+transitioning. Slowness, transport loss or a missing event does not prove failure
+or authorize a replacement worker. Never invoke an agent CLI to bypass a native
+worker interface or runtime authority boundary.
 
-Give workers bounded objectives and runtime-enforced authority where available.
-Keep useful non-overlapping operator work with ChatGPT while they run. Worker
-narration and conversation history provide context; canonical host/runtime state
-provides evidence.
+## Preserve authority and recover state
 
-## Recover and verify
+Give workers explicit objectives, cwd/model and runtime-enforced authority when
+available. Keep canonical identities: Codex thread/turn IDs, OpenCode session/user
+message IDs, and native command kind/ID/location/cursors. Inbox admission is not
+completed execution. Worker permissions do not automatically constrain HostPlane.
 
-Retain canonical worker and command handles. Recover retained work before creating
-a replacement after interruption, transport loss, or missing events. An event is
-a wake-up hint; inspect persisted state before acting on it. Use bounded waits at
-real dependency boundaries and preserve authority across reconnects.
+Recover existing handles and persisted state before retries or replacement.
+Distinguish acknowledged actions from failed observations; uncertain input or
+mutations must not be automatically replayed. Events are hints. Reconcile against
+persisted state, and wait only at real dependency boundaries. Establish platform
+continuation before promising work after the current turn ends.
 
-Verify source changes, checks, Git commits, prepared artifacts, deployment, live
-services, connector discovery, event delivery, and CI separately. Finish with
-verified outcomes and any remaining concrete acceptance or user action.
+## Verify at the owning layer
 
-Codex and OpenCode remain independently deployed runtimes. Shared ingress and
-operator doctrine do not create a universal backend or a second authority for
-either runtime's worker state or model catalog.
+Worker narration provides context. Check tool evidence and independently verify
+consequential outcomes in files/VCS, tests, deployed runtime and live connections.
+Keep source changes, commits, prepared artifacts, publication, deployment,
+connector discovery, authentication, event delivery and CI as separate facts.
+Report verified outcomes and concrete remaining actions. Preserve credentials,
+unrelated changes and independently owned host services.
+
+Shared doctrine and ingress do not create a universal backend, a connector-local
+state authority, or a second owner of model availability. Codex and OpenCode
+remain independently deployed runtimes.

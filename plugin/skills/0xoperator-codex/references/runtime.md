@@ -1,11 +1,6 @@
----
-name: codex-connect-operator
-description: Use the Codex provider under 0x0perator for connected host operations and delegated Codex work through codexConnect. Choose efficient host calls and worker synchronization, recover retained state, and verify outcomes. Skip unrelated tasks.
----
+# Codex substrate mechanics
 
-# Codex provider
-
-Apply the [0x0perator core](../0xoperator/SKILL.md), then use these mechanics when Codex Connect owns the workstream. Keep host actions, workers, recovery, and event handling with `@codexConnect`. The live app and its tool schemas own call arguments, limits, lifecycle, and result shapes. The local console is read-only; ChatGPT remains the action surface.
+Apply the [0x0perator core](../../0xoperator/SKILL.md), then use these mechanics when Codex Connect owns the workstream. Keep host actions, workers, recovery, and event handling with `@codexConnect`. The live app and its tool schemas own call arguments, limits, lifecycle, and result shapes. The local console is read-only; the primary operator remains the action surface.
 
 ## Act deliberately
 
@@ -56,6 +51,12 @@ Use `codex.inspect` for a specific activity/result question, `command.read` for 
 Send concise ChatGPT progress updates during prolonged current-turn work. Transport keepalives, streaming HTTP, and tool calls do not replace user-facing updates.
 
 ## Continue through MCP Events
+
+The platform tools and webhook examples in this section describe ChatGPT. In
+another calling product, discover its supported continuation mechanism; these
+examples do not establish tool availability or authorize a fabricated equivalent.
+If no supported subscription can be confirmed, retain handles and use bounded
+current-turn synchronization without promising a later automatic reply.
 
 Treat terminal webhook follow-up as a live-validated capability on this connection. Use current discovery, authorization, and subscription evidence for each chosen watch; do not repeat an acceptance test for ordinary work. ChatGPT's MCP Events integration supports webhook delivery, not Events polling or streaming. Ordinary Streamable HTTP transport and synchronous `codex.wait` are separate mechanisms.
 

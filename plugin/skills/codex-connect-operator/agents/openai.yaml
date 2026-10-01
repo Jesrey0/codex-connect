@@ -1,4 +1,0 @@
-interface:
-  display_name: "Codex provider"
-  short_description: "Operate host work through codexConnect"
-  default_prompt: "Use $codex-connect-operator under 0x0perator to continue the task from the latest verified state."
