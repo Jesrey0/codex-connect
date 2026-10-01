@@ -1,0 +1,33 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "codex-connect",
+  "version": "0.1.11",
+  "description": "Guide ChatGPT host work and delegated Codex work through the existing codexConnect connection.",
+  "author": {
+    "name": "Jes"
+  },
+  "extensions": {
+    "com.openai": {
+      "apps": "./.app.json",
+      "interface": {
+        "displayName": "codexConnect",
+        "shortDescription": "Host work and Codex workers",
+        "longDescription": "Use codexConnect for connected host work, selective Codex delegation, event-driven worker follow-up, recovery, and verification.",
+        "developerName": "Jes",
+        "category": "Productivity",
+        "capabilities": [
+          "Read",
+          "Write",
+          "Interactive"
+        ],
+        "defaultPrompt": [
+          "Check the connected server status and tell me what needs attention.",
+          "Orient to the connected environment and identify the next useful action.",
+          "Continue the current task from the latest verified state."
+        ],
+        "composerIcon": "./assets/codex-connect-icon-black.png",
+        "logo": "./assets/codex-connect-icon-black.png"
+      }
+    }
+  }
+}
