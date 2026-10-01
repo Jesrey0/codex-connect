@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codex-connect",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Use the 0x0perator core and separate Codex and OpenCode provider skills for connected host work, delegation, recovery, and verification.",
   "author": {
     "name": "Jes"

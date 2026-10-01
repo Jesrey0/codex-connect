@@ -5,7 +5,7 @@ description: Use the Codex provider under 0x0perator for connected host operatio
 
 # Codex provider
 
-Apply the [0xOperator core](../0xoperator/SKILL.md), then use these mechanics when Codex Connect owns the workstream. Keep host actions, workers, recovery, and event handling with `@codexConnect`. The live app and its tool schemas own call arguments, limits, lifecycle, and result shapes. The local console is read-only; ChatGPT remains the action surface.
+Apply the [0x0perator core](../0xoperator/SKILL.md), then use these mechanics when Codex Connect owns the workstream. Keep host actions, workers, recovery, and event handling with `@codexConnect`. The live app and its tool schemas own call arguments, limits, lifecycle, and result shapes. The local console is read-only; ChatGPT remains the action surface.
 
 ## Act deliberately
 

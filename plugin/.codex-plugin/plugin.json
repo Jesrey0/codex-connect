@@ -20,7 +20,7 @@
     "logo": "./assets/codex-connect-icon-black.png"
   },
   "name": "codex-connect",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Use the 0x0perator core and separate Codex and OpenCode provider skills for connected host work, delegation, recovery, and verification.",
   "author": {
     "name": "Jes"
