@@ -69,14 +69,32 @@ Use `command.exec` for short, non-interactive commands and `command.start` for
 long-running or interactive work. Commands take argv; invoke a shell explicitly
 for pipes, redirects, or expansion. Set `tty=true` only when a terminal is needed.
 
-After `command.start`, retain `processId`; the first `command.read` starts at cursor `0`, then
-passes each returned cursor to the next read. If the start response is lost, `status.commands`
-lists retained `processId`, effective cwd, state, and TTY mode for recovery. `timeoutMs=0` reads immediately; otherwise the read waits for output
-or exit, up to 43 seconds per call. That ceiling leaves headroom below the measured ChatGPT
-outer result window. Timeout does not terminate the process. Continue until `drained=true` for
-final output; `historyLost=true` means older output was evicted. Termination can be
-forceful: confirm exit with `command.read`. Process handles belong to the backend's
-App Server connection and do not survive its restart.
+`command.start` returns `processId`, effective `cwd`, and the first retained observation
+in `output`. `yieldTimeMs` defaults to 1 second and accepts `0..=10_000`: it waits for
+output or exit, and never stops the process. Use `0` to return a handle immediately.
+Continue `command.read` from `output.cursor`, then pass each returned cursor to the next
+read. All observations preserve the same retained output; another reader can independently
+read from cursor `0`. If the start response is lost, `status.commands` lists retained
+`processId`, effective cwd, state, and TTY mode for recovery. `timeoutMs=0` reads
+immediately; otherwise the read waits for output or exit, up to 43 seconds per call.
+That ceiling leaves headroom below the measured ChatGPT outer result window. Timeout
+never terminates the process. Continue until `drained=true` for final output;
+`historyLost=true` means older output was evicted. Termination can be forceful:
+confirm exit with `command.read`. Handles belong to the backend's App Server
+connection and do not survive its restart.
+
+`command.control(action="write")` writes or closes stdin and returns an observation in
+that same call. Pass the last output cursor as `afterCursor` to avoid replaying earlier
+output; `yieldTimeMs` has the same bounds and meaning as start. Invalid yield/cursor
+arguments are rejected before writing. For example, start a REPL and use its returned
+prompt cursor when sending the first input; the write result can contain the next prompt
+without a separate read call.
+
+A successful start or acknowledged write remains successful when its subsequent
+observation fails: `output=null` and `readError` explains the failure. Recover by reading
+the retained handle or inspecting status. Do not replay acknowledged input or start
+replacement work merely because observation failed. Transport loss still leaves the
+caller uncertain; check retained/authoritative state before retrying consequential work.
 
 ## Worker lifecycle
 

@@ -1,6 +1,9 @@
 //! Public operator catalog and compact MCP schemas.
 use super::MAX_INSPECT_OPERATIONS;
-use codex_connect_relay::{DEFAULT_COMMAND_READ_MS, MAX_COMMAND_READ_MS, MAX_COMMAND_WRITE_BYTES};
+use codex_connect_relay::{
+    DEFAULT_COMMAND_READ_MS, DEFAULT_COMMAND_YIELD_MS, MAX_COMMAND_READ_MS,
+    MAX_COMMAND_WRITE_BYTES, MAX_COMMAND_YIELD_MS,
+};
 use rmcp::model::{Icon, JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -80,7 +83,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.start",
                 "Start Persistent Command",
-                "Start a long-running or interactive host command. Returns processId; use command.read for output and command.control for stdin, PTY resize, or termination.",
+                "Start a long-running or interactive host command and return its handle plus initial output or exit. Continue command.read from output.cursor when needed. If the call is lost, recover from status.commands before starting a replacement.",
                 false,
                 true,
                 true,
@@ -106,7 +109,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.control",
                 "Control Persistent Command",
-                "Write or close stdin, resize a PTY, or terminate a command.start process. Termination may be forceful; use command.read to confirm exit and drain output.",
+                "Write or close stdin and observe output in one call; pass the last output.cursor as afterCursor. A readError after written=true does not undo the input: recover with command.read rather than replaying it. Also resize a PTY or request termination; use command.read to confirm exit and drain output.",
                 false,
                 true,
                 false,
@@ -634,22 +637,31 @@ fn command_start_schema() -> Value {
             "cwd":cwd_schema(),
             "env":{"type":["object","null"],"description":"Child environment overrides; null values remove variables.","additionalProperties":{"type":["string","null"]}},
             "tty":{"type":"boolean","default":false,"description":"Enable PTY semantics only when the program needs an interactive terminal."},
-            "size":{"description":"Initial PTY size. Relevant only when tty=true.","anyOf":[terminal_size_schema(),{"type":"null"}]}
+            "size":{"description":"Initial PTY size. Relevant only when tty=true.","anyOf":[terminal_size_schema(),{"type":"null"}]},
+            "yieldTimeMs":command_yield_schema()
         }),
         &["command"],
     )
 }
+fn command_yield_schema() -> Value {
+    json!({"type":"integer","minimum":0,"maximum":MAX_COMMAND_YIELD_MS,"default":DEFAULT_COMMAND_YIELD_MS,"description":"Wait for the first output or exit observation. 0 returns immediately; reaching this wait never stops the process."})
+}
 fn command_started_schema() -> Value {
     object_schema(
-        json!({"processId":{"type":"string"},"cwd":{"type":"string"}}),
-        &["processId", "cwd"],
+        json!({
+            "processId":{"type":"string"},
+            "cwd":{"type":"string"},
+            "output":{"anyOf":[command_read_output_schema(),{"type":"null"}]},
+            "readError":{"type":["string","null"],"description":"Observation failed after starting. Recover the retained handle with command.read or status; do not start a replacement without checking state."}
+        }),
+        &["processId", "cwd", "output", "readError"],
     )
 }
 fn command_read_schema() -> Value {
     object_schema(
         json!({
             "processId":{"type":"string","minLength":1,"description":"Connection-scoped process handle returned by command.start."},
-            "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Return output after the cursor from command.start/read."},
+            "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Return output after output.cursor from command.start/control or cursor from command.read."},
             "timeoutMs":{"type":"integer","minimum":0,"maximum":MAX_COMMAND_READ_MS,"default":DEFAULT_COMMAND_READ_MS,"description":"Wait for output or exit; 0 returns immediately. Timeout does not stop the process."}
         }),
         &["processId"],
@@ -696,7 +708,9 @@ fn command_control_schema() -> Value {
             "action":{"const":"write","description":"Write bytes to the process stdin and optionally close stdin."},
             "processId":process_id(),
             "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES,"description":"Exact UTF-8 bytes to write. Omit/null when only closing stdin."},
-            "closeStdin":{"type":"boolean","default":false,"description":"Close stdin after any supplied input is written."}
+            "closeStdin":{"type":"boolean","default":false,"description":"Close stdin after any supplied input is written."},
+            "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Observe after the last returned output cursor to avoid replaying earlier output."},
+            "yieldTimeMs":command_yield_schema()
         }),
         &["action", "processId"],
     );
@@ -724,9 +738,11 @@ fn command_control_output_schema() -> Value {
             json!({
                 "processId":{"type":"string"},
                 "written":{"type":"boolean"},
-                "stdinClosed":{"type":"boolean"}
+                "stdinClosed":{"type":"boolean"},
+                "output":{"anyOf":[command_read_output_schema(),{"type":"null"}]},
+                "readError":{"type":["string","null"],"description":"Observation failed after input was acknowledged. Recover with command.read; input may already have taken effect."}
             }),
-            &["processId", "written", "stdinClosed"],
+            &["processId", "written", "stdinClosed", "output", "readError"],
         ),
         object_schema(
             json!({"processId":{"type":"string"},"resized":{"type":"boolean"}}),
@@ -747,42 +763,74 @@ fn review_target_schema() -> Value {
     ]})
 }
 fn codex_start_schema() -> Value {
-    let mut work = object_schema(
-        json!({
-            "mode":{"const":"work","description":"Start or resume a work turn."},
-            "task":{"type":"string","minLength":1,"description":"Self-contained objective or next delta for the workstream."},
-            "cwd":{"type":"string","minLength":1,"description":"Required for fresh work. Resume and fork inherit the canonical cwd and reject this field."},
-            "threadId":{"type":"string","description":"Existing work thread to resume. Resume retains its cwd, reasoning effort, and access and is subject to the server cache-age policy."},
-            "forkFromThreadId":{"type":"string","description":"Source thread whose durable context should be copied into a new workstream instead of resuming it."},
-            "lastTurnId":{"type":"string","description":"With forkFromThreadId, optional source turn to fork through, inclusive."},
-            "model":{"type":"string","minLength":1,"description":"Required on every start. For resume or fork, must equal the canonical thread model; discover IDs with codex.query."},
-            "effort":{"type":"string","description":"Reasoning effort for a new workstream; discover supported values with codex.query."},
-            "access":{"type":"string","enum":["workspace","full"],"default":"workspace","description":"Access for a new workstream. workspace permits workspace writes and network access; full grants unrestricted host access."},
-            "writableRoots":{"type":"array","items":{"type":"string","minLength":1},"description":"Additional absolute directories writable by fresh workspace work (including default access). cwd remains the primary working directory. Omitted or [] adds no roots. Rejected with full access, review, resume, or fork. Persistence across reload/fork depends on App Server."}
-        }),
-        &["mode", "task", "model"],
+    let work_properties = json!({
+        "mode":{"const":"work","description":"Start fresh work, resume a compatible workstream, or fork durable context."},
+        "task":{"type":"string","minLength":1,"description":"Self-contained objective or next delta for the workstream."},
+        "cwd":{"type":"string","minLength":1,"description":"Explicit working directory for fresh work."},
+        "threadId":{"type":"string","minLength":1,"description":"Resume a cache-valid work thread, inheriting its cwd, effort, and access."},
+        "forkFromThreadId":{"type":"string","minLength":1,"description":"Copy a source thread's durable context into a new workstream, inheriting its cwd, effort, and access."},
+        "lastTurnId":{"type":"string","minLength":1,"description":"Optional source turn to fork through, inclusive."},
+        "model":{"type":"string","minLength":1,"description":"Required on every start. Resume and fork must match the canonical thread model; discover IDs with codex.query."},
+        "effort":{"type":"string","description":"Reasoning effort for fresh work; discover supported values with codex.query."},
+        "access":{"type":"string","description":"Fresh workspace work permits workspace writes and network access; full grants unrestricted host access."},
+        "writableRoots":{"type":"array","items":{"type":"string","minLength":1},"description":"Additional absolute write directories for fresh workspace work. cwd stays primary. Omitted or [] adds no roots. App Server owns enforcement and persistence across reload/fork."}
+    });
+    let work_variant = |fields: &[&str], required: &[&str]| {
+        let properties = fields
+            .iter()
+            .map(|field| ((*field).to_owned(), work_properties[*field].clone()))
+            .collect::<JsonObject>();
+        object_schema(Value::Object(properties), required)
+    };
+    let mut workspace = work_variant(
+        &[
+            "mode",
+            "task",
+            "model",
+            "cwd",
+            "effort",
+            "access",
+            "writableRoots",
+        ],
+        &["mode", "task", "model", "cwd"],
     );
-    work["allOf"] = json!([
-        {"if":{"not":{"anyOf":[{"required":["threadId"]},{"required":["forkFromThreadId"]}]}},"then":{"required":["cwd"]}},
-        {"if":{"anyOf":[{"required":["threadId"]},{"required":["forkFromThreadId"]}]},"then":{"not":{"anyOf":[{"required":["cwd"]},{"required":["writableRoots"]}]}}},
-        {"if":{"properties":{"access":{"const":"full"}},"required":["access"]},"then":{"not":{"required":["writableRoots"]}}}
-    ]);
-    let mut review = object_schema(
+    workspace["properties"]["access"]["const"] = json!("workspace");
+    workspace["properties"]["access"]["default"] = json!("workspace");
+    let mut full = work_variant(
+        &["mode", "task", "model", "cwd", "effort", "access"],
+        &["mode", "task", "model", "cwd", "access"],
+    );
+    full["properties"]["access"]["const"] = json!("full");
+    let resumed = work_variant(
+        &["mode", "task", "model", "threadId"],
+        &["mode", "task", "model", "threadId"],
+    );
+    let forked = work_variant(
+        &["mode", "task", "model", "forkFromThreadId", "lastTurnId"],
+        &["mode", "task", "model", "forkFromThreadId"],
+    );
+    let review_model = json!({"type":"string","minLength":1,"description":"Required on every review start. Resume must match the canonical thread model."});
+    let review = object_schema(
         json!({
-            "mode":{"const":"review","description":"Run a review."},
-            "cwd":{"type":"string","minLength":1,"description":"Required for a fresh review. Resume inherits the canonical cwd and rejects this field."},
-            "threadId":{"type":"string","description":"Existing review thread to resume. Resume retains its cwd and model and is subject to the server cache-age policy."},
+            "mode":{"const":"review","description":"Start a fresh read-only review."},
+            "cwd":{"type":"string","minLength":1,"description":"Explicit working directory for a fresh review."},
             "target":review_target_schema(),
-            "model":{"type":"string","minLength":1,"description":"Required on every review start. Resume must match the canonical thread model."}
+            "model":review_model
         }),
-        &["mode", "target", "model"],
+        &["mode", "target", "model", "cwd"],
     );
-    review["allOf"] = json!([
-        {"if":{"not":{"required":["threadId"]}},"then":{"required":["cwd"]}},
-        {"if":{"required":["threadId"]},"then":{"not":{"required":["cwd"]}}}
-    ]);
-    json!({"type":"object","oneOf":[work,review]})
+    let resumed_review = object_schema(
+        json!({
+            "mode":{"const":"review","description":"Resume a cache-valid read-only review."},
+            "threadId":{"type":"string","minLength":1,"description":"Existing review thread; inherits its cwd and model."},
+            "target":review_target_schema(),
+            "model":review_model
+        }),
+        &["mode", "target", "model", "threadId"],
+    );
+    json!({"type":"object","oneOf":[workspace,full,resumed,forked,review,resumed_review]})
 }
+
 fn codex_wait_schema() -> Value {
     object_schema(
         json!({
@@ -1350,66 +1398,47 @@ mod tests {
         let start = codex_start_schema();
         assert_eq!(start["type"], "object");
         let variants = start["oneOf"].as_array().unwrap();
-        assert_eq!(variants.len(), 2);
-        let work = variants
-            .iter()
-            .find(|variant| variant["properties"]["mode"]["const"] == "work")
-            .unwrap();
-        let work_properties = work["properties"].as_object().unwrap();
-        assert_eq!(
-            work_properties
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "access",
-                "cwd",
-                "effort",
-                "forkFromThreadId",
-                "lastTurnId",
-                "mode",
-                "model",
-                "task",
-                "threadId",
-                "writableRoots",
-            ])
-        );
-        assert_eq!(work["required"], json!(["mode", "task", "model"]));
-        assert_eq!(work["allOf"][0]["then"]["required"], json!(["cwd"]));
-        assert_eq!(work["additionalProperties"], false);
-        assert_eq!(work_properties["access"]["default"], "workspace");
-        assert_eq!(work_properties["writableRoots"]["type"], "array");
-        assert_eq!(work_properties["writableRoots"]["items"]["type"], "string");
-        assert_eq!(
-            work_properties["access"]["enum"],
-            json!(["workspace", "full"])
-        );
-        for hidden in [
-            "sandboxPolicy",
-            "developerInstructions",
-            "serviceTier",
-            "approvalPolicy",
-        ] {
-            assert!(work_properties.get(hidden).is_none(), "{hidden}");
+        assert_eq!(variants.len(), 6);
+        for variant in variants {
+            let properties = variant["properties"].as_object().unwrap();
+            assert_eq!(variant["additionalProperties"], false);
+            assert!(
+                variant["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("model"))
+            );
+            assert!(variant.get("allOf").is_none());
+            for hidden in [
+                "sandboxPolicy",
+                "developerInstructions",
+                "serviceTier",
+                "approvalPolicy",
+            ] {
+                assert!(properties.get(hidden).is_none(), "{hidden}");
+            }
+            if properties.contains_key("threadId") || properties.contains_key("forkFromThreadId") {
+                for inherited in ["cwd", "effort", "access", "writableRoots"] {
+                    assert!(properties.get(inherited).is_none(), "{inherited}");
+                }
+            } else {
+                assert!(
+                    variant["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("cwd"))
+                );
+            }
+            if properties["mode"]["const"] == "review" {
+                assert!(!properties.contains_key("access"));
+                assert!(!properties.contains_key("effort"));
+            }
+            if let Some(roots) = properties.get("writableRoots") {
+                assert_eq!(properties["access"]["const"], "workspace");
+                assert_eq!(properties["access"]["default"], "workspace");
+                assert_eq!(roots["items"]["type"], "string");
+            }
         }
-
-        let review = variants
-            .iter()
-            .find(|variant| variant["properties"]["mode"]["const"] == "review")
-            .unwrap();
-        let review_properties = review["properties"].as_object().unwrap();
-        assert_eq!(
-            review_properties
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["cwd", "mode", "model", "target", "threadId"])
-        );
-        assert_eq!(review["required"], json!(["mode", "target", "model"]));
-        assert_eq!(review["allOf"][0]["then"]["required"], json!(["cwd"]));
-        assert_eq!(review["additionalProperties"], false);
-        assert!(review_properties.get("access").is_none());
-        assert!(review_properties.get("effort").is_none());
     }
 
     #[test]

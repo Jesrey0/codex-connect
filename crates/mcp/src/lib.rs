@@ -102,6 +102,8 @@ struct CommandStartArgs {
     #[serde(default)]
     tty: bool,
     size: Option<CommandExecTerminalSize>,
+    #[serde(default = "default_command_yield_ms")]
+    yield_time_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +128,10 @@ fn default_command_read_ms() -> u64 {
     codex_connect_relay::DEFAULT_COMMAND_READ_MS
 }
 
+fn default_command_yield_ms() -> u64 {
+    codex_connect_relay::DEFAULT_COMMAND_YIELD_MS
+}
+
 #[derive(Deserialize)]
 #[serde(
     tag = "action",
@@ -139,6 +145,10 @@ enum CommandControlArgs {
         input: Option<String>,
         #[serde(default)]
         close_stdin: bool,
+        #[serde(default)]
+        after_cursor: u64,
+        #[serde(default = "default_command_yield_ms")]
+        yield_time_ms: u64,
     },
     Resize {
         process_id: String,
@@ -1060,7 +1070,7 @@ async fn dispatch(
         "command.start" => {
             let a: CommandStartArgs = parse(arguments)?;
             relay
-                .command_start(a.command, a.cwd, a.env, a.tty, a.size)
+                .command_start_with_output(a.command, a.cwd, a.env, a.tty, a.size, a.yield_time_ms)
                 .await
                 .map_err(Into::into)
         }
@@ -1076,8 +1086,16 @@ async fn dispatch(
                 process_id,
                 input,
                 close_stdin,
+                after_cursor,
+                yield_time_ms,
             } => relay
-                .command_write(process_id, input, close_stdin)
+                .command_write_with_output(
+                    process_id,
+                    input,
+                    close_stdin,
+                    after_cursor,
+                    yield_time_ms,
+                )
                 .await
                 .map_err(Into::into),
             CommandControlArgs::Resize {
@@ -1486,7 +1504,7 @@ fn project_tool_output(name: &str, value: &mut Value) {
                 object.remove("stderrBytes");
             }
         }
-        "command.start" => retain_object_keys(value, &["processId", "cwd"]),
+        "command.start" => retain_object_keys(value, &["processId", "cwd", "output", "readError"]),
         "codex.start" => {
             if let Some(object) = value.as_object_mut() {
                 object.remove("createdThread");
@@ -1808,11 +1826,19 @@ fn summary_for(name: &str, value: &Value) -> String {
             )
         }
         "command.start" => format!(
-            "Persistent command started: {}.",
+            "Command {}: {}. Continue from cursor {} if output remains or the command is running.",
             value
                 .get("processId")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown")
+                .unwrap_or("unknown"),
+            value["output"]
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("observation unavailable; recover before retrying"),
+            value["output"]
+                .get("cursor")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
         ),
         "command.read" => {
             let state = value

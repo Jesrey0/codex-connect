@@ -46,6 +46,8 @@ Open **Workers** in a supporting ChatGPT conversation to browse current/recent w
 
 Use `command.exec` for short HostPlane commands, `command.start/read/control` for persistent or interactive host processes, and `codex.start` for delegated work/review. `codex.start` can also fork persisted thread context into a new workstream. Use `codex.query` for Codex-owned discovery and persisted thread/process state, and `codex.act` for Codex-owned lifecycle mutations. `status` is backend-global and non-destructive; its `defaultCwd` is the service user's home, while retained workers and commands expose their own cwd. Read `status.workers` to recover a lost start response. The live schemas are authoritative for inputs, outputs, annotations, and limits.
 
+`command.start` returns the first retained observation with its handle; stdin write through `command.control` also returns output in the same call. Continue reading from the returned output cursor. See the [tool ergonomics review](docs/tool-ergonomics.md) for the full catalog assessment.
+
 ## Install and operate
 
 Start with [Getting Started](docs/getting-started.md) to install the pinned Codex CLI/App Server and backend, configure authenticated HTTPS ingress, and verify calls from ChatGPT. Read [Security](SECURITY.md) first.

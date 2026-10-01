@@ -86,6 +86,8 @@ pub const MAX_COMMAND_MS: u64 = 45_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_COMMAND_READ_MS: u64 = 43_000;
 pub const DEFAULT_COMMAND_READ_MS: u64 = 40_000;
+pub const DEFAULT_COMMAND_YIELD_MS: u64 = 1_000;
+pub const MAX_COMMAND_YIELD_MS: u64 = 10_000;
 pub const MAX_COMMAND_WRITE_BYTES: usize = 64 * 1024;
 const APP_SERVER_RESPONSE_HEADROOM_BYTES: usize = 64 * 1024;
 const MAX_APP_SERVER_RESPONSE_BYTES: usize = MAX_WIRE_BYTES - APP_SERVER_RESPONSE_HEADROOM_BYTES;
@@ -1463,6 +1465,67 @@ impl Relay {
             "tty":tty,
             "cursor":0,
         }))
+    }
+
+    /// Start once and return the first retained output/exit observation. Yielding
+    /// never stops the upstream process or creates another command lifecycle.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn command_start_with_output(
+        &self,
+        command: Vec<String>,
+        cwd: Option<String>,
+        env: Option<std::collections::BTreeMap<String, Option<String>>>,
+        tty: bool,
+        size: Option<CommandExecTerminalSize>,
+        yield_time_ms: u64,
+    ) -> Result<Value, RelayError> {
+        validate_command_yield(yield_time_ms)?;
+        let mut started = self.command_start(command, cwd, env, tty, size).await?;
+        let process_id = started["processId"].as_str().unwrap().to_owned();
+        match self.command_read(process_id, 0, yield_time_ms).await {
+            Ok(output) => {
+                started["output"] = output;
+                started["readError"] = Value::Null;
+            }
+            Err(error) => {
+                started["output"] = Value::Null;
+                started["readError"] = json!(error.to_string());
+            }
+        }
+        Ok(started)
+    }
+
+    /// Validate read intent before writing, then observe the same retained
+    /// command. A failed read after acknowledgement must not invite input replay.
+    pub async fn command_write_with_output(
+        &self,
+        process_id: String,
+        input: Option<String>,
+        close_stdin: bool,
+        after_cursor: u64,
+        yield_time_ms: u64,
+    ) -> Result<Value, RelayError> {
+        validate_command_yield(yield_time_ms)?;
+        self.command_sessions
+            .read_after(&process_id, after_cursor)
+            .await
+            .map_err(RelayError::Invalid)?;
+        let acknowledgement = self
+            .command_write(process_id.clone(), input, close_stdin)
+            .await?;
+        // The write has already succeeded. Keep that fact explicit even when
+        // observation fails (for example, App Server disconnects afterward).
+        let read = match self
+            .command_read(process_id, after_cursor, yield_time_ms)
+            .await
+        {
+            Ok(output) => json!({"output": output, "readError": Value::Null}),
+            Err(error) => json!({"output": Value::Null, "readError": error.to_string()}),
+        };
+        let mut value = acknowledgement;
+        value["output"] = read["output"].clone();
+        value["readError"] = read["readError"].clone();
+        Ok(value)
     }
 
     pub async fn command_read(
@@ -3435,6 +3498,15 @@ fn validate_terminal_size(size: CommandExecTerminalSize) -> Result<(), RelayErro
         return Err(RelayError::Invalid(
             "terminal size rows and cols must be greater than 0".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_command_yield(yield_time_ms: u64) -> Result<(), RelayError> {
+    if yield_time_ms > MAX_COMMAND_YIELD_MS {
+        return Err(RelayError::Invalid(format!(
+            "yieldTimeMs must be less than or equal to {MAX_COMMAND_YIELD_MS}; yielding does not stop the command"
+        )));
     }
     Ok(())
 }

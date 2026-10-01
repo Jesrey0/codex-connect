@@ -104,7 +104,7 @@ Thread context is not runtime authority. Mutable repository, filesystem, Git, de
 - `codex.inspect` projects bounded semantic activity, raw relay notifications, or the canonical handoff result in bounded text chunks.
 - `codex.query` reads Codex-owned discovery, persisted thread metadata/listings, and thread-owned background terminals.
 - `codex.act` steers or interrupts, answers pending requests, manages persisted thread archival/deletion, and terminates thread-owned background terminals.
-- `command.start/read/control` preserve the official streaming command lifecycle, including PTY stdin, resize, and termination.
+- `command.start/read/control` preserve the official streaming command lifecycle, including PTY stdin, resize, and termination. Start and write compose that operation with a retained observation in one response; they create no additional command lifecycle.
 
 Connect journals and caches are bounded observations; App Server owns lifecycle state. The relay retains only the projections needed for ChatGPT recovery, bounded inspection, current operator telemetry, and the read-only local console. Public MCP results expose operator-relevant data rather than a shadow App Server object graph. Loopback observer routes feed the console only and must remain mutation-free.
 

@@ -539,7 +539,7 @@ class OperatorProtocolTests(unittest.TestCase):
             "command": ["fixture-stream"],
         })
         self.assertIn("processId", started)
-        self.assertEqual(set(started), {"processId", "cwd"})
+        self.assertEqual(set(started), {"processId", "cwd", "output", "readError"})
         self.assertEqual(started["cwd"], str(self.workspace))
         recovered = next(
             command for command in self.client.call("status")["commands"]
@@ -611,27 +611,27 @@ class OperatorProtocolTests(unittest.TestCase):
             "tty": True,
             "size": {"rows": 24, "cols": 80},
         })
-        prompt = self.client.call("command.read", {
-            "processId": started["processId"], "timeoutMs": 1000,
-        })
+        self.assertIsNone(started["readError"])
+        prompt = started["output"]
         self.assertEqual(prompt["stdout"], ">>> ")
         self.assertEqual(prompt["stderr"], "")
         self.client.call("command.control", {
             "action": "resize", "processId": started["processId"], "rows": 40, "cols": 120,
         })
-        self.client.call("command.control", {
+        written = self.client.call("command.control", {
             "action": "write", "processId": started["processId"], "input": "2+2\n",
+            "afterCursor": prompt["cursor"],
         })
-        answer = self.client.call("command.read", {
-            "processId": started["processId"], "afterCursor": prompt["cursor"], "timeoutMs": 1000,
-        })
+        self.assertTrue(written["written"])
+        self.assertIsNone(written["readError"])
+        answer = written["output"]
         self.assertEqual(answer["stdout"], "4\n>>> ")
-        self.client.call("command.control", {
+        closed = self.client.call("command.control", {
             "action": "write", "processId": started["processId"], "closeStdin": True,
+            "afterCursor": answer["cursor"],
         })
-        exited = self.client.call("command.read", {
-            "processId": started["processId"], "afterCursor": answer["cursor"], "timeoutMs": 1000,
-        })
+        self.assertTrue(closed["stdinClosed"])
+        exited = closed["output"]
         self.assertEqual(exited["state"], "exited")
         self.assertEqual(exited["exitCode"], 0)
         for args in [
@@ -640,6 +640,88 @@ class OperatorProtocolTests(unittest.TestCase):
             {"action": "terminate", "processId": started["processId"]},
         ]:
             self.client.call("command.control", args, error=True)
+
+    def test_cancelled_command_start_yield_retains_recoverable_handle(self):
+        known = {row["processId"] for row in self.client.call("status")["commands"]}
+        caller = McpClient(self.url)
+        caller.request_timeout = 0.1
+        with self.assertRaises((TimeoutError, socket.timeout)):
+            caller.call("command.start", {
+                "command": ["fixture-quiet"], "cwd": str(self.project), "yieldTimeMs": 10000,
+            })
+        retained = [row for row in self.client.call("status")["commands"] if row["processId"] not in known]
+        self.assertEqual(len(retained), 1)
+        command = retained[0]
+        self.assertEqual(command["state"], "running")
+        self.assertEqual(command["cwd"], str(self.project))
+        self.assertIn(command, self.client.call("status")["commands"])
+        self.client.call("command.control", {"action": "terminate", "processId": command["processId"]})
+        result = self.client.call("command.read", {
+            "processId": command["processId"], "afterCursor": 0, "timeoutMs": 1000,
+        })
+        self.assertTrue(result["drained"])
+        self.assertEqual(result["exitCode"], 143)
+
+    def test_command_yield_is_observation_and_validates_before_mutation(self):
+        starts_before = len(self.method_params("command/exec"))
+        self.client.call("command.start", {
+            "command": ["fixture-quiet"], "yieldTimeMs": 10001,
+        }, error=True, validate_input=False)
+        self.assertEqual(len(self.method_params("command/exec")), starts_before)
+
+        quiet = self.client.call("command.start", {
+            "command": ["fixture-quiet"], "yieldTimeMs": 0,
+        })
+        self.assertIsNone(quiet["readError"])
+        self.assertEqual(quiet["output"]["state"], "running")
+        self.assertEqual(quiet["output"]["wakeReason"], "timeout")
+        self.assertFalse(quiet["output"]["drained"])
+        self.assertEqual(quiet["output"]["cursor"], 0)
+        writes_before = len(self.method_params("command/exec/write"))
+        for invalid in [{"yieldTimeMs": 10001}, {"afterCursor": 999999}]:
+            self.client.call("command.control", {
+                "action": "write", "processId": quiet["processId"], "input": "no replay\n",
+                **invalid,
+            }, error=True, validate_input=False)
+        self.assertEqual(len(self.method_params("command/exec/write")), writes_before)
+        self.assertEqual(next(command for command in self.client.call("status")["commands"]
+                              if command["processId"] == quiet["processId"])["state"], "running")
+        written = self.client.call("command.control", {
+            "action": "write", "processId": quiet["processId"], "input": "once\n",
+            "afterCursor": 0, "yieldTimeMs": 0,
+        })
+        self.assertTrue(written["written"])
+        self.assertIsNone(written["readError"])
+        self.assertEqual(written["output"]["state"], "running")
+        self.assertEqual(written["output"]["wakeReason"], "timeout")
+        self.assertEqual(len(self.method_params("command/exec/write")), writes_before + 1)
+        self.client.call("command.control", {"action": "terminate", "processId": quiet["processId"]})
+
+    def test_codex_start_schema_matches_fresh_and_inherited_settings(self):
+        schema = jsonschema.Draft202012Validator(self.client.tools["codex.start"]["inputSchema"])
+        work = {"mode": "work", "task": "complete", "model": "fixture-model-1"}
+        review = {"mode": "review", "target": {"type": "uncommittedChanges"}, "model": "fixture-model-1"}
+        for valid in [
+            {**work, "cwd": str(self.project)},
+            {**work, "cwd": str(self.project), "access": "workspace", "writableRoots": []},
+            {**work, "cwd": str(self.project), "access": "full", "effort": "high"},
+            {**work, "threadId": "canonical"},
+            {**work, "forkFromThreadId": "canonical", "lastTurnId": "source-turn"},
+            {**review, "cwd": str(self.project)},
+            {**review, "threadId": "canonical"},
+        ]:
+            with self.subTest(valid=valid):
+                schema.validate(valid)
+        for invalid in [work, review, {**work, "cwd": str(self.project), "access": "full", "writableRoots": []},
+                        {**work, "cwd": str(self.project), "lastTurnId": "orphan"},
+                        {**work, "threadId": "canonical", "forkFromThreadId": "canonical"}]:
+            with self.subTest(invalid=invalid):
+                self.assertFalse(schema.is_valid(invalid))
+        for inherited in ["threadId", "forkFromThreadId"]:
+            for override in [{"cwd": str(self.project)}, {"effort": "high"}, {"access": "full"}, {"writableRoots": []}]:
+                with self.subTest(inherited=inherited, override=override):
+                    self.assertFalse(schema.is_valid({**work, inherited: "canonical", **override}))
+        self.assertFalse(schema.is_valid({**review, "threadId": "canonical", "cwd": str(self.project)}))
 
     def test_persistent_read_timeout_exit_and_invalid_handle(self):
         quiet = self.client.call("command.start", {"command": ["fixture-quiet"]})
@@ -2076,7 +2158,7 @@ class OperatorProtocolTests(unittest.TestCase):
     def test_z_disconnect_exits_backend_for_service_recovery(self):
         self.start("question")
         persistent = self.client.call("command.start", {"command": ["fixture-quiet"]})
-        self.assertEqual(set(persistent), {"processId", "cwd"})
+        self.assertEqual(set(persistent), {"processId", "cwd", "output", "readError"})
         try:
             self.client.call("command.exec",{"command":["disconnect"]},error=True)
         except (urllib.error.URLError, ConnectionError):
