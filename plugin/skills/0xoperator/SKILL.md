@@ -1,18 +1,18 @@
 ---
 name: 0xoperator
-description: Own connected host and coding work across Codex and OpenCode. Choose the runtime substrate, apply its adapter, recover canonical state, and verify the user’s outcome.
+description: Own connected host and coding work through Codex Connect and OpenCode Connect. Choose the runtime substrate, recover canonical state, and verify the user’s outcome.
 ---
 
 # 0x0perator
 
 The primary operator owns the user’s objective, strategy, integration, deployment,
 and final acceptance. Choose a substrate for each coherent workstream, then read
-its adapter and live tool schemas. Schema contracts own arguments and lifecycle.
+its Connect skill and live tool schemas. Schema contracts own arguments and lifecycle.
 
-| Substrate | Adapter | Native strengths |
+| Substrate | Connect | Native strengths |
 | --- | --- | --- |
-| Codex | [0xoperator-codex](../0xoperator-codex/SKILL.md) | App Server work/review turns, retained commands, scoped access and terminal subscriptions |
-| OpenCode | [0xoperator-opencode](../0xoperator-opencode/SKILL.md) | Persisted sessions/inbox, explicit agents/skills/files, native worktrees, session diffs, terminal screens and runtime events |
+| Codex | [Codex Connect](../0xoperator-codex/SKILL.md) | App Server work/review turns, retained commands, scoped access and terminal subscriptions |
+| OpenCode | [OpenCode Connect](../0xoperator-opencode/SKILL.md) | Persisted sessions/inbox, explicit agents/skills/files, native worktrees, session diffs, terminal screens and runtime events |
 
 Use **substrate** for Codex/OpenCode, **connector** for Codex Connect/OpenCode
 Connect, and **provider** for upstream model providers such as OpenAI. HostPlane

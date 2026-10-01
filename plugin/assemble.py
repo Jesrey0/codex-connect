@@ -21,8 +21,9 @@ def collect(plugin, opencode):
             if p.is_file():
                 files[str(Path('skills') / name / p.relative_to(directory))] = p.read_bytes()
     for old, new in MIGRATIONS.items():
-        files[f'skills/{old}/SKILL.md'] = (f'---\nname: {old}\ndescription: Migration notice for an explicitly requested former skill path. Use the canonical {new} adapter for connected work.\n---\n\n# Retained migration notice\n\nThis account release retains this path because its publisher overlays files.\nFor connected work, read [{new}](../{new}/SKILL.md) and the\n[shared core](../0xoperator/SKILL.md). This file defines no runtime mechanics.\n').encode()
-        files[f'skills/{old}/agents/openai.yaml'] = (f'interface:\n  display_name: "Migration notice · {old}"\n  short_description: "Explicit notice for a retained old path"\n  default_prompt: "Use ${old} to find the canonical substrate adapter."\npolicy:\n  allow_implicit_invocation: false\n').encode()
+        connect = 'Codex Connect' if new == '0xoperator-codex' else 'OpenCode Connect'
+        files[f'skills/{old}/SKILL.md'] = (f'---\nname: {old}\ndescription: Migration notice for an explicitly requested former skill path. Use {connect} through the canonical {new} skill for connected work.\n---\n\n# Retained migration notice\n\nThis account release retains this path because its publisher overlays files.\nFor connected work, read [{connect}](../{new}/SKILL.md) and the\n[shared core](../0xoperator/SKILL.md). This file defines no runtime mechanics.\n').encode()
+        files[f'skills/{old}/agents/openai.yaml'] = (f'interface:\n  display_name: "Migration notice · {old}"\n  short_description: "Explicit notice for a retained old path"\n  default_prompt: "Use ${old} to find the canonical Connect skill."\npolicy:\n  allow_implicit_invocation: false\n').encode()
     return files
 
 def validate(files):

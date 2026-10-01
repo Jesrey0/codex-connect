@@ -1,9 +1,9 @@
 ---
 name: 0xoperator-codex
-description: Apply the Codex substrate under 0x0perator for connected host work, App Server implementation/review turns, retained commands and terminal-event recovery. Use after selecting Codex.
+description: Use Codex Connect under 0x0perator for connected host work, App Server implementation/review turns, retained commands and terminal-event recovery. Use after selecting Codex.
 ---
 
-# 0x0perator — Codex substrate
+# 0x0perator — Codex Connect
 
 Apply the [shared core](../0xoperator/SKILL.md). Read
 [runtime mechanics](references/runtime.md) for command observations, work/review

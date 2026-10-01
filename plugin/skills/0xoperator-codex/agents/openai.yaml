@@ -1,4 +1,4 @@
 interface:
-  display_name: "0x0perator · Codex"
+  display_name: "0x0perator · Codex Connect"
   short_description: "Use native Codex work and recovery"
   default_prompt: "Use $0xoperator-codex to continue the authorized task from its latest verified state."

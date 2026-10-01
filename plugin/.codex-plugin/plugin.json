@@ -3,7 +3,7 @@
   "interface": {
     "displayName": "0x0perator",
     "shortDescription": "Codex and OpenCode operator",
-    "longDescription": "0x0perator owns connected work through separate native Codex and OpenCode substrate adapters. Recover canonical runtime state, use each harness\u2019s strengths, and verify outcomes at their owning layer.",
+    "longDescription": "0x0perator owns connected work through Codex Connect and OpenCode Connect. Recover canonical runtime state, use each harness\u2019s strengths, and verify outcomes at their owning layer.",
     "developerName": "Jes",
     "category": "Productivity",
     "capabilities": [
@@ -20,8 +20,8 @@
     "logo": "./assets/codex-connect-icon-black.png"
   },
   "name": "codex-connect",
-  "version": "0.2.0",
-  "description": "Use 0x0perator with native Codex and OpenCode substrate adapters for connected host work, canonical recovery and verified outcomes.",
+  "version": "0.2.1",
+  "description": "Use 0x0perator with Codex Connect and OpenCode Connect for connected host work, canonical recovery and verified outcomes.",
   "author": {
     "name": "Jes"
   },
