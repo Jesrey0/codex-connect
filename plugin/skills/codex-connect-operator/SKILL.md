@@ -1,23 +1,17 @@
 ---
 name: codex-connect-operator
-description: Operate as 0xOperator through codexConnect for connected host operations and delegated Codex work. Choose efficient host calls and worker synchronization, recover retained state, and verify outcomes. Skip unrelated tasks.
+description: Use the Codex provider under 0x0perator for connected host operations and delegated Codex work through codexConnect. Choose efficient host calls and worker synchronization, recover retained state, and verify outcomes. Skip unrelated tasks.
 ---
 
-# 0xOperator
+# Codex provider
 
-Act as **0xOperator**, the user's operator for connected host and delegated Codex work through `@codexConnect`. The live app and its tool schemas own call arguments, limits, lifecycle, and result shapes; do not duplicate those contracts here.
-
-## Own the work
-
-ChatGPT owns the user's goal, execution, integration, and final verification. PlatformPlane contains ChatGPT-native capabilities; HostPlane owns connected host files, processes, Git, deployment, and runtime; WorkerPlane owns delegated Codex work. Use the plane that owns each fact or action. Authority does not transfer between planes.
-
-Treat source, tests, Git, prepared artifacts, deployments, live services, plugin discovery, event delivery, and CI as separate states. Recheck mutable facts at their owning layer. Worker reports, event receipts, and conversation history are context, not proof. The local console is read-only; ChatGPT remains the action surface.
+Apply the [0xOperator core](../0xoperator/SKILL.md), then use these mechanics when Codex Connect owns the workstream. Keep host actions, workers, recovery, and event handling with `@codexConnect`. The live app and its tool schemas own call arguments, limits, lifecycle, and result shapes. The local console is read-only; ChatGPT remains the action surface.
 
 ## Act deliberately
 
-Use HostPlane directly for short deterministic checks and edits. Start retained commands for long-running or interactive host work and keep their handles. Delegate only when autonomous investigation, substantial implementation, independent review, or real parallelism materially helps. Do not invoke the Codex CLI through host commands when a `codex.*` operation exists.
+Use HostPlane directly for short deterministic checks and edits. Start retained commands for long-running or interactive host work. Do not invoke the Codex CLI through host commands when a `codex.*` operation exists.
 
-Give workers bounded objectives, context, constraints, and acceptance criteria. Do useful non-overlapping operator work while they run. Reuse a compatible retained thread when its context helps; fork or start fresh when independence or changed settings require it. Verify consequential worker results at the owning layer.
+Reuse a compatible retained thread when its context helps; fork or start fresh when independence or changed settings require it. The connection may enforce a conservative cache-reuse window; recover terminal state and carry a self-contained handoff into fresh work when reuse is rejected.
 
 For fresh workspace work that legitimately spans additional directories, prefer explicit `writableRoots` over full host access. Keep `cwd` as the primary work root and grant only the additional absolute directories the task needs. Do not use `writableRoots` with full access, review, resume, or fork. Additional roots are not guaranteed across a cold reload or fork; start a fresh bounded workstream when those permissions must be re-established.
 

@@ -1,9 +1,9 @@
 {
   "apps": "./.app.json",
   "interface": {
-    "displayName": "codexConnect",
-    "shortDescription": "0xOperator",
-    "longDescription": "0xOperator guides connected host work, efficient command interaction, selective Codex delegation, event-driven follow-up, recovery, and verification through codexConnect.",
+    "displayName": "0x0perator",
+    "shortDescription": "Codex and OpenCode operator",
+    "longDescription": "0x0perator supplies shared operator principles with separate Codex Connect and OpenCode Connect mechanics. Select one substrate for each workstream, recover canonical runtime state, and verify outcomes at their owning layer.",
     "developerName": "Jes",
     "category": "Productivity",
     "capabilities": [
@@ -20,8 +20,8 @@
     "logo": "./assets/codex-connect-icon-black.png"
   },
   "name": "codex-connect",
-  "version": "0.1.12",
-  "description": "Use 0xOperator with codexConnect for connected host work, selective Codex delegation, recovery, and verification.",
+  "version": "0.1.13",
+  "description": "Use the 0x0perator core and separate Codex and OpenCode provider skills for connected host work, delegation, recovery, and verification.",
   "author": {
     "name": "Jes"
   },
