@@ -11,8 +11,11 @@ MIGRATIONS = {'codex-connect-operator': '0xoperator-codex', 'opencode-connect': 
 
 def collect(plugin, opencode):
     files = {}
-    for name in ('plugin.json', '.codex-plugin/plugin.json'):
+    for name in ('plugin.json', '.codex-plugin/plugin.json', '.app.json'):
         files[name] = (plugin / name).read_bytes()
+    files['assets/codex-connect-icon-black.png'] = (
+        plugin.parent / 'assets' / 'codex-connect-icon-black.png'
+    ).read_bytes()
     for name, root in [('0xoperator', plugin), ('0xoperator-codex', plugin), ('0xoperator-opencode', opencode)]:
         directory = root / 'skills' / name
         for p in directory.rglob('*'):
@@ -29,6 +32,7 @@ def collect(plugin, opencode):
 def validate(files):
     manifest = json.loads(files['plugin.json'])
     overlay = json.loads(files['.codex-plugin/plugin.json'])
+    json.loads(files['.app.json'].decode('utf-8'))
     if manifest['name'] != 'codex-connect' or overlay['name'] != manifest['name']:
         raise ValueError('Existing plugin identity must be preserved')
     if overlay['version'] != manifest['version'] or overlay['interface'] != manifest['extensions']['com.openai']['interface']:
@@ -37,12 +41,25 @@ def validate(files):
         raise ValueError('Plugin subtitle is too long')
     if not re.fullmatch(r'\d+\.\d+\.\d+', manifest['version']):
         raise ValueError('Plugin version must be semantic')
+    for ref in (
+        manifest['extensions']['com.openai']['apps'],
+        overlay['apps'],
+        manifest['extensions']['com.openai']['interface']['composerIcon'],
+        manifest['extensions']['com.openai']['interface']['logo'],
+        overlay['interface']['composerIcon'],
+        overlay['interface']['logo'],
+    ):
+        path = ref.removeprefix('./')
+        if path not in files:
+            raise ValueError('Missing packaged manifest reference: ' + ref)
     expected = set(CANONICAL) | set(MIGRATIONS)
     found = {Path(p).parts[1] for p in files if p.endswith('/SKILL.md')}
     if found != expected:
         raise ValueError('Unexpected skill inventory')
     forbidden = re.compile('j' + 'e' + 'v', re.I)
     for path, data in files.items():
+        if not path.endswith(('.json', '.md', '.yaml', '.yml')):
+            continue
         text = data.decode('utf-8')
         if forbidden.search(text):
             raise ValueError('Excluded component reference in ' + path)
@@ -82,6 +99,8 @@ def main():
         for path, data in sorted(files.items()):
             info = zipfile.ZipInfo('codex-connect/' + path, (2026, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3
+            info.external_attr = 0o100644 << 16
             archive.writestr(info, data)
     print(json.dumps({'version': manifest['version'], 'archive': str(args.archive.resolve()), 'canonicalSkills': CANONICAL, 'retainedMigrationPaths': list(MIGRATIONS), 'files': len(files)}))
 
