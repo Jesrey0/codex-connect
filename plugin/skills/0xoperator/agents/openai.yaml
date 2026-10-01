@@ -1,4 +1,0 @@
-interface:
-  display_name: "0x0perator"
-  short_description: "Own the connected runtime workstream"
-  default_prompt: "Use $0xoperator to continue the authorized task from its latest verified state."
