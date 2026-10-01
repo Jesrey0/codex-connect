@@ -26,7 +26,7 @@ from support.mcp_client import McpClient, PROTOCOL_VERSION
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONTRACT = json.loads((ROOT / "config/app-server-tool-schemas.json").read_text())
 EXPECTED = {
-    "status", "inspect", "apply_patch", "view_image", "command.exec",
+    "status", "host.inspect", "host.apply_patch", "host.view_image", "command.exec",
     "command.start", "command.read", "command.control",
     "codex.start", "codex.wait", "codex.inspect", "codex.query", "codex.act",
     "workers.open", "workers.snapshot",
@@ -118,6 +118,10 @@ class OperatorProtocolTests(unittest.TestCase):
             "afterCursor": work["cursor"] if after_cursor is None else after_cursor,
             "detail": detail,
         })
+
+    def follow_next_call(self, next_call):
+        self.assertEqual(set(next_call), {"tool", "arguments"})
+        return self.client.call(next_call["tool"], next_call["arguments"])
 
     def transcript(self, work):
         thread_id = urllib.parse.quote(work["threadId"], safe="")
@@ -216,6 +220,13 @@ class OperatorProtocolTests(unittest.TestCase):
         for tool in tools:
             self.assertEqual(tool["securitySchemes"], expected_security)
             self.assertNotIn("securitySchemes", tool.get("_meta", {}))
+
+    def test_bare_host_tool_names_are_not_dispatch_aliases(self):
+        for name in ["inspect", "apply_patch", "view_image"]:
+            with self.subTest(name=name):
+                result = self.client.request("tools/call", {"name": name, "arguments": {}})
+                self.assertTrue(result["isError"])
+                self.assertIn("unknown tool", result["content"][0]["text"].lower())
 
     def test_workers_resource_discovery_and_launch_contract(self):
         discovery = self.client.request("server/discover")
@@ -388,7 +399,7 @@ class OperatorProtocolTests(unittest.TestCase):
         path = self.workspace / ("many-matches-" + "p" * 100 + ".txt")
         path.write_text(("needle" + "x" * 994 + "\n") * 1_000)
         try:
-            row = self.client.call("inspect", {"operations": [
+            row = self.client.call("host.inspect", {"operations": [
                 {"type": "searchContent", "query": "needle", "path": path.name, "maxResults": 1_000},
             ]})["results"][0]
             matches = row["result"]["matches"]
@@ -400,7 +411,7 @@ class OperatorProtocolTests(unittest.TestCase):
             path.unlink()
 
     def test_inspection_uses_default_cwd_and_accepts_absolute_host_paths(self):
-        result = self.client.call("inspect", {"operations": [
+        result = self.client.call("host.inspect", {"operations": [
             {"type": "readText", "path": "sample.txt", "startLine": 2, "endLine": 2},
             {"type": "searchContent", "query": "two", "maxResults": 1},
             {"type": "metadata", "path": "sample.txt"},
@@ -418,13 +429,13 @@ class OperatorProtocolTests(unittest.TestCase):
         )
         fuzzy = result["results"][4]["result"]["files"][0]
         self.assertEqual(fuzzy, {"path": str(self.workspace / "sample.txt"), "kind": "file"})
-        escaped = self.client.call("inspect", {"operations": [
+        escaped = self.client.call("host.inspect", {"operations": [
             {"type": "fuzzyFileSearch", "query": "external", "path": "."},
         ]})
         self.assertEqual(escaped["results"][0]["result"]["files"], [])
         large = self.workspace / "large.txt"
         large.write_bytes(b"x" * (7 * 1024 * 1024))
-        large_result = self.client.call("inspect", {"operations": [
+        large_result = self.client.call("host.inspect", {"operations": [
             {"type": "readText", "path": "large.txt", "startLine": 1, "endLine": 1},
         ]})
         self.assertEqual(large_result["results"][0]["index"], 0)
@@ -434,15 +445,15 @@ class OperatorProtocolTests(unittest.TestCase):
         suffix = "x" * 240
         for index in range(28_000):
             (large_directory / f"{index:05d}-{suffix}").touch()
-        large_directory_result = self.client.call("inspect", {"operations": [
+        large_directory_result = self.client.call("host.inspect", {"operations": [
             {"type": "readDirectory", "path": "large-directory"},
         ]})
         self.assertIn("directory listing exceeds", large_directory_result["results"][0]["error"])
-        healthy = self.client.call("inspect", {"operations": [
+        healthy = self.client.call("host.inspect", {"operations": [
             {"type": "readText", "path": "sample.txt", "startLine": 1, "endLine": 1},
         ]})
         self.assertEqual(healthy["results"][0]["result"]["text"], "one")
-        partial = self.client.call("inspect", {"operations": [
+        partial = self.client.call("host.inspect", {"operations": [
             {"type":"readText","path":"/etc/passwd"},
             {"type":"readText","path":"sample.txt","startLine":3,"endLine":3},
         ]})
@@ -450,24 +461,24 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIn("root:", partial["results"][0]["result"]["text"])
         self.assertEqual(partial["results"][1]["index"], 1)
         self.assertEqual(partial["results"][1]["result"]["text"], "three")
-        escaped_fuzzy = self.client.call("inspect", {"operations": [
+        escaped_fuzzy = self.client.call("host.inspect", {"operations": [
             {"type":"fuzzyFileSearch","query":"passwd","path":"/etc"},
         ]})
         self.assertEqual(escaped_fuzzy["results"][0]["result"]["files"][0]["path"], "/etc/passwd")
-        outside_cwd = self.client.call("inspect", {
+        outside_cwd = self.client.call("host.inspect", {
             "cwd":"/etc", "operations":[{"type":"readDirectory","path":"."}],
         })
         self.assertIn("passwd", {entry["fileName"] for entry in outside_cwd["results"][0]["result"]["entries"]})
 
     def test_request_cwd_applies_consistently_to_paths_patch_and_image(self):
         cwd = str(self.project)
-        inspected = self.client.call("inspect", {"cwd":cwd,"operations":[
+        inspected = self.client.call("host.inspect", {"cwd":cwd,"operations":[
             {"type":"readText","path":"local.txt"},
             {"type":"searchContent","query":"project-local"},
         ]})
         self.assertEqual(inspected["results"][0]["result"]["text"], "project-local")
         self.assertEqual(inspected["results"][1]["result"]["matches"][0]["path"], "local.txt")
-        self.client.call("apply_patch", {
+        self.client.call("host.apply_patch", {
             "cwd":cwd,
             "patch":"*** Begin Patch\n*** Add File: patch.txt\n+created\n*** End Patch",
         })
@@ -476,7 +487,7 @@ class OperatorProtocolTests(unittest.TestCase):
             (entry := json.loads(line))["kind"] == "method" and entry["name"] == "fs/readFile"
             for line in self.coverage_path.read_text().splitlines()
         )
-        image = self.client.call("view_image", {"cwd":cwd,"path":"pixel.png"})
+        image = self.client.call("host.view_image", {"cwd":cwd,"path":"pixel.png"})
         self.assertEqual(image["path"], "project/pixel.png")
         self.assertEqual(image["mimeType"], "image/png")
         after_image_reads = sum(
@@ -484,7 +495,7 @@ class OperatorProtocolTests(unittest.TestCase):
             for line in self.coverage_path.read_text().splitlines()
         )
         self.assertEqual(after_image_reads, before_image_reads + 1)
-        self.client.call("apply_patch", {
+        self.client.call("host.apply_patch", {
             "cwd":cwd,
             "patch":"*** Begin Patch\n*** Add File: ../escape.txt\n+outside-cwd\n*** End Patch",
         })
@@ -615,6 +626,12 @@ class OperatorProtocolTests(unittest.TestCase):
         prompt = started["output"]
         self.assertEqual(prompt["stdout"], ">>> ")
         self.assertEqual(prompt["stderr"], "")
+        quiet = self.follow_next_call(prompt["nextCall"])
+        self.assertEqual(quiet["state"], "running")
+        self.assertEqual(quiet["wakeReason"], "timeout")
+        self.assertEqual(quiet["stdout"], "")
+        self.assertFalse(quiet["drained"])
+        self.assertEqual(quiet["nextCall"]["arguments"]["afterCursor"], quiet["cursor"])
         self.client.call("command.control", {
             "action": "resize", "processId": started["processId"], "rows": 40, "cols": 120,
         })
@@ -626,6 +643,8 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertIsNone(written["readError"])
         answer = written["output"]
         self.assertEqual(answer["stdout"], "4\n>>> ")
+        self.assertEqual(answer["nextCall"]["tool"], "command.read")
+        self.assertEqual(answer["nextCall"]["arguments"]["afterCursor"], answer["cursor"])
         closed = self.client.call("command.control", {
             "action": "write", "processId": started["processId"], "closeStdin": True,
             "afterCursor": answer["cursor"],
@@ -634,6 +653,7 @@ class OperatorProtocolTests(unittest.TestCase):
         exited = closed["output"]
         self.assertEqual(exited["state"], "exited")
         self.assertEqual(exited["exitCode"], 0)
+        self.assertIsNone(exited["nextCall"])
         for args in [
             {"action": "write", "processId": started["processId"], "input": "x"},
             {"action": "resize", "processId": started["processId"], "rows": 1, "cols": 1},
@@ -877,10 +897,14 @@ class OperatorProtocolTests(unittest.TestCase):
         })
         self.assertTrue(result["historyLost"])
         self.assertLessEqual(len(result["stdout"].encode()), 128 * 1024)
+        self.assertEqual(result["nextCall"]["tool"], "command.read")
+        self.assertEqual(result["nextCall"]["arguments"]["processId"], started["processId"])
+        self.assertEqual(result["nextCall"]["arguments"]["afterCursor"], result["cursor"])
         stale = self.client.call("command.read", {
             "processId": started["processId"], "afterCursor": 1, "timeoutMs": 0,
         })
         self.assertTrue(stale["historyLost"])
+        self.assertIsNotNone(stale["nextCall"])
         self.client.call("command.control", {"action": "terminate", "processId": started["processId"]})
 
     def test_persistent_terminal_state_does_not_imply_output_is_drained(self):
@@ -921,12 +945,14 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertLess(first["cursor"], terminal["cursor"])
         self.assertEqual(len(first["stdout"].encode()), 128 * 1024)
 
-        second = self.client.call("command.read", {
+        self.assertEqual(first["nextCall"], {"tool": "command.read", "arguments": {
             "processId": started["processId"], "afterCursor": first["cursor"], "timeoutMs": 0,
-        })
+        }})
+        second = self.follow_next_call(first["nextCall"])
         self.assertEqual(second["state"], "exited")
         self.assertFalse(second["hasMoreOutput"])
         self.assertTrue(second["drained"])
+        self.assertIsNone(second["nextCall"])
         self.assertGreater(second["cursor"], first["cursor"])
         self.assertEqual(second["stdout"], "c" * 20000)
 
@@ -1420,24 +1446,29 @@ class OperatorProtocolTests(unittest.TestCase):
         raw = self.inspect_turn(work, detail="raw")
         self.assertTrue(raw["historyLost"])
 
-        offset = 0
+        next_call = {"tool": "codex.inspect", "arguments": {
+            "threadId": work["threadId"], "turnId": work["turnId"],
+            "detail": "result", "textOffset": 0,
+        }}
         chunks = []
-        while True:
-            page = self.client.call("codex.inspect", {
-                "threadId": work["threadId"],
-                "turnId": work["turnId"],
-                "detail": "result",
-                "textOffset": offset,
-            })
+        while next_call is not None:
+            offset = next_call["arguments"]["textOffset"]
+            page = self.follow_next_call(next_call)
             self.assertEqual(page["detail"], "result")
             self.assertTrue(page["resultPage"]["selectionComplete"])
+            self.assertEqual(page["resultPage"]["item"]["id"], "long-final")
             chunks.append(page["resultPage"]["text"])
             self.assertLessEqual(len(page["resultPage"]["text"]), 10_240)
             next_offset = page["resultPage"]["nextTextOffset"]
+            next_call = page["nextCall"]
             if next_offset is None:
-                break
-            self.assertEqual(next_offset, offset + len(page["resultPage"]["text"]))
-            offset = next_offset
+                self.assertIsNone(next_call)
+            else:
+                self.assertEqual(next_offset, offset + len(page["resultPage"]["text"]))
+                self.assertEqual(next_call, {"tool": "codex.inspect", "arguments": {
+                    "threadId": work["threadId"], "turnId": work["turnId"],
+                    "detail": "result", "textOffset": next_offset,
+                }})
         self.assertEqual("".join(chunks), "abcdefghij" * 3_000)
 
         for arguments in [
@@ -1468,6 +1499,65 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(calls[1]["limit"], 50)
         self.assertIsNone(calls[0].get("cursor"))
         self.assertIsNone(calls[1].get("cursor"))
+
+    def test_inspect_next_call_preserves_event_modes_cursors_and_history_loss(self):
+        work = self.start("journal_pages")
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        for detail in ["semantic", "raw"]:
+            with self.subTest(detail=detail):
+                first = self.inspect_turn(work, detail=detail)
+                self.assertTrue(first["historyLost"])
+                self.assertTrue(first["hasMore"])
+                page = first
+                cursors = []
+                pages = 0
+                while True:
+                    pages += 1
+                    self.assertLess(pages, 100)
+                    self.assertEqual(page["detail"], detail)
+                    cursors.extend(event["cursor"] for event in page["events"])
+                    if not page["hasMore"]:
+                        self.assertIsNone(page["nextCall"])
+                        break
+                    self.assertEqual(page["nextCall"], {"tool": "codex.inspect", "arguments": {
+                        "threadId": work["threadId"], "turnId": work["turnId"],
+                        "detail": detail, "afterCursor": page["cursor"],
+                    }})
+                    continued = self.follow_next_call(page["nextCall"])
+                    self.assertGreater(continued["cursor"], page["cursor"])
+                    self.assertFalse(continued["historyLost"])
+                    page = continued
+                self.assertGreater(pages, 1)
+                self.assertEqual(cursors, sorted(set(cursors)))
+                replay = self.inspect_turn(work, detail=detail)
+                self.assertEqual(replay["events"], first["events"])
+                self.assertEqual(replay["cursor"], first["cursor"])
+
+    def test_result_continuation_does_not_establish_terminal_output_or_authority(self):
+        work = self.start("active_long_result")
+        candidate = self.client.call("codex.inspect", {
+            "threadId": work["threadId"], "turnId": work["turnId"], "detail": "result",
+        })
+        self.assertEqual(candidate["status"], "inProgress")
+        self.assertTrue(candidate["resultPage"]["hasMoreText"])
+        self.assertFalse(candidate["resultPage"]["selectionComplete"])
+        self.assertIsNone(candidate["nextCall"])
+        self.client.call("codex.act", {
+            "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
+        })
+        self.assertEqual(self.wait(work)["turn"]["status"], "interrupted")
+
+        empty = self.start("complete_without_handoff")
+        joined = self.wait(empty)
+        self.assertEqual(joined["state"], "terminal")
+        self.assertEqual(joined["turn"]["output"], [])
+        result = self.client.call("codex.inspect", {
+            "threadId": empty["threadId"], "turnId": empty["turnId"], "detail": "result",
+        })
+        self.assertTrue(result["resultPage"]["selectionComplete"])
+        self.assertIsNone(result["resultPage"]["item"])
+        self.assertEqual(result["resultPage"]["text"], "")
+        self.assertIsNone(result["nextCall"])
 
     def test_result_mode_shares_budget_with_slow_turn_metadata_lookup(self):
         work = self.start("result_slow_metadata")
@@ -2047,7 +2137,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(result["turn"]["status"], "failed")
 
     def test_contract_surface_is_completely_reachable_and_schema_valid(self):
-        inspected = self.client.call("inspect", {"operations": [
+        inspected = self.client.call("host.inspect", {"operations": [
             {"type": "readText", "path": "sample.txt"},
             {"type": "readDirectory", "path": "."},
             {"type": "metadata", "path": "sample.txt"},

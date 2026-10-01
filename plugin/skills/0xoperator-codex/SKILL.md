@@ -13,8 +13,9 @@ the primary operator owns actions.
 
 ## Choose native Codex capabilities
 
-Use HostPlane for deterministic inspection, changes and commands; use `codex.*`
-for delegated work and independent review. Batch independent questions that
+Use `host.inspect`, `host.apply_patch` and `host.view_image` for direct host
+files; use `command.*` for host processes and `codex.*` for delegated work and
+independent review. Batch independent questions that
 inform the next action. Preserve separate host and worker authority. Prefer
 explicit additional writable roots to full host access for fresh bounded work;
 follow the live schema’s restrictions on resume/fork/review and inherited roots.
@@ -33,7 +34,8 @@ acknowledged input. Recover the handle rather than repeating the action.
 
 Terminal process state and drained output are separate. Follow output cursors,
 `hasMoreOutput`, `drained` and `historyLost`. Independent readers do not consume
-each other’s output. Follow the current schema for location and retention bounds.
+each other’s output. Reuse a returned read-only `nextCall` when continuing a
+page; keep its original handles and inspect completeness metadata. Follow the current schema for location and retention bounds.
 
 ## Synchronize and continue
 

@@ -14,6 +14,14 @@ That rule currently covers Codex threads/turns, review, model and skill discover
 
 The public catalog and schemas are owned by `crates/mcp/src/catalog.rs`; parsing and dispatch are in `crates/mcp/src/lib.rs`. Update both with protocol tests when changing inputs or outputs. `status` is backend-global and non-destructive; its `defaultCwd` describes HostPlane defaults, while retained worker and command handles carry effective cwd. `codex.start` requires model on every invocation and cwd on fresh work/review. Its input is an explicit union of fresh workspace/full work, resumed work, forked work, fresh review, and resumed review. Inherited-setting overrides are absent from resumed/forked variants; relay validation remains authoritative.
 
+Public host tools use `host.inspect`, `host.apply_patch`, and `host.view_image`;
+commands use `command.*` and workers use `codex.*`. Bare host names have no aliases.
+Keep descriptions to selection guidance and essential lifecycle rules, with precise
+constraints in schema fields and references. `codex.inspect.nextCall` and command
+observation `nextCall` values are additive MCP projections over existing IDs,
+cursors, and offsets, never another lifecycle or pagination store. Test direct
+invocation against the consumed catalog, independently of explanatory wording.
+
 The public endpoint supports only MCP `2026-07-28`: advertise that version in `server/discover` and require modern per-request metadata. There is no legacy `initialize` path or compatibility mode in the public endpoint. The integration client exercises this stateless contract. The separate Codex App Server handshake is internal to the pinned upstream protocol.
 
 Keep ownership one-way. `crates/host` owns host-path validation and only those deterministic host mechanics that are genuinely Connect-native. `crates/app-server` owns the pinned upstream protocol/transport. `crates/relay` adapts and composes upstream/host primitives without becoming a second authority. `crates/mcp` projects that behavior into the ChatGPT-facing tool/HTTP surface. The CLI is the composition root plus maintainer-only installation/service/deployment/diagnostic plumbing; it is not a second human product interface.

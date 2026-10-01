@@ -72,8 +72,11 @@ for pipes, redirects, or expansion. Set `tty=true` only when a terminal is neede
 `command.start` returns `processId`, effective `cwd`, and the first retained observation
 in `output`. `yieldTimeMs` defaults to 1 second and accepts `0..=10_000`: it waits for
 output or exit, and never stops the process. Use `0` to return a handle immediately.
-Continue `command.read` from `output.cursor`, then pass each returned cursor to the next
-read. All observations preserve the same retained output; another reader can independently
+When `output` is present, follow `output.nextCall={tool,arguments}` from start/write
+observations or `nextCall` from `command.read`. Each call carries the existing process ID and cursor. It reads
+immediately when more retained output is available, otherwise uses the bounded default
+wait; `null` means `drained=true`. A running command may have no output yet. All
+observations preserve the same retained output; another reader can independently
 read from cursor `0`. If the start response is lost, `status.commands` lists retained
 `processId`, effective cwd, state, and TTY mode for recovery. `timeoutMs=0` reads
 immediately; otherwise the read waits for output or exit, up to 43 seconds per call.
@@ -91,8 +94,9 @@ prompt cursor when sending the first input; the write result can contain the nex
 without a separate read call.
 
 A successful start or acknowledged write remains successful when its subsequent
-observation fails: `output=null` and `readError` explains the failure. Recover by reading
-the retained handle or inspecting status. Do not replay acknowledged input or start
+observation fails: `output=null` and `readError` explains the failure, so there is no
+observation `nextCall` to reuse. Recover by reading the retained handle or inspecting
+status. Do not replay acknowledged input or start
 replacement work merely because observation failed. Transport loss still leaves the
 caller uncertain; check retained/authoritative state before retrying consequential work.
 
@@ -170,10 +174,16 @@ wait uses a fixed server budget and returns:
   establish a stall or authorize taking over its scope.
 
 Use `codex.inspect` semantic/raw details and `afterCursor` for activity and retained journal
-notifications; use `detail: "result"` and `textOffset` to retrieve the persisted handoff.
-Treat it as authoritative only when `resultPage.selectionComplete` is true. Raw
-notifications can be lost with the relay journal. Use `codex.act` to steer
-or interrupt, and `codex.wait` to confirm terminal state after interruption.
+pages. When `hasMore=true`, `nextCall={tool,arguments}` is directly reusable and
+preserves the selected mode, worker IDs, and cursor. Result text pages return the
+same shape using `textOffset` when a terminal turn has more text. `nextCall=null`
+means no available continuation for that read; it does not establish successful
+work, output presence, or selection authority. Check `resultPage.selectionComplete`
+independently. An active result candidate may have more text but cannot be paged
+with a nonzero offset until terminal. Continuation cannot recover lost relay history.
+
+Use `codex.act` to steer or interrupt, and `codex.wait` to confirm terminal state
+after interruption.
 
 `codex.query` also reads persisted thread metadata/listings and App Server background terminals.
 `codex.act` archives, unarchives, or deletes persisted threads and can terminate a background

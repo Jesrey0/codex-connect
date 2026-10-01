@@ -20,7 +20,7 @@
     "logo": "./assets/codex-connect-icon-black.png"
   },
   "name": "codex-connect",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Use 0x0perator with Codex Connect and OpenCode Connect for connected host work, canonical recovery and verified outcomes.",
   "author": {
     "name": "Jes"

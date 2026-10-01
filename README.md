@@ -40,7 +40,7 @@ Do not invoke the Codex CLI through HostPlane commands when a `codex.*` semantic
 
 The MCP catalog contains 14 model-visible tools:
 
-`status`, `inspect`, `view_image`, `apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control`, `codex.start`, `codex.wait`, `codex.inspect`, `codex.query`, `codex.act`, and `workers.open`. A fifteenth descriptor, `workers.snapshot`, is app-only for explicit panel Refresh.
+`status`, `host.inspect`, `host.view_image`, `host.apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control`, `codex.start`, `codex.wait`, `codex.inspect`, `codex.query`, `codex.act`, and `workers.open`. A fifteenth descriptor, `workers.snapshot`, is app-only for explicit panel Refresh.
 
 Open **Workers** in a supporting ChatGPT conversation to browse current/recent workers by project, inspect canonical results, attach selected context, or ask ChatGPT to inspect pending state. The panel is observational; worker actions stay in ChatGPT. Its initial snapshot comes from the opener, and updates require Refresh. See the [panel contract](docs/development.md#conversation-worker-panel).
 

@@ -512,6 +512,21 @@ for line in sys.stdin:
             complete(thread_id, turn_id, emit_notification=False)
         elif scenario == "progress":
             send({"method":"item/agentMessage/delta","params":{"threadId":thread_id,"turnId":turn_id,"delta":"Working"}})
+        elif scenario == "journal_pages":
+            for index in range(520):
+                send({"method": "item/completed", "params": {
+                    "threadId": thread_id, "turnId": turn_id,
+                    "item": {"type": "agentMessage", "id": f"journal-{index}",
+                             "text": f"page-{index}:" + "x" * 6000},
+                }})
+            complete(thread_id, turn_id)
+        elif scenario == "active_long_result":
+            turn["items"] = [{"type": "agentMessage", "id": "candidate",
+                              "text": "x" * 20000, "phase": "commentary"}]
+        elif scenario == "complete_without_handoff":
+            turn["status"] = "completed"
+            turn["items"] = []
+            notify("turn/completed", {"threadId": thread_id, "turn": turn})
         elif scenario == "oversized":
             send({"method":"item/completed","params":{"threadId":thread_id,"turnId":turn_id,"data":"x"*140000}})
         elif scenario == "wire_oversized":

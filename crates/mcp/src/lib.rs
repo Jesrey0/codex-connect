@@ -13,8 +13,9 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::{Router, extract::Request};
 use codex_connect_host::Host;
 use codex_connect_relay::{
-    ApprovalDecision, CommandExec, CommandExecTerminalSize, ElicitationAction, InspectDetail,
-    PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId, SandboxPolicy,
+    ApprovalDecision, CommandExec, CommandExecTerminalSize, DEFAULT_COMMAND_READ_MS,
+    ElicitationAction, InspectDetail, PermissionGrant, PermissionScope, Relay, ReviewTarget, RpcId,
+    SandboxPolicy,
 };
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
@@ -713,7 +714,7 @@ impl ServerHandler for McpHandler {
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
         let name = request.name.as_ref();
         let arguments = request.arguments.unwrap_or_default();
-        if name == "view_image" {
+        if name == "host.view_image" {
             return match tokio::time::timeout(
                 Duration::from_millis(QUICK_TOOL_GUARD_MS),
                 image_response(&self.relay, &self.host, arguments),
@@ -727,7 +728,7 @@ impl ServerHandler for McpHandler {
                 .into()),
             };
         }
-        if name == "apply_patch" {
+        if name == "host.apply_patch" {
             return apply_patch_response(&self.host, arguments).await;
         }
         let operation_cancelled = Arc::new(AtomicBool::new(false));
@@ -1051,7 +1052,9 @@ async fn dispatch(
             value["workers"] = Value::Array(relay.worker_handles().await);
             Ok(value)
         }
-        "inspect" => inspect(relay, host, parse(arguments)?, context, operation_cancelled).await,
+        "host.inspect" => {
+            inspect(relay, host, parse(arguments)?, context, operation_cancelled).await
+        }
         "command.exec" => {
             let a: HostCommandExecArgs = parse(arguments)?;
             relay
@@ -1338,7 +1341,7 @@ async fn inspect(
 ) -> anyhow::Result<Value> {
     let _cancel_on_drop = CancelOnDrop(operation_cancelled.clone());
     if args.operations.is_empty() || args.operations.len() > MAX_INSPECT_OPERATIONS {
-        anyhow::bail!("inspect requires 1 to {MAX_INSPECT_OPERATIONS} operations");
+        anyhow::bail!("host.inspect requires 1 to {MAX_INSPECT_OPERATIONS} operations");
     }
     let cwd = host.resolve_cwd(args.cwd.as_deref())?;
     let operation_count = args.operations.len();
@@ -1454,7 +1457,7 @@ async fn inspect(
                 output_bytes += serde_json::to_vec(&bounded)?.len();
                 results.push(bounded);
             } else {
-                results.push(json!({"index":index,"type":kind,"error":"inspect output limit exceeded; narrow the requested range or result count"}));
+                results.push(json!({"index":index,"type":kind,"error":"host.inspect output limit exceeded; narrow the requested range or result count"}));
             }
         } else {
             output_bytes += size;
@@ -1497,14 +1500,25 @@ fn ensure_empty(arguments: JsonObject) -> anyhow::Result<()> {
 
 fn project_tool_output(name: &str, value: &mut Value) {
     match name {
-        "inspect" => project_inspection_results(value),
+        "host.inspect" => project_inspection_results(value),
         "command.exec" => {
             if let Some(object) = value.as_object_mut() {
                 object.remove("stdoutBytes");
                 object.remove("stderrBytes");
             }
         }
-        "command.start" => retain_object_keys(value, &["processId", "cwd", "output", "readError"]),
+        "command.start" => {
+            retain_object_keys(value, &["processId", "cwd", "output", "readError"]);
+            if let Some(output) = value.get_mut("output").filter(|v| v.is_object()) {
+                project_command_continuation(output);
+            }
+        }
+        "command.read" => project_command_continuation(value),
+        "command.control" => {
+            if let Some(output) = value.get_mut("output").filter(|v| v.is_object()) {
+                project_command_continuation(output);
+            }
+        }
         "codex.start" => {
             if let Some(object) = value.as_object_mut() {
                 object.remove("createdThread");
@@ -1521,10 +1535,43 @@ fn project_tool_output(name: &str, value: &mut Value) {
                 }
             }
         }
-        "codex.inspect" => project_current_activity(value.get_mut("currentActivity")),
+        "codex.inspect" => {
+            project_current_activity(value.get_mut("currentActivity"));
+            let next_arguments = match value["detail"].as_str() {
+                Some("result") if value["status"] != "inProgress" => {
+                    value["resultPage"]["nextTextOffset"]
+                        .as_u64()
+                        .map(|offset| {
+                            json!({
+                                "threadId":value["threadId"], "turnId":value["turnId"],
+                                "detail":"result", "textOffset":offset
+                            })
+                        })
+                }
+                Some("semantic" | "raw") if value["hasMore"] == true => Some(json!({
+                    "threadId":value["threadId"], "turnId":value["turnId"],
+                    "detail":value["detail"], "afterCursor":value["cursor"]
+                })),
+                _ => None,
+            };
+            value["nextCall"] = next_arguments
+                .map(|arguments| json!({"tool":"codex.inspect", "arguments":arguments}))
+                .unwrap_or(Value::Null);
+        }
         "codex.query" => project_codex_query(value),
         _ => {}
     }
+}
+
+fn project_command_continuation(value: &mut Value) {
+    value["nextCall"] = if value["drained"] == true {
+        Value::Null
+    } else {
+        json!({"tool":"command.read", "arguments":{
+            "processId":value["processId"], "afterCursor":value["cursor"],
+            "timeoutMs":if value["hasMoreOutput"] == true { 0 } else { DEFAULT_COMMAND_READ_MS }
+        }})
+    };
 }
 
 fn retain_object_keys(value: &mut Value, keys: &[&str]) {
@@ -1884,7 +1931,7 @@ fn summary_for(name: &str, value: &Value) -> String {
                 .unwrap_or("unknown")
         ),
         "codex.inspect" => "Codex activity inspected.".into(),
-        "inspect" => "Inspection completed.".into(),
+        "host.inspect" => "Inspection completed.".into(),
         _ => "Operation completed.".into(),
     }
 }
@@ -1979,6 +2026,40 @@ async fn image_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_projection_preserves_acknowledged_mutations_and_read_errors() {
+        for name in ["command.start", "command.control"] {
+            let mut value = if name == "command.start" {
+                json!({"processId":"retained", "cwd":"/project", "output":null,
+                    "readError":"observation unavailable"})
+            } else {
+                json!({"processId":"retained", "written":true, "stdinClosed":true,
+                    "output":null, "readError":"observation unavailable"})
+            };
+            let original = value.clone();
+            project_tool_output(name, &mut value);
+            assert_eq!(value, original);
+        }
+    }
+
+    #[test]
+    fn result_continuation_does_not_change_incomplete_selection() {
+        let mut value = json!({"threadId":"thread", "turnId":"turn",
+            "status":"failed", "detail":"result", "currentActivity":null,
+            "resultPage":{"selectionComplete":false, "hasMoreText":true,
+                "nextTextOffset":10240}});
+        let page = value["resultPage"].clone();
+        project_tool_output("codex.inspect", &mut value);
+        assert_eq!(value["resultPage"], page);
+        assert_eq!(value["status"], "failed");
+        assert_eq!(
+            value["nextCall"],
+            json!({"tool":"codex.inspect", "arguments":{
+                "threadId":"thread", "turnId":"turn", "detail":"result", "textOffset":10240
+            }})
+        );
+    }
 
     #[test]
     fn server_instructions_are_compact_and_identify_the_planes() {

@@ -28,7 +28,7 @@ Host ingress (Caddy routing + OAuth)
         │ loopback MCP
         ▼
 Codex Connect
-  ├─ HostPlane: inspect, patch, image, commands, status, deployment
+  ├─ HostPlane: host.*, command.*, status; trusted-host deployment plumbing
   └─ WorkerPlane: codex.* → official Codex App Server
 ```
 

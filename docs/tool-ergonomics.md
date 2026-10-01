@@ -1,5 +1,40 @@
 # Tool ergonomics review
 
+## Operator grouping and continuation
+
+From source baseline `4e757abf6e1c8021883f4b80d31b2fc58863f173`, the deterministic
+host tools use `host.inspect`, `host.apply_patch`, and `host.view_image`. Command,
+Codex, status, and Workers names stay unchanged. The old bare names are removed.
+Descriptions give purpose, selection guidance, and essential lifecycle rules;
+schema fields and the operations guide carry precise constraints. The consumed
+`codex.start` descriptor already exposes six explicit authority alternatives,
+so its union and exact parser remain intact.
+
+`codex.inspect` returns `nextCall={tool,arguments}` for available semantic/raw
+journal pages or terminal result text pages, and `null` otherwise. Commands expose
+the same shape on `command.read` and inside start/write `output`. Operators can
+invoke these reads directly without rebuilding cursor arguments. They use canonical
+IDs and cursors, preserve independent readers and history loss, and leave result
+`selectionComplete` independent of text continuation. Active result candidates
+cannot continue at nonzero text offsets. Command continuations stop only when
+`drained=true` when an observation is available; failed observations return
+`output=null`/`readError` and require handle recovery without replaying acknowledged
+input. Completion alone establishes neither successful work nor output presence.
+No new App Server or relay lifecycle, panel behavior, transport, authorization, or
+budget mechanism is introduced; the relay retention fix below only preserves an
+existing history-loss boundary monotonically.
+
+The pagination protocol test fills the retained journal and exposed an existing
+history-loss defect: eviction could overwrite a newer transport gap with an older
+cursor. The journal now keeps that boundary monotonic, so semantic/raw continuation
+reports missing history correctly after oversized notifications.
+
+The local source gate does not verify deployment or refreshed ChatGPT discovery.
+The primary operator owns plugin skill changes, immutable artifact deployment,
+and package publication.
+
+## Earlier call-count review
+
 Reviewed the complete catalog on 2026-10-01: 14 model-visible tools and the one
 app-only helper. The clean source baseline is commit
 `26bf302f3fb8f273e021d3bbdd6d6c4ce2112a12`, created before modifications.
@@ -22,9 +57,9 @@ retain Connect's explicit execution intent and authority boundaries.
 | Tool | Assessment and decision |
 | --- | --- |
 | `status` | Keep a single compact orientation/recovery call. Recovery is backend-global and non-destructive; cwd is context, never ownership. No duplicate account or deployment state. |
-| `inspect` | Already batches independent file reads, directory listings, metadata, literal content search, and fuzzy discovery. Use one batch before iterative calls. Keep per-operation errors and aggregate bounds; continue using App Server for exposed filesystem/fuzzy primitives. |
-| `view_image` | Already returns native image content with high/original detail. Keep host paths explicit and image bounds intact. A new download/upload route would cross a different authority boundary. |
-| `apply_patch` | Keep one deterministic diff operation with existing cancellation/rollback handling. No worker required for a known patch. Do not add a duplicate file-writing tool or mutation batch with ambiguous partial retries. |
+| `host.inspect` | Already batches independent file reads, directory listings, metadata, literal content search, and fuzzy discovery. Use one batch before iterative calls. Keep per-operation errors and aggregate bounds; continue using App Server for exposed filesystem/fuzzy primitives. |
+| `host.view_image` | Already returns native image content with high/original detail. Keep host paths explicit and image bounds intact. A new download/upload route would cross a different authority boundary. |
+| `host.apply_patch` | Keep one deterministic diff operation with existing cancellation/rollback handling. No worker required for a known patch. Do not add a duplicate file-writing tool or mutation batch with ambiguous partial retries. |
 | `command.exec` | Keep the concise short-command path and fixed execution/output bounds. It already returns exit code, stdout/stderr, truncation indicators, and elapsed time in one call. Use explicit argv/shell intent for a coherent command. |
 | `command.start` | **Changed:** returns the existing retained handle plus the first output/exit observation. Optional `yieldTimeMs` defaults to 1,000 and permits 0–10,000. Yield expiration leaves execution running. A lost response is recovered through `status.commands`. |
 | `command.read` | Keep independent cursor reads, bounded output, explicit history loss, and `hasMoreOutput`/`drained`. Describe cursors from start/control as well as reads. Never interpret terminal state alone as fully drained output. |

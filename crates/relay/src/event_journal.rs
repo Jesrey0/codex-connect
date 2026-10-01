@@ -91,7 +91,8 @@ impl EventJournal {
         let retained_bytes = serde_json::to_vec(&event).unwrap().len();
         state.events.push_back((event, retained_bytes));
         while state.events.len() > MAX_EVENTS {
-            state.dropped_through = state.events.pop_front().unwrap().0.cursor;
+            let evicted_cursor = state.events.pop_front().unwrap().0.cursor;
+            state.dropped_through = state.dropped_through.max(evicted_cursor);
         }
         self.changed.send_replace(state.cursor);
     }
@@ -217,6 +218,45 @@ fn string(value: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn eviction_preserves_a_newer_transport_history_gap() {
+        let journal = EventJournal::default();
+        for _ in 0..MAX_EVENTS {
+            journal
+                .push(
+                    "turn/started",
+                    &json!({"threadId":"old", "turnId":"old-turn"}),
+                )
+                .await;
+        }
+        let before_gap = journal.cursor().await;
+        journal.mark_gap().await;
+        journal
+            .push(
+                "turn/completed",
+                &json!({"threadId":"current", "turn":{"id":"turn", "status":"completed"}}),
+            )
+            .await;
+        let raw = journal
+            .read_after(before_gap, "current", Some("turn"))
+            .await
+            .unwrap();
+        assert!(raw.history_lost);
+        assert_eq!(raw.events.len(), 1);
+        let semantic = journal
+            .read_semantic_after(before_gap, "current", Some("turn"), 16)
+            .await
+            .unwrap();
+        assert!(semantic.history_lost);
+        assert_eq!(semantic.events.len(), 1);
+        let after_gap = journal
+            .read_after(before_gap + 1, "current", Some("turn"))
+            .await
+            .unwrap();
+        assert!(!after_gap.history_lost);
+        assert_eq!(after_gap.cursor, raw.cursor);
+    }
 
     #[tokio::test]
     async fn retention_filtering_and_oversized_events_preserve_cursors() {

@@ -12,7 +12,7 @@ For fresh workspace work that legitimately spans additional directories, prefer 
 
 ## Use remote calls efficiently
 
-Batch independent host inspections with `inspect` and independent Codex discovery/state questions with `codex.query` when their results inform the same next step. A short `command.exec` can answer a coherent host question directly. Avoid unrelated mutation batches whose partial completion would make retries ambiguous.
+Batch independent host inspections with `host.inspect` and independent Codex discovery/state questions with `codex.query` when their results inform the same next step. A short `command.exec` can answer a coherent host question directly. Avoid unrelated mutation batches whose partial completion would make retries ambiguous.
 
 `command.start` returns a retained handle and the first output/exit observation together. Use its output before issuing a separate read. Choose `yieldTimeMs` for the observation the next step needs; zero returns immediately, and yield expiration leaves execution running. Keep the handle and continue only when more output or exit confirmation matters.
 
@@ -23,6 +23,12 @@ A `readError` after start or acknowledged input describes an observation failure
 Fresh `codex.start` work or review requires explicit cwd and model. Discover model IDs and supported effort through `codex.query`. Resume and fork inherit canonical cwd, effort, and access and require the canonical model; do not supply inherited-setting overrides. Start fresh when those settings must change. Choose the live schema variant that matches fresh work, resume, fork, or review.
 
 `workers.open` delivers the initial snapshot with the read-only Workers panel. Its Refresh helper, `workers.snapshot`, is app-only. Keep panel actions observational and worker mutations with ChatGPT; do not add polling or duplicate the initial snapshot read.
+
+Read-only continuations can include `nextCall: { tool, arguments }`. Use those
+arguments with the named tool on this same connector; they preserve the native
+handle/cursor and the selected detail. They do not automatically execute, retry a
+mutation or establish post-turn continuation. `selectionComplete`, text paging,
+output drainage and replay loss remain the evidence for completeness.
 
 ## Choose how to wait
 

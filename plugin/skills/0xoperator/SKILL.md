@@ -19,6 +19,21 @@ Connect, and **provider** for upstream model providers such as OpenAI. HostPlane
 owns direct files/processes/VCS/worktrees; WorkerPlane owns delegated execution;
 PlatformPlane owns the calling product’s subscriptions and continuation.
 
+## Operator workflow
+
+Choose the substrate for the workstream, then orient with its `status` and native
+worker `query`. Use `host.*` for direct files/VCS/worktrees and `command.*` for
+host processes. Use `codex.*` or `opencode.*` for native worker execution.
+The groups identify intent; their native authority and lifecycle remain distinct.
+
+Discover native models and, for OpenCode, effective agents and their permission
+rules before selecting execution settings. Start or recover the workstream,
+inspect when a specific observation matters, and wait when the result or a pending
+request is a real dependency. Reuse a returned read-only `nextCall` for the next
+page; it carries native identities and continuation state, not a new run handle.
+Verify the result and consequential host changes before accepting the outcome.
+Execution stopping, result selection, text completeness and success are separate.
+
 ## Choose and own the workstream
 
 Keep host operations, worker lifecycle, recovery and events with one substrate.

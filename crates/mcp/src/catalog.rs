@@ -25,7 +25,7 @@ struct ToolMetadata {
 pub(super) fn tool_catalog() -> Vec<Tool> {
     vec![
         tool(
-            meta("workers.open", "Workers", "Open the conversation worker panel to browse current and recent delegated workers by project, inspect activity and canonical results, and attach selected context to ChatGPT. Worker actions remain with ChatGPT.", true, false, false, true),
+            meta("workers.open", "Workers", "Open the Workers panel to browse activity and results by cwd and attach context to ChatGPT. Actions stay with ChatGPT.", true, false, false, true),
             empty_schema(),
             Some(workers_snapshot_schema()),
         ).with_icons(vec![Icon::new("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='currentColor' stroke-width='1.33'%3E%3Crect x='2' y='3' width='16' height='14' rx='2'/%3E%3Cpath d='M8 3v14M11 7h4M11 10h4M11 13h2'/%3E%3C/svg%3E").with_mime_type("image/svg+xml").with_sizes(vec!["any".into()])]),
@@ -38,7 +38,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "status",
                 "Read Operator Status",
-                "Read backend-global readiness, build identity, default cwd, pinned Codex release, and retained command/worker handles for recovery after caller interruption. Reading status does not consume recovery state.",
+                "Read backend readiness and retained command/worker handles to recover interrupted calls. Recovery is backend-global and non-destructive.",
                 true,
                 false,
                 false,
@@ -49,9 +49,9 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "inspect",
+                "host.inspect",
                 "Inspect Workspace",
-                "Batch host file reads, directory listings, metadata, content search, and fuzzy file discovery. Use command.exec when a repository or system command answers the question directly.",
+                "Batch host file reads, listings, metadata, content search, and fuzzy file discovery. Use command.exec for command-based checks.",
                 true,
                 false,
                 false,
@@ -62,7 +62,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "apply_patch",
+                "host.apply_patch",
                 "Apply Patch",
                 "Apply a known diff to host files. Use codex.start for investigation or iterative coding.",
                 false,
@@ -71,7 +71,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
                 false,
             ),
             object_schema(
-                json!({"patch":{"type":"string","minLength":1,"description":"apply_patch-format diff for host files."},"cwd":cwd_schema()}),
+                json!({"patch":{"type":"string","minLength":1,"description":"Patch text in the supported `*** Begin Patch` format."},"cwd":cwd_schema()}),
                 &["patch"],
             ),
             Some(object_schema(
@@ -83,7 +83,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.start",
                 "Start Persistent Command",
-                "Start a long-running or interactive host command and return its handle plus initial output or exit. Continue command.read from output.cursor when needed. If the call is lost, recover from status.commands before starting a replacement.",
+                "Start a long-running or interactive host command with a retained handle and initial observation. Follow output.nextCall as needed; recover lost calls through status.commands.",
                 false,
                 true,
                 true,
@@ -96,7 +96,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.read",
                 "Read Persistent Command",
-                "Read output and state for a command.start process. Continue from the returned cursor until drained=true to collect final retained output. Timeout does not terminate the process.",
+                "Read retained command output and state. Follow nextCall until drained=true; timeout leaves the process running.",
                 true,
                 false,
                 false,
@@ -109,7 +109,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "command.control",
                 "Control Persistent Command",
-                "Write or close stdin and observe output in one call; pass the last output.cursor as afterCursor. A readError after written=true does not undo the input: recover with command.read rather than replaying it. Also resize a PTY or request termination; use command.read to confirm exit and drain output.",
+                "Write/close stdin, resize a PTY, or request termination. Follow output.nextCall to read; a readError never undoes acknowledged input. Confirm exit and drain with command.read.",
                 false,
                 true,
                 false,
@@ -120,7 +120,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
         ),
         tool(
             meta(
-                "view_image",
+                "host.view_image",
                 "View Image",
                 "Load a host image for inspection. ChatGPT uploads and native sandbox paths are separate.",
                 true,
@@ -175,7 +175,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.start",
                 "Start Codex Turn",
-                "Delegate work or a read-only review when autonomous investigation, implementation, independent review, or real parallelism materially helps. Start fresh, resume a related cache-valid workstream, or fork durable thread context into a new workstream. Keep routine operator work local. If the call is lost, recover the handle from status.workers before starting replacement work.",
+                "Delegate autonomous work or read-only review; start fresh, resume compatible context, or fork. Keep routine checks in host/command tools. Recover lost calls through status.workers.",
                 false,
                 true,
                 true,
@@ -188,7 +188,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.wait",
                 "Wait for Codex Turn",
-                "Synchronize with a delegated turn when its result or required action is needed. Do not use this tool as a polling loop: continue useful non-overlapping operator work first, and use codex.inspect for a non-blocking activity check when necessary. Terminal output contains at most one canonical handoff message, capped at 10,240 characters: final_answer agentMessage, then exitedReviewMode, then the newest agentMessage. selectionIncomplete separately reports when the bounded scan could not establish that choice. Recover clipped text with codex.inspect detail=result and textOffset; treat that result as authoritative only when resultPage.selectionComplete is true. An individual App Server item above the transport limit remains incomplete. Returns after a bounded wait if still active; timeout does not mean failure or loss of scope ownership.",
+                "Join a delegated turn when its result or required action is needed; never poll for progress. Timeout leaves work active. Terminal state alone promises neither success nor output; recover clipped handoffs with codex.inspect detail=result.",
                 true,
                 false,
                 false,
@@ -201,7 +201,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.inspect",
                 "Inspect Codex Turn",
-                "Inspect a turn without waiting for completion. semantic reads activity summaries, raw pages relay journal notifications, and result searches App Server turn items newest-first in 10,240-character chunks. The result is authoritative only when resultPage.selectionComplete is true; a single item above the transport limit leaves it false. Continue raw/semantic with afterCursor or result text with textOffset and resultPage.nextTextOffset.",
+                "Read turn activity, raw events, or canonical result text without waiting. Follow nextCall for available pages. Result authority requires resultPage.selectionComplete; completion alone promises neither success nor output.",
                 true,
                 false,
                 false,
@@ -287,12 +287,12 @@ fn tool_invocation_meta(name: &str) -> MetaObject {
         ),
         "workers.open" => ("Opening Workers…", "Workers ready"),
         "workers.snapshot" => ("Refreshing Workers…", "Workers refreshed"),
-        "inspect" => ("Inspecting host workspace…", "Host workspace inspected"),
-        "apply_patch" => ("Applying host patch…", "Host patch applied"),
+        "host.inspect" => ("Inspecting host workspace…", "Host workspace inspected"),
+        "host.apply_patch" => ("Applying host patch…", "Host patch applied"),
         "command.start" => ("Starting host command…", "Host command started"),
         "command.read" => ("Reading host command…", "Host command state updated"),
         "command.control" => ("Controlling host command…", "Host command controlled"),
-        "view_image" => ("Loading host image…", "Host image loaded"),
+        "host.view_image" => ("Loading host image…", "Host image loaded"),
         "command.exec" => ("Running host command…", "Host command finished"),
         "codex.start" => ("Starting Codex turn…", "Codex turn started"),
         "codex.wait" => ("Synchronizing with Codex…", "Codex state updated"),
@@ -561,9 +561,9 @@ fn codex_inspect_output_schema() -> Value {
             "item":nullable(item),
             "text":{"type":"string","maxLength":10240,"description":"At most 10,240 characters. Continue at nextTextOffset to recover the remainder of the selected result."},
             "textOffset":{"type":"integer","minimum":0},
-            "nextTextOffset":{"type":["integer","null"],"minimum":0},
+            "nextTextOffset":{"type":["integer","null"],"minimum":0,"description":"Next character offset for this selected item; null at end of text. Independent of selectionComplete."},
             "hasMoreText":{"type":"boolean"},
-            "selectionComplete":{"type":"boolean","description":"True only when the newest final answer was found or the turn was exhausted. False when the internal search budget expires or an App Server item page remains too large at limit 1."}
+            "selectionComplete":{"type":"boolean","description":"Authoritative selection only for a terminal turn when the newest final answer was found or the turn exhausted. False on search-budget expiry or an App Server item page too large at limit 1. Does not promise an item, text, or successful work."}
         }),
         &[
             "item",
@@ -582,19 +582,29 @@ fn codex_inspect_output_schema() -> Value {
             "detail":{"type":"string","enum":["semantic","raw"]},
             "currentActivity":nullable(current_activity_schema()),
             "cursor":{"type":"integer","minimum":0},
-            "historyLost":{"type":"boolean"},
-            "hasMore":{"type":"boolean"},
+            "historyLost":{"type":"boolean","description":"Older relay journal events were lost; continuation cannot recover them."},
+            "hasMore":{"type":"boolean","description":"More retained journal events after cursor; nextCall continues without waiting."},
+            "nextCall":next_call_schema("codex.inspect", codex_inspect_schema(), "Available retained-event continuation; null when hasMore=false. Not a progress polling instruction."),
             "events":{"type":"array","description":"Semantic or raw relay journal events. Raw notifications can be lost with the relay journal.","items":{"oneOf":[semantic_event_schema(),event_schema()]}}
-        }), &["threadId", "turnId", "status", "detail", "currentActivity", "cursor", "historyLost", "hasMore", "events"]),
+        }), &["threadId", "turnId", "status", "detail", "currentActivity", "cursor", "historyLost", "hasMore", "events", "nextCall"]),
         object_schema(json!({
             "threadId":{"type":"string"},
             "turnId":{"type":"string"},
             "status":{"enum":["inProgress","completed","failed","interrupted"]},
             "detail":{"const":"result"},
             "currentActivity":nullable(current_activity_schema()),
-            "resultPage":result_page
-        }), &["threadId", "turnId", "status", "detail", "currentActivity", "resultPage"])
+            "resultPage":result_page,
+            "nextCall":next_call_schema("codex.inspect", codex_inspect_schema(), "Available text continuation for a terminal turn; null at end of text or while active. Does not establish selection authority.")
+        }), &["threadId", "turnId", "status", "detail", "currentActivity", "resultPage", "nextCall"])
     ]})
+}
+fn next_call_schema(tool: &str, arguments: Value, description: &str) -> Value {
+    let mut schema = nullable(object_schema(
+        json!({"tool":{"const":tool},"arguments":arguments}),
+        &["tool", "arguments"],
+    ));
+    schema["description"] = json!(description);
+    schema
 }
 fn inspect_schema() -> Value {
     object_schema(
@@ -676,9 +686,10 @@ fn command_read_output_schema() -> Value {
             "tty":{"type":"boolean"},
             "stdinOpen":{"type":"boolean"},
             "cursor":{"type":"integer","minimum":0},
-            "historyLost":{"type":"boolean"},
+            "historyLost":{"type":"boolean","description":"Older retained command output was evicted; continuation cannot recover it."},
             "hasMoreOutput":{"type":"boolean","description":"More retained output is available after this cursor."},
-            "drained":{"type":"boolean","description":"The command is terminal and all retained output was read. historyLost indicates missing older output."},
+            "drained":{"type":"boolean","description":"The command is terminal and all retained output was read. historyLost indicates missing older output. Exit alone implies neither success nor drained output."},
+            "nextCall":next_call_schema("command.read", command_read_schema(), "Read after cursor until drained; null when drained=true. Running commands may have no output yet."),
             "stdout":{"type":"string"},
             "stderr":{"type":"string"},
             "exitCode":{"type":["integer","null"]},
@@ -694,6 +705,7 @@ fn command_read_output_schema() -> Value {
             "historyLost",
             "hasMoreOutput",
             "drained",
+            "nextCall",
             "stdout",
             "stderr",
             "exitCode",
@@ -707,7 +719,7 @@ fn command_control_schema() -> Value {
         json!({
             "action":{"const":"write","description":"Write bytes to the process stdin and optionally close stdin."},
             "processId":process_id(),
-            "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES,"description":"Exact UTF-8 bytes to write. Omit/null when only closing stdin."},
+            "input":{"type":["string","null"],"maxLength":MAX_COMMAND_WRITE_BYTES,"description":"Exact UTF-8 bytes to write; limited by byte count. Omit/null when only closing stdin. Never replay acknowledged input after readError."},
             "closeStdin":{"type":"boolean","default":false,"description":"Close stdin after any supplied input is written."},
             "afterCursor":{"type":"integer","minimum":0,"default":0,"description":"Observe after the last returned output cursor to avoid replaying earlier output."},
             "yieldTimeMs":command_yield_schema()
@@ -852,7 +864,7 @@ fn codex_inspect_schema() -> Value {
             "threadId":{"type":"string","description":"Codex thread ID returned by codex.start."},
             "turnId":{"type":"string","description":"Specific delegated turn ID to inspect."},
             "detail":{"const":"result","description":"Search persisted App Server turn items newest-first until the newest final answer, end of turn, or internal time budget. The selection is authoritative only when resultPage.selectionComplete is true."},
-            "textOffset":{"type":"integer","minimum":0,"default":0,"description":"Character offset into the selected result. Continue with resultPage.nextTextOffset; each response returns at most 10,240 characters."}
+            "textOffset":{"type":"integer","minimum":0,"default":0,"description":"Character offset into the selected result; nonzero requires a terminal turn. Continue with nextCall or resultPage.nextTextOffset; each response returns at most 10,240 characters."}
         }), &["threadId", "turnId", "detail"])
     ]})
 }
@@ -1617,7 +1629,7 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect::<BTreeSet<_>>();
         let expected = [
-            "apply_patch",
+            "host.apply_patch",
             "codex.act",
             "codex.inspect",
             "codex.query",
@@ -1627,9 +1639,9 @@ mod tests {
             "command.exec",
             "command.read",
             "command.start",
-            "inspect",
+            "host.inspect",
             "status",
-            "view_image",
+            "host.view_image",
             "workers.open",
             "workers.snapshot",
         ]

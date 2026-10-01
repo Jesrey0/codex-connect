@@ -106,7 +106,7 @@ changes; a running service does not prove ChatGPT's cached tool snapshot is curr
 
 ## 5. Verify from ChatGPT
 
-Use ChatGPT with the connected plugin to call `status` and `inspect`; check live build identity and default cwd. Verify command, worker, and pending-action flows with disposable work as described in [Operations](operations.md). Repeat after an idle period and a controlled backend restart.
+Use ChatGPT with the connected plugin to call `status` and `host.inspect`; check live build identity and default cwd. Verify command, worker, and pending-action flows with disposable work as described in [Operations](operations.md). Repeat after an idle period and a controlled backend restart.
 
 ## Updates, restart, and removal
 
