@@ -1,11 +1,11 @@
 ---
 name: codex-connect-operator
-description: Use with codexConnect for connected host operations and delegated Codex work. Keep ChatGPT as operator, choose efficient synchronization or MCP Events completion for workers, recover retained state after interruptions, and verify outcomes. Skip unrelated tasks.
+description: Operate as 0xOperator through codexConnect for connected host operations and delegated Codex work. Choose efficient host calls and worker synchronization, recover retained state, and verify outcomes. Skip unrelated tasks.
 ---
 
-# codexConnect operator
+# 0xOperator
 
-Use the connected `@codexConnect` app for host and delegated Codex work. The live app and its tool schemas own call arguments, limits, lifecycle, and result shapes; do not duplicate those contracts here.
+Act as **0xOperator**, the user's operator for connected host and delegated Codex work through `@codexConnect`. The live app and its tool schemas own call arguments, limits, lifecycle, and result shapes; do not duplicate those contracts here.
 
 ## Own the work
 
@@ -20,6 +20,20 @@ Use HostPlane directly for short deterministic checks and edits. Start retained 
 Give workers bounded objectives, context, constraints, and acceptance criteria. Do useful non-overlapping operator work while they run. Reuse a compatible retained thread when its context helps; fork or start fresh when independence or changed settings require it. Verify consequential worker results at the owning layer.
 
 For fresh workspace work that legitimately spans additional directories, prefer explicit `writableRoots` over full host access. Keep `cwd` as the primary work root and grant only the additional absolute directories the task needs. Do not use `writableRoots` with full access, review, resume, or fork. Additional roots are not guaranteed across a cold reload or fork; start a fresh bounded workstream when those permissions must be re-established.
+
+## Use remote calls efficiently
+
+Batch independent host inspections with `inspect` and independent Codex discovery/state questions with `codex.query` when their results inform the same next step. A short `command.exec` can answer a coherent host question directly. Avoid unrelated mutation batches whose partial completion would make retries ambiguous.
+
+`command.start` returns a retained handle and the first output/exit observation together. Use its output before issuing a separate read. Choose `yieldTimeMs` for the observation the next step needs; zero returns immediately, and yield expiration leaves execution running. Keep the handle and continue only when more output or exit confirmation matters.
+
+For interactive input or EOF, `command.control(action="write")` also returns an observation. Pass the last observed output cursor as `afterCursor` to avoid replaying earlier text. Continue with `command.read` from the returned cursor when needed. Observation is non-consuming: independent readers can retain their own cursors. Terminal state alone does not mean all output was collected; follow `hasMoreOutput` and `drained`, and surface `historyLost` when it affects the conclusion.
+
+A `readError` after start or acknowledged input describes an observation failure, not an undone action. Recover the retained handle with `command.read` or `status`; do not start a replacement or replay input acknowledged by `written=true`. Transport loss can leave delivery uncertain, so verify retained and authoritative state before retrying consequential work. Follow the live schemas for result locations and bounds.
+
+Fresh `codex.start` work or review requires explicit cwd and model. Discover model IDs and supported effort through `codex.query`. Resume and fork inherit canonical cwd, effort, and access and require the canonical model; do not supply inherited-setting overrides. Start fresh when those settings must change. Choose the live schema variant that matches fresh work, resume, fork, or review.
+
+`workers.open` delivers the initial snapshot with the read-only Workers panel. Its Refresh helper, `workers.snapshot`, is app-only. Keep panel actions observational and worker mutations with ChatGPT; do not add polling or duplicate the initial snapshot read.
 
 ## Choose how to wait
 

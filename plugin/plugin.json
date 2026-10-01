@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codex-connect",
-  "version": "0.1.11",
-  "description": "Guide ChatGPT host work and delegated Codex work through the existing codexConnect connection.",
+  "version": "0.1.12",
+  "description": "Use 0xOperator with codexConnect for connected host work, selective Codex delegation, recovery, and verification.",
   "author": {
     "name": "Jes"
   },
@@ -11,8 +11,8 @@
       "apps": "./.app.json",
       "interface": {
         "displayName": "codexConnect",
-        "shortDescription": "Host work and Codex workers",
-        "longDescription": "Use codexConnect for connected host work, selective Codex delegation, event-driven worker follow-up, recovery, and verification.",
+        "shortDescription": "0xOperator",
+        "longDescription": "0xOperator guides connected host work, efficient command interaction, selective Codex delegation, event-driven follow-up, recovery, and verification through codexConnect.",
         "developerName": "Jes",
         "category": "Productivity",
         "capabilities": [
