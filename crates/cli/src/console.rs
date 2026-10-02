@@ -947,7 +947,7 @@ fn render_tiny(
             if let Some(snapshot) = snapshot {
                 let pending = pending_for_target(snapshot, target);
                 if !pending.is_empty() {
-                    labels.push(format!("{} action(s) need operator", pending.len()));
+                    labels.push(format!("{} action(s) need 0xOperator", pending.len()));
                 }
             }
             let status = snapshot
@@ -965,7 +965,7 @@ fn render_tiny(
             ));
             if let Some(last) = state.transcript.as_ref().and_then(latest_agent_text) {
                 labels.push(format!(
-                    "Agent: {}",
+                    "Codex worker: {}",
                     bounded_one_line_terminal_text(last, MAX_ACTION_ROW_CHARS)
                 ));
             }
@@ -1071,7 +1071,7 @@ fn render_snapshot(
         lines.push(styled(
             row(
                 &format!(
-                    " Needs operator · {} pending · resolve in ChatGPT",
+                    " Needs 0xOperator · {} pending · resolve in ChatGPT",
                     pending.len()
                 ),
                 width,
@@ -1446,12 +1446,12 @@ fn render_transcript_entries(transcript: &Value, width: usize) -> Vec<String> {
         }
         let label = if kind.eq_ignore_ascii_case("agent") {
             match entry["title"].as_str() {
-                Some(title) if title.contains("FINAL") => "agent · final",
-                Some(title) if title.contains("REVIEW") => "agent · review",
-                _ => "agent",
+                Some(title) if title.contains("FINAL") => "Codex worker · final",
+                Some(title) if title.contains("REVIEW") => "Codex worker · review",
+                _ => "Codex worker",
             }
         } else {
-            "operator"
+            "0xOperator"
         };
         lines.push(styled(
             row(&format!(" {label}"), width),
@@ -1853,7 +1853,7 @@ fn action_summary(action: &Value) -> String {
         return serde_json::to_string(&params["permissions"])
             .unwrap_or_else(|_| "additional permissions requested".into());
     }
-    "operator response required".into()
+    "0xOperator response required".into()
 }
 
 fn compact_action_row(action: &Value, width: usize) -> String {
@@ -1963,7 +1963,7 @@ fn render_action_card(action: &Value, width: usize) -> Vec<String> {
         }
     }
     lines.push(styled(
-        row("   resolve through ChatGPT operator", width),
+        row("   resolve through 0xOperator", width),
         DIM,
     ));
     lines
@@ -2496,7 +2496,7 @@ mod tests {
         assert!(rendered.contains("QUESTION · blocking"));
         assert!(rendered.contains("Which output format?"));
         assert!(rendered.contains("JSON / Markdown"));
-        assert!(rendered.contains("resolve through ChatGPT operator"));
+        assert!(rendered.contains("resolve through 0xOperator"));
 
         let approval = serde_json::json!({
             "method": "item/commandExecution/requestApproval",
@@ -3009,6 +3009,8 @@ mod tests {
         );
         assert!(rendered.contains("^[[31m"));
         assert!(rendered.contains("complete agent"));
+        assert!(rendered.contains("0xOperator"));
+        assert!(rendered.contains("Codex worker"));
         assert!(!rendered.contains("raw tool output"));
         assert!(!rendered.contains("\u{1b}[31m"));
         assert_eq!(wrap_terminal_text("abcdefgh", 3), ["abc", "def", "gh"]);
@@ -3024,7 +3026,7 @@ mod tests {
         });
         let rendered = render_transcript_entries(&transcript, 80).join("\n");
         assert_eq!(rendered.matches("same review response").count(), 1);
-        assert!(rendered.contains("agent · review"));
+        assert!(rendered.contains("Codex worker · review"));
     }
 
     #[test]
@@ -3041,7 +3043,7 @@ mod tests {
         let rendered = render_transcript_entries(&transcript, 80).join("\n");
         assert_eq!(rendered.matches("ordinary repeat").count(), 2);
         assert_eq!(rendered.matches("terminal response").count(), 1);
-        assert!(rendered.contains("agent · final"));
+        assert!(rendered.contains("Codex worker · final"));
     }
 
     #[test]
