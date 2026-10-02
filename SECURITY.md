@@ -62,7 +62,6 @@ with the OAuth provider or receiver. Cancellation acknowledgement follows any
 in-flight admitted attempt. Durable pending deliveries retain IDs and attempt
 counts through restart; delivery may repeat after a crash, and receivers must
 deduplicate. Connect does not promise capture while offline or history replay.
-See the [actual contract and acceptance checkpoint](docs/proposals/mcp-events-authentication-checkpoint.md).
 
 ## Operational guidance
 

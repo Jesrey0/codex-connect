@@ -226,8 +226,9 @@ The source implements authenticated discovery, `events/list`, `events/subscribe`
 and `events/unsubscribe` for `codex.turn.terminal`. Require both canonical Codex
 `threadId` and `turnId`; ChatGPT supplies the callback and associates it with its
 chat. Incoming methods use the existing OAuth-protected MCP route. Delivery is
-outbound HTTPS and needs no additional ngrok route. Installed services and the
-ChatGPT plugin have not been updated by source validation.
+outbound HTTPS and needs no additional ngrok route. Source validation does not
+deploy installed services or refresh the ChatGPT plugin; deploy and rediscover
+separately at their own layers.
 
 Events state is `${XDG_STATE_HOME:-$HOME/.local/state}/codex-connect/events`, with
 private atomic storage and exclusive process ownership. An omitted `ttlMs` gets
@@ -249,6 +250,13 @@ keep rotation bounded. Cancellation, finite expiry and recognized
 revocation retire pending work and remove signing keys. Ingress outage pauses
 without allowing delivery; recovery requires the same stored grant to remain
 valid. A new grant never auto-reactivates an old subscription.
+
+Subscription identity hashes the authenticated principal, exact callback URL,
+event name and canonical arguments; it excludes client and grant. Re-subscribing
+the same identity is idempotent and refreshes it. Explicit authenticated refresh
+may rebind that identity to the current grant; reconnecting with a new grant
+does not revive retired subscriptions. Unsubscribe uses the original
+name/arguments/callback and the current principal.
 
 After restart, unfinished verification is retired, live subscriptions start
 paused, and current authorization is checked before observation or delivery.
@@ -279,10 +287,13 @@ failure. Authorization is rechecked before recovery and delivery. Healthy
 subscriptions do not poll turn state. `historyGap` and `observationRecovery`
 diagnostics expose this recovery work.
 
-See the [contract, validation and exact acceptance steps](proposals/mcp-events-authentication-checkpoint.md).
-Deployment of ingress and backend, plugin rescan, account discovery, post-turn
-follow-up and closed-browser acceptance still require separate authorization.
-A callback 2xx does not establish any of those ChatGPT behaviors.
+Treat source/runtime deployment, connector discovery, and ChatGPT follow-up as
+separate evidence layers: a successful `cargo` gate, a healthy deployed build,
+plugin discovery, account discovery, and post-turn wake behavior must each be
+verified at its own layer and none implies the others. Do not claim closed-browser
+or post-turn follow-up behavior without observing it. A callback 2xx proves
+receipt only; it does not establish that ChatGPT processed, resumed, or acted on
+the event.
 
 ## Restart recovery
 

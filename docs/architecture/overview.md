@@ -46,18 +46,22 @@ resolved by ingress; subscriptions retain a separately authenticated opaque gran
 context and check its current grant through the private loopback authority. The
 fixed operator and existing OAuth provider remain the only identity model.
 
+MCP Events let a subscribed ChatGPT chat be notified after a retained worker
+finishes, even when the initiating assistant turn has already ended, without
+manual polling. Event delivery never grants conversation ownership.
+
 Only `codex.turn.terminal` is implemented, with exact canonical `threadId` and
-`turnId` filters. Both notifications and authoritative reads pass through relay
-terminal reconciliation. A compact observer records a stable logical event and
-matching outbox entries durably before callback I/O. The MCP Events service owns
-bounded subscription/delivery state, webhook verification and delivery; it is not
-a second App Server worker lifecycle. Restart rechecks grants before restoring
+`turnId` filters; extra or wildcard filters are rejected. Authenticated
+`server/discover` projects the Events capability, and `events/list` describes
+that sole definition. Both notifications and authoritative reads pass through
+relay terminal reconciliation. A compact observer records a stable logical event
+and matching outbox entries durably before callback I/O. The MCP Events service
+owns bounded subscription/delivery state, webhook verification and delivery; it
+is not a second App Server worker lifecycle. Restart rechecks grants before restoring
 observation through the relay's existing thread-subscription owner. Multiple
 callbacks can independently observe the same turn. Missed offline transitions
 cannot be recovered through a replay cursor; explicit authoritative terminal
 reads may project an existing terminal fact without creating a new logical ID.
-See the [implementation checkpoint](../proposals/mcp-events-authentication-checkpoint.md).
-
 
 ## Component ownership
 

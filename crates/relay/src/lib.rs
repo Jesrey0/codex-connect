@@ -64,6 +64,8 @@ const MAX_OBSERVER_PROMPT_CHARS: usize = 8 * 1024;
 const MAX_OBSERVER_SUMMARY_PROMPT_CHARS: usize = 512;
 const MAX_UNANNOTATED_TERMINALS: usize = 256;
 const MAX_RECENT_WORKERS: usize = 32;
+// Bound on retained per-thread cumulative usage baselines.
+const MAX_THREAD_USAGE_BASELINES: usize = 64;
 const MAX_WAIT_SCAN_ITEMS: usize = 512;
 // Keep the normal codex.wait handoff small enough for an operator context window.
 const MAX_WAIT_HANDOFF_CHARS: usize = 10 * 1024;
@@ -71,6 +73,10 @@ const MAX_WAIT_OUTPUT_PAGES: usize = 32;
 const RESULT_SELECTION_BUDGET_MS: u64 = 30_000;
 const MAX_TRANSCRIPT_PAGES: usize = 128;
 const MAX_TURN_LOOKUP_PAGES: usize = 1_024;
+// model/list walks the full upstream catalog; cap accumulating a misbehaving
+// upstream that never terminates pagination.
+const MAX_MODEL_LIST_PAGES: usize = 128;
+const MAX_MODEL_LIST_MODELS: usize = 4_096;
 // Connector-computed advisory reuse hint: 30 minutes after the latest observed
 // model usage. Informational only; resume/fork permission never depends on it.
 // Native thread identity/model/cwd/effort checks and upstream errors decide.
@@ -207,6 +213,47 @@ fn checked_next_cursor(
     Ok(next)
 }
 
+async fn collect_model_list_pages<F, Fut>(mut fetch: F) -> Result<Vec<Value>, RelayError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<codex_connect_app_server::protocol::ModelListResponse, RelayError>,
+        >,
+{
+    let mut cursor = None;
+    let mut data = Vec::new();
+    let mut seen_cursors = HashSet::new();
+    for _ in 0..MAX_MODEL_LIST_PAGES {
+        let response = fetch(cursor.clone()).await?;
+        if data.len() + response.data.len() > MAX_MODEL_LIST_MODELS {
+            return Err(RelayError::BudgetExceeded(format!(
+                "model/list exceeded {MAX_MODEL_LIST_MODELS} accumulated models"
+            )));
+        }
+        data.extend(response.data);
+        match checked_next_cursor(&mut seen_cursors, response.next_cursor, "model/list")? {
+            Some(next) => cursor = Some(next),
+            None => return Ok(data),
+        }
+    }
+    Err(RelayError::BudgetExceeded(format!(
+        "model/list exceeded {MAX_MODEL_LIST_PAGES} pages"
+    )))
+}
+
+fn select_turn_projection(
+    stored: Option<codex_connect_app_server::protocol::Turn>,
+    live: Option<codex_connect_app_server::protocol::Turn>,
+) -> Option<codex_connect_app_server::protocol::Turn> {
+    match (stored, live) {
+        (Some(stored), Some(live)) if live.status.is_terminal() && !stored.status.is_terminal() => {
+            Some(live)
+        }
+        (Some(stored), _) => Some(stored),
+        (None, live) => live,
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalTurn {
@@ -265,10 +312,35 @@ struct LiveTurns {
     // while its turn/start response catches up with an early completion event.
     turns: HashMap<(String, String), ObservedTurn>,
     order: VecDeque<(String, String)>,
-    // App Server usage updates are cumulative thread snapshots, including on resume replay.
-    thread_token_usage_totals: HashMap<String, u64>,
+    // Bounded LRU of per-thread cumulative totals. App Server usage updates are
+    // cumulative thread snapshots, including on resume replay, so a baseline must
+    // survive turn-retention exits; capacity stays bounded across backend life.
+    thread_token_usage_totals: ThreadUsageBaselines,
     // Only the newest delegated terminal observations remain in the console view.
     recent: VecDeque<(String, String, ObservedTurn)>,
+}
+
+#[derive(Default)]
+struct ThreadUsageBaselines {
+    values: HashMap<String, u64>,
+    recency: VecDeque<String>,
+}
+
+impl ThreadUsageBaselines {
+    fn observe(&mut self, thread_id: &str, total: u64) -> Option<u64> {
+        let previous = self.values.insert(thread_id.to_string(), total);
+        self.recency.retain(|candidate| candidate != thread_id);
+        self.recency.push_back(thread_id.to_string());
+        while self.values.len() > MAX_THREAD_USAGE_BASELINES {
+            match self.recency.pop_front() {
+                Some(evicted) => {
+                    self.values.remove(&evicted);
+                }
+                None => break,
+            }
+        }
+        previous
+    }
 }
 
 #[derive(Clone)]
@@ -517,7 +589,7 @@ impl LiveTurns {
             });
             let previous_total = self
                 .thread_token_usage_totals
-                .insert(thread_id.to_string(), thread_total_tokens);
+                .observe(thread_id, thread_total_tokens);
             let usage_advanced = previous_total
                 .map(|previous| thread_total_tokens > previous)
                 // A nonzero first snapshot on an observed live turn establishes usage from
@@ -910,15 +982,7 @@ impl Relay {
     ) -> Result<(), RelayError> {
         let stored = self.find_stored_turn_metadata(thread_id, turn_id).await?;
         let live = self.live_turn(thread_id, turn_id).await;
-        let turn = match (stored, live) {
-            (Some(stored), Some(live))
-                if !stored.status.is_terminal() && live.status.is_terminal() =>
-            {
-                Some(live)
-            }
-            (Some(stored), _) => Some(stored),
-            (None, live) => live,
-        };
+        let turn = select_turn_projection(stored, live);
         let Some(turn) = turn else {
             // Only authoritative absence releases this registration. A read error
             // must not detach an existing worker that still needs observation.
@@ -2200,14 +2264,24 @@ impl Relay {
                 Some(next) => cursor = Some(next),
                 None => {
                     return Ok(TerminalOutput {
-                        handoff_item: newest_review.or(newest_agent_message),
+                        handoff_item: canonical_handoff_item(
+                            [&newest_review, &newest_agent_message]
+                                .into_iter()
+                                .flatten(),
+                        )
+                        .cloned(),
                         selection_complete: true,
                     });
                 }
             }
         }
         Ok(TerminalOutput {
-            handoff_item: newest_review.or(newest_agent_message),
+            handoff_item: canonical_handoff_item(
+                [&newest_review, &newest_agent_message]
+                    .into_iter()
+                    .flatten(),
+            )
+            .cloned(),
             selection_complete: false,
         })
     }
@@ -2382,15 +2456,9 @@ impl Relay {
                 .as_ref()
                 .is_some_and(|turn| turn.status.is_terminal());
             let live = self.live_turn(&thread_id, &turn_id).await;
-            let mut selected = match (stored.clone(), live) {
-                (Some(stored), Some(live))
-                    if live.status.is_terminal() && !stored.status.is_terminal() =>
-                {
-                    live
-                }
-                (Some(stored), _) => stored,
-                (None, Some(live)) => live,
-                (None, None) => {
+            let mut selected = match select_turn_projection(stored.clone(), live) {
+                Some(selected) => selected,
+                None => {
                     return Err(RelayError::Invalid(format!(
                         "turn {turn_id} does not exist in thread {thread_id}"
                     )));
@@ -2585,15 +2653,9 @@ impl Relay {
         } else {
             self.find_stored_turn_metadata(&thread_id, &turn_id).await?
         };
-        let selected = match (stored, live) {
-            (Some(stored), Some(live))
-                if live.status.is_terminal() && !stored.status.is_terminal() =>
-            {
-                live
-            }
-            (Some(stored), _) => stored,
-            (None, Some(live)) => live,
-            (None, None) => {
+        let selected = match select_turn_projection(stored, live) {
+            Some(selected) => selected,
+            None => {
                 return Err(RelayError::Invalid(format!(
                     "turn {turn_id} does not exist in thread {thread_id}"
                 )));
@@ -2821,29 +2883,21 @@ impl Relay {
     }
 
     pub async fn model_list(&self) -> Result<Value, RelayError> {
-        let mut cursor = None;
-        let mut data = Vec::new();
-        let mut seen_cursors = HashSet::new();
-        loop {
-            let response = self
-                .app_server
-                .request(ModelList {
-                    include_hidden: None,
-                    cursor,
-                    limit: None,
-                })
-                .await?;
-            data.extend(response.data);
-            let Some(next_cursor) = response.next_cursor else {
-                return Ok(json!({"data":data,"nextCursor":null}));
-            };
-            if !seen_cursors.insert(next_cursor.clone()) {
-                return Err(RelayError::Invalid(
-                    "model/list returned a repeated pagination cursor".into(),
-                ));
+        let data = collect_model_list_pages(|cursor| {
+            let app_server = self.app_server.clone();
+            async move {
+                app_server
+                    .request(ModelList {
+                        include_hidden: None,
+                        cursor,
+                        limit: None,
+                    })
+                    .await
+                    .map_err(RelayError::from)
             }
-            cursor = Some(next_cursor);
-        }
+        })
+        .await?;
+        Ok(json!({"data":data,"nextCursor":null}))
     }
 
     pub async fn skills_list(
@@ -3180,15 +3234,9 @@ impl Relay {
         self.read_thread_metadata(thread_id.clone()).await?;
         let live = self.live_turn(&thread_id, &turn_id).await;
         let stored = self.find_stored_turn_metadata(&thread_id, &turn_id).await?;
-        let selected = match (stored, live) {
-            (Some(stored), Some(live))
-                if live.status.is_terminal() && !stored.status.is_terminal() =>
-            {
-                live
-            }
-            (Some(stored), _) => stored,
-            (None, Some(live)) => live,
-            (None, None) => {
+        let selected = match select_turn_projection(stored, live) {
+            Some(selected) => selected,
+            None => {
                 return Err(RelayError::Invalid(format!(
                     "turn {turn_id} does not exist in thread {thread_id}"
                 )));
@@ -3700,7 +3748,99 @@ fn validate_command(command: &CommandExec) -> Result<(), RelayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_connect_app_server::protocol::{Thread, Turn, TurnStatus};
+    use codex_connect_app_server::protocol::{ModelListResponse, Thread, Turn, TurnStatus};
+
+    #[tokio::test]
+    async fn model_list_pages_accumulate_full_catalog() {
+        let pages = [
+            ModelListResponse {
+                data: vec![json!({"id":"m1"}), json!({"id":"m2"})],
+                next_cursor: Some("c1".into()),
+            },
+            ModelListResponse {
+                data: vec![json!({"id":"m3"})],
+                next_cursor: None,
+            },
+        ];
+        let mut calls = 0;
+        let data = collect_model_list_pages(|cursor| {
+            let index = calls;
+            calls += 1;
+            let page = pages[index].clone();
+            async move {
+                assert_eq!(
+                    cursor,
+                    match index {
+                        0 => None,
+                        _ => Some("c1".to_string()),
+                    }
+                );
+                Ok(page)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(data.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn model_list_pages_reject_repeated_cursor() {
+        let mut calls = 0;
+        let error = collect_model_list_pages(|_| {
+            calls += 1;
+            async move {
+                Ok(ModelListResponse {
+                    data: Vec::new(),
+                    next_cursor: Some("same".into()),
+                })
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("repeated pagination cursor"));
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn model_list_pages_enforce_page_bound() {
+        let mut calls = 0;
+        let error = collect_model_list_pages(|_| {
+            calls += 1;
+            async move {
+                Ok(ModelListResponse {
+                    data: vec![json!({"id":"m"})],
+                    next_cursor: Some(format!("c{calls}")),
+                })
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("pages"));
+        assert_eq!(calls, MAX_MODEL_LIST_PAGES);
+    }
+
+    #[tokio::test]
+    async fn model_list_pages_enforce_result_bound() {
+        let error = collect_model_list_pages(|_| async move {
+            Ok(ModelListResponse {
+                data: (0..1024).map(|index| json!({"id":index})).collect(),
+                next_cursor: None,
+            })
+        })
+        .await;
+        // 1024 items per page stays under MAX_MODEL_LIST_MODELS; the first page
+        // terminates with nextCursor null, so this succeeds.
+        assert_eq!(error.unwrap().len(), 1024);
+        let error = collect_model_list_pages(|_| async move {
+            Ok(ModelListResponse {
+                data: (0..8192).map(|index| json!({"id":index})).collect(),
+                next_cursor: None,
+            })
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("accumulated models"));
+    }
 
     #[test]
     fn thread_summary_preserves_historical_cwd_without_canonicalizing_it() {
@@ -3956,6 +4096,77 @@ mod tests {
         assert!(second["lastRequestCachedInputTokens"].is_null());
         assert!(second["lastModelUsageAtMs"].is_null());
         assert!(second["cacheGuaranteedUntilMs"].is_null());
+    }
+
+    #[test]
+    fn resumed_thread_replay_does_not_reattribute_unchanged_usage() {
+        let mut live = LiveTurns::default();
+        let usage_event = |thread: &str, turn: &str, total: u64, input: u64| {
+            json!({
+                "threadId":thread,
+                "turnId":turn,
+                "tokenUsage":{
+                    "modelContextWindow":200000,
+                    "last":{"inputTokens":input,"cachedInputTokens":input/2},
+                    "total":{"totalTokens":total}
+                }
+            })
+        };
+        live.insert("thread", test_turn("turn", TurnStatus::InProgress));
+        live.observe_event(
+            "thread/tokenUsage/updated",
+            &usage_event("thread", "turn", 150, 120),
+        );
+        // The turn leaves retained worker state entirely; the thread baseline
+        // must survive so a resume replay of the same cumulative total is not
+        // mistaken for new usage.
+        live.remove("thread", "turn");
+        live.insert("thread", test_turn("second-turn", TurnStatus::InProgress));
+        live.annotate(
+            "thread",
+            "second-turn",
+            WorkerAnnotation {
+                mode: "work".into(),
+                cwd: "/project".into(),
+                model: None,
+                effort: None,
+                prompt: None,
+            },
+        );
+        live.observe_event(
+            "thread/tokenUsage/updated",
+            &usage_event("thread", "second-turn", 150, 999),
+        );
+        let observed = live
+            .turns
+            .get(&("thread".to_string(), "second-turn".to_string()))
+            .unwrap();
+        assert_eq!(observed.thread_total_tokens, Some(150));
+        assert!(observed.last_request_input_tokens.is_none());
+        assert!(observed.last_request_cached_input_tokens.is_none());
+        assert!(observed.last_model_usage_at_ms.is_none());
+    }
+
+    #[test]
+    fn thread_usage_baselines_are_capacity_bounded() {
+        let mut live = LiveTurns::default();
+        for index in 0..(MAX_THREAD_USAGE_BASELINES + 5) {
+            let thread = format!("thread-{index}");
+            live.observe_event(
+                "thread/tokenUsage/updated",
+                &json!({
+                    "threadId":thread,
+                    "tokenUsage":{"total":{"totalTokens":10}}
+                }),
+            );
+        }
+        assert!(live.thread_token_usage_totals.values.len() <= MAX_THREAD_USAGE_BASELINES);
+        assert!(
+            !live
+                .thread_token_usage_totals
+                .values
+                .contains_key("thread-0")
+        );
     }
 
     #[test]
