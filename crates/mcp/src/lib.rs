@@ -54,7 +54,7 @@ const MAX_TOOL_LIST_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_MCP_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MCP_ALLOWED_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 const MCP_ALLOWED_ORIGINS: [&str; 2] = ["https://chatgpt.com", "https://chat.openai.com"];
-const SERVER_INSTRUCTIONS: &str = "Codex Connect operates on the connected host. HostPlane owns host files/processes; WorkerPlane uses codex.*; PlatformPlane is ChatGPT-native. Host tools use OS-account authority; cwd only selects a directory. Codex threads are cache-bounded workstreams; revalidate mutable host state. Keep operator critical path local; delegate only when autonomy, independent review, or real parallelism materially helps. Workers own scope until terminal/action/input/interrupt/redirect; timeout does not release it. codex.wait is synchronization, not polling; do useful non-overlapping work first. After caller interruption, use status before replacements. Use codex.* for Codex lifecycle, never host commands invoking Codex CLI. Create Git workflow state only when requested.";
+const SERVER_INSTRUCTIONS: &str = "Codex Connect operates on the connected host. HostPlane owns host files/processes; WorkerPlane uses codex.*; PlatformPlane is ChatGPT-native. Host tools use OS-account authority; cwd only selects a directory. Codex threads are durable workstreams with advisory cache hints; revalidate mutable host state. Keep operator critical path local; delegate only when autonomy, independent review, or real parallelism materially helps. Workers own scope until terminal/action/input/interrupt/redirect; timeout does not release it. codex.wait is synchronization, not polling; do useful non-overlapping work first. After caller interruption, use status before replacements. Use codex.* for Codex lifecycle, never host commands invoking Codex CLI. Create Git workflow state only when requested.";
 
 struct CancelOnDrop(Arc<AtomicBool>);
 
@@ -1593,7 +1593,10 @@ fn project_current_activity(activity: Option<&mut Value>) {
             key.as_str(),
             "threadTotalTokens"
                 | "lastRequestModelContextWindow"
+                | "lastRequestInputTokens"
+                | "lastRequestCachedInputTokens"
                 | "cacheHitPercent"
+                | "lastModelUsageAtMs"
                 | "cacheGuaranteedUntilMs"
                 | "cacheGuaranteeActive"
         )
@@ -2101,6 +2104,9 @@ mod tests {
                 "totalTokens": 1234,
                 "lastRequestModelContextWindow": 200000,
                 "modelContextWindow": 200000,
+                "lastRequestInputTokens": 800,
+                "lastRequestCachedInputTokens": 600,
+                "lastModelUsageAtMs": 123,
                 "cacheHitPercent": 75
             }
         });
@@ -2110,6 +2116,9 @@ mod tests {
             activity["tokenUsage"]["lastRequestModelContextWindow"],
             200000
         );
+        assert_eq!(activity["tokenUsage"]["lastRequestInputTokens"], 800);
+        assert_eq!(activity["tokenUsage"]["lastRequestCachedInputTokens"], 600);
+        assert_eq!(activity["tokenUsage"]["lastModelUsageAtMs"], 123);
         assert!(activity["tokenUsage"].get("totalTokens").is_none());
         assert!(activity["tokenUsage"].get("modelContextWindow").is_none());
     }

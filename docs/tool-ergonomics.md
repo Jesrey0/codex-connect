@@ -64,7 +64,7 @@ retain Connect's explicit execution intent and authority boundaries.
 | `command.start` | **Changed:** returns the existing retained handle plus the first output/exit observation. Optional `yieldTimeMs` defaults to 1,000 and permits 0–10,000. Yield expiration leaves execution running. A lost response is recovered through `status.commands`. |
 | `command.read` | Keep independent cursor reads, bounded output, explicit history loss, and `hasMoreOutput`/`drained`. Describe cursors from start/control as well as reads. Never interpret terminal state alone as fully drained output. |
 | `command.control` | **Changed for write:** stdin write/close plus retained observation in one call. `afterCursor` avoids replaying earlier output; `yieldTimeMs` has start's semantics. Validate observation arguments before mutation. Preserve acknowledged input if observation later fails. PTY resize/termination remain explicit actions. |
-| `codex.start` | **Changed:** explicit disjoint schemas for fresh workspace work, fresh full-access work, resume, fork, fresh review, and resumed review. All require model; fresh variants require cwd. Resume/fork advertise no inherited-setting overrides. Existing relay validation, lifecycle, cache gate, and sandbox behavior stay authoritative. |
+| `codex.start` | **Changed:** explicit disjoint schemas for fresh workspace work, fresh full-access work, resume, fork, fresh review, and resumed review. All require model; fresh variants require cwd. Resume/fork advertise no inherited-setting overrides. Existing relay validation, lifecycle, advisory cache hints, and sandbox behavior stay authoritative. |
 | `codex.wait` | Keep the bounded event-driven join and canonical terminal handoff. It already combines completion, pending action/input, and compact output. No user wait tuning or polling loop; operator dependency determines when to join. |
 | `codex.inspect` | Keep semantic activity, raw retained events, and canonical result text as explicit modes. Existing cursor/text pagination and `selectionComplete` distinguish completeness from authority. Do not replace authoritative result retrieval with a local transcript cache. |
 | `codex.query` | Already batches independent model/skill/usage/thread/background-terminal discovery with per-query errors. Keep small actionable projections and existing pagination. No host CLI wrapper for Codex primitives. |
@@ -114,8 +114,7 @@ remain the acceptance criteria:
 6. Worker scope/delegation policy is unchanged; routine host work needs no worker.
 7. Source, commit, push, build, deployment, live identity, plugin discovery, and
    CI remain separately verified states.
-8. Resume/fork inherit canonical cwd, effort, and access. Model validation,
-   resume cache-age policy, and upstream root-persistence limitations remain.
+8. Resume/fork inherit canonical cwd, effort, and access. Model validation, advisory cache hints, and upstream root-persistence limitations remain.
 9. Output is bounded, retained, cursor-based, and event-driven. Observation
    timeout/caller loss does not establish process or worker failure.
 10. Loopback backend, independent ingress/OAuth, scope, and metadata stay intact.

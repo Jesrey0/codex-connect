@@ -518,15 +518,21 @@ fn current_activity_schema() -> Value {
             "summary":{"type":["string","null"]},
             "lastActivityAtMs":{"type":"integer","minimum":0},
             "tokenUsage":object_schema(json!({
-                "threadTotalTokens":{"type":["integer","null"],"minimum":0,"description":"Cumulative raw token total for this Codex thread/session; a snapshot, not per-turn usage."},
-                "lastRequestModelContextWindow":{"type":["integer","null"],"minimum":0,"description":"Model context window reported with the latest request usage snapshot."},
-                "cacheHitPercent":{"type":["integer","null"],"minimum":0,"maximum":100,"description":"Latest-request cached-input share, computed server-side."},
-                "cacheGuaranteedUntilMs":{"type":["integer","null"],"minimum":0,"description":"End of OpenAI's minimum 30-minute prompt-cache reuse guarantee measured from the latest observed model usage. Cache entries may survive longer."},
-                "cacheGuaranteeActive":{"type":["boolean","null"],"description":"Whether this thread is still inside the minimum guaranteed cache-reuse window."}
+                "threadTotalTokens":{"type":["integer","null"],"minimum":0,"description":"Cumulative raw token total for this Codex thread/session; a snapshot, not per-turn usage. Never derive current context occupancy from this cumulative total."},
+                "lastRequestModelContextWindow":{"type":["integer","null"],"minimum":0,"description":"Model context-window capacity reported with the latest request usage snapshot."},
+                "lastRequestInputTokens":{"type":["integer","null"],"minimum":0,"description":"Latest observed request input size in tokens; the only per-request size signal."},
+                "lastRequestCachedInputTokens":{"type":["integer","null"],"minimum":0,"description":"Latest observed cached input tokens within the latest request."},
+                "cacheHitPercent":{"type":["integer","null"],"minimum":0,"maximum":100,"description":"Latest-request cached-input share of the latest request input, computed server-side."},
+                "lastModelUsageAtMs":{"type":["integer","null"],"minimum":0,"description":"Wall-clock snapshot of the latest observed model usage; freshness signal for operator choice."},
+                "cacheGuaranteedUntilMs":{"type":["integer","null"],"minimum":0,"description":"Connector-computed advisory reuse hint 30 minutes after the latest observed model usage. Not an upstream cache guarantee; resume and fork stay allowed."},
+                "cacheGuaranteeActive":{"type":["boolean","null"],"description":"Whether the connector advisory reuse-hint window is still open. Informational only."}
             }), &[
                 "threadTotalTokens",
                 "lastRequestModelContextWindow",
+                "lastRequestInputTokens",
+                "lastRequestCachedInputTokens",
                 "cacheHitPercent",
+                "lastModelUsageAtMs",
                 "cacheGuaranteedUntilMs",
                 "cacheGuaranteeActive"
             ])
@@ -779,7 +785,7 @@ fn codex_start_schema() -> Value {
         "mode":{"const":"work","description":"Start fresh work, resume a compatible workstream, or fork durable context."},
         "task":{"type":"string","minLength":1,"description":"Self-contained objective or next delta for the workstream."},
         "cwd":{"type":"string","minLength":1,"description":"Explicit working directory for fresh work."},
-        "threadId":{"type":"string","minLength":1,"description":"Resume a cache-valid work thread, inheriting its cwd, effort, and access."},
+        "threadId":{"type":"string","minLength":1,"description":"Resume a persisted work thread, inheriting its cwd, effort, and access. Cache age is advisory only."},
         "forkFromThreadId":{"type":"string","minLength":1,"description":"Copy a source thread's durable context into a new workstream, inheriting its cwd, effort, and access."},
         "lastTurnId":{"type":"string","minLength":1,"description":"Optional source turn to fork through, inclusive."},
         "model":{"type":"string","minLength":1,"description":"Required on every start. Resume and fork must match the canonical thread model; discover IDs with codex.query."},
@@ -833,7 +839,7 @@ fn codex_start_schema() -> Value {
     );
     let resumed_review = object_schema(
         json!({
-            "mode":{"const":"review","description":"Resume a cache-valid read-only review."},
+            "mode":{"const":"review","description":"Resume a persisted read-only review."},
             "threadId":{"type":"string","minLength":1,"description":"Existing review thread; inherits its cwd and model."},
             "target":review_target_schema(),
             "model":review_model
@@ -1558,11 +1564,20 @@ mod tests {
         let usage = &schema["properties"]["tokenUsage"]["properties"];
         assert_eq!(
             usage["threadTotalTokens"]["description"],
-            "Cumulative raw token total for this Codex thread/session; a snapshot, not per-turn usage."
+            "Cumulative raw token total for this Codex thread/session; a snapshot, not per-turn usage. Never derive current context occupancy from this cumulative total."
         );
         assert!(usage.get("totalTokens").is_none());
         assert!(usage.get("modelContextWindow").is_none());
         assert!(usage.get("lastRequestModelContextWindow").is_some());
+        assert!(usage.get("lastRequestInputTokens").is_some());
+        assert!(usage.get("lastRequestCachedInputTokens").is_some());
+        assert!(usage.get("lastModelUsageAtMs").is_some());
+        assert!(
+            usage["cacheGuaranteedUntilMs"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Not an upstream cache guarantee")
+        );
     }
 
     #[test]

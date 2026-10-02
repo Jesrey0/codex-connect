@@ -9,7 +9,16 @@ const workerSchema = z.object({
   model: nullableText, effort: nullableText,
   lastActivityAtMs: z.number().nonnegative(), terminalAtMs: z.number().nullable(),
   activityKind: z.string(), activitySummary: nullableText,
-  tokenUsage: z.object({ threadTotalTokens: z.number().nullable() }),
+  tokenUsage: z.object({
+    threadTotalTokens: z.number().nullable(),
+    lastRequestInputTokens: z.number().nullable().optional(),
+    lastRequestCachedInputTokens: z.number().nullable().optional(),
+    lastRequestModelContextWindow: z.number().nullable().optional(),
+    cacheHitPercent: z.number().nullable().optional(),
+    lastModelUsageAtMs: z.number().nullable().optional(),
+    cacheGuaranteedUntilMs: z.number().nullable().optional(),
+    cacheGuaranteeActive: z.boolean().nullable().optional(),
+  }).passthrough(),
 });
 const pendingSchema = z.object({
   threadId: z.string(), turnId: nullableText, type: z.string(), blocking: z.boolean(),

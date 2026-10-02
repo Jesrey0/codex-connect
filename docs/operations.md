@@ -102,7 +102,7 @@ caller uncertain; check retained/authoritative state before retrying consequenti
 
 ## Worker lifecycle
 
-Treat a Codex thread as a cache-bounded workstream. Every `codex.start` call supplies a
+Treat a Codex thread as a durable workstream with advisory cache hints. Every `codex.start` call supplies a
 model. Fresh work and review also supply an explicit cwd. Resume and fork inherit the
 canonical cwd and reject a cwd argument; the supplied model must equal the canonical
 thread model. Workstream effort and access are inherited on resume and fork.
@@ -129,20 +129,23 @@ does not override sandbox settings on resume or fork; upstream owns persistence.
 See the [pinned persistence limitation](development.md#writable-root-persistence)
 before relying on additional roots after a thread reload or fork.
 
-Connect conservatively accepts resume only inside OpenAI's minimum 30-minute prompt-cache
-guarantee, even though the cache may survive longer. Live model-usage telemetry drives that
-cutoff when available; after restart/history loss, latest completed-turn time is the fallback.
-Outside that cutoff, or when cwd/model/effort/access must change, start a fresh thread with
+Cache age never gates resume or fork: native thread identity, model, cwd, and
+upstream errors decide. The 30-minute connector reuse hint only informs the
+operator's choice; older persisted threads remain recoverable. When
+cwd/model/effort/access must change, start a fresh thread with
 self-contained context. Revalidate mutable repository, Git, runtime, and external state even
 inside a reused thread.
 
 Use `codex.query` to discover model IDs and supported effort. `codex.start` returns the
 effective model/effort reported for the workstream. `codex.wait` and semantic inspection
-surface compact context/cache telemetry: total/context-window tokens, latest cache-hit
-percentage, the minimum cache-guarantee deadline, and whether that guarantee is active.
+surface compact context/cache telemetry: cumulative thread tokens, the latest request's
+input/cached tokens and context-window capacity, the latest-request cached-input share,
+the latest observed model-usage time, and the connector advisory reuse-hint deadline
+with whether that hint window is open. Thread totals never measure current context
+occupancy.
 
-When durable thread context is still useful but normal resume is outside that cache window,
-`codex.start` can fork the persisted thread into a new workstream. A fork may optionally stop
+When durable thread context is still useful but the connector reuse hint has expired,
+either resume the persisted thread or fork it into a new workstream. A fork may optionally stop
 at a specific completed source turn. Forking preserves conversation history; it does not
 promise prompt-cache reuse.
 

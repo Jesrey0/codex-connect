@@ -71,8 +71,10 @@ const MAX_WAIT_OUTPUT_PAGES: usize = 32;
 const RESULT_SELECTION_BUDGET_MS: u64 = 30_000;
 const MAX_TRANSCRIPT_PAGES: usize = 128;
 const MAX_TURN_LOOKUP_PAGES: usize = 1_024;
-const THREAD_REUSE_POLICY_MS: u64 = 30 * 60 * 1000;
-const THREAD_REUSE_POLICY_SECS: i64 = 30 * 60;
+// Connector-computed advisory reuse hint: 30 minutes after the latest observed
+// model usage. Informational only; resume/fork permission never depends on it.
+// Native thread identity/model/cwd/effort checks and upstream errors decide.
+const CACHE_REUSE_HINT_MS: u64 = 30 * 60 * 1000;
 const TURN_PAGE_SIZE: u32 = 50;
 const ITEM_PAGE_SIZE: u32 = 100;
 const CODEX_QUERY_PAGE_DEFAULT: u32 = 25;
@@ -795,6 +797,10 @@ fn operator_worker_handle_value(thread_id: &str, observed: &ObservedTurn) -> Val
 }
 
 fn token_usage_value(observed: &ObservedTurn) -> Value {
+    // cacheHitPercent is the latest-request cached-input share, not context
+    // occupancy. Never derive occupancy from cumulative threadTotalTokens.
+    // cacheGuaranteedUntilMs/Active are connector-computed advisory hints from
+    // lastModelUsageAtMs, not upstream proof of cache retention.
     let cache_hit_percent = match (
         observed.last_request_input_tokens,
         observed.last_request_cached_input_tokens,
@@ -806,7 +812,7 @@ fn token_usage_value(observed: &ObservedTurn) -> Value {
     };
     let cache_guaranteed_until_ms = observed
         .last_model_usage_at_ms
-        .map(|timestamp| timestamp.saturating_add(THREAD_REUSE_POLICY_MS));
+        .map(|timestamp| timestamp.saturating_add(CACHE_REUSE_HINT_MS));
     let cache_guarantee_active = cache_guaranteed_until_ms.map(|until| now_epoch_ms() < until);
     json!({
         "threadTotalTokens": observed.thread_total_tokens,
@@ -1892,10 +1898,8 @@ impl Relay {
                 self.finish_thread_start(&id, None).await;
                 return Err(error);
             }
-            if let Err(error) = self.ensure_thread_reuse_policy(&metadata).await {
-                self.finish_thread_start(&id, None).await;
-                return Err(error);
-            }
+            // Cache recency is advisory only: native thread identity, model,
+            // cwd, and upstream errors decide resume permission.
             let response = match self
                 .app_server
                 .start_request(ThreadResume {
@@ -1972,57 +1976,6 @@ impl Relay {
         self.host
             .resolve_app_server_directory(&response.thread.cwd)?;
         Ok(response.thread)
-    }
-
-    async fn ensure_thread_reuse_policy(&self, thread: &Thread) -> Result<(), RelayError> {
-        let observed_model_usage_at_ms = {
-            let live = self.live_turns.lock().await;
-            let active = live
-                .turns
-                .iter()
-                .filter(|((thread_id, _), _)| thread_id == &thread.id)
-                .filter_map(|(_, observed)| observed.last_model_usage_at_ms);
-            let recent = live
-                .recent
-                .iter()
-                .filter(|(thread_id, _, _)| thread_id == &thread.id)
-                .filter_map(|(_, _, observed)| observed.last_model_usage_at_ms);
-            active.chain(recent).max()
-        };
-        if let Some(last_model_usage_at_ms) = observed_model_usage_at_ms {
-            if now_epoch_ms().saturating_sub(last_model_usage_at_ms) >= THREAD_REUSE_POLICY_MS {
-                return Err(RelayError::Invalid(format!(
-                    "thread {} is outside Codex Connect's conservative 30-minute guaranteed-cache reuse policy; start a fresh thread without threadId and provide self-contained context",
-                    thread.id
-                )));
-            }
-            return Ok(());
-        }
-        let latest = self
-            .app_server
-            .request(ThreadTurnsList {
-                thread_id: thread.id.clone(),
-                cursor: None,
-                limit: Some(1),
-                sort_direction: Some(SortDirection::Desc),
-                items_view: Some(TurnItemsView::NotLoaded),
-            })
-            .await?
-            .data
-            .into_iter()
-            .next();
-        let last_model_turn_at = latest
-            .and_then(|turn| turn.completed_at)
-            .unwrap_or(thread.updated_at);
-        let now_secs = (now_epoch_ms() / 1000).min(i64::MAX as u64) as i64;
-        let age_secs = now_secs.saturating_sub(last_model_turn_at);
-        if age_secs >= THREAD_REUSE_POLICY_SECS {
-            return Err(RelayError::Invalid(format!(
-                "thread {} is outside Codex Connect's conservative 30-minute guaranteed-cache reuse policy; start a fresh thread without threadId and provide self-contained context",
-                thread.id
-            )));
-        }
-        Ok(())
     }
 
     async fn hydrate_turn_items_when_ready(

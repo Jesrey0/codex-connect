@@ -292,7 +292,18 @@ class OperatorProtocolTests(unittest.TestCase):
             self.assertEqual(workers[active["turnId"]]["status"], "inProgress")
             self.assertEqual(workers[active["turnId"]]["model"], "fixture-model-1")
             self.assertIn("tokenUsage", workers[active["turnId"]])
-            self.assertNotIn("lastRequestInputTokens", workers[active["turnId"]]["tokenUsage"])
+            usage = workers[active["turnId"]]["tokenUsage"]
+            for key in [
+                "threadTotalTokens",
+                "lastRequestModelContextWindow",
+                "lastRequestInputTokens",
+                "lastRequestCachedInputTokens",
+                "cacheHitPercent",
+                "lastModelUsageAtMs",
+                "cacheGuaranteedUntilMs",
+                "cacheGuaranteeActive",
+            ]:
+                self.assertIn(key, usage)
             pending = [request for request in refreshed["pendingActions"] if request["threadId"] == question["threadId"]]
             self.assertEqual(pending[0]["type"], "userInput")
             self.assertTrue(pending[0]["blocking"])
@@ -1907,19 +1918,12 @@ class OperatorProtocolTests(unittest.TestCase):
 
         expired = self.start("expire_thread")
         self.assertEqual(self.wait(expired)["state"], "terminal")
-        resumes_before_expired = len(self.method_params("thread/resume"))
-        self.client.call(
-            "codex.start",
-            {
-                "mode": "work",
-                "task": "complete",
-                "threadId": expired["threadId"],
-                "model": expired["model"],
-            },
-            error=True,
-        )
-        self.assertEqual(len(self.method_params("thread/resume")), resumes_before_expired)
-
+        # Cold source: no live usage telemetry, so no cache metrics exist.
+        cold = self.inspect_turn(expired)
+        self.assertIsNone(cold["currentActivity"]["tokenUsage"]["lastModelUsageAtMs"])
+        self.assertIsNone(cold["currentActivity"]["tokenUsage"]["cacheGuaranteedUntilMs"])
+        self.assertIsNone(cold["currentActivity"]["tokenUsage"]["cacheGuaranteeActive"])
+        # Stale fork first, while the source is provably untouched since expiry.
         forks_before = len(self.method_params("thread/fork"))
         forked = self.codex_start({
             "mode": "work",
@@ -1937,6 +1941,30 @@ class OperatorProtocolTests(unittest.TestCase):
             "type": "thread", "threadId": forked["threadId"],
         }]})["results"][0]["result"]
         self.assertEqual(fork_summary["forkedFromThreadId"], expired["threadId"])
+        # Stale cache never gates native resume: the expired thread still reaches upstream.
+        resumes_before_expired = len(self.method_params("thread/resume"))
+        stale_resumed = self.codex_start({
+            "mode": "work",
+            "task": "complete",
+            "threadId": expired["threadId"],
+            "model": expired["model"],
+        })
+        self.assertEqual(self.wait(stale_resumed)["state"], "terminal")
+        self.assertEqual(len(self.method_params("thread/resume")), resumes_before_expired + 1)
+        # Native permission checks still hold on stale threads.
+        stale_rejected = len(self.method_params("thread/resume"))
+        self.client.call(
+            "codex.start",
+            {
+                "mode": "work",
+                "task": "complete",
+                "threadId": expired["threadId"],
+                "model": "fixture-model-2",
+            },
+            error=True,
+            validate_input=False,
+        )
+        self.assertEqual(len(self.method_params("thread/resume")), stale_rejected)
 
         before_threads = len(self.method_params("thread/start"))
         before_reviews = len(self.method_params("review/start"))

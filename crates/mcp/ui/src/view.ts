@@ -58,7 +58,16 @@ function details(panel: Panel, tools: boolean): HTMLElement {
     ["Effort", worker.effort ?? "Unavailable"], ["Last activity", date(worker.lastActivityAtMs)],
     ["Thread", worker.threadId], ["Turn", worker.turnId],
   ]) metadata.append(element("dt", label), element("dd", value));
-  if (worker.tokenUsage.threadTotalTokens !== null) metadata.append(element("dt", "Thread tokens"), element("dd", worker.tokenUsage.threadTotalTokens.toLocaleString()));
+  if (worker.tokenUsage.threadTotalTokens !== null) metadata.append(element("dt", "Thread tokens (cumulative)"), element("dd", worker.tokenUsage.threadTotalTokens.toLocaleString()));
+  if (worker.tokenUsage.lastRequestInputTokens != null) {
+    const window = worker.tokenUsage.lastRequestModelContextWindow;
+    metadata.append(element("dt", "Latest request input"), element("dd", window != null ? `${worker.tokenUsage.lastRequestInputTokens.toLocaleString()} tok / ${window.toLocaleString()} tok window` : `${worker.tokenUsage.lastRequestInputTokens.toLocaleString()} tok`));
+  }
+  if (worker.tokenUsage.lastRequestCachedInputTokens != null) {
+    const percent = worker.tokenUsage.cacheHitPercent;
+    metadata.append(element("dt", "Latest cached input"), element("dd", percent != null ? `${worker.tokenUsage.lastRequestCachedInputTokens.toLocaleString()} tok · ${percent}%` : `${worker.tokenUsage.lastRequestCachedInputTokens.toLocaleString()} tok`));
+  }
+  if (worker.tokenUsage.lastModelUsageAtMs != null) metadata.append(element("dt", "Usage observed"), element("dd", date(worker.tokenUsage.lastModelUsageAtMs)));
   section.append(metadata);
   const activity = element("div", "", "card");
   activity.append(element("h3", "Latest activity"), element("p", worker.activitySummary || worker.activityKind));

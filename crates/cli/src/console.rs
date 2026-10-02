@@ -1758,11 +1758,11 @@ fn worker_context_detail(usage: &Value) -> Option<String> {
         let remaining = until.saturating_sub(now) / 1_000;
         let active = until > now && usage["cacheGuaranteeActive"].as_bool().unwrap_or(true);
         parts.push(if !active {
-            "thread cache guarantee expired".to_string()
+            "connector cache hint expired".to_string()
         } else if remaining < 60 {
-            "thread cache guarantee <1m left".to_string()
+            "connector cache hint <1m left".to_string()
         } else {
-            format!("thread cache guarantee {}m left", remaining / 60)
+            format!("connector cache hint {}m left", remaining / 60)
         });
     }
     (!parts.is_empty()).then(|| parts.join("\n"))
@@ -1962,10 +1962,7 @@ fn render_action_card(action: &Value, width: usize) -> Vec<String> {
             }
         }
     }
-    lines.push(styled(
-        row("   resolve through 0xOperator", width),
-        DIM,
-    ));
+    lines.push(styled(row("   resolve through 0xOperator", width), DIM));
     lines
 }
 
@@ -2375,7 +2372,7 @@ mod tests {
         let usage = serde_json::json!({"cacheGuaranteedUntilMs":1,"cacheGuaranteeActive":true});
         assert_eq!(
             worker_context_detail(&usage).unwrap(),
-            "thread cache guarantee expired"
+            "connector cache hint expired"
         );
         let summary = account_line(&Value::Null, 100);
         assert!(summary.contains("Primary unavailable"));
@@ -2587,7 +2584,7 @@ mod tests {
         let rendered = worker_context_detail(&worker["tokenUsage"]).unwrap();
         assert!(rendered.contains("latest request input 12.0k / 200.0k tok window"));
         assert!(rendered.contains("latest request cached 9.0k tok · 75%"));
-        assert!(rendered.contains("thread cache guarantee"));
+        assert!(rendered.contains("connector cache hint"));
     }
 
     #[test]
