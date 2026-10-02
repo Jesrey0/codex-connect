@@ -2951,7 +2951,6 @@ impl Relay {
             .await?;
         let mut threads = Vec::with_capacity(response.data.len());
         for thread in response.data {
-            self.host.resolve_app_server_directory(&thread.cwd)?;
             threads.push(thread_summary(&thread));
         }
         Ok(json!({
@@ -3748,7 +3747,31 @@ fn validate_command(command: &CommandExec) -> Result<(), RelayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_connect_app_server::protocol::{Turn, TurnStatus};
+    use codex_connect_app_server::protocol::{Thread, Turn, TurnStatus};
+
+    #[test]
+    fn thread_summary_preserves_historical_cwd_without_canonicalizing_it() {
+        let thread = Thread {
+            id: "thread-stale-cwd".into(),
+            session_id: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            preview: "historical thread".into(),
+            cwd: "/deleted/project".into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 2,
+            status: json!({"type":"idle"}),
+            name: None,
+            turns: Vec::new(),
+        };
+
+        let summary = thread_summary(&thread);
+
+        assert_eq!(summary["threadId"], "thread-stale-cwd");
+        assert_eq!(summary["cwd"], "/deleted/project");
+    }
 
     fn test_turn(id: &str, status: TurnStatus) -> Turn {
         Turn {
