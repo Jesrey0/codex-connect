@@ -6,7 +6,7 @@ Notable project-level changes remain under `Unreleased` until Codex Connect has 
 
 ### Changed
 
-- Account-plugin sources and 0x0perator skills moved out of this backend repository to the neutral user-root `~/0xoperator/` source tree; Codex Connect now owns backend/runtime code only.
+- Account-plugin sources and 0x0perator skills moved out of this backend repository to the neutral user-root `~/plugins/0x0perator/` source tree; Codex Connect now owns backend/runtime code only.
 - Persistent command start and stdin write return a retained output/exit observation in the same call, with a bounded yield that never stops execution.
 - `codex.start` now advertises explicit fresh/resumed/forked input variants that match the existing inherited-setting rules.
 
