@@ -126,8 +126,11 @@ access and upstream temporary-directory defaults remain enabled. For example:
 `writableRoots` is rejected with full access, review, resume, or fork, including an
 explicit empty list. Start a fresh workstream to select different roots. Connect
 does not override sandbox settings on resume or fork; upstream owns persistence.
-See the [pinned persistence limitation](development.md#writable-root-persistence)
-before relying on additional roots after a thread reload or fork.
+Pinned Codex 0.160.0 restores its separate native `runtimeWorkspaceRoots` field
+on cold resume, but Connect's `writableRoots` are carried through legacy
+`sandboxPolicy` instead and are not covered by that restoration path. Do not
+rely on additional Connect write roots surviving a cold reload or fork. See the
+[pinned persistence details](development.md#writable-root-persistence).
 
 Cache age never gates resume or fork: native thread identity, model, cwd, and
 upstream errors decide. The 30-minute connector reuse hint only informs the

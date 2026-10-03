@@ -141,7 +141,9 @@ All repository gate checks passed on 2026-10-01: 200 workspace tests, 66 protoco
 tests, pinned schema generation check, formatting, diff hygiene, strict Clippy,
 and the locked CLI build. Schema validation used the existing Linux Codex
 0.159.0 binary through an isolated command PATH; the desktop shell's 0.159.2
-binary and the project pin were not changed.
+binary and the project pin were not changed. This verification record predates
+the current 0.160.0 pin; re-run the gate under the current pin before treating
+it as current acceptance.
 
 Regression coverage checks combined PTY start/write/close, zero-yield continued
 execution, invalid cursor/yield rejection before upstream mutation, retained

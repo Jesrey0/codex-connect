@@ -121,7 +121,25 @@ Each tool descriptor advertises OAuth scope `codex-connect:access`. Host ingress
 
 Connect forwards fresh workspace `writableRoots` unchanged through `turn/start.sandboxPolicy`, with network access enabled, and sends no sandbox override for resumed or forked work. Fixture lifecycle tests verify that Connect leaves the inherited policy alone; they do not prove upstream persistence or OS enforcement.
 
-The [App Server documentation](https://learn.chatgpt.com/docs/app-server) describes turn settings as defaults for later turns. Pinned 0.159.0 source, however, installs a raw sandbox override as an unnamed permission snapshot (`core/src/session/session.rs` and `protocol/src/permission_profile_snapshot.rs`). Cold resume and fork restore only the active permission-profile ID (`app-server/src/request_processors/persisted_resume_settings.rs` and `thread_processor.rs`), not the persisted concrete policy. Loaded-thread defaults are distinct from cold restoration. Additional roots therefore cannot be guaranteed across cold reload or fork from this interface alone. This is an integration blocker for durable root retention, not evidence that wire forwarding failed. No Connect-owned policy store or raw rollout parser is introduced here.
+Pinned Codex 0.160.0 has a separate persistence path for App Server's native
+`runtimeWorkspaceRoots`: `SessionConfiguration::thread_settings_snapshot`
+records `runtime_workspace_roots`, and cold `thread/resume` restores the latest
+thread-owned `ThreadSettingsApplied` roots, falling back to startup
+`SessionMeta.runtime_workspace_roots`. App Server tests cover that restoration
+and foreign-path validation.
+
+That path does **not** establish persistence for Connect's `writableRoots`.
+Connect supplies those paths through the legacy
+`turn/start.sandboxPolicy.writableRoots` field. In pinned 0.160.0,
+`SessionConfiguration::apply` projects such a sandbox override into an unnamed
+legacy permission profile without updating `runtime_workspace_roots`. Cold
+resume restores the active permission-profile identity, not that unnamed concrete
+policy. `thread/fork` likewise does not reconstruct it from the source thread.
+Loaded-thread defaults are distinct from cold restoration. Additional
+`writableRoots` therefore cannot be guaranteed across cold reload or fork from
+this interface alone. This is an upstream integration limitation, not evidence
+that Connect's wire forwarding failed. Connect does not add a policy store or
+parse raw rollout history to compensate for it.
 
 ## MCP Events feature validation
 
