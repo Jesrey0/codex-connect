@@ -35,10 +35,6 @@ jobs:
         run: npm install --global "@openai/codex@$(cat config/codex-cli-pin)"
       - name: Install protocol test dependencies
         run: python -m pip install jsonschema
-      - name: Install Workers panel dependencies
-        run: npm ci --prefix crates/mcp/ui --no-audit --no-fund
-      - name: Check Workers panel and embedded asset
-        run: npm run check --prefix crates/mcp/ui
       - name: Check pinned App Server schemas
         run: ./scripts/generate-app-server-tool-schemas.py --check
       - run: cargo fmt --all -- --check

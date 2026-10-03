@@ -34,7 +34,7 @@ Use the current OpenAI Plugin documentation as the ChatGPT-specific contract and
 - Keep `name`, `title`, `description`, `inputSchema`, and `outputSchema` accurate and compact. Output schemas must describe the structured result actually returned.
 - Set `readOnlyHint`, `destructiveHint`, and `openWorldHint` explicitly according to behavior. `idempotentHint` is optional and should be truthful when present.
 - Declare OAuth with root-level per-tool `securitySchemes`. Do not emit the optional `_meta.securitySchemes` compatibility mirror.
-- Use `_meta` only for documented MCP Apps/OpenAI extensions: invocation status, tool visibility, the Workers opener association and thread entrypoint, and resource display/CSP metadata. Keep OAuth at descriptor root.
+- Use `_meta` only for documented OpenAI extensions such as tool invocation status. Keep OAuth at descriptor root.
 - Keep server instructions short and cross-tool. Tool-specific selection guidance belongs in each tool description.
 
 Current references:
@@ -60,50 +60,6 @@ Keep service tier, raw sandbox/approval policy, developer instructions, and cach
 ChatGPT is the only supported action/control interface. All mutation intent enters through the ChatGPT MCP/plugin surface. Human-visible local observability is allowed only when it is read-only and cannot steer or mutate workers, host state, or App Server state.
 
 The local `codex-connect console` is an explicitly supported read-only visibility surface for workers, transcripts, pending state, and usage. Its loopback observer routes exist only to feed that console. They must remain observational: no steering, approval responses, archive/delete, command control, or other mutation may be added there. Other local CLI commands are trusted-host maintenance and development plumbing: setup, service state, logs, diagnostics/probes, deployment, and internal entrypoints.
-
-## Conversation worker panel
-
-The Rust MCP runtime owns `workers.open`, the app-only `workers.snapshot` helper,
-and the enumerated HTML resource (`text/html;profile=mcp-app`). The opener accepts
-`{}` and advertises a thread entrypoint titled **Workers**. Only the opener has
-`_meta.ui.resourceUri`; Refresh must not reopen the view. Resource metadata and
-browser capabilities both declare fullscreen only. In supporting ChatGPT hosts
-this is the conversation side panel; placement remains host-controlled.
-
-Snapshots reuse Relay's retained observer projection and existing pending-request
-projection. They are backend-global, grouped/filterable by effective cwd in the
-view, and timestamped. No conversation/project ownership or upstream worker state
-is added. Selection reads canonical results through `codex.inspect(detail=result)`;
-`selectionComplete` controls authority independently of `hasMoreText` and
-`nextTextOffset`. Late replies cannot replace another selected worker. Pending
-requests are informational. Attach context uses `ui/update-model-context`; asking
-ChatGPT to inspect uses `ui/message`. All mutation tools are model-only.
-
-The browser source and locked dependencies live in `crates/mcp/ui`. Its bridge uses
-`@modelcontextprotocol/ext-apps` **1.7.5**, with `@openai/mcp-extensions` **0.1.0**
-([node-v0.1.0 source contract](https://github.com/openai/mcp-extensions/blob/4ff03c033e170d623f5101e885ce94dac959a1d9/docs/spec.md)).
-Follow the [MCP Apps specification](https://github.com/modelcontextprotocol/ext-apps/blob/v1.7.5/specification/draft/apps.mdx)
-and [official UI guide](https://developers.openai.com/plugins/build/chatgpt-ui).
-Do not introduce another bridge or a browser connection to loopback ingress.
-
-`workers.html` is the source-controlled compiled asset embedded by Rust; Cargo
-builds and existing deployment builds need no Node toolchain. Rebuild it with
-`npm run build` from `crates/mcp/ui` after browser changes. The resource URI hashes
-the actual HTML, so rebuilt assets cannot reuse a stale host cache key. The bundle
-has no runtime external assets/network access; resource CSP has empty domain
-allowlists and HTML CSP permits only hashed inline script/style. Initial rendering
-uses the delivered launch result with no duplicate fetch. Refresh and result
-pagination are explicit; there are no background polling loops.
-
-For browser work use Node **24.16 or newer** (native TypeScript test execution),
-then run `npm ci` and `npm run check` in `crates/mcp/ui` before the Rust gate.
-This checks types, embedded asset freshness, and real SDK bridge behavior using
-in-memory host transport. Run focused protocol validation with
-`python3 tests/protocol_integration.py OperatorProtocolTests.test_workers_resource_discovery_and_launch_contract OperatorProtocolTests.test_workers_snapshot_reuses_retained_projection_and_informational_pending_requests`
-after building the CLI. A JSON resource/tool result proves protocol behavior,
-not actual rendering or placement. Verify light/dark narrow/wide layouts, keyboard
-selection, empty/stale/error/unsupported states, and initial delivery in a browser;
-verify placement and context actions separately in the intended ChatGPT host.
 
 ## Worker contract
 

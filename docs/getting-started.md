@@ -89,7 +89,7 @@ Private status/health endpoints and undeclared routes must remain inaccessible.
    do not invent or paste a static client secret for ChatGPT.
 4. Complete the browser operator login and consent. The login uses the existing
    host-ingress credential; never put credentials in the MCP URL or tool arguments.
-5. Scan/discover the server and install/enable the resulting Codex Connect plugin. Expect 15 tool descriptors: 14 model-visible tools and one app-only Workers Refresh helper. Supporting ChatGPT hosts expose a conversation entrypoint titled **Workers**; verify its actual panel rendering separately from tool discovery.
+5. Scan/discover the server and install/enable the resulting Codex Connect plugin. Expect 13 operator tool descriptors.
 
 OpenAI's product labels and supported invocation surfaces can change independently of
 Codex Connect. The architectural requirement here is stable: **all actions and mutations

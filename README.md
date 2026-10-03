@@ -38,11 +38,9 @@ Do not invoke the Codex CLI through HostPlane commands when a `codex.*` semantic
 
 ## Public MCP surface
 
-The MCP catalog contains 14 model-visible tools:
+The MCP catalog contains 13 operator tools:
 
-`status`, `host.inspect`, `host.view_image`, `host.apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control`, `codex.start`, `codex.wait`, `codex.inspect`, `codex.query`, `codex.act`, and `workers.open`. A fifteenth descriptor, `workers.snapshot`, is app-only for explicit panel Refresh.
-
-Open **Workers** in a supporting ChatGPT conversation to browse current/recent workers by project, inspect canonical results, attach selected context, or ask ChatGPT to inspect pending state. The panel is observational; worker actions stay in ChatGPT. Its initial snapshot comes from the opener, and updates require Refresh. See the [panel contract](docs/development.md#conversation-worker-panel).
+`status`, `host.inspect`, `host.view_image`, `host.apply_patch`, `command.exec`, `command.start`, `command.read`, `command.control`, `codex.start`, `codex.wait`, `codex.inspect`, `codex.query`, and `codex.act`.
 
 Use `command.exec` for short HostPlane commands, `command.start/read/control` for persistent or interactive host processes, and `codex.start` for delegated work/review. `codex.start` can also fork persisted thread context into a new workstream. Use `codex.query` for Codex-owned discovery and persisted thread/process state, and `codex.act` for Codex-owned lifecycle mutations. `status` is backend-global and non-destructive; its `defaultCwd` is the service user's home, while retained workers and commands expose their own cwd. Read `status.workers` to recover a lost start response. The live schemas are authoritative for inputs, outputs, annotations, and limits.
 

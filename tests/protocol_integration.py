@@ -5,7 +5,6 @@ Run after cargo build -p codex-connect. Requires Python jsonschema.
 """
 
 import base64
-import hashlib
 import http.client
 import json
 import os
@@ -29,7 +28,6 @@ EXPECTED = {
     "status", "host.inspect", "host.apply_patch", "host.view_image", "command.exec",
     "command.start", "command.read", "command.control",
     "codex.start", "codex.wait", "codex.inspect", "codex.query", "codex.act",
-    "workers.open", "workers.snapshot",
 }
 
 
@@ -160,12 +158,16 @@ class OperatorProtocolTests(unittest.TestCase):
         self.fail("worker was not registered in status")
 
     def test_catalog_status_runtime_and_origin_boundary(self):
-        self.assertEqual(len(self.client.catalog), 15)
+        self.assertEqual(len(self.client.catalog), 13)
         self.assertEqual(set(self.client.tools), EXPECTED)
+        discovery = self.client.request("server/discover")
+        self.assertNotIn("resources", discovery["capabilities"])
         expected_security = [{"type": "oauth2", "scopes": ["codex-connect:access"]}]
         for tool in self.client.catalog:
             self.assertEqual(tool["securitySchemes"], expected_security)
             self.assertNotIn("securitySchemes", tool.get("_meta", {}))
+            self.assertNotIn("ui", tool.get("_meta", {}))
+            self.assertNotIn("openai/ui", tool.get("_meta", {}))
         status = self.client.call("status")
         self.assertTrue(status["ready"])
         self.assertEqual(
@@ -227,98 +229,6 @@ class OperatorProtocolTests(unittest.TestCase):
                 result = self.client.request("tools/call", {"name": name, "arguments": {}})
                 self.assertTrue(result["isError"])
                 self.assertIn("unknown tool", result["content"][0]["text"].lower())
-
-    def test_workers_resource_discovery_and_launch_contract(self):
-        discovery = self.client.request("server/discover")
-        self.assertEqual(discovery["supportedVersions"], [PROTOCOL_VERSION])
-        self.assertIn("resources", discovery["capabilities"])
-        opener = self.client.tools["workers.open"]
-        uri = opener["_meta"]["ui"]["resourceUri"]
-        self.assertEqual(opener["title"], "Workers")
-        self.assertEqual(opener["_meta"]["openai/ui"]["entrypoints"], [{"type": "thread"}])
-        self.assertEqual(opener["_meta"]["ui"]["visibility"], ["model"])
-        self.assertTrue(opener["icons"][0]["src"].startswith("data:image/svg+xml,"))
-        self.assertEqual(self.client.tools["workers.snapshot"]["_meta"]["ui"], {"visibility": ["app"]})
-        app_tools = {tool["name"] for tool in self.client.catalog if "app" in tool["_meta"]["ui"]["visibility"]}
-        self.assertEqual(app_tools, {"workers.snapshot", "codex.inspect"})
-        resources = self.client.request("resources/list")
-        self.assertEqual(resources["ttlMs"], 0)
-        self.assertEqual(resources["resources"][0]["uri"], uri)
-        read = self.client.request("resources/read", {"uri": uri})
-        self.assertEqual(read["cacheScope"], "public")
-        content = read["contents"][0]
-        self.assertEqual(content["mimeType"], "text/html;profile=mcp-app")
-        self.assertEqual(content["_meta"]["openai/ui"], {
-            "preferredDisplayMode": "fullscreen", "availableDisplayModes": ["fullscreen"],
-        })
-        self.assertEqual(content["_meta"]["ui"]["csp"], {
-            "connectDomains": [], "resourceDomains": [], "frameDomains": [],
-        })
-        html = content["text"]
-        self.assertEqual(html, (ROOT / "crates/mcp/ui/workers.html").read_text())
-        self.assertTrue(html.startswith("<!doctype html>"))
-        self.assertIn("Content-Security-Policy", html)
-        self.assertNotIn('src="https://', html)
-        self.assertEqual(uri, f"ui://codex-connect/workers-{hashlib.sha256(html.encode()).hexdigest()}.html")
-        snapshot = self.client.call("workers.open")
-        self.assertTrue(snapshot["ready"])
-        self.assertEqual(snapshot["codexRelease"], CONTRACT["codexPin"])
-        self.assertEqual(snapshot["defaultCwd"], str(self.workspace))
-        self.assertGreater(snapshot["capturedAtMs"], 0)
-        self.client.call("workers.open", {"cwd": "/unexpected"}, error=True, validate_input=False)
-        with self.assertRaises(urllib.error.HTTPError) as error:
-            self.client.request("resources/read", {"uri": "ui://codex-connect/missing"})
-        with error.exception as response:
-            self.assertEqual(response.code, 400)
-            failure = json.load(response)["error"]
-        self.assertEqual(failure["code"], -32602)
-        self.assertEqual(failure["message"], "Unknown UI resource")
-
-    def test_workers_snapshot_reuses_retained_projection_and_informational_pending_requests(self):
-        active = self.start("idle", cwd=str(self.project))
-        done = self.start("complete")
-        self.wait(done)
-        question = self.start("question")
-        self.assertEqual(self.wait(question)["wakeReason"], "inputRequired")
-        try:
-            # Snapshot reads must not introduce thread/item progress polling.
-            reads_before = len(self.method_params("thread/read"))
-            opened = self.client.call("workers.open")
-            refreshed = self.client.call("workers.snapshot")
-            self.assertEqual(len(self.method_params("thread/read")), reads_before)
-            workers = {worker["turnId"]: worker for worker in refreshed["workers"]}
-            self.assertEqual(workers[active["turnId"]]["cwd"], str(self.project))
-            self.assertEqual(workers[done["turnId"]]["status"], "completed")
-            self.assertEqual(workers[active["turnId"]]["status"], "inProgress")
-            self.assertEqual(workers[active["turnId"]]["model"], "fixture-model-1")
-            self.assertIn("tokenUsage", workers[active["turnId"]])
-            usage = workers[active["turnId"]]["tokenUsage"]
-            for key in [
-                "threadTotalTokens",
-                "lastRequestModelContextWindow",
-                "lastRequestInputTokens",
-                "lastRequestCachedInputTokens",
-                "cacheHitPercent",
-                "lastModelUsageAtMs",
-                "cacheGuaranteedUntilMs",
-                "cacheGuaranteeActive",
-            ]:
-                self.assertIn(key, usage)
-            pending = [request for request in refreshed["pendingActions"] if request["threadId"] == question["threadId"]]
-            self.assertEqual(pending[0]["type"], "userInput")
-            self.assertTrue(pending[0]["blocking"])
-            self.assertEqual(opened["buildId"], refreshed["buildId"])
-            self.assertGreaterEqual(refreshed["capturedAtMs"], opened["capturedAtMs"])
-            self.client.call("workers.snapshot", {"threadId": active["threadId"]}, error=True, validate_input=False)
-            canonical = self.client.call("codex.inspect", {
-                "threadId": done["threadId"], "turnId": done["turnId"], "detail": "result", "textOffset": 0,
-            })
-            self.assertTrue(canonical["resultPage"]["selectionComplete"])
-            self.assertFalse(canonical["resultPage"]["hasMoreText"])
-            self.assertTrue(canonical["resultPage"]["text"])
-        finally:
-            for work in (active, question):
-                self.client.call("codex.act", {"action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"]})
 
     def test_dns_rebinding_validation_precedes_oversized_body_limit(self):
         server = urllib.parse.urlsplit(self.url)

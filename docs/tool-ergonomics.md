@@ -4,7 +4,7 @@
 
 From source baseline `4e757abf6e1c8021883f4b80d31b2fc58863f173`, the deterministic
 host tools use `host.inspect`, `host.apply_patch`, and `host.view_image`. Command,
-Codex, status, and Workers names stay unchanged. The old bare names are removed.
+Codex and status names stay unchanged. The old bare names are removed.
 Descriptions give purpose, selection guidance, and essential lifecycle rules;
 schema fields and the operations guide carry precise constraints. The consumed
 `codex.start` descriptor already exposes six explicit authority alternatives,
@@ -20,7 +20,7 @@ cannot continue at nonzero text offsets. Command continuations stop only when
 `drained=true` when an observation is available; failed observations return
 `output=null`/`readError` and require handle recovery without replaying acknowledged
 input. Completion alone establishes neither successful work nor output presence.
-No new App Server or relay lifecycle, panel behavior, transport, authorization, or
+No new App Server or relay lifecycle, transport, authorization, or
 budget mechanism is introduced; the relay retention fix below only preserves an
 existing history-loss boundary monotonically.
 
@@ -35,8 +35,8 @@ and package publication.
 
 ## Earlier call-count review
 
-Reviewed the complete catalog on 2026-10-01: 14 model-visible tools and the one
-app-only helper. The clean source baseline is commit
+The current catalog contains 13 operator tools. The earlier call-count review
+was conducted on 2026-10-01. Its clean source baseline is commit
 `26bf302f3fb8f273e021d3bbdd6d6c4ce2112a12`, created before modifications.
 
 ## Design target
@@ -69,8 +69,6 @@ retain Connect's explicit execution intent and authority boundaries.
 | `codex.inspect` | Keep semantic activity, raw retained events, and canonical result text as explicit modes. Existing cursor/text pagination and `selectionComplete` distinguish completeness from authority. Do not replace authoritative result retrieval with a local transcript cache. |
 | `codex.query` | Already batches independent model/skill/usage/thread/background-terminal discovery with per-query errors. Keep small actionable projections and existing pagination. No host CLI wrapper for Codex primitives. |
 | `codex.act` | Keep explicit action variants, expected-turn protection for steering, pending-request IDs, and batch archive/delete inputs. Preserve upstream errors. A generic batch of unrelated mutations would make partial completion and retries harder to reason about. |
-| `workers.open` | Already delivers the initial retained snapshot with the panel opener; no duplicate initial fetch. Keep the panel observational, context attachment explicit, and mutations model-only. |
-| `workers.snapshot` (app-only) | Keep explicit Refresh and shared retained observer projections. No browser polling, second worker lifecycle, or conversation ownership. |
 
 ## Concrete call savings
 
@@ -94,9 +92,9 @@ sets `output=null`, and reports `readError`. Recover by reading; do not replay
 acknowledged input. A lost transport response still requires state recovery.
 
 No compatibility alias, combined execution-mode tool, generic mutation batch,
-new lifecycle, or dependency is introduced. The public catalog remains the same
-size. The worker schema replaces conditional `allOf`/`if`/`then` rules with
-explicit object alternatives, making valid input choices visible to consumers.
+new lifecycle, or dependency is introduced. The public catalog contains 13
+operator tools. The worker schema replaces conditional `allOf`/`if`/`then` rules
+with explicit object alternatives, making valid input choices visible to consumers.
 Actual ChatGPT discovery/rendering must be verified after deployment/rescan.
 
 ## Invariants retained

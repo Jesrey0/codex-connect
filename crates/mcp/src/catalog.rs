@@ -4,7 +4,7 @@ use codex_connect_relay::{
     DEFAULT_COMMAND_READ_MS, DEFAULT_COMMAND_YIELD_MS, MAX_COMMAND_READ_MS,
     MAX_COMMAND_WRITE_BYTES, MAX_COMMAND_YIELD_MS,
 };
-use rmcp::model::{Icon, JsonObject, MetaObject, Tool, ToolAnnotations};
+use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -24,16 +24,6 @@ struct ToolMetadata {
 
 pub(super) fn tool_catalog() -> Vec<Tool> {
     vec![
-        tool(
-            meta("workers.open", "Workers", "Open the Workers panel to browse activity and results by cwd and attach context to ChatGPT. Actions stay with ChatGPT.", true, false, false, true),
-            empty_schema(),
-            Some(workers_snapshot_schema()),
-        ).with_icons(vec![Icon::new("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='currentColor' stroke-width='1.33'%3E%3Crect x='2' y='3' width='16' height='14' rx='2'/%3E%3Cpath d='M8 3v14M11 7h4M11 10h4M11 13h2'/%3E%3C/svg%3E").with_mime_type("image/svg+xml").with_sizes(vec!["any".into()])]),
-        tool(
-            meta("workers.snapshot", "Refresh Workers", "Read a fresh retained observer snapshot for the Workers panel. Informational only; does not wait for completion or open a new view.", true, false, false, true),
-            empty_schema(),
-            Some(workers_snapshot_schema()),
-        ),
         tool(
             meta(
                 "status",
@@ -285,8 +275,6 @@ fn tool_invocation_meta(name: &str) -> MetaObject {
             "Reading Codex Connect status…",
             "Codex Connect status ready",
         ),
-        "workers.open" => ("Opening Workers…", "Workers ready"),
-        "workers.snapshot" => ("Refreshing Workers…", "Workers refreshed"),
         "host.inspect" => ("Inspecting host workspace…", "Host workspace inspected"),
         "host.apply_patch" => ("Applying host patch…", "Host patch applied"),
         "command.start" => ("Starting host command…", "Host command started"),
@@ -302,20 +290,6 @@ fn tool_invocation_meta(name: &str) -> MetaObject {
         _ => ("Running Codex Connect tool…", "Codex Connect tool finished"),
     };
     let mut meta = MetaObject::new();
-    let visibility = match name {
-        "workers.snapshot" => json!(["app"]),
-        "codex.inspect" => json!(["model", "app"]),
-        _ => json!(["model"]),
-    };
-    meta.0
-        .insert("ui".into(), json!({"visibility": visibility}));
-    if name == "workers.open" {
-        meta.0.get_mut("ui").unwrap()["resourceUri"] = json!(super::workers::uri());
-        meta.0.insert(
-            "openai/ui".into(),
-            json!({"entrypoints": [{"type": "thread"}]}),
-        );
-    }
     meta.0.insert(
         "openai/toolInvocation/invoking".into(),
         Value::String(invoking.into()),
@@ -450,39 +424,6 @@ fn status_schema() -> Value {
             "codexRelease",
             "commands",
             "workers",
-        ],
-    )
-}
-fn workers_snapshot_schema() -> Value {
-    let mut worker = status_schema()["properties"]["workers"]["items"].clone();
-    worker["properties"]["cwd"] = json!({"type":["string","null"]});
-    for key in ["model", "effort"] {
-        worker["properties"][key] = json!({"type":["string","null"]});
-        worker["required"].as_array_mut().unwrap().push(json!(key));
-    }
-    worker["properties"]["transcriptRevision"] = json!({"type":"integer","minimum":0});
-    worker["properties"]["tokenUsage"] =
-        current_activity_schema()["properties"]["tokenUsage"].clone();
-    worker["required"]
-        .as_array_mut()
-        .unwrap()
-        .extend([json!("transcriptRevision"), json!("tokenUsage")]);
-    object_schema(
-        json!({
-            "ready":{"type":"boolean"}, "buildId":{"type":"string"},
-            "codexRelease":{"type":"string"}, "defaultCwd":{"type":"string"},
-            "capturedAtMs":{"type":"integer","minimum":0},
-            "workers":{"type":"array","items":worker},
-            "pendingActions":{"type":"array","items":pending_schema()}
-        }),
-        &[
-            "ready",
-            "buildId",
-            "codexRelease",
-            "defaultCwd",
-            "capturedAtMs",
-            "workers",
-            "pendingActions",
         ],
     )
 }
@@ -1664,8 +1605,6 @@ mod tests {
             "host.inspect",
             "status",
             "host.view_image",
-            "workers.open",
-            "workers.snapshot",
         ]
         .into_iter()
         .map(str::to_string)
@@ -1783,6 +1722,8 @@ mod tests {
                 assert!(message.chars().count() <= 64);
             }
             assert!(meta.get("securitySchemes").is_none());
+            assert!(meta.get("ui").is_none());
+            assert!(meta.get("openai/ui").is_none());
             assert!(
                 serde_json::to_vec(tool).unwrap().len() < 20_000,
                 "tool schema too large: {}",
