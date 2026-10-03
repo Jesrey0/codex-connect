@@ -785,13 +785,13 @@ fn codex_start_schema() -> Value {
         "mode":{"const":"work","description":"Start fresh work, resume a compatible workstream, or fork durable context."},
         "task":{"type":"string","minLength":1,"description":"Self-contained objective or next delta for the workstream."},
         "cwd":{"type":"string","minLength":1,"description":"Explicit working directory for fresh work."},
-        "threadId":{"type":"string","minLength":1,"description":"Resume a persisted work thread, inheriting its cwd, effort, and access. Cache age is advisory only."},
-        "forkFromThreadId":{"type":"string","minLength":1,"description":"Copy a source thread's durable context into a new workstream, inheriting its cwd, effort, and access."},
+        "threadId":{"type":"string","minLength":1,"description":"Resume a persisted work thread with upstream-restored settings. cwd and effort are inherited; additional write roots and access are not guaranteed after cold reload. Cache age is advisory only."},
+        "forkFromThreadId":{"type":"string","minLength":1,"description":"Copy a source thread's durable context into a new workstream with upstream-selected permissions. cwd and effort are inherited; additional write roots and access are not guaranteed."},
         "lastTurnId":{"type":"string","minLength":1,"description":"Optional source turn to fork through, inclusive."},
         "model":{"type":"string","minLength":1,"description":"Required on every start. Resume and fork must match the canonical thread model; discover IDs with codex.query."},
         "effort":{"type":"string","description":"Reasoning effort for fresh work; discover supported values with codex.query."},
         "access":{"type":"string","description":"Fresh workspace work permits workspace writes and network access; full grants unrestricted host access."},
-        "writableRoots":{"type":"array","items":{"type":"string","minLength":1},"description":"Additional absolute write directories for fresh workspace work. cwd stays primary. Omitted or [] adds no roots. App Server owns enforcement and persistence across reload/fork."}
+        "writableRoots":{"type":"array","items":{"type":"string","minLength":1},"description":"Additional absolute write directories for fresh workspace work. cwd stays primary. Omitted or [] adds no roots. App Server enforces these roots for fresh work; they are not guaranteed across cold reload or fork."}
     });
     let work_variant = |fields: &[&str], required: &[&str]| {
         let properties = fields
@@ -1429,6 +1429,7 @@ mod tests {
             assert!(variant.get("allOf").is_none());
             for hidden in [
                 "sandboxPolicy",
+                "runtimeWorkspaceRoots",
                 "developerInstructions",
                 "serviceTier",
                 "approvalPolicy",
@@ -1436,8 +1437,8 @@ mod tests {
                 assert!(properties.get(hidden).is_none(), "{hidden}");
             }
             if properties.contains_key("threadId") || properties.contains_key("forkFromThreadId") {
-                for inherited in ["cwd", "effort", "access", "writableRoots"] {
-                    assert!(properties.get(inherited).is_none(), "{inherited}");
+                for override_field in ["cwd", "effort", "access", "writableRoots"] {
+                    assert!(properties.get(override_field).is_none(), "{override_field}");
                 }
             } else {
                 assert!(
@@ -1455,6 +1456,12 @@ mod tests {
                 assert_eq!(properties["access"]["const"], "workspace");
                 assert_eq!(properties["access"]["default"], "workspace");
                 assert_eq!(roots["items"]["type"], "string");
+                assert!(
+                    roots["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("not guaranteed across cold reload or fork")
+                );
             }
         }
     }

@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use codex_connect_mcp::RuntimeStatus;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -220,10 +220,29 @@ async fn prepare_deployment_inner(operation_id: &str, source: &Path) -> Result<(
             ensure_executable(&candidate)?;
             Ok::<PathBuf, anyhow::Error>(candidate)
         })?;
-        let status = Command::new(cargo)
-            .current_dir(&source)
-            .env("CARGO_TARGET_DIR", &build_root)
-            .args(["build", "--release", "-p", "codex-connect", "--locked"])
+        let inputs = match crate::prepare_cache::fingerprint(&source, &cargo, &build_root) {
+            Ok(inputs) => Some(inputs),
+            Err(error) => {
+                eprintln!("Preparation reuse unavailable; building normally: {error}");
+                None
+            }
+        };
+        if let Some(inputs) = inputs.as_deref() {
+            match crate::prepare_cache::reuse(&build_root, inputs) {
+                Ok(Some(identity)) => {
+                    install_artifact(&identity.executable, &identity.sha256)?;
+                    return Ok(identity);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("Preparation receipt unavailable; building normally: {error}")
+                }
+            }
+        }
+        // Every unproven path discards the previous release outputs. Cargo must
+        // reconstruct them even when source size and timestamps are unchanged.
+        crate::prepare_cache::invalidate(&build_root)?;
+        let status = crate::prepare_cache::build_command(&cargo, &source, &build_root)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -234,6 +253,17 @@ async fn prepare_deployment_inner(operation_id: &str, source: &Path) -> Result<(
         let built = build_root.join("release/codex-connect");
         let identity = artifact::for_path(&built)?;
         install_artifact(&built, &identity.sha256)?;
+        if let Some(before) = inputs {
+            match crate::prepare_cache::fingerprint(&source, &cargo, &build_root) {
+                Ok(after) if after == before => {
+                    crate::prepare_cache::record(&build_root, after, &identity)?
+                }
+                Ok(_) => {
+                    eprintln!("Build inputs changed during preparation; reuse receipt not saved.")
+                }
+                Err(error) => eprintln!("Preparation reuse unavailable after build: {error}"),
+            }
+        }
         Ok(identity)
     })();
 

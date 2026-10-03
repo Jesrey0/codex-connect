@@ -4,6 +4,7 @@ mod console;
 mod deployment;
 mod management;
 mod paths;
+mod prepare_cache;
 mod service;
 use codex_connect_host::storage;
 

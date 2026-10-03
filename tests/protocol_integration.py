@@ -728,7 +728,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.method_params("command/exec/write")), writes_before + 1)
         self.client.call("command.control", {"action": "terminate", "processId": quiet["processId"]})
 
-    def test_codex_start_schema_matches_fresh_and_inherited_settings(self):
+    def test_codex_start_schema_matches_fresh_settings_and_upstream_restoration(self):
         schema = jsonschema.Draft202012Validator(self.client.tools["codex.start"]["inputSchema"])
         work = {"mode": "work", "task": "complete", "model": "fixture-model-1"}
         review = {"mode": "review", "target": {"type": "uncommittedChanges"}, "model": "fixture-model-1"}
@@ -748,10 +748,10 @@ class OperatorProtocolTests(unittest.TestCase):
                         {**work, "threadId": "canonical", "forkFromThreadId": "canonical"}]:
             with self.subTest(invalid=invalid):
                 self.assertFalse(schema.is_valid(invalid))
-        for inherited in ["threadId", "forkFromThreadId"]:
+        for restored in ["threadId", "forkFromThreadId"]:
             for override in [{"cwd": str(self.project)}, {"effort": "high"}, {"access": "full"}, {"writableRoots": []}]:
-                with self.subTest(inherited=inherited, override=override):
-                    self.assertFalse(schema.is_valid({**work, inherited: "canonical", **override}))
+                with self.subTest(restored=restored, override=override):
+                    self.assertFalse(schema.is_valid({**work, restored: "canonical", **override}))
         self.assertFalse(schema.is_valid({**review, "threadId": "canonical", "cwd": str(self.project)}))
 
     def test_persistent_read_timeout_exit_and_invalid_handle(self):
@@ -2063,7 +2063,10 @@ class OperatorProtocolTests(unittest.TestCase):
                 with self.subTest(arguments=arguments):
                     self.assertFalse(schema.is_valid(arguments))
                     result = self.client.call("codex.start", arguments, error=True, validate_input=False)
-                    self.assertIn("writableRoots", result["content"][0]["text"])
+                    message = result["content"][0]["text"]
+                    self.assertIn("writableRoots", message)
+                    if arguments["mode"] == "work" and ("threadId" in arguments or "forkFromThreadId" in arguments):
+                        self.assertIn("not guaranteed", message)
         for roots in ["/project", [123]]:
             result = self.client.call("codex.start", {**base, "writableRoots": roots}, error=True, validate_input=False)
             self.assertTrue(result["isError"])

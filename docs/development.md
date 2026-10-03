@@ -111,7 +111,7 @@ Worker instructions come from Codex config, AGENTS.md, and the delegated task. C
 
 Work uses `approvalPolicy="never"` with the selected workspace or full-access sandbox. Disabling prompts does not widen the sandbox. New reviews start read-only.
 
-Preserve thread identity for durable workstreams. Fresh work and review require explicit cwd and model. Every resume or fork supplies the canonical thread model, inherits cwd, and rejects cwd mutation. Work turns send canonical model and effort to App Server; effort and access remain inherited. Cache recency is advisory only: the 30-minute connector reuse hint informs the operator's choice but never gates resume or fork; persisted native threads remain recoverable and upstream errors stay authoritative. Start fresh when settings must change or independence itself is useful, especially for adversarial review. Reuse never substitutes for checking mutable host/runtime state. See [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching).
+Preserve thread identity for durable workstreams. Fresh work and review require explicit cwd and model. Every resume or fork supplies the canonical thread model, inherits cwd, and rejects cwd mutation. Work turns send canonical model and effort to App Server; upstream selects permissions on resume and fork. Cache recency is advisory only: the 30-minute connector reuse hint informs the operator's choice but never gates resume or fork; persisted native threads remain recoverable and upstream errors stay authoritative. Start fresh when settings must change or independence itself is useful, especially for adversarial review. Reuse never substitutes for checking mutable host/runtime state. See [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching).
 
 Preserve the [worker lifecycle and recovery contract](operations.md#worker-lifecycle). Starts complete independently of caller lifetime. Active turns remain retained until terminal and terminal state from events or authoritative reads must use the same reconciliation path. Events drive live state; reads hydrate existing state, reconcile history loss or wait expiry, and load one canonical terminal handoff capped at 10,240 characters. Keep persisted thread history intact; `codex.inspect` with `detail: "result"` searches App Server turn items newest-first with adaptive page sizing. Treat the result as authoritative only when `resultPage.selectionComplete` is true; a single item above the App Server transport limit leaves selection incomplete. Result text is paged in 10,240-character chunks, independent of relay journal retention. Raw detail is the relay notification journal and can be lost. Do not poll App Server for progress.
 
@@ -119,10 +119,12 @@ Each tool descriptor advertises OAuth scope `codex-connect:access`. Host ingress
 
 ### Writable-root persistence
 
-Connect forwards fresh workspace `writableRoots` unchanged through `turn/start.sandboxPolicy`, with network access enabled, and sends no sandbox override for resumed or forked work. Fixture lifecycle tests verify that Connect leaves the inherited policy alone; they do not prove upstream persistence or OS enforcement.
+Connect forwards fresh workspace `writableRoots` unchanged through `turn/start.sandboxPolicy`, with network access enabled, and sends no sandbox override for resumed or forked work. Fixture lifecycle tests verify that Connect sends no permission override; they do not prove upstream persistence or OS enforcement.
 
 Pinned Codex 0.160.0 has a separate persistence path for App Server's native
-`runtimeWorkspaceRoots`: `SessionConfiguration::thread_settings_snapshot`
+`runtimeWorkspaceRoots`, which replaces the workspace selection used to materialize
+symbolic `:workspace_roots` permission entries; it does not independently grant
+write authority. `SessionConfiguration::thread_settings_snapshot`
 records `runtime_workspace_roots`, and cold `thread/resume` restores the latest
 thread-owned `ThreadSettingsApplied` roots, falling back to startup
 `SessionMeta.runtime_workspace_roots`. App Server tests cover that restoration
@@ -137,9 +139,12 @@ resume restores the active permission-profile identity, not that unnamed concret
 policy. `thread/fork` likewise does not reconstruct it from the source thread.
 Loaded-thread defaults are distinct from cold restoration. Additional
 `writableRoots` therefore cannot be guaranteed across cold reload or fork from
-this interface alone. This is an upstream integration limitation, not evidence
-that Connect's wire forwarding failed. Connect does not add a policy store or
-parse raw rollout history to compensate for it.
+this interface alone; the fresh access selection has the same limitation. This is
+an upstream integration limitation, not evidence that Connect's wire forwarding failed. Connect does not add a policy store or
+parse raw rollout history to compensate for it. The authoritative paths are the
+pinned [session settings projection](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/core/src/session/session.rs),
+[resume/fork processor](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/app-server/src/request_processors/thread_processor.rs),
+and [persisted permission selection](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/app-server/src/request_processors/persisted_resume_settings.rs).
 
 ## MCP Events feature validation
 
@@ -172,6 +177,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --locked -p codex-connect
 python3 tests/protocol_integration.py
+python3 tests/deployment_prepare.py
 ```
 
 The protocol tests validate the exact catalog, App Server request/response schemas, server requests, streaming commands, worker authority mapping, and end-to-end lifecycle. Do not weaken a test or schema to accommodate an unpinned CLI.

@@ -1759,14 +1759,14 @@ impl Relay {
         }
         if thread_id.is_some() && (cwd.is_some() || effort.is_some() || sandbox_policy.is_some()) {
             return Err(RelayError::Invalid(
-                "resumed work rejects cwd, effort, access, and writableRoots overrides; start a fresh thread to change workstream settings".into(),
+                "resumed work rejects cwd, effort, access, and writableRoots overrides; upstream restores permissions, and additional write roots and access are not guaranteed after cold reload; start fresh to select them".into(),
             ));
         }
         if fork_from_thread_id.is_some()
             && (cwd.is_some() || effort.is_some() || sandbox_policy.is_some())
         {
             return Err(RelayError::Invalid(
-                "forked work rejects cwd, effort, access, and writableRoots overrides; settings come from its source thread".into(),
+                "forked work rejects cwd, effort, access, and writableRoots overrides; upstream selects permissions, and additional write roots and access are not guaranteed; start fresh to select them".into(),
             ));
         }
         if thread_id.is_none() && fork_from_thread_id.is_none() && cwd.is_none() {

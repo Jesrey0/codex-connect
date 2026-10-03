@@ -105,7 +105,7 @@ caller uncertain; check retained/authoritative state before retrying consequenti
 Treat a Codex thread as a durable workstream with advisory cache hints. Every `codex.start` call supplies a
 model. Fresh work and review also supply an explicit cwd. Resume and fork inherit the
 canonical cwd and reject a cwd argument; the supplied model must equal the canonical
-thread model. Workstream effort and access are inherited on resume and fork.
+thread model. Workstream effort is inherited on resume and fork; upstream selects permissions, and the fresh access selection is not guaranteed.
 
 Fresh work with `access: "workspace"` (or omitted access) accepts `writableRoots`,
 an array of absolute directory paths passed directly to App Server's workspace-write
@@ -125,11 +125,11 @@ access and upstream temporary-directory defaults remain enabled. For example:
 
 `writableRoots` is rejected with full access, review, resume, or fork, including an
 explicit empty list. Start a fresh workstream to select different roots. Connect
-does not override sandbox settings on resume or fork; upstream owns persistence.
+does not override sandbox settings on resume or fork; upstream selects permissions.
 Pinned Codex 0.160.0 restores its separate native `runtimeWorkspaceRoots` field
 on cold resume, but Connect's `writableRoots` are carried through legacy
 `sandboxPolicy` instead and are not covered by that restoration path. Do not
-rely on additional Connect write roots surviving a cold reload or fork. See the
+rely on additional Connect write roots or the fresh access selection surviving a cold reload or fork. See the
 [pinned persistence details](development.md#writable-root-persistence).
 
 Cache age never gates resume or fork: native thread identity, model, cwd, and
@@ -322,7 +322,26 @@ codex-connect deploy activate <operation-id>
 codex-connect deploy status <operation-id>
 ```
 
-`prepare` queues a detached release build and records a durable operation. Wait for `prepared`; `activate` queues the backend restart; the final `status` verifies the exact prepared artifact is live. The deployment build cache at `~/.cache/codex-connect/deploy/build` is a compiler cache, not runtime authority. Deployment does not restart ingress or rescan the ChatGPT plugin.
+`prepare` queues detached artifact preparation and records a durable operation.
+It reuses a SHA-256-verified binary when runtime/build input contents and the build
+environment match a successful build receipt. Documentation and Git-only changes
+outside those inputs require no release rebuild. Whenever reuse is not proven,
+preparation invalidates the receipt and the entire managed release output directory
+before an ordinary Cargo build. This includes dependency artifacts and Cargo
+fingerprints, so unchanged file sizes/timestamps cannot preserve stale bytes.
+Cleanup failures fail preparation before building. Wait for `prepared`;
+`activate` queues the backend restart; the final `status` verifies the exact
+prepared artifact is live.
+
+The cache at `~/.cache/codex-connect/deploy/build` contains compiler output and a
+private preparation receipt, not runtime authority. The receipt covers resolved
+Cargo package contents, manifests/lockfile, embedded inputs, Cargo configuration,
+compiler/toolchain inputs, and the effective build environment. Source paths and
+dirty file contents participate directly; branch names and commit IDs do not.
+Local build scripts and unsupported compiler/configuration settings disable reuse.
+New external includes need a stable before/after input check before caching;
+inputs that change during a build are not cached. Deployment does not restart
+ingress or rescan the ChatGPT plugin.
 
 Deployment records and managed unit files use the same durable atomic-write primitive. Deployment build, activation, and per-operation transitions use one file-lock mechanism with separate lock keys; these locks serialize local state changes but do not create a second runtime authority. Activation preflights the managed operator link before touching the backend, stages its replacement, and commits the service, operator link, and deployment record under the activation lock; a failed commit restores the previous link and service state, reporting any partial rollback explicitly.
 

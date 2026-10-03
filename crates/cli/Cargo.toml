@@ -27,3 +27,5 @@ tempfile.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+sha2 = "0.10"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }

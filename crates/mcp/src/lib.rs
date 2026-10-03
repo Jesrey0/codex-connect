@@ -889,7 +889,7 @@ fn work_sandbox_policy(
         WorkAccess::Full => {
             if writable_roots.is_some() {
                 anyhow::bail!(
-                    "writableRoots is only supported for fresh work with workspace access"
+                    "writableRoots is only supported for fresh work with workspace access; additional write roots are not guaranteed across cold reload or fork"
                 );
             }
             SandboxPolicy::DangerFullAccess

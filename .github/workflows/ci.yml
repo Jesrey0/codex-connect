@@ -49,3 +49,5 @@ jobs:
         run: cargo build --locked -p codex-connect
       - name: Run protocol integration suite
         run: python tests/protocol_integration.py
+      - name: Run deployment preparation suite
+        run: python tests/deployment_prepare.py

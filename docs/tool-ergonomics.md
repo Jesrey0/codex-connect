@@ -114,7 +114,7 @@ remain the acceptance criteria:
 6. Worker scope/delegation policy is unchanged; routine host work needs no worker.
 7. Source, commit, push, build, deployment, live identity, plugin discovery, and
    CI remain separately verified states.
-8. Resume/fork inherit canonical cwd, effort, and access. Model validation, advisory cache hints, and upstream root-persistence limitations remain.
+8. Resume/fork inherit canonical cwd and effort; upstream selects permissions without guaranteeing the fresh access selection. Model validation, advisory cache hints, and upstream root-persistence limitations remain.
 9. Output is bounded, retained, cursor-based, and event-driven. Observation
    timeout/caller loss does not establish process or worker failure.
 10. Loopback backend, independent ingress/OAuth, scope, and metadata stay intact.
