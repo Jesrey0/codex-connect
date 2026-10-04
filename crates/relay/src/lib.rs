@@ -341,6 +341,11 @@ impl ThreadUsageBaselines {
         }
         previous
     }
+
+    fn remove(&mut self, thread_id: &str) {
+        self.values.remove(thread_id);
+        self.recency.retain(|candidate| candidate != thread_id);
+    }
 }
 
 #[derive(Clone)]
@@ -426,9 +431,9 @@ fn turn_metadata(
 }
 
 impl LiveTurns {
-    fn has_active_thread(&self, thread_id: &str) -> bool {
+    fn has_active_delegated_thread(&self, thread_id: &str) -> bool {
         self.turns.iter().any(|((candidate, _), observed)| {
-            candidate == thread_id && !observed.turn.status.is_terminal()
+            candidate == thread_id && observed.mode.is_some() && !observed.turn.status.is_terminal()
         })
     }
 
@@ -804,6 +809,18 @@ impl LiveTurns {
         let key = (thread_id.to_string(), turn_id.to_string());
         self.turns.remove(&key);
         self.order.retain(|candidate| candidate != &key);
+    }
+
+    fn remove_thread(&mut self, thread_id: &str) -> bool {
+        let turns_before = self.turns.len();
+        let recent_before = self.recent.len();
+        self.turns
+            .retain(|(candidate, _), _| candidate != thread_id);
+        self.order.retain(|(candidate, _)| candidate != thread_id);
+        self.recent
+            .retain(|(candidate, _, _)| candidate != thread_id);
+        self.thread_token_usage_totals.remove(thread_id);
+        turns_before != self.turns.len() || recent_before != self.recent.len()
     }
 }
 
@@ -3014,7 +3031,12 @@ impl Relay {
     }
 
     async fn ensure_thread_not_active(&self, thread_id: &str) -> Result<(), RelayError> {
-        if self.live_turns.lock().await.has_active_thread(thread_id) {
+        if self
+            .live_turns
+            .lock()
+            .await
+            .has_active_delegated_thread(thread_id)
+        {
             return Err(RelayError::Invalid(format!(
                 "thread {thread_id} has an active delegated turn"
             )));
@@ -3081,7 +3103,18 @@ impl Relay {
                 })
                 .await
             {
-                Ok(_) => results.push(json!({"threadId":thread_id,"deleted":true})),
+                Ok(_) => {
+                    let changed = self.live_turns.lock().await.remove_thread(&thread_id);
+                    if changed {
+                        self.journal
+                            .push(
+                                "codexConnect/observerWorkerChanged",
+                                &json!({"threadId":thread_id.clone()}),
+                            )
+                            .await;
+                    }
+                    results.push(json!({"threadId":thread_id,"deleted":true}));
+                }
                 Err(error) => results.push(json!({"threadId":thread_id,"error":error.to_string()})),
             }
         }

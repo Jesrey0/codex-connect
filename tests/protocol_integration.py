@@ -1211,6 +1211,29 @@ class OperatorProtocolTests(unittest.TestCase):
             f"{review['threadId']}-review-auxiliary",
             [turn["turnId"] for turn in observer["projection"]["workers"]],
         )
+        archived = self.client.call("codex.act", {
+            "action": "setArchived",
+            "threadIds": [review["threadId"]],
+            "archived": True,
+        })
+        self.assertTrue(archived["results"][0].get("archived"))
+        restored = self.client.call("codex.act", {
+            "action": "setArchived",
+            "threadIds": [review["threadId"]],
+            "archived": False,
+        })
+        self.assertTrue(restored["results"][0].get("archived") is False)
+        deleted = self.client.call("codex.act", {
+            "action": "delete",
+            "threadIds": [review["threadId"]],
+        })
+        self.assertTrue(deleted["results"][0].get("deleted"))
+        with urllib.request.urlopen(self.url + "/observe") as response:
+            observer_after_delete = json.load(response)
+        self.assertNotIn(
+            review["threadId"],
+            [worker["threadId"] for worker in observer_after_delete["projection"]["workers"]],
+        )
 
     def test_wait_uses_paginated_turn_lookup(self):
         work = self.start("inflate_history")
