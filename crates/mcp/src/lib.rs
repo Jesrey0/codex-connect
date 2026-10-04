@@ -263,6 +263,7 @@ pub fn router(
                 }
             }),
         )
+        .layer(middleware::from_fn(enforce_local_http_boundary))
 }
 
 #[derive(Clone)]
@@ -280,9 +281,6 @@ async fn project_openai_tool_descriptors(
 ) -> Response {
     let is_mcp_post = request.method() == axum::http::Method::POST
         && matches!(request.uri().path(), "/mcp" | "/mcp/");
-    if is_mcp_post && let Err((status, message)) = validate_mcp_dns_rebinding_headers(&request) {
-        return mcp_header_error_response(status, message);
-    }
 
     let mut advertise_events = false;
     let response = if is_mcp_post {
@@ -403,10 +401,19 @@ async fn project_openai_tool_descriptors(
     Response::from_parts(parts, Body::from(projected))
 }
 
-// Keep this pre-body check aligned with StreamableHttpServerConfig above. RMCP performs the
-// same DNS-rebinding validation, but the request-aware tools/list split must validate headers
-// before reading a body that may exceed its size limit.
-fn validate_mcp_dns_rebinding_headers(request: &Request) -> Result<(), (StatusCode, &'static str)> {
+// Apply one DNS-rebinding boundary to every local HTTP surface, not only MCP POSTs. RMCP also
+// validates the MCP transport, but observer/runtime GETs can expose operator state and must reject
+// foreign Host/Origin values before their handlers run.
+async fn enforce_local_http_boundary(request: Request, next: Next) -> Response {
+    if let Err((status, message)) = validate_local_dns_rebinding_headers(&request) {
+        return mcp_header_error_response(status, message);
+    }
+    next.run(request).await
+}
+
+fn validate_local_dns_rebinding_headers(
+    request: &Request,
+) -> Result<(), (StatusCode, &'static str)> {
     let host = if let Some(value) = request.headers().get(header::HOST) {
         let value = value.to_str().map_err(|_| {
             (
@@ -2128,5 +2135,37 @@ mod tests {
         assert!(matches.len() < 1_000);
         assert_eq!(matches[0]["line"], 1);
         assert!(serde_json::to_vec(&bounded).unwrap().len() <= MAX_INSPECT_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn local_http_boundary_rejects_dns_rebinding_hosts_and_foreign_origins() {
+        let request = |host: &str, origin: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("GET")
+                .uri("/observe")
+                .header(header::HOST, host);
+            if let Some(origin) = origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+
+        assert!(validate_local_dns_rebinding_headers(&request("127.0.0.1:8767", None)).is_ok());
+        assert!(validate_local_dns_rebinding_headers(&request("localhost:8767", None)).is_ok());
+        assert!(validate_local_dns_rebinding_headers(&request("attacker.example", None)).is_err());
+        assert!(
+            validate_local_dns_rebinding_headers(&request(
+                "127.0.0.1:8767",
+                Some("https://attacker.example")
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_local_dns_rebinding_headers(&request(
+                "127.0.0.1:8767",
+                Some("https://chatgpt.com")
+            ))
+            .is_ok()
+        );
     }
 }
