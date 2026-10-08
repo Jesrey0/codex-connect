@@ -31,7 +31,7 @@ class DeploymentPrepareTests(unittest.TestCase):
         (self.package / "src").mkdir()
         (self.package / "src/main.rs").write_text("runtime bytes\n")
         (self.source / "config").mkdir()
-        (self.source / "config/codex-cli-pin").write_text("0.160.0\n")
+        (self.source / "config/codex-cli-pin").write_text((ROOT / "config/codex-cli-pin").read_text())
         (self.source / "docs").mkdir()
         (self.source / "docs/operations.md").write_text("docs\n")
         self.dependency = self.root / "path-dependency"

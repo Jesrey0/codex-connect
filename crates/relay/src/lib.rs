@@ -15,19 +15,19 @@ pub use actions::{
 use activity::{activity, compact_text};
 use base64::Engine;
 pub use codex_connect_app_server::APP_SERVER_LAUNCH_OVERRIDES;
-pub use codex_connect_app_server::protocol::{
-    ApprovalPolicy, CommandExec, CommandExecTerminalSize, ModelList, ReviewTarget, RpcId,
-    SandboxMode, SandboxPolicy,
-};
 use codex_connect_app_server::protocol::{
-    CommandExecOutputDeltaNotification, CommandExecResize, CommandExecTerminate, CommandExecWrite,
-    FsGetMetadata, FsGetMetadataResponse, FsReadDirectory, FsReadDirectoryResponse, FsReadFile,
-    FuzzyFileSearch, FuzzyFileSearchResponse, RateLimitsRead, ReviewStart, SkillsList,
-    SortDirection, StreamingCommandExec, TextInput, Thread, ThreadArchive,
+    AccountUsageRead, CommandExecOutputDeltaNotification, CommandExecResize, CommandExecTerminate,
+    CommandExecWrite, FsGetMetadata, FsGetMetadataResponse, FsReadDirectory,
+    FsReadDirectoryResponse, FsReadFile, FuzzyFileSearch, FuzzyFileSearchResponse, RateLimitsRead,
+    ReviewStart, SkillsList, SortDirection, StreamingCommandExec, TextInput, Thread, ThreadArchive,
     ThreadBackgroundTerminalsList, ThreadBackgroundTerminalsTerminate, ThreadDelete, ThreadFork,
     ThreadItemsList, ThreadItemsListResponse, ThreadList, ThreadRead, ThreadResume, ThreadSortKey,
     ThreadStart, ThreadTurnsList, ThreadUnarchive, ThreadUnsubscribe, TurnInterrupt, TurnItemsView,
     TurnStart, TurnSteer,
+};
+pub use codex_connect_app_server::protocol::{
+    ApprovalPolicy, CommandExec, CommandExecTerminalSize, ModelList, ReviewTarget, RpcId,
+    SandboxMode, SandboxPolicy,
 };
 use codex_connect_app_server::{
     AppServerClient, AppServerConfig, AppServerError, DEFAULT_REQUEST_TIMEOUT, DeferredRequest,
@@ -2987,6 +2987,49 @@ impl Relay {
     pub async fn thread_summary(&self, thread_id: String) -> Result<Value, RelayError> {
         let thread = self.read_thread_metadata(thread_id).await?;
         Ok(thread_summary(&thread))
+    }
+
+    pub async fn account_activity(&self) -> Result<Value, RelayError> {
+        Ok(serde_json::to_value(
+            self.app_server.request(AccountUsageRead {}).await?,
+        )?)
+    }
+
+    pub async fn turns(
+        &self,
+        thread_id: String,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Value, RelayError> {
+        if limit.is_some_and(|limit| limit == 0 || limit > CODEX_QUERY_PAGE_MAX) {
+            return Err(RelayError::Invalid(format!(
+                "turn query limit must be between 1 and {CODEX_QUERY_PAGE_MAX}"
+            )));
+        }
+        self.read_thread_metadata(thread_id.clone()).await?;
+        let response = self
+            .app_server
+            .request(ThreadTurnsList {
+                thread_id,
+                cursor,
+                limit: Some(limit.unwrap_or(CODEX_QUERY_PAGE_DEFAULT)),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::NotLoaded),
+            })
+            .await?;
+        let turns = response
+            .data
+            .into_iter()
+            .map(|turn| {
+                json!({
+                    "turnId":turn.id,
+                    "status":turn.status,
+                    "completedAt":turn.completed_at,
+                    "error":turn.error,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"turns":turns,"nextCursor":response.next_cursor}))
     }
 
     pub async fn background_terminals(

@@ -14,6 +14,7 @@ ARTIFACT = ROOT / "config/app-server-tool-schemas.json"
 METHODS = {
     "initialize": ("InitializeParams", "InitializeResponse"),
     "account/rateLimits/read": ("v2/GetAccountRateLimitsParams", "v2/GetAccountRateLimitsResponse"),
+    "account/usage/read": ("v2/GetAccountTokenUsageParams", "v2/GetAccountTokenUsageResponse"),
     "command/exec": ("v2/CommandExecParams", "v2/CommandExecResponse"),
     "command/exec/resize": ("v2/CommandExecResizeParams", "v2/CommandExecResizeResponse"),
     "command/exec/terminate": ("v2/CommandExecTerminateParams", "v2/CommandExecTerminateResponse"),

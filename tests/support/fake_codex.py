@@ -3,6 +3,7 @@
 
 import base64
 import copy
+import datetime
 import json
 import os
 import pathlib
@@ -646,7 +647,7 @@ for line in sys.stdin:
         elif scenario == "unsubscribe_error":
             unsubscribe_failures.add(thread_id)
             complete(thread_id, turn_id)
-        elif scenario == "background_terminal":
+        elif scenario in ("background_terminal", "background_terminals_paged"):
             background_terminals[thread_id] = [{
                 "itemId": "terminal-item-1",
                 "processId": "background-process-1",
@@ -656,6 +657,12 @@ for line in sys.stdin:
                 "cpuPercent": 1.5,
                 "rssKb": 2048,
             }]
+            if scenario == "background_terminals_paged":
+                background_terminals[thread_id] = [
+                    {**background_terminals[thread_id][0],
+                     "itemId": f"terminal-item-{index}", "processId": f"background-process-{index}"}
+                    for index in range(1, 4)
+                ]
             complete(thread_id, turn_id)
         elif scenario == "expire_thread":
             complete(thread_id, turn_id)
@@ -854,6 +861,35 @@ for line in sys.stdin:
             "score": 100,
             "indices": [0, 2],
         }] if candidate.is_file() else []
+    elif method == "account/usage/read":
+        assert "threadId" not in params, "account activity must stay account-wide"
+        result.update(
+            summary={
+                "currentStreakDays": 3,
+                "lifetimeTokens": 12000,
+                "longestRunningTurnSec": None,
+                "longestStreakDays": 7,
+                "peakDailyTokens": 8000,
+                "upstreamOnly": "omit summary internals",
+            },
+            dailyUsageBuckets=[
+                {"startDate": (datetime.datetime.now(datetime.timezone.utc).date()
+                               + datetime.timedelta(days=offset)).isoformat(),
+                 "tokens": tokens, "upstreamOnly": "omit bucket internals"}
+                for offset, tokens in [(-365, 1), (-364, 2), (-30, 3), (-29, 4),
+                                       (-10, 5), (-1, 4000), (0, 8000), (1, 6)]
+            ],
+            threadUsage={
+                "threadId": "upstream-thread",
+                "estimatedUsageCreditsMicros": 500,
+                "estimatedUsageUsdMicros": 100,
+                "groups": [],
+            },
+            upstreamOnly="omit account internals",
+        )
+        usage_override = os.environ.get("CODEX_CONNECT_FAKE_ACCOUNT_USAGE_FILE")
+        if usage_override and pathlib.Path(usage_override).exists():
+            result["dailyUsageBuckets"] = json.loads(pathlib.Path(usage_override).read_text())
     elif method == "account/rateLimits/read":
         result.update(
             accountId="fixture-account",

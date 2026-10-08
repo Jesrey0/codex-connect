@@ -5,6 +5,7 @@ Run after cargo build -p codex-connect. Requires Python jsonschema.
 """
 
 import base64
+import datetime
 import http.client
 import json
 import os
@@ -44,6 +45,7 @@ class OperatorProtocolTests(unittest.TestCase):
         cls.project = cls.workspace / "project"
         cls.project.mkdir()
         cls.coverage_path = cls.workspace / "fake-app-server-coverage.jsonl"
+        cls.account_usage_path = cls.workspace / "fake-account-usage.json"
         (cls.project / "local.txt").write_text("project-local\n")
         (cls.project / "pixel.png").write_bytes(base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
@@ -59,6 +61,7 @@ class OperatorProtocolTests(unittest.TestCase):
         ], stdout=cls.log, stderr=cls.log, env={
             **os.environ,
             "CODEX_CONNECT_FAKE_COVERAGE_FILE": str(cls.coverage_path),
+            "CODEX_CONNECT_FAKE_ACCOUNT_USAGE_FILE": str(cls.account_usage_path),
             "XDG_STATE_HOME": str(cls.workspace / "state"),
         })
         try:
@@ -1664,6 +1667,212 @@ class OperatorProtocolTests(unittest.TestCase):
             validate_input=False,
         )
 
+    def test_account_activity_is_account_wide_and_separate_from_rate_limits(self):
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        reads_before = len(self.method_params("thread/read"))
+        info = self.client.call("codex.query", {"queries": [
+            {"type": "accountActivity"}, {"type": "usage"},
+        ]})
+        self.assertEqual([row["type"] for row in info["results"]], ["accountActivity", "usage"])
+        self.assertEqual(self.method_params("account/usage/read")[-1], {})
+        self.assertEqual(len(self.method_params("thread/read")), reads_before)
+        self.assertEqual(info["results"][0]["result"], {
+            "summary": {
+                "currentStreakDays": 3, "lifetimeTokens": 12000,
+                "longestRunningTurnSec": None, "longestStreakDays": 7,
+                "peakDailyTokens": 8000,
+            },
+            "dailyUsageBuckets": [
+                {"startDate": (today + datetime.timedelta(days=offset)).isoformat(), "tokens": tokens}
+                for offset, tokens in [(-29, 4), (-10, 5), (-1, 4000), (0, 8000)]
+            ],
+        })
+        self.assertEqual(info["results"][1]["result"]["primary"]["usedPercent"], 100)
+        self.client.call("codex.query", {"queries": [
+            {"type": "accountActivity", "threadId": "thread-unapproved"},
+        ]}, error=True, validate_input=False)
+
+    def test_account_activity_recent_calendar_window_summary_only_and_null(self):
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        rows = self.client.call("codex.query", {"queries": [
+            {"type": "accountActivity", "historyDays": days} for days in [0, 1, 2, 30, 365]
+        ]})["results"]
+        offsets = [[], [(0, 8000)], [(-1, 4000), (0, 8000)],
+                   [(-29, 4), (-10, 5), (-1, 4000), (0, 8000)],
+                   [(-364, 2), (-30, 3), (-29, 4), (-10, 5), (-1, 4000), (0, 8000)]]
+        for index, (row, buckets) in enumerate(zip(rows, offsets)):
+            self.assertEqual(row["index"], index)
+            self.assertEqual(row["result"]["summary"], rows[0]["result"]["summary"])
+            self.assertEqual(row["result"]["dailyUsageBuckets"], [
+                {"startDate": (today + datetime.timedelta(days=offset)).isoformat(), "tokens": tokens}
+                for offset, tokens in buckets
+            ])
+        self.account_usage_path.write_text("null")
+        try:
+            rows = self.client.call("codex.query", {"queries": [
+                {"type": "accountActivity", "historyDays": days} for days in [0, 30, 365]
+            ]})["results"]
+            self.assertTrue(all(row["result"]["dailyUsageBuckets"] is None for row in rows))
+            self.assertTrue(all(row["result"]["summary"] == rows[0]["result"]["summary"] for row in rows))
+        finally:
+            self.account_usage_path.unlink()
+        reads_before = len(self.method_params("account/usage/read"))
+        for days in [-1, 366, 1.5, "30", None]:
+            self.client.call("codex.query", {"queries": [
+                {"type": "accountActivity"}, {"type": "accountActivity", "historyDays": days},
+            ]}, error=True, validate_input=False)
+        self.assertEqual(len(self.method_params("account/usage/read")), reads_before)
+
+    def test_query_pagination_continuations_preserve_queries_and_batched_errors(self):
+        with tempfile.TemporaryDirectory(dir=self.workspace) as cwd:
+            work = self.start("inflate_history", cwd=cwd)
+            terminals = self.start("background_terminals_paged", cwd=cwd)
+            self.assertEqual(self.wait(work)["state"], "terminal")
+            self.assertEqual(self.wait(terminals)["state"], "terminal")
+            queries = [
+                {"type": "threads", "cwd": cwd, "searchTerm": "fixture", "archived": False,
+                 "cursor": "0", "limit": 1},
+                {"type": "turns", "threadId": "thread-does-not-exist"},
+                {"type": "turns", "threadId": work["threadId"], "limit": 50},
+                {"type": "backgroundTerminals", "threadId": terminals["threadId"],
+                 "cursor": "0", "limit": 2},
+            ]
+            methods = ["thread/list", "thread/turns/list", "thread/backgroundTerminals/list"]
+            before = {method: len(self.method_params(method)) for method in methods}
+            rows = self.client.call("codex.query", {"queries": queries})["results"]
+            self.assertEqual([row["index"] for row in rows], list(range(4)))
+            self.assertEqual(set(rows[1]), {"index", "type", "error"})
+            self.assertIn("thread not found", rows[1]["error"])
+            for method in methods:
+                self.assertEqual(len(self.method_params(method)), before[method] + 1)
+            for index, collection in [(0, "threads"), (2, "turns"), (3, "terminals")]:
+                row = rows[index]
+                continued = {**queries[index], "cursor": row["result"]["nextCursor"]}
+                self.assertEqual(row["nextCall"], {
+                    "tool": "codex.query", "arguments": {"queries": [continued]},
+                })
+                next_row = self.follow_next_call(row["nextCall"])["results"][0]
+                self.assertEqual(next_row["index"], 0)
+                self.assertEqual(next_row["type"], row["type"])
+                self.assertTrue(next_row["result"][collection])
+                self.assertIsNone(next_row["result"]["nextCursor"])
+                self.assertIsNone(next_row["nextCall"])
+            empty = self.client.call("codex.query", {"queries": [{
+                **queries[0], "cursor": "2",
+            }]})["results"][0]
+            self.assertEqual(empty["result"]["threads"], [])
+            self.assertIsNone(empty["nextCall"])
+
+    def test_turns_query_pages_durable_summaries_newest_first(self):
+        work = self.start("inflate_history")
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        reads_before = len(self.method_params("thread/read"))
+        items_before = len(self.method_params("thread/items/list"))
+        turns_before = len(self.method_params("thread/turns/list"))
+        page = self.client.call("codex.query", {"queries": [{
+            "type": "turns", "threadId": work["threadId"],
+        }]})["results"][0]["result"]
+        self.assertEqual(len(self.method_params("thread/turns/list")), turns_before + 1)
+        self.assertEqual(len(self.method_params("thread/read")), reads_before + 1)
+        self.assertEqual(self.method_params("thread/read")[-1], {
+            "threadId": work["threadId"], "includeTurns": False,
+        })
+        self.assertEqual(self.method_params("thread/turns/list")[-1], {
+            "threadId": work["threadId"], "limit": 25,
+            "sortDirection": "desc", "itemsView": "notLoaded",
+        })
+        self.assertEqual(set(page), {"turns", "nextCursor"})
+        self.assertEqual(page["nextCursor"], "25")
+        self.assertEqual([turn["turnId"] for turn in page["turns"]], [
+            f'{work["threadId"]}-filler-{index}' for index in range(59, 34, -1)
+        ])
+        for turn in page["turns"]:
+            self.assertEqual(set(turn), {"turnId", "status", "completedAt", "error"})
+            self.assertEqual(turn["status"], "completed")
+            self.assertIsNone(turn["completedAt"])
+            self.assertIsNone(turn["error"])
+        last = self.client.call("codex.query", {"queries": [{
+            "type": "turns", "threadId": work["threadId"],
+            "cursor": page["nextCursor"], "limit": 50,
+        }]})["results"][0]["result"]
+        self.assertEqual(self.method_params("thread/turns/list")[-1]["cursor"], "25")
+        self.assertEqual(self.method_params("thread/turns/list")[-1]["limit"], 50)
+        self.assertEqual(len(last["turns"]), 36)
+        self.assertIsNone(last["nextCursor"])
+        self.assertEqual(last["turns"][-1]["turnId"], work["turnId"])
+        self.assertIsInstance(last["turns"][-1]["completedAt"], int)
+        empty = self.client.call("codex.query", {"queries": [{
+            "type": "turns", "threadId": work["threadId"], "cursor": "61",
+        }]})["results"][0]["result"]
+        self.assertEqual(empty, {"turns": [], "nextCursor": None})
+        self.assertEqual(len(self.method_params("thread/items/list")), items_before)
+
+    def test_turns_query_preserves_active_failed_and_interrupted_states(self):
+        work = self.start("idle")
+        query = {"queries": [{"type": "turns", "threadId": work["threadId"]}]}
+        active = self.client.call("codex.query", query)["results"][0]["result"]["turns"][0]
+        self.assertEqual(active, {
+            "turnId": work["turnId"], "status": "inProgress", "completedAt": None, "error": None,
+        })
+        self.client.call("codex.act", {
+            "action": "interrupt", "threadId": work["threadId"], "turnId": work["turnId"],
+        })
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        interrupted = self.client.call("codex.query", query)["results"][0]["result"]["turns"][0]
+        self.assertEqual(interrupted["status"], "interrupted")
+        self.assertIsInstance(interrupted["completedAt"], int)
+        source = self.start("complete")
+        self.assertEqual(self.wait(source)["state"], "terminal")
+        review = self.codex_start({
+            "mode": "review", "threadId": source["threadId"],
+            "target": {"type": "custom", "instructions": "delayed_visibility"},
+        })
+        self.assertEqual(self.wait(review)["state"], "terminal")
+        # The fixture publishes the failed review's durable history after its notification.
+        deadline = time.monotonic() + 2
+        while True:
+            turns = self.client.call("codex.query", {"queries": [{
+                "type": "turns", "threadId": source["threadId"],
+            }]})["results"][0]["result"]["turns"]
+            if turns[0]["turnId"] == review["turnId"] or time.monotonic() >= deadline:
+                break
+            time.sleep(0.025)
+        self.assertEqual(turns[0]["status"], "failed")
+        self.assertEqual(turns[0]["error"], {
+            "message": "quota exhausted", "codexErrorInfo": "usageLimitExceeded",
+        })
+
+    def test_turns_query_validates_inputs_and_thread_path_before_listing(self):
+        work = self.start("complete")
+        self.assertEqual(self.wait(work)["state"], "terminal")
+        turns_before = len(self.method_params("thread/turns/list"))
+        for query in [
+            {"type": "turns"},
+            {"type": "turns", "threadId": work["threadId"], "itemsView": "full"},
+        ]:
+            self.client.call("codex.query", {"queries": [query]}, error=True, validate_input=False)
+        for limit in [0, 51]:
+            result = self.client.call("codex.query", {"queries": [{
+                "type": "turns", "threadId": work["threadId"], "limit": limit,
+            }]}, validate_input=False)["results"][0]
+            self.assertIn("limit must be between 1 and 50", result["error"])
+        missing = self.client.call("codex.query", {"queries": [
+            {"type": "turns", "threadId": "thread-does-not-exist"},
+            {"type": "accountActivity"},
+        ]})["results"]
+        self.assertIn("thread not found", missing[0]["error"])
+        self.assertIn("summary", missing[1]["result"])
+        self.assertEqual(len(self.method_params("thread/turns/list")), turns_before)
+        with tempfile.TemporaryDirectory(dir=self.workspace) as cwd:
+            gone = self.start("complete", cwd=cwd)
+            self.assertEqual(self.wait(gone)["state"], "terminal")
+        turns_before = len(self.method_params("thread/turns/list"))
+        invalid_path = self.client.call("codex.query", {"queries": [{
+            "type": "turns", "threadId": gone["threadId"],
+        }]})["results"][0]
+        self.assertIn("error", invalid_path)
+        self.assertEqual(len(self.method_params("thread/turns/list")), turns_before)
+
     def test_persisted_thread_query_archive_unarchive_and_delete(self):
         first = self.start("complete")
         second = self.start("complete")
@@ -2198,7 +2407,7 @@ class OperatorProtocolTests(unittest.TestCase):
         self.assertEqual(self.wait(elicitation)["state"], "terminal")
 
         self.client.call("codex.query", {"queries":[
-            {"type":"models"}, {"type":"skills"}, {"type":"usage"},
+            {"type":"models"}, {"type":"skills"}, {"type":"usage"}, {"type":"accountActivity"},
         ]})
 
         observed = {"method": set(), "serverRequest": set(), "notification": set()}

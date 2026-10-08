@@ -77,7 +77,7 @@ Each tool descriptor advertises OAuth scope `codex-connect:access`. Host ingress
 
 Connect forwards fresh workspace `writableRoots` unchanged through `turn/start.sandboxPolicy`, with network access enabled, and sends no sandbox override for resumed or forked work. Fixture lifecycle tests verify that Connect sends no permission override; they do not prove upstream persistence or OS enforcement.
 
-Pinned Codex 0.160.0 has a separate persistence path for App Server's native
+Pinned Codex 0.160.1 has a separate persistence path for App Server's native
 `runtimeWorkspaceRoots`, which replaces the workspace selection used to materialize
 symbolic `:workspace_roots` permission entries; it does not independently grant
 write authority. `SessionConfiguration::thread_settings_snapshot`
@@ -88,7 +88,7 @@ and foreign-path validation.
 
 That path does **not** establish persistence for Connect's `writableRoots`.
 Connect supplies those paths through the legacy
-`turn/start.sandboxPolicy.writableRoots` field. In pinned 0.160.0,
+`turn/start.sandboxPolicy.writableRoots` field. In pinned 0.160.1,
 `SessionConfiguration::apply` projects such a sandbox override into an unnamed
 legacy permission profile without updating `runtime_workspace_roots`. Cold
 resume restores the active permission-profile identity, not that unnamed concrete
@@ -98,9 +98,9 @@ Loaded-thread defaults are distinct from cold restoration. Additional
 this interface alone; the fresh access selection has the same limitation. This is
 an upstream integration limitation, not evidence that Connect's wire forwarding failed. Connect does not add a policy store or
 parse raw rollout history to compensate for it. The authoritative paths are the
-pinned [session settings projection](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/core/src/session/session.rs),
-[resume/fork processor](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/app-server/src/request_processors/thread_processor.rs),
-and [persisted permission selection](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/app-server/src/request_processors/persisted_resume_settings.rs).
+pinned [session settings projection](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/core/src/session/session.rs),
+[resume/fork processor](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/app-server/src/request_processors/thread_processor.rs),
+and [persisted permission selection](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/app-server/src/request_processors/persisted_resume_settings.rs).
 
 ## MCP Events feature validation
 

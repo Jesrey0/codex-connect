@@ -6,6 +6,7 @@ Notable project-level changes remain under `Unreleased` until Codex Connect has 
 
 ### Changed
 
+- Aligned the pinned Codex CLI/App Server contract with 0.160.1; the protocol subset used by Connect is unchanged from 0.160.0.
 - Account-plugin sources and 0x0perator skills moved out of this backend repository to the neutral user-root `~/plugins/0x0perator/` source tree; Codex Connect now owns backend/runtime code only.
 - Persistent command start and stdin write return a retained output/exit observation in the same call, with a bounded yield that never stops execution.
 - `codex.start` now advertises explicit fresh/resumed/forked input variants that match the existing inherited-setting rules.

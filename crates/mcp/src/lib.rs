@@ -976,6 +976,13 @@ enum CodexQuery {
         cwds: Vec<String>,
     },
     Usage,
+    AccountActivity {
+        #[serde(
+            default = "default_history_days",
+            deserialize_with = "deserialize_history_days"
+        )]
+        history_days: u16,
+    },
     Threads {
         cursor: Option<String>,
         limit: Option<u32>,
@@ -986,11 +993,81 @@ enum CodexQuery {
     Thread {
         thread_id: String,
     },
+    Turns {
+        thread_id: String,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    },
     BackgroundTerminals {
         thread_id: String,
         cursor: Option<String>,
         limit: Option<u32>,
     },
+}
+
+fn default_history_days() -> u16 {
+    30
+}
+
+fn deserialize_history_days<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u16, D::Error> {
+    let days = u16::deserialize(deserializer)?;
+    if days > 365 {
+        return Err(serde::de::Error::custom(
+            "historyDays must be between 0 and 365",
+        ));
+    }
+    Ok(days)
+}
+
+fn bound_account_history(
+    value: &mut Value,
+    history_days: u16,
+    today: chrono::NaiveDate,
+) -> Result<(), codex_connect_relay::RelayError> {
+    use codex_connect_relay::RelayError;
+
+    let buckets = match &mut value["dailyUsageBuckets"] {
+        Value::Null => return Ok(()),
+        Value::Array(buckets) => buckets,
+        _ => {
+            return Err(RelayError::Invalid(
+                "invalid dailyUsageBuckets response".into(),
+            ));
+        }
+    };
+    if history_days == 0 {
+        buckets.clear();
+        return Ok(());
+    }
+    let first_day = today - chrono::Days::new(u64::from(history_days - 1));
+    let mut recent = Vec::new();
+    for bucket in buckets.iter() {
+        let date = bucket["startDate"]
+            .as_str()
+            .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+            .ok_or_else(|| RelayError::Invalid("invalid daily usage bucket startDate".into()))?;
+        if (first_day..=today).contains(&date) {
+            recent.push(bucket.clone());
+        }
+    }
+    *buckets = recent;
+    Ok(())
+}
+
+fn query_success_row(index: usize, kind: &str, value: Value, mut original_query: Value) -> Value {
+    let mut row = json!({"index":index,"type":kind,"result":value});
+    if matches!(kind, "threads" | "turns" | "backgroundTerminals") {
+        row["nextCall"] = match row["result"]["nextCursor"].as_str() {
+            Some(cursor) => {
+                original_query["cursor"] = json!(cursor);
+                json!({"tool":"codex.query", "arguments":{"queries":[original_query]}})
+            }
+            None => Value::Null,
+        };
+    }
+    row
 }
 
 async fn dispatch(
@@ -1224,6 +1301,7 @@ async fn dispatch(
             ),
         },
         "codex.query" => {
+            let original_arguments = Value::Object(arguments.clone());
             let a: CodexQueryArgs = parse(arguments)?;
             if a.queries.is_empty() || a.queries.len() > 10 {
                 anyhow::bail!("codex.query queries must contain 1..=10 items");
@@ -1232,6 +1310,7 @@ async fn dispatch(
             let mut pending = tokio::task::JoinSet::new();
             for (index, query) in a.queries.into_iter().enumerate() {
                 let relay = relay.clone();
+                let original_query = original_arguments["queries"][index].clone();
                 pending.spawn(async move {
                     let (kind, result) = match query {
                         CodexQuery::Models => ("models", relay.model_list().await),
@@ -1239,6 +1318,18 @@ async fn dispatch(
                             ("skills", relay.skills_list(cwds, false).await)
                         }
                         CodexQuery::Usage => ("usage", relay.usage().await),
+                        CodexQuery::AccountActivity { history_days } => {
+                            let result = match relay.account_activity().await {
+                                Ok(mut value) => bound_account_history(
+                                    &mut value,
+                                    history_days,
+                                    chrono::Utc::now().date_naive(),
+                                )
+                                .map(|()| value),
+                                Err(error) => Err(error),
+                            };
+                            ("accountActivity", result)
+                        }
                         CodexQuery::Threads {
                             cursor,
                             limit,
@@ -1254,6 +1345,11 @@ async fn dispatch(
                         CodexQuery::Thread { thread_id } => {
                             ("thread", relay.thread_summary(thread_id).await)
                         }
+                        CodexQuery::Turns {
+                            thread_id,
+                            cursor,
+                            limit,
+                        } => ("turns", relay.turns(thread_id, cursor, limit).await),
                         CodexQuery::BackgroundTerminals {
                             thread_id,
                             cursor,
@@ -1264,7 +1360,7 @@ async fn dispatch(
                         ),
                     };
                     let entry = match result {
-                        Ok(value) => json!({"index":index,"type":kind,"result":value}),
+                        Ok(value) => query_success_row(index, kind, value, original_query),
                         Err(error) => json!({"index":index,"type":kind,"error":error.to_string()}),
                     };
                     (index, entry)
@@ -1987,6 +2083,127 @@ async fn image_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_history_input_defaults_and_bounds() {
+        let CodexQuery::AccountActivity { history_days } =
+            serde_json::from_value(json!({"type":"accountActivity"})).unwrap()
+        else {
+            panic!("expected account activity")
+        };
+        assert_eq!(history_days, 30);
+        for days in [json!(0), json!(365)] {
+            assert!(
+                serde_json::from_value::<CodexQuery>(json!({
+                    "type":"accountActivity", "historyDays":days
+                }))
+                .is_ok()
+            );
+        }
+        for days in [json!(-1), json!(366), json!(1.5), json!("30"), Value::Null] {
+            assert!(
+                serde_json::from_value::<CodexQuery>(json!({
+                    "type":"accountActivity", "historyDays":days
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn account_history_uses_calendar_days_and_preserves_summary_and_null() {
+        let today = chrono::NaiveDate::from_ymd_opt(2024, 3, 1).unwrap();
+        let source = json!({"summary":{"lifetimeTokens":999,"currentStreakDays":null},
+        "dailyUsageBuckets":[
+            {"startDate":"2024-03-02","tokens":99},
+            {"startDate":"2024-03-01","tokens":1},
+            {"startDate":"2024-02-29","tokens":2},
+            {"startDate":"2024-02-27","tokens":3},
+            {"startDate":"2023-03-03","tokens":4},
+            {"startDate":"2023-03-02","tokens":5}
+        ]});
+        for (days, tokens) in [
+            (0, vec![]),
+            (1, vec![1]),
+            (3, vec![1, 2]),
+            (4, vec![1, 2, 3]),
+            (365, vec![1, 2, 3, 4]),
+        ] {
+            let mut value = source.clone();
+            bound_account_history(&mut value, days, today).unwrap();
+            assert_eq!(value["summary"], source["summary"]);
+            assert_eq!(
+                value["dailyUsageBuckets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|bucket| bucket["tokens"].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                tokens
+            );
+        }
+        for days in [0, 30, 365] {
+            let mut value = json!({"summary":source["summary"],"dailyUsageBuckets":null});
+            let original = value.clone();
+            bound_account_history(&mut value, days, today).unwrap();
+            assert_eq!(value, original);
+        }
+        let mut invalid =
+            json!({"summary":{},"dailyUsageBuckets":[{"startDate":"invalid","tokens":1}]});
+        assert!(bound_account_history(&mut invalid, 30, today).is_err());
+    }
+
+    #[test]
+    fn query_pagination_preserves_original_fields_and_only_changes_cursor() {
+        for query in [
+            json!({"type":"threads", "cursor":"old", "limit":1,
+                "archived":false,"cwd":"/workspace","searchTerm":"exact"}),
+            json!({"type":"turns","threadId":"thread"}),
+            json!({"type":"backgroundTerminals","threadId":"thread","cursor":"old","limit":50}),
+        ] {
+            let kind = query["type"].as_str().unwrap();
+            for cursor in [json!("next"), json!(""), Value::Null] {
+                let result = json!({"nextCursor":cursor});
+                let row = query_success_row(3, kind, result.clone(), query.clone());
+                assert_eq!(row["index"], 3);
+                assert_eq!(row["result"], result);
+                let expected = if cursor.is_null() {
+                    Value::Null
+                } else {
+                    let mut continued = query.clone();
+                    continued["cursor"] = cursor;
+                    json!({"tool":"codex.query","arguments":{"queries":[continued]}})
+                };
+                assert_eq!(row["nextCall"], expected);
+            }
+        }
+        let row = query_success_row(0, "usage", json!({}), json!({"type":"usage"}));
+        assert!(row.get("nextCall").is_none());
+    }
+
+    #[test]
+    fn account_activity_and_turns_queries_reject_unapproved_inputs() {
+        assert!(serde_json::from_value::<CodexQuery>(json!({"type":"accountActivity"})).is_ok());
+        assert!(
+            serde_json::from_value::<CodexQuery>(json!({
+                "type":"accountActivity", "threadId":"thread"
+            }))
+            .is_err()
+        );
+        assert!(serde_json::from_value::<CodexQuery>(json!({"type":"turns"})).is_err());
+        assert!(
+            serde_json::from_value::<CodexQuery>(json!({
+                "type":"turns", "threadId":"thread", "cursor":"next", "limit":25
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<CodexQuery>(json!({
+                "type":"turns", "threadId":"thread", "itemsView":"full"
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn continuation_projection_preserves_acknowledged_mutations_and_read_errors() {

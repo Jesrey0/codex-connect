@@ -24,6 +24,20 @@ No new App Server or relay lifecycle, transport, authorization, or
 budget mechanism is introduced; the relay retention fix below only preserves an
 existing history-loss boundary monotonically.
 
+Successful `codex.query` rows for `threads`, `turns`, and `backgroundTerminals`
+expose a row-level `nextCall`. It invokes `codex.query` with just the original
+query, preserving every filter, limit, and thread ID and replacing only `cursor`
+with the native `nextCursor`. It is `null` when no page remains. Continuations
+are read-only descriptions; Connect does not execute them or poll automatically.
+Batch indices and per-query error rows remain unchanged.
+
+`accountActivity.historyDays` defaults to 30 and accepts integers from 0 through
+365. The account summary is unchanged. History includes only buckets dated within
+that many calendar days ending today in UTC, including today; sparse activity
+does not extend the window into older days, and future buckets are excluded.
+Zero returns an empty history array for summary-only reads; upstream `null`
+history stays `null`. Invalid inputs are rejected before any upstream request.
+
 The pagination protocol test fills the retained journal and exposed an existing
 history-loss defect: eviction could overwrite a newer transport gap with an older
 cursor. The journal now keeps that boundary monotonic, so semantic/raw continuation
@@ -140,7 +154,7 @@ tests, pinned schema generation check, formatting, diff hygiene, strict Clippy,
 and the locked CLI build. Schema validation used the existing Linux Codex
 0.159.0 binary through an isolated command PATH; the desktop shell's 0.159.2
 binary and the project pin were not changed. This verification record predates
-the current 0.160.0 pin; re-run the gate under the current pin before treating
+the current 0.160.1 pin; re-run the gate under the current pin before treating
 it as current acceptance.
 
 Regression coverage checks combined PTY start/write/close, zero-yield continued

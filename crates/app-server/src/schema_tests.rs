@@ -85,6 +85,60 @@ fn turn_pagination_matches_the_pinned_wire_shape() {
 }
 
 #[test]
+fn account_activity_matches_the_pin_and_omits_unapproved_upstream_fields() {
+    assert_eq!(AccountUsageRead::METHOD, "account/usage/read");
+    assert_eq!(
+        serde_json::to_value(AccountUsageRead {}).unwrap(),
+        json!({})
+    );
+    let response: AccountUsageReadResponse = serde_json::from_value(json!({
+        "summary":{
+            "currentStreakDays":3,
+            "lifetimeTokens":12000,
+            "longestRunningTurnSec":null,
+            "longestStreakDays":7,
+            "peakDailyTokens":8000,
+            "upstreamOnly":"private"
+        },
+        "dailyUsageBuckets":[{"startDate":"2026-10-08","tokens":8000,"upstreamOnly":"private"}],
+        "threadUsage":{"threadId":"private"},
+        "upstreamOnly":"private"
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(response).unwrap(),
+        json!({
+            "summary":{
+                "currentStreakDays":3,
+                "lifetimeTokens":12000,
+                "longestRunningTurnSec":null,
+                "longestStreakDays":7,
+                "peakDailyTokens":8000
+            },
+            "dailyUsageBuckets":[{"startDate":"2026-10-08","tokens":8000}]
+        })
+    );
+    let empty: AccountUsageReadResponse = serde_json::from_value(json!({"summary":{}})).unwrap();
+    let empty = serde_json::to_value(empty).unwrap();
+    assert!(empty["dailyUsageBuckets"].is_null());
+    assert!(
+        empty["summary"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(Value::is_null)
+    );
+    assert!(serde_json::from_value::<AccountUsageReadResponse>(json!({})).is_err());
+    assert_eq!(
+        artifact()["methods"][AccountUsageRead::METHOD],
+        json!({
+            "inputSchema":{"$ref":"#/definitions/v2/GetAccountTokenUsageParams"},
+            "outputSchema":{"$ref":"#/definitions/v2/GetAccountTokenUsageResponse"}
+        })
+    );
+}
+
+#[test]
 fn thread_management_matches_the_pinned_wire_shape() {
     assert_eq!(
         serde_json::to_value(ThreadFork {
@@ -164,6 +218,7 @@ fn exact_internal_contracts_include_initialization_and_selected_actions() {
         ModelList::METHOD,
         SkillsList::METHOD,
         RateLimitsRead::METHOD,
+        AccountUsageRead::METHOD,
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();

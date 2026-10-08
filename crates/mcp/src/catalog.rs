@@ -204,7 +204,7 @@ pub(super) fn tool_catalog() -> Vec<Tool> {
             meta(
                 "codex.query",
                 "Query Codex State",
-                "Batch read Codex-owned models, skills, usage, persisted threads, thread metadata, or background terminals. Each query returns its own result or error.",
+                "Batch read Codex-owned models, skills, current rate-limit usage, account activity, persisted threads, thread metadata, durable turns, or background terminals. Each query returns its own result or error. Follow paginated rows' nextCall for available pages.",
                 true,
                 false,
                 false,
@@ -880,6 +880,10 @@ fn codex_query_schema() -> Value {
         }), &["type"]),
         object_schema(json!({"type":{"const":"usage"}}), &["type"]),
         object_schema(json!({
+            "type":{"const":"accountActivity"},
+            "historyDays":{"type":"integer","minimum":0,"maximum":365,"default":30,"description":"Recent calendar days including today in UTC; 0 returns summary only. Summary is unchanged; null upstream history remains null."}
+        }), &["type"]),
+        object_schema(json!({
             "type":{"const":"threads"},
             "cursor":{"type":"string"},
             "limit":{"type":"integer","minimum":1,"maximum":50,"default":25},
@@ -890,6 +894,12 @@ fn codex_query_schema() -> Value {
         object_schema(json!({
             "type":{"const":"thread"},
             "threadId":{"type":"string","minLength":1}
+        }), &["type","threadId"]),
+        object_schema(json!({
+            "type":{"const":"turns"},
+            "threadId":{"type":"string","minLength":1},
+            "cursor":{"type":"string"},
+            "limit":{"type":"integer","minimum":1,"maximum":50,"default":25}
         }), &["type","threadId"]),
         object_schema(json!({
             "type":{"const":"backgroundTerminals"},
@@ -979,6 +989,43 @@ fn codex_query_output_schema() -> Value {
             "resetCreditsAvailable",
         ],
     );
+    let account_summary = object_schema(
+        json!({
+            "currentStreakDays":{"type":["integer","null"]},
+            "lifetimeTokens":{"type":["integer","null"]},
+            "longestRunningTurnSec":{"type":["integer","null"]},
+            "longestStreakDays":{"type":["integer","null"]},
+            "peakDailyTokens":{"type":["integer","null"]}
+        }),
+        &[],
+    );
+    let daily_bucket = object_schema(
+        json!({"startDate":{"type":"string"},"tokens":{"type":"integer"}}),
+        &["startDate", "tokens"],
+    );
+    let account_activity = object_schema(
+        json!({
+            "summary":account_summary,
+            "dailyUsageBuckets":{"type":["array","null"],"items":daily_bucket,"description":"Buckets within historyDays calendar days ending today in UTC (default 30); empty for 0, null when upstream history is null. Sparse history does not extend the window."}
+        }),
+        &["summary", "dailyUsageBuckets"],
+    );
+    let turn = object_schema(
+        json!({
+            "turnId":{"type":"string"},
+            "status":{"enum":["completed","interrupted","failed","inProgress"]},
+            "completedAt":{"type":["integer","null"]},
+            "error":{"type":["object","null"]}
+        }),
+        &["turnId", "status", "completedAt", "error"],
+    );
+    let turns = object_schema(
+        json!({
+            "turns":{"type":"array","items":turn},
+            "nextCursor":{"type":["string","null"]}
+        }),
+        &["turns", "nextCursor"],
+    );
     let threads = object_schema(
         json!({
             "threads":{"type":"array","items":thread_summary_schema()},
@@ -995,19 +1042,32 @@ fn codex_query_output_schema() -> Value {
         &["terminals", "nextCursor"],
     );
     let success = |kind: &'static str, result: Value| {
-        object_schema(
-            json!({
-                "index":{"type":"integer","minimum":0},
-                "type":{"const":kind},
-                "result":result
-            }),
-            &["index", "type", "result"],
-        )
+        let mut properties = json!({
+            "index":{"type":"integer","minimum":0},
+            "type":{"const":kind},
+            "result":result
+        });
+        let mut required = vec!["index", "type", "result"];
+        if matches!(kind, "threads" | "turns" | "backgroundTerminals") {
+            let mut arguments = codex_query_schema();
+            arguments["properties"]["queries"]["maxItems"] = json!(1);
+            arguments["properties"]["queries"]["items"]["oneOf"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|query| query["properties"]["type"]["const"] == kind);
+            properties["nextCall"] = next_call_schema(
+                "codex.query",
+                arguments,
+                "Read-only continuation preserving the original query with cursor replaced by nextCursor; null at the end. Does not execute or poll automatically.",
+            );
+            required.push("nextCall");
+        }
+        object_schema(properties, &required)
     };
     let error = object_schema(
         json!({
             "index":{"type":"integer","minimum":0},
-            "type":{"enum":["models","skills","usage","threads","thread","backgroundTerminals"]},
+            "type":{"enum":["models","skills","usage","accountActivity","threads","thread","turns","backgroundTerminals"]},
             "error":{"type":"string"}
         }),
         &["index", "type", "error"],
@@ -1017,8 +1077,10 @@ fn codex_query_output_schema() -> Value {
             success("models", models),
             success("skills", skills),
             success("usage", usage),
+            success("accountActivity", account_activity),
             success("threads", threads),
             success("thread", thread_summary_schema()),
+            success("turns", turns),
             success("backgroundTerminals", background_terminals),
             error
         ]}}}),

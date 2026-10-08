@@ -126,7 +126,7 @@ access and upstream temporary-directory defaults remain enabled. For example:
 `writableRoots` is rejected with full access, review, resume, or fork, including an
 explicit empty list. Start a fresh workstream to select different roots. Connect
 does not override sandbox settings on resume or fork; upstream selects permissions.
-Pinned Codex 0.160.0 restores its separate native `runtimeWorkspaceRoots` field
+Pinned Codex 0.160.1 restores its separate native `runtimeWorkspaceRoots` field
 on cold resume, but Connect's `writableRoots` are carried through legacy
 `sandboxPolicy` instead and are not covered by that restoration path. Do not
 rely on additional Connect write roots or the fresh access selection surviving a cold reload or fork. See the

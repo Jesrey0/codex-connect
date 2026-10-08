@@ -543,6 +543,39 @@ pub struct RateLimitsRead {
 }
 request!(RateLimitsRead, "account/rateLimits/read", Value);
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AccountUsageRead {}
+request!(
+    AccountUsageRead,
+    "account/usage/read",
+    AccountUsageReadResponse
+);
+
+// Only account activity is exposed; upstream thread billing details are omitted.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsageReadResponse {
+    pub summary: AccountTokenUsageSummary,
+    pub daily_usage_buckets: Option<Vec<AccountTokenUsageDailyBucket>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountTokenUsageSummary {
+    pub current_streak_days: Option<i64>,
+    pub lifetime_tokens: Option<i64>,
+    pub longest_running_turn_sec: Option<i64>,
+    pub longest_streak_days: Option<i64>,
+    pub peak_daily_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountTokenUsageDailyBucket {
+    pub start_date: String,
+    pub tokens: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CommandExec {
