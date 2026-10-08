@@ -6,7 +6,7 @@ Use [Getting Started](getting-started.md) for a fresh installation. This guide c
 
 Codex Connect owns its backend service, deployment state/cache, and installed content-addressed artifacts. Codex CLI/App Server and host ingress have independent user-global lifecycles. Host ingress is the sole owner of public routing and OAuth.
 
-The backend listens on loopback at `127.0.0.1:8767/mcp`. Public calls use `${NGROK_URL}/codex-connect/mcp` through ngrok and the OAuth-protected host ingress. Never expose the backend port directly.
+The backend listens on loopback at `127.0.0.1:8767/mcp`. Public calls use `${PUBLIC_ORIGIN}/codex-connect/mcp` through ngrok and the OAuth-protected host ingress; `PUBLIC_ORIGIN` is configured by host-ingress, not Codex Connect. Never expose the backend port directly.
 
 ## MCP streaming
 

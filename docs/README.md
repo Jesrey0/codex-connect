@@ -14,3 +14,5 @@ Policy and history:
 - [Security](../SECURITY.md)
 - [Contributing](../CONTRIBUTING.md)
 - [Changelog](../CHANGELOG.md)
+
+Sibling operational sources (not copied into this backend): [host-ingress](https://github.com/Jesrey0/host-ingress) owns OAuth, ngrok, Caddy and the public origin; [OpenCode Connect](https://github.com/Jesrey0/opencode-connect) owns its separate backend and Windows computer/printing adapters. A Git update to any one repository does not deploy the others.

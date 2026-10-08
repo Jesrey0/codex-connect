@@ -75,7 +75,7 @@ Follow the [host-ingress README](https://github.com/Jesrey0/host-ingress) for OA
 CHECK_PUBLIC=1 ./scripts/check
 ```
 
-The public URL is `${NGROK_URL}/codex-connect/mcp`; host ingress reports `NGROK_URL` through `scripts/status`.
+The public URL is `${PUBLIC_ORIGIN}/codex-connect/mcp`. Set `PUBLIC_ORIGIN` consistently in host-ingress's `env.ngrok` and `env.oauth`; `./scripts/operator status` or `./scripts/status` from the [host-ingress checkout](https://github.com/Jesrey0/host-ingress) reports the deployed endpoint. Never substitute the private `127.0.0.1:8767` listener.
 
 Anonymous and invalid-token MCP requests must return 401 with a Bearer discovery
 challenge. Public metadata must describe the exact HTTPS resource and issuer.
